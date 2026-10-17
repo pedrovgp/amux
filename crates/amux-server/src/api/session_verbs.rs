@@ -1826,6 +1826,16 @@ fn agent_ui_visible(clean_output: &str) -> bool {
         if ls.contains("voice input") || ls.contains("muse-spark") {
             return true;
         }
+        // OpenCode's TUI composer footer (measured v2.0.29): two hints unique
+        // to it and printed by no shell. NOTE: this is terminal-scrape
+        // recognition — the documented FALLBACK (amux README: "terminal
+        // scraping is the fallback, not the plan"). M2 (opencode over its
+        // structured protocol: `run --format json` / `serve`) makes the
+        // interactive composer unnecessary, at which point this matcher (and
+        // opencode_composer_state below) can be deleted with their call sites.
+        if ls.contains("shift+tab agents") || ls.contains("ctrl+p commands") {
+            return true;
+        }
     }
     for l in &lines[n.saturating_sub(12)..] {
         let s = l.trim();
@@ -3015,6 +3025,17 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
     if gemini_composer_state(&raw_lines, &stripped).is_some() {
         return "idle".into();
     }
+    // OpenCode draws its composer too, and — like gemini — with NO ❯/› glyph,
+    // so without this the function falls to the empty-string return and
+    // `pane_is_at_boundary` reads an idle opencode lane as NOT at boundary:
+    // the boot gate never clears (every send queues "waiting for fresh boot
+    // readiness" forever) and the steer sweep refuses the queued row with
+    // `boundary_refused_unknown_state` (agent_state unknown, authority
+    // inferred). Measured live 2026-10-16 on a server-started worker,
+    // opencode 2.0.30.
+    if opencode_composer_state(&stripped).is_some() {
+        return "idle".into();
+    }
     if clean.contains('\u{276f}') {
         // About to settle on idle: if a generating-shaped line sits in frame
         // unclassified, that is the next AMUX-3426 — make it self-announce.
@@ -3069,11 +3090,18 @@ fn idle_hook_frame(raw: &str) -> IdleHookFrame {
 pub(crate) fn pane_bar_says_generating(raw_output: &str) -> bool {
     let clean = strip_ansi(raw_output);
     let nonblank: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    // `esc interrupt` (no "to") is opencode's in-flight footer; measured
+    // 2026-10-16 on 2.0.29/2.0.30. Claude/codex print `esc to interrupt`
+    // (which does not contain this string) and gemini `esc to cancel`, so the
+    // opencode spelling is a safe positive marker rather than a loose one.
     let has_esc = nonblank
         .iter()
         .rev()
         .take(3)
-        .any(|l| l.to_lowercase().contains("esc to interrupt"));
+        .any(|l| {
+            let ll = l.to_lowercase();
+            ll.contains("esc to interrupt") || ll.contains("esc interrupt")
+        });
     // AN EMPTY COMPOSER DOES NOT MAKE IT IDLE. A peer's in-flight edit added a
     // `prompt_visible` exception on the theory that "empty ❯ + esc to interrupt
     // = idle with background agents". Measured against a lane provably mid-turn
@@ -5379,12 +5407,17 @@ fn render_transcript_records(
 // contract).
 // ---------------------------------------------------------------------------
 
-pub const SESSION_PROVIDERS: [&str; 7] =
-    ["claude", "codex", "gemini", "iterm2", "ollama", "grok", "muse"];
-const PROVIDER_YOLO_FLAGS: [&str; 3] = [
+pub const SESSION_PROVIDERS: [&str; 8] = [
+    "claude", "codex", "gemini", "iterm2", "ollama", "grok", "muse", "opencode",
+];
+const PROVIDER_YOLO_FLAGS: [&str; 4] = [
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
     "--yolo",
+    // OpenCode's auto-approve is the boolean `--auto` (see provider_yolo_flag).
+    // It is in this list so yolo DETECTION (is_yolo_enabled, the dashboard
+    // badge) and STRIP (toggle-off) treat it like every other provider's flag.
+    "--auto",
 ];
 const VALID_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
@@ -5701,6 +5734,9 @@ fn provider_yolo_flag(provider: &str) -> &'static str {
     match provider {
         "codex" | "ollama" => "--dangerously-bypass-approvals-and-sandbox",
         "gemini" | "muse" => "--yolo",
+        // OpenCode has no skip-permissions flag; `--auto` auto-approves the
+        // permissions that are not explicitly denied.
+        "opencode" => "--auto",
         _ => "--dangerously-skip-permissions",
     }
 }
@@ -5857,6 +5893,10 @@ pub(crate) fn default_model_for_provider(provider: &str) -> String {
         "grok" => "grok-4.6".into(),
         // The catalog default (is_default/is_current) as of 1.0.3.
         "muse" => "muse-spark-1.3-contributor".into(),
+        // OpenCode has no single default model (`provider/model#variant`, from
+        // the worker's own config). Empty is honest; the launch arm never
+        // invents a model (ethos rule 8: the model choice is the user's).
+        "opencode" => String::new(),
         _ => get_default_model(),
     }
 }
@@ -6017,6 +6057,9 @@ pub fn launch_base_binary(provider: &str) -> &'static str {
         "muse" => "muse",
         "gemini" => "gemini",
         "grok" => "grok",
+        // OpenCode CLI. Terminal-hosted in M0; the structured pump learns it
+        // in M1 (crates/amux-server/src/opencode/).
+        "opencode" => "opencode",
         // claude, iterm2, and anything unknown launch via build_claude_cmd,
         // whose default binary is `claude` (overridable by AMUX_CLAUDE_CMD).
         _ => "claude",
@@ -6086,6 +6129,42 @@ pub(crate) fn grok_new_session_id() -> String {
         bytes[8], bytes[9], bytes[10], bytes[11],
         bytes[12], bytes[13], bytes[14], bytes[15]
     )
+}
+
+/// OpenCode's interactive launch opts. Pure, so the launch contract is
+/// testable without a tmux pane (muse_launch_command's precedent).
+///
+/// - `--standalone` ALWAYS: without it the TUI connects to the shared
+///   background service (`opencode serve --service`), which loaded its config
+///   — and therefore any per-worker OPENCODE_CONFIG_CONTENT instructions —
+///   before this worker existed, so the composed scoped-context file never
+///   reached the model. A private server reads the worker's own env, and
+///   lanes stop sharing one service (session state included). Measured live
+///   2026-10-16: the env pair was on the process but the marker was absent
+///   from the model until --standalone was added.
+/// - yolo normalizes to `--auto`; stale spellings never leak.
+/// - No model default: opencode wants `provider/model#variant` and its own
+///   config supplies the default. A `--model` in CC_FLAGS passes through.
+pub(crate) fn opencode_launch_opts(flags: &str, extra_flags: &str) -> String {
+    let mut oflags = flags.to_string();
+    let oyolo = PROVIDER_YOLO_FLAGS.iter().any(|f| oflags.contains(f));
+    if oyolo {
+        oflags = strip_provider_yolo_flags(&oflags);
+    }
+    let mut opts = String::new();
+    if !oflags.is_empty() {
+        opts += &format!(" {}", shell_quote_flags(&oflags));
+    }
+    if !extra_flags.is_empty() {
+        opts += &format!(" {}", shell_quote_flags(extra_flags));
+    }
+    if oyolo && !opts.contains("--auto") {
+        opts += " --auto";
+    }
+    if !opts.contains("--standalone") {
+        opts += " --standalone";
+    }
+    opts
 }
 
 /// Muse Code (`muse`) is the one provider whose session id amux CANNOT mint.
@@ -6377,6 +6456,57 @@ mod grok_launch_tests {
 }
 
 #[cfg(test)]
+mod opencode_provider_tests {
+    use super::{
+        default_model_for_provider, launch_base_binary, opencode_launch_opts,
+        provider_yolo_flag, SESSION_PROVIDERS,
+    };
+
+    #[test]
+    fn opencode_is_a_session_provider_and_launches_opencode() {
+        assert!(SESSION_PROVIDERS.contains(&"opencode"));
+        assert_eq!(launch_base_binary("opencode"), "opencode");
+        assert_ne!(launch_base_binary("opencode"), "claude");
+    }
+
+    #[test]
+    fn opencode_yolo_is_auto_and_has_no_invented_model() {
+        assert_eq!(provider_yolo_flag("opencode"), "--auto");
+        // No provider default model: opencode wants provider/model#variant and
+        // the worker's own config supplies it (ethos rule 8).
+        assert_eq!(default_model_for_provider("opencode"), "");
+    }
+
+    #[test]
+    fn opencode_launch_is_standalone_and_normalizes_yolo() {
+        // `--standalone` is load-bearing: without a private server the TUI
+        // reads config from the shared background service, which never saw the
+        // worker's OPENCODE_CONFIG_CONTENT (measured live 2026-10-16).
+        let opts = opencode_launch_opts("--dangerously-skip-permissions", "");
+        assert!(opts.contains("--standalone"), "private server is the scoped-context channel: {opts}");
+        assert!(opts.contains("--auto"), "{opts}");
+        assert!(
+            !opts.contains("--dangerously-skip-permissions"),
+            "claude's yolo spelling must not leak: {opts}"
+        );
+
+        // A user-supplied --standalone is not duplicated.
+        let opts = opencode_launch_opts("--standalone", "");
+        assert_eq!(opts.matches("--standalone").count(), 1, "{opts}");
+
+        // Model flags pass through verbatim; no model is invented.
+        let opts = opencode_launch_opts("--model opencode-go/deepseek-v4.1-flash", "");
+        assert!(opts.contains("--model"), "{opts}");
+        assert!(opts.contains("opencode-go/deepseek-v4.1-flash"), "{opts}");
+        assert!(!opts.contains("sonnet"), "{opts}");
+
+        // Even with nothing configured, the private server rides along.
+        let opts = opencode_launch_opts("", "");
+        assert_eq!(opts.trim(), "--standalone");
+    }
+}
+
+#[cfg(test)]
 mod muse_launch_tests {
     use super::{
         launch_base_binary, muse_launch_command, muse_pick_session, provider_yolo_flag,
@@ -6521,6 +6651,7 @@ fn provider_label(provider: &str) -> &str {
         "ollama" => "Ollama",
         "grok" => "Grok",
         "muse" => "Muse Code",
+        "opencode" => "OpenCode",
         other => {
             if other.is_empty() {
                 "Claude Code"
@@ -10684,6 +10815,67 @@ pub(crate) fn empty_send_plan(raw_frame: &str) -> EmptySendPlan {
     }
 }
 
+/// OpenCode's TUI composer (`opencode` v2.0.29/2.0.30), recognized from
+/// stripped lines.
+///
+/// OpenCode draws its input as a bordered box — `┃` (U+2503) verticals and a
+/// `╹▀▀…` bottom border — with a footer carrying `ctrl+p commands` and one
+/// rotating hint. The box holds the empty hint (`Ask anything… "…"`) and a
+/// mode row (`Build · <model> · <effort>`); real typed text sits in the box
+/// above the mode row.
+///
+/// The footer's LEFT segment rotates with state (measured live 2026-10-16,
+/// 2.0.29 and 2.0.30): `shift+tab agents` on a fresh TUI, usage/cost
+/// (`8.7K (1%) · $0.00`) after a turn, and `esc interrupt` while a turn runs.
+/// Only the last of those is NOT an idle composer, so the matcher keys on the
+/// stable `ctrl+p commands` and excludes the in-flight spelling.
+///
+/// NOTE: terminal-scrape recognition — the documented FALLBACK. When M2 drives
+/// opencode over its structured protocol, the interactive composer (and this
+/// matcher, plus `agent_ui_visible`'s opencode markers) become unnecessary and
+/// can be deleted together.
+fn opencode_composer_state(stripped: &[String]) -> Option<ComposerState> {
+    // The composer footer. `ctrl+p commands` is the stable marker; requiring
+    // both hints here (the pre-2.0.30 matcher) made a post-turn idle frame
+    // read as NotVisible, and accepting every `ctrl+p` frame would read a
+    // mid-turn frame as an empty composer. Neither is the composer.
+    let footer = stripped.iter().rposition(|l| {
+        l.contains("ctrl+p commands") && !l.to_lowercase().contains("esc interrupt")
+    })?;
+    // The bottom border sits directly above the footer.
+    let border = footer.checked_sub(1)?;
+    if !stripped[border].trim_start().starts_with('\u{2579}') {
+        return None;
+    }
+    // The box body: the run of `┃`-prefixed lines above the border.
+    let mut top = border;
+    while top > 0 && stripped[top - 1].trim_start().starts_with('\u{2503}') {
+        top -= 1;
+    }
+    if top == border {
+        return None; // footer without a drawn box: prose, not the composer
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for l in &stripped[top..border] {
+        let t = l.trim_start().trim_start_matches('\u{2503}').trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Chrome, never content: the empty hint and the mode row.
+        if t.starts_with("Ask anything") {
+            continue;
+        }
+        if t.starts_with("Build ") && t.contains('\u{00b7}') {
+            continue;
+        }
+        parts.extend(t.split_whitespace().map(str::to_string));
+    }
+    if parts.is_empty() {
+        return Some(ComposerState::Placeholder("Askanything".into()));
+    }
+    Some(ComposerState::Typed(parts.concat()))
+}
+
 pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     let clean = strip_ansi(raw_frame);
     // The manager view owns the keyboard: its own status bar says so. Positive
@@ -10730,6 +10922,14 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     // therefore spun its twelve no-ui looks and reported `Unverified` while the
     // message sat delivered in the lane.
     if let Some(state) = gemini_composer_state(&raw_lines, &stripped) {
+        return state;
+    }
+    // OpenCode draws its composer too, and — like gemini — with NO ❯/› prompt
+    // glyph, so the scan below returns NotVisible for a plainly drawn composer
+    // and `read_frame` maps that to NoUi, which `final_frame_confirms` refuses
+    // by design: every send would report `Unverified` while the message sat in
+    // the box. Same shape, same fix as AMUX-3889 one provider over.
+    if let Some(state) = opencode_composer_state(&stripped) {
         return state;
     }
     let Some(idx) = stripped
@@ -15791,6 +15991,17 @@ pub(crate) async fn start_session(
             }
             format!("{base_bin}{opts}")
         }
+        "opencode" => {
+            // OpenCode (`opencode`). The interactive TUI launches in tmux; the
+            // structured headless path is CliProvider::OpenCode. Do NOT fall
+            // through to build_claude_cmd — that would launch `claude`.
+            //
+            // The opts are pure (opencode_launch_opts): yolo normalizes to
+            // `--auto`, no model is invented, and `--standalone` always rides
+            // so the worker runs its own server with its own env (the
+            // scoped-context channel + lane isolation; see the helper's doc).
+            format!("{base_bin}{}", opencode_launch_opts(&flags, extra_flags))
+        }
         _ => build_claude_cmd(&cfg, &flags, &default_flags, &session_flag, extra_flags) + &rules_opts,
     };
 
@@ -15803,6 +16014,7 @@ pub(crate) async fn start_session(
         && provider != "ollama"
         && provider != "grok"
         && provider != "muse"
+        && provider != "opencode"
     {
         shell_rc.push_str("unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; ");
         if let Ok(t) = std::fs::read_to_string(
@@ -15881,6 +16093,7 @@ pub(crate) async fn start_session(
         && provider != "ollama"
         && provider != "grok"
         && provider != "muse"
+        && provider != "opencode"
         && has_oauth
     {
         shell_rc.push_str("unset ANTHROPIC_API_KEY; ");
@@ -15927,6 +16140,14 @@ pub(crate) async fn start_session(
             "worker CLI and hooks use the launching server home and endpoint");
     }
     let mut env_args: Vec<String> = Vec::new();
+    // SCOPED CONTEXT, ENV CHANNEL (opencode). `worker_rules_args` above already
+    // composed and wrote ~/.amux/rules/<name>.md for this launch; opencode
+    // loads that file as ambient instructions through its merged inline
+    // config. Every other provider carries its context in argv instead.
+    for (key, value) in worker_rules_env(name, &provider, isolated) {
+        env_args.push("-e".into());
+        env_args.push(format!("{key}={value}"));
+    }
     // SECRET VALUES NEVER GO IN ARGV (AMUX-4803). Process arguments are
     // world-readable on macOS, and a tmux SERVER keeps the argv of the
     // new-session that created it for its whole lifetime — measured at 3d22h,
@@ -29700,9 +29921,12 @@ pub fn worker_rules_file(name: &str) -> PathBuf {
 ///
 /// - claude: `--append-system-prompt-file <~/.amux/rules/<name>.md>`
 /// - codex: `-c developer_instructions=<toml string>`
+/// - opencode: NO argv (returns empty), but the file above IS written; its
+///   channel is the env pair from [`worker_rules_env`] (opencode merges
+///   `OPENCODE_CONFIG_CONTENT` and loads its `instructions` paths at start).
 /// - an isolated worker gets nothing (no injected prompts, CLAUDE.md
-///   "Isolated workers"); other providers have no channel yet. Both are logged
-///   when rules exist, so a rule that cannot reach its worker says so.
+///   "Isolated workers"); providers without a channel are logged when rules
+///   exist, so a rule that cannot reach its worker says so.
 ///
 /// Every launch logs verdict=rules_delivered|rules_not_delivered.
 pub fn worker_rules_args(name: &str, provider: &str, isolated: bool) -> Vec<String> {
@@ -29722,12 +29946,12 @@ pub fn worker_rules_args(name: &str, provider: &str, isolated: bool) -> Vec<Stri
         let _ = std::fs::remove_file(&file);
         return refuse("isolated workers receive no injected prompts");
     }
-    if !matches!(provider, "claude" | "" | "codex") {
+    if !matches!(provider, "claude" | "" | "codex" | "opencode") {
         return refuse("this provider has no rules channel");
     }
-    // Written for codex too: the composed block names this file as the place
-    // a changed scope is re-read from (`SCOPED_CONTEXT_MARKER`), so it must
-    // exist for every provider that receives that pointer.
+    // Written for codex and opencode too: the composed block names this file
+    // as the place a changed scope is re-read from (`SCOPED_CONTEXT_MARKER`),
+    // so it must exist for every provider that receives that pointer.
     if !write_worker_context_file(name, &block) {
         return refuse("could not write the rules file");
     }
@@ -29736,6 +29960,10 @@ pub fn worker_rules_args(name: &str, provider: &str, isolated: bool) -> Vec<Stri
             "-c".to_string(),
             format!("developer_instructions={}", serde_json::to_string(&block).unwrap_or_default()),
         ],
+        // OpenCode's channel is the launch env, not argv (worker_rules_env):
+        // the composed file written above is what its `instructions` config
+        // will load.
+        "opencode" => Vec::new(),
         _ => vec!["--append-system-prompt-file".to_string(), file.to_string_lossy().into_owned()],
     };
     if block.len() > SCOPED_CONTEXT_WARN_BYTES {
@@ -29746,6 +29974,29 @@ pub fn worker_rules_args(name: &str, provider: &str, isolated: bool) -> Vec<Stri
     tracing::info!(session = name, provider, layers, bytes = block.len(), measured = true,
         n_considered = layers, verdict = "rules_delivered", "binding rules composed into this launch");
     args
+}
+
+/// The launch ENV that gives `name` its scoped context on providers whose
+/// channel is not a CLI flag. OpenCode is the case: its config sources MERGE
+/// and the inline `OPENCODE_CONFIG_CONTENT` is a runtime override (highest
+/// precedence except managed configs), and every path in its `instructions`
+/// array is loaded as ambient instructions at startup. The pair points at the
+/// same composed `worker_rules_file` claude/codex receive — written by
+/// [`worker_rules_args`], which every launch calls before its spawn.
+///
+/// Empty for every other provider and for isolated workers. Measured live
+/// 2026-10-16 (opencode 2.0.30); before this, every opencode launch logged
+/// `rules_not_delivered` "this provider has no rules channel".
+pub fn worker_rules_env(name: &str, provider: &str, isolated: bool) -> Vec<(String, String)> {
+    if provider != "opencode" || isolated {
+        return Vec::new();
+    }
+    let file = worker_rules_file(name);
+    if !file.is_file() {
+        return Vec::new();
+    }
+    let content = serde_json::json!({ "instructions": [file.to_string_lossy()] }).to_string();
+    vec![("OPENCODE_CONFIG_CONTENT".to_string(), content)]
 }
 
 /// What a memory or rules write promises, returned beside the write.
@@ -41007,6 +41258,20 @@ mod tests {
                      gpt-5.6-sol default \u{b7} ~/w";
         assert!(agent_ui_visible(codex), "codex composer not recognised");
 
+        // OpenCode v2.0.29: a ┃-bordered box with a ╹▀ bottom border and a
+        // footer carrying two hints unique to it ("shift+tab agents",
+        // "ctrl+p commands"). No ❯/› glyph, like gemini's box.
+        let opencode = "\u{2503}\n\
+                        \u{2503}  Ask anything\u{2026} \"What is the tech stack of this project?\"\n\
+                        \u{2503}\n\
+                        \u{2503}  Build \u{b7} DeepSeek V4.1 Flash OpenCode Go \u{b7} max\n\
+                        \u{2579}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\n\
+                        \u{2026}/w    shift+tab agents  ctrl+p commands";
+        assert!(
+            agent_ui_visible(opencode),
+            "opencode composer not recognised:\n{opencode}"
+        );
+
         let claude =
             "\u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} for agents";
         assert!(agent_ui_visible(claude), "claude composer not recognised");
@@ -48045,6 +48310,75 @@ mod composer_state_tests {
     }
 
     #[test]
+    fn an_opencode_composer_is_read_rather_than_reported_as_no_ui() {
+        // The bug, one provider over from AMUX-3889: opencode's box draws no
+        // ❯/› glyph, so the generic scan returned NotVisible → NoUi → every
+        // send reported Unverified while the text sat in the box. Measured live
+        // 2026-10-15 on worker `test` (opencode 2.0.29).
+        const EMPTY: &str = "\u{2503}\n\
+             \u{2503}  Ask anything\u{2026} \"What is the tech stack of this project?\"\n\
+             \u{2503}\n\
+             \u{2503}  Build \u{b7} DeepSeek V4.1 Flash OpenCode Go \u{b7} max\n\
+             \u{2579}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\n\
+             \u{2026}/projetos/amux:feat/opencode-provider    shift+tab agents  ctrl+p commands";
+        assert_ne!(
+            composer_state(EMPTY),
+            ComposerState::NotVisible,
+            "opencode's box is a drawn composer; NotVisible routes the send to NoUi \
+             and a delivered message is reported as failed"
+        );
+        assert_eq!(composer_state(EMPTY).typed(), None);
+        assert_eq!(read_frame(EMPTY, "somemessagetail"), FrameRead::Cleared);
+        assert!(final_frame_confirms(read_frame(EMPTY, "somemessagetail")));
+        // The provider-UI marker that clears the boot gate.
+        assert!(agent_ui_visible(EMPTY));
+
+        // Control: real typed text must read as typed, never Cleared.
+        const TYPED: &str = "\u{2503}\n\
+             \u{2503}  hello world\n\
+             \u{2503}\n\
+             \u{2503}  Build \u{b7} DeepSeek V4.1 Flash OpenCode Go \u{b7} max\n\
+             \u{2579}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\n\
+             \u{2026}/w    shift+tab agents  ctrl+p commands";
+        assert_eq!(composer_state(TYPED).typed(), Some("helloworld"));
+        assert_eq!(read_frame(TYPED, "world"), FrameRead::StillThereIdle);
+        assert!(!final_frame_confirms(read_frame(TYPED, "world")));
+
+        // 2.0.30, post-turn idle: the hint row swaps `shift+tab agents` for
+        // usage/cost. Still the composer — and the boundary the boot gate and
+        // the steer sweep need. Measured live 2026-10-16; before this, an
+        // idle opencode lane read as NOT at boundary (detect_claude_status
+        // returned ""), so every send queued "waiting for fresh boot
+        // readiness" forever and the steer sweep refused the row with
+        // `boundary_refused_unknown_state`.
+        const IDLE_USED: &str = "\u{2503}\n\
+             \u{2503}\n\
+             \u{2503}\n\
+             \u{2503}  Build auto \u{b7} DeepSeek V4.1 Flash OpenCode Go \u{b7} high\n\
+             \u{2579}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\n\
+             \u{2026}/projetos/django-k8s:main   9.1K (1%) \u{b7} $0.00  ctrl+p commands";
+        assert_ne!(composer_state(IDLE_USED), ComposerState::NotVisible);
+        assert_eq!(composer_state(IDLE_USED).typed(), None);
+        assert!(agent_ui_visible(IDLE_USED));
+        assert!(pane_is_at_boundary(IDLE_USED));
+        assert_eq!(detect_claude_status(IDLE_USED), "idle");
+
+        // Mid-turn (2.0.30): the footer keeps `ctrl+p commands` and swaps the
+        // idle hints for `esc interrupt`. A turn in flight is NOT a boundary
+        // and must not read as an empty composer.
+        const RUNNING: &str = "\u{2503}\n\
+             \u{2503}\n\
+             \u{2503}\n\
+             \u{2503}  Build auto \u{b7} DeepSeek V4.1 Flash OpenCode Go \u{b7} high\n\
+             \u{2579}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\n\
+             \u{2026}/projetos/django-k8s:main   \u{25a0}\u{25a0}\u{2b1d}\u{2b1d}\u{2b1d}\u{2b1d}\u{2b1d}\u{2b1d} esc interrupt   \u{2193} 1 shell \u{b7} 9.1K (1%) \u{b7} $0.00  ctrl+p commands";
+        assert_eq!(composer_state(RUNNING), ComposerState::NotVisible);
+        assert!(pane_bar_says_generating(RUNNING));
+        assert!(!pane_is_at_boundary(RUNNING));
+        assert_ne!(detect_claude_status(RUNNING), "idle");
+    }
+
+    #[test]
     fn a_gemini_composer_is_read_rather_than_reported_as_no_ui() {
         // 1. THE BUG. An empty gemini composer is a composer, not an absence.
         assert_ne!(
@@ -51970,6 +52304,54 @@ mod commit_shape_tests {
         let defaults = read(&super::worker_rules_args("ruled", "claude", false));
         assert!(!defaults.contains("GLOBALRULE") && !defaults.contains("GROUPRULE") && !defaults.contains("WORKERRULE"));
         assert!(defaults.contains("amux browser route advance"));
+    }
+
+    /// OpenCode has no argv channel for ambient instructions; its composed
+    /// scoped context reaches the launch through `OPENCODE_CONFIG_CONTENT`
+    /// (config sources merge; the inline form is a runtime override) whose
+    /// `instructions` array points at the same `~/.amux/rules/<name>.md`
+    /// claude/codex get. Measured live 2026-10-16 (opencode 2.0.30) — before
+    /// this every opencode launch logged `rules_not_delivered` "this provider
+    /// has no rules channel" and no scoped memory reached a worker.
+    #[tokio::test]
+    async fn opencode_gets_its_scoped_context_through_the_config_env() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("sessions")).unwrap();
+        std::fs::create_dir_all(h.join("memory/tags")).unwrap();
+        let _g = crate::api::settings::test_env::set_home(h);
+        std::fs::write(h.join("sessions/oc.env"), "CC_TAGS=\"alpha\"\n").unwrap();
+        std::fs::write(h.join("memory/_rules.md"), "GLOBALRULE").unwrap();
+        std::fs::write(h.join("memory/oc.rules.md"), "WORKERRULE").unwrap();
+        std::fs::write(h.join("memory/oc.md"), "OCMEMORY").unwrap();
+
+        // No argv for opencode…
+        let args = super::worker_rules_args("oc", "opencode", false);
+        assert!(args.is_empty(), "opencode's channel is env, not argv: {args:?}");
+        // …but the file every other provider's pointer names IS written.
+        let file = super::worker_rules_file("oc");
+        let body = std::fs::read_to_string(&file).unwrap();
+        for needle in ["GLOBALRULE", "WORKERRULE", "OCMEMORY", "Keeping this scoped context current"] {
+            assert!(body.contains(needle), "{needle} missing from the composed context: {body}");
+        }
+
+        // The env pair points opencode's `instructions` at that exact file.
+        let env = super::worker_rules_env("oc", "opencode", false);
+        assert_eq!(env.len(), 1, "{env:?}");
+        assert_eq!(env[0].0, "OPENCODE_CONFIG_CONTENT");
+        let v: serde_json::Value = serde_json::from_str(&env[0].1).unwrap();
+        assert_eq!(
+            v["instructions"][0].as_str().unwrap(),
+            file.to_string_lossy(),
+            "the pair must name the composed file: {}",
+            env[0].1
+        );
+
+        // Other providers keep their own channels; isolated workers get nothing.
+        assert!(super::worker_rules_env("oc", "claude", false).is_empty());
+        assert!(super::worker_rules_env("oc", "codex", false).is_empty());
+        assert!(super::worker_rules_env("oc", "gemini", false).is_empty());
+        assert!(super::worker_rules_env("oc", "opencode", true).is_empty());
     }
 }
 

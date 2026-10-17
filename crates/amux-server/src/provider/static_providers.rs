@@ -392,6 +392,69 @@ impl ProviderAdapter for MuseAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OpenCode
+// ---------------------------------------------------------------------------
+
+/// OpenCode CLI (`opencode`, measured against v2.0.28 on Linux).
+///
+/// Runs the interactive TUI in tmux (M0) and speaks the structured protocol for
+/// headless runs: `opencode run --format json` emits one JSON object per line
+/// carrying a stable `sessionID` (`ses_…`). The structured path is wired
+/// through [`super::super::opencode::structured::CliProvider::OpenCode`] and
+/// `events::translate_opencode` (M1). See the fork's
+/// `docs/opencode-provider-plan.md`.
+///
+/// No usage/quota API is read on this host, so `usage()` stays Unknown
+/// (Invariant 20) rather than inventing a number.
+pub struct OpenCodeAdapter;
+
+#[async_trait]
+impl ProviderAdapter for OpenCodeAdapter {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("opencode")
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            hot_model_switch: false,
+            // No usage surface read (terminal scrape only, like the others).
+            reports_usage: false,
+            // `opencode run --format json` emits JSONL lifecycle events.
+            structured_events: true,
+            // No hook surface wired for opencode yet.
+            hooks: false,
+        }
+    }
+
+    async fn usage(&self) -> ProviderUsage {
+        // No usage API to read; unknown is the only honest answer.
+        ProviderUsage::unknown(self.id())
+    }
+
+    async fn models(&self) -> Vec<String> {
+        // Models are account-specific (`opencode models`); enumerating them means
+        // spawning the CLI, which is not worth a launch-time probe. Empty is the
+        // honest answer, and the configured model is an open string either way.
+        Vec::new()
+    }
+
+    fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
+        match prompt_mode {
+            // The interactive TUI, exactly as `opencode` launches it.
+            PromptMode::Interactive => vec!["opencode".into()],
+            // The real headless structured shape (consumed once M1 wires the
+            // protocol); the prompt itself is supplied by the protocol, not argv.
+            PromptMode::HeadlessStructured => vec![
+                "opencode".into(),
+                "run".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+        }
+    }
+}
+
 /// Parse `ollama list` output: a header line, then one model per line with
 /// the name as the first whitespace-separated column, e.g.
 /// `llama3:latest    365c0bd3c000    4.7 GB    2 weeks ago`.
@@ -516,6 +579,17 @@ mod tests {
         assert!(muse.structured_events);
         assert!(!muse.reports_usage);
         assert!(!muse.hot_model_switch);
+        // OpenCode: JSONL lifecycle events (M1), no hook surface wired, no usage
+        // API read on this host, no hot model switch. Pinned so a future flip is
+        // a build failure rather than a silent capability claim.
+        let opencode = OpenCodeAdapter.capabilities();
+        assert!(
+            opencode.structured_events,
+            "opencode run --format json emits JSONL lifecycle events"
+        );
+        assert!(!opencode.hooks, "no hook surface is wired for opencode yet");
+        assert!(!opencode.reports_usage, "no usage API is read on this host");
+        assert!(!opencode.hot_model_switch);
     }
 
     #[test]
