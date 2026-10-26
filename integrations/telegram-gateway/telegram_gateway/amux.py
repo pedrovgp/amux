@@ -1,8 +1,19 @@
 """Thin async client for the amux HTTP API.
 
-Only the worker verbs this gateway needs.  Every method raises ``AmuxError``
-carrying the server's own ``error`` text, so the bot can show a real reason
-instead of a status code.
+amux has two substrates behind the same names, and they answer different verbs:
+
+- **lanes** — env-file + tmux fleet workers (``POST /api/sessions`` writes the
+  env file); verbs live under ``/api/sessions/<name>``.
+- **worker rows** — the newer ``workers`` table (``POST /api/workers``); verbs
+  live under ``/api/workers/<name>``. They have no lane env file, so a send to
+  one is refused by the server ("session not found").
+
+``GET /api/sessions`` returns BOTH, merged; a lane carries the fleet fields
+(``activity``, ``agent_state``, ``backend``) that a worker row does not. Every
+verb resolves the name to the right base before calling, so the bot can list
+whatever amux lists and still address it correctly.
+
+Every method raises ``AmuxError`` carrying the server's own ``error`` text.
 """
 from __future__ import annotations
 
@@ -12,6 +23,8 @@ from urllib.parse import quote
 
 import httpx
 
+LANE_MARKER = "activity"  # present on fleet lanes, absent on worker rows
+
 
 class AmuxError(RuntimeError):
     """A non-2xx answer or an unreachable server."""
@@ -20,6 +33,10 @@ class AmuxError(RuntimeError):
         self.status = status
         self.detail = detail
         super().__init__(f"HTTP {status}: {detail}")
+
+
+def is_lane(row: dict) -> bool:
+    return LANE_MARKER in row
 
 
 class AmuxClient:
@@ -97,76 +114,120 @@ class AmuxClient:
     def _key(key: str) -> str:
         return quote(str(key), safe="")
 
-    # ---- verbs ----------------------------------------------------------
+    # ---- discovery ------------------------------------------------------
 
     async def health(self) -> dict:
         return await self._json("GET", "/health", timeout=10.0)
 
-    async def list_workers(self, limit: int = 200) -> list[dict]:
-        data = await self._json("GET", "/api/workers", params={"limit": limit})
-        items = data.get("items")
-        return items if isinstance(items, list) else []
+    async def list_sessions(self) -> list[dict]:
+        rows = await self._parsed("GET", "/api/sessions")
+        return rows if isinstance(rows, list) else []
 
-    async def get_worker(self, key: str) -> dict:
-        return await self._json("GET", f"/api/workers/{self._key(key)}")
+    async def find(self, name: str) -> dict:
+        for row in await self.list_sessions():
+            if isinstance(row, dict) and row.get("name") == name:
+                return row
+        raise AmuxError(404, f"session '{name}' not found")
 
-    async def create_worker(
+    def _base(self, row: dict) -> str:
+        return "/api/sessions" if is_lane(row) else "/api/workers"
+
+    # ---- lifecycle ------------------------------------------------------
+
+    async def create_session(
         self,
-        display_name: str,
+        name: str,
         *,
         cwd: str | None = None,
         provider: str | None = None,
-        backend: str | None = None,
     ) -> dict:
-        body: dict = {"display_name": display_name}
+        """Create a fleet lane (env file + autostart).
+
+        ``POST /api/workers`` would only write a table row with no lane env
+        file, and the server refuses sends to those; the SPA's own create uses
+        ``POST /api/sessions`` for exactly this reason.
+        """
+        body: dict = {"name": name, "start": True}
         if cwd:
-            body["cwd"] = cwd
+            body["dir"] = cwd
         if provider:
             body["provider"] = provider
-        if backend:
-            body["backend"] = backend
-        return await self._json("POST", "/api/workers", body=body)
+        return await self._json("POST", "/api/sessions", body=body, timeout=120.0)
 
-    async def start_worker(self, key: str) -> dict:
-        # Starting can wait on host admission and a provider spawn.
-        return await self._json("POST", f"/api/workers/{self._key(key)}/start", timeout=120.0)
+    async def start(self, name: str) -> dict:
+        row = await self.find(name)
+        return await self._json(
+            "POST", f"{self._base(row)}/{self._key(name)}/start", timeout=120.0
+        )
 
-    async def stop_worker(self, key: str) -> dict:
-        return await self._json("POST", f"/api/workers/{self._key(key)}/stop", timeout=60.0)
+    async def stop(self, name: str) -> dict:
+        row = await self.find(name)
+        return await self._json(
+            "POST", f"{self._base(row)}/{self._key(name)}/stop", timeout=60.0
+        )
+
+    async def delete(self, name: str) -> dict:
+        row = await self.find(name)
+        if is_lane(row):
+            return await self._json(
+                "POST", f"/api/sessions/{self._key(name)}/delete", timeout=60.0
+            )
+        return await self._json("DELETE", f"/api/workers/{self._key(name)}", timeout=60.0)
 
     async def wait_until_started(
-        self, key: str, *, timeout: float = 25.0, interval: float = 1.5
+        self, name: str, *, timeout: float = 25.0, interval: float = 1.5
     ) -> dict:
         """Poll until the spawn settles, so the bot reports the real outcome.
 
-        A start answers ``{"state": "starting"}`` before the backend process
-        exists; answering the user from that would say "started" for a worker
-        that later parks in ``error`` (the herdr spawn failure looked exactly
-        like that).  Returns the last row read, even on timeout.
+        Creation/start answers before the backend process answers, which is why
+        the first peek can 409 ("live but backend not found"). Returns the last
+        row read, even on timeout.
         """
         deadline = time.monotonic() + timeout
         row: dict = {}
         while True:
             try:
-                row = await self.get_worker(key)
+                row = await self.find(name)
             except AmuxError:
                 if time.monotonic() >= deadline:
                     raise
                 await asyncio.sleep(interval)
                 continue
-            state = row.get("state")
-            slug = state.get("state") if isinstance(state, dict) else row.get("status")
-            if slug not in ("starting", "registered", "stopping"):
+            status = str(row.get("status") or "")
+            if status and status not in ("starting", "stopping"):
                 return row
             if time.monotonic() >= deadline:
                 return row
             await asyncio.sleep(interval)
 
+    # ---- interaction ----------------------------------------------------
+
+    async def send(self, name: str, text: str) -> dict:
+        # A send is answered when accepted, not when delivered; the relay's
+        # pane read is the delivery signal.
+        row = await self.find(name)
+        return await self._json(
+            "POST",
+            f"{self._base(row)}/{self._key(name)}/send",
+            body={"text": text},
+            timeout=90.0,
+        )
+
+    async def peek(self, name: str, lines: int = 200) -> str:
+        row = await self.find(name)
+        data = await self._json(
+            "GET",
+            f"{self._base(row)}/{self._key(name)}/peek",
+            params={"lines": lines},
+        )
+        output = data.get("output")
+        return output if isinstance(output, str) else ""
+
     async def todo_cards(self, session: str) -> list[dict]:
         """Cards still assigned to a session that will restart it on stop.
 
         Bootstrap auto-starts any stopped worker that owns a waiting Todo card,
-        so a stop that "fails" is usually this.  A board read failure returns
+        so a stop that "fails" is usually this. A board read failure returns
         ``[]``: this decorates a stop message, it must not turn a real stop
         into an error.
         """
@@ -190,20 +251,3 @@ class AmuxClient:
                     }
                 )
         return out
-
-    async def send(self, key: str, text: str) -> dict:
-        # A send is answered when accepted, not when delivered; the relay's
-        # pane read is the delivery signal.
-        return await self._json(
-            "POST",
-            f"/api/workers/{self._key(key)}/send",
-            body={"text": text},
-            timeout=90.0,
-        )
-
-    async def peek(self, key: str, lines: int = 200) -> str:
-        data = await self._json(
-            "GET", f"/api/workers/{self._key(key)}/peek", params={"lines": lines}
-        )
-        output = data.get("output")
-        return output if isinstance(output, str) else ""

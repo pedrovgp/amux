@@ -115,7 +115,18 @@ async def _deliver_prompt(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, session: str, text: str, username: str
 ) -> None:
     stamp = f"[from Telegram @{username}] {text}"
-    await _client(context).send(session, stamp)
+    client = _client(context)
+    # A session can be mid-restart (live row, backend not spawned yet); the
+    # bootstrap pass finishes in seconds, so retry once before surfacing it.
+    for attempt in (1, 2):
+        try:
+            await client.send(session, stamp)
+            return
+        except AmuxError as exc:
+            if exc.status in (409, 503) and attempt == 1:
+                await asyncio.sleep(2.0)
+                continue
+            raise
 
 
 async def _report_send_error(
@@ -139,12 +150,20 @@ async def _report_send_error(
     if message is None:
         return
     if exc.status == 404:
-        _state(context).clear(update.effective_chat.id)
-        workers = await _client(context).list_workers()
+        rows = await _client(context).list_sessions()
+        if not any(row.get("name") == session for row in rows):
+            _state(context).clear(update.effective_chat.id)
+            await message.reply_text(
+                f"⚠️ `{session}` no longer exists — pick another session.",
+                reply_markup=sessions_keyboard(rows, "pick") if rows else main_menu(),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
         await message.reply_text(
-            f"⚠️ `{session}` no longer exists — pick another session.",
-            reply_markup=sessions_keyboard(workers, "pick") if workers else main_menu(),
-            parse_mode=ParseMode.MARKDOWN,
+            f"⚠️ `{session}` is a worker row with no lane env file, so amux "
+            "refused the send. Pick the lane it runs in, or start a fresh "
+            "session with 🚀.",
+            reply_markup=main_menu(),
         )
         return
     await message.reply_text(f"❌ amux refused: {exc.detail}")
@@ -154,7 +173,12 @@ async def _require_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     session = _state(context).selected(update.effective_chat.id)
     if session:
         return session
-    workers = await _client(context).list_workers()
+    log.info(
+        "session_required user=%s chat=%s",
+        update.effective_user.id if update.effective_user else "-",
+        update.effective_chat.id,
+    )
+    workers = await _client(context).list_sessions()
     await _say(
         update,
         "Pick a session first:",
@@ -168,34 +192,34 @@ async def _create_session(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     name = f"tg-{time.strftime('%m%d-%H%M')}-{secrets.token_hex(2)}"
     client = _client(context)
     try:
-        row = await client.create_worker(
+        # A lane (env file + autostart), not a bare workers-table row: the
+        # server refuses sends to a row because it has no lane env file.
+        await client.create_session(
             name,
             cwd=cfg.default_workdir,
             provider=cfg.default_provider,
-            backend=cfg.default_backend,
         )
-        key = row.get("id") or name
-        await client.start_worker(key)
-        # A start answers "starting" before the backend process exists, so wait
-        # for the real state instead of reporting a start that may have failed.
-        worker = await client.wait_until_started(key)
+        worker = await client.wait_until_started(name)
+        slug = str(worker.get("status") or "")
+        if slug == "stopped":
+            # Autostart can be skipped when the box refuses a spawn; one
+            # explicit start is the documented retry.
+            await client.start(name)
+            worker = await client.wait_until_started(name)
+            slug = str(worker.get("status") or slug)
     except AmuxError as exc:
         log.warning(
-            "session_create_failed name=%s provider=%s backend=%s status=%s detail=%s",
+            "session_create_failed name=%s provider=%s status=%s detail=%s",
             name,
             cfg.default_provider,
-            cfg.default_backend,
             exc.status,
             exc.detail,
         )
         await _say(update, f"❌ Could not start a session: {exc.detail}")
         return
 
-    state = worker.get("state")
-    state = state if isinstance(state, dict) else {}
-    slug = state.get("state") or worker.get("status") or "unknown"
     if slug == "error":
-        detail = state.get("detail") or "unknown error"
+        detail = worker.get("error") or worker.get("state") or "unknown error"
         log.warning("session_start_failed name=%s detail=%s", name, detail)
         await _say(
             update,
@@ -206,11 +230,10 @@ async def _create_session(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     _state(context).select(update.effective_chat.id, name)
     provider = worker.get("provider") or cfg.default_provider or "server default"
-    backend = worker.get("backend") or cfg.default_backend
-    log.info("session_started name=%s provider=%s backend=%s state=%s", name, provider, backend, slug)
+    log.info("session_started name=%s provider=%s status=%s", name, provider, slug or "unknown")
     await _say(
         update,
-        f"🚀 Started `{name}` ({provider} · {backend}, {slug}).\n"
+        f"🚀 Started `{name}` ({provider}, {slug or 'running'}).\n"
         "Send a message to give it a task.",
         reply_markup=status_keyboard(name),
         parse_mode=ParseMode.MARKDOWN,
@@ -218,11 +241,27 @@ async def _create_session(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def _peek(update: Update, context: ContextTypes.DEFAULT_TYPE, session: str) -> None:
-    try:
-        raw = await _client(context).peek(session, lines=200)
-    except AmuxError as exc:
-        log.warning("peek_failed session=%s status=%s detail=%s", session, exc.status, exc.detail)
-        await _say(update, f"❌ Peek failed: {exc.detail}")
+    client = _client(context)
+    raw = None
+    for attempt in (1, 2):
+        try:
+            raw = await client.peek(session, lines=200)
+            break
+        except AmuxError as exc:
+            if exc.status == 409 and attempt == 1:
+                await asyncio.sleep(2.5)
+                continue
+            log.warning("peek_failed session=%s status=%s detail=%s", session, exc.status, exc.detail)
+            if exc.status == 409:
+                detail = (
+                    f"`{session}` is being (re)started by amux right now — "
+                    "try again in a few seconds."
+                )
+            else:
+                detail = exc.detail
+            await _say(update, f"❌ Peek failed: {detail}", parse_mode=ParseMode.MARKDOWN)
+            return
+    if raw is None:
         return
     text = strip_ansi(raw).strip()
     if not text:
@@ -249,17 +288,20 @@ def _status_text(workers: list[dict]) -> str:
 
 @allow_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("command start user=%s chat=%s", update.effective_user.id, update.effective_chat.id)
     await update.message.reply_text(WELCOME, reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
 
 
 @allow_only
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("command menu user=%s chat=%s", update.effective_user.id, update.effective_chat.id)
     await update.message.reply_text("Menu:", reply_markup=main_menu())
 
 
 @allow_only
 async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    workers = await _client(context).list_workers()
+    log.info("command sessions user=%s chat=%s", update.effective_user.id, update.effective_chat.id)
+    workers = await _client(context).list_sessions()
     await _say(
         update,
         _status_text(workers),
@@ -270,11 +312,12 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 @allow_only
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("command status user=%s chat=%s", update.effective_user.id, update.effective_chat.id)
     session = _state(context).selected(update.effective_chat.id)
     if session:
         await _peek(update, context, session)
         return
-    workers = await _client(context).list_workers()
+    workers = await _client(context).list_sessions()
     await _say(
         update,
         _status_text(workers),
@@ -294,6 +337,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not data.startswith(PREFIX):
         return
     action, _, raw = data[len(PREFIX):].partition(":")
+    log.info(
+        "callback action=%s target=%s user=%s chat=%s",
+        action,
+        raw or "-",
+        update.effective_user.id,
+        update.effective_chat.id,
+    )
 
     if action in ("menu", "cancel"):
         await _say(update, WELCOME, reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
@@ -303,7 +353,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if raw:
             await _peek(update, context, raw)
         else:
-            workers = await _client(context).list_workers()
+            workers = await _client(context).list_sessions()
             await _say(
                 update,
                 _status_text(workers),
@@ -328,7 +378,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
-        workers = await _client(context).list_workers()
+        workers = await _client(context).list_sessions()
         if not workers:
             await _say(update, "No workers to stop.", reply_markup=main_menu())
             return
@@ -348,7 +398,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif action == "stopok":
         chat_id = update.effective_chat.id
         try:
-            await _client(context).stop_worker(raw)
+            await _client(context).stop(raw)
         except AmuxError as exc:
             log.warning(
                 "session_stop_failed session=%s status=%s detail=%s",
@@ -362,7 +412,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # worker that still owns a waiting card. Check the truth, then report it.
         await asyncio.sleep(3)
         try:
-            worker = await _client(context).get_worker(raw)
+            worker = await _client(context).find(raw)
         except AmuxError:
             worker = {}
         if worker.get("running"):
@@ -402,6 +452,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = await _require_session(update, context)
     if not session:
         return
+    log.info(
+        "prompt_text user=%s session=%s chars=%s",
+        update.effective_user.id,
+        session,
+        len(text),
+    )
     try:
         await _deliver_prompt(context, update.effective_chat.id, session, text, _username(update))
     except AmuxError as exc:
@@ -421,6 +477,12 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = await _require_session(update, context)
     if not session:
         return
+    log.info(
+        "voice_note user=%s session=%s media_type=%s",
+        update.effective_user.id,
+        session,
+        getattr(update.message.voice, "mime_type", "?"),
+    )
     try:
         transcript = await transcribe_voice(
             update.message.voice, groq_transcriber(cfg.groq_api_key, cfg.groq_model)
@@ -470,6 +532,12 @@ async def receive_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("No session selected — /menu")
         return ConversationHandler.END
     if text:
+        log.info(
+            "prompt_state user=%s session=%s chars=%s",
+            update.effective_user.id,
+            session,
+            len(text),
+        )
         try:
             await _deliver_prompt(
                 context, update.effective_chat.id, session, text, _username(update)

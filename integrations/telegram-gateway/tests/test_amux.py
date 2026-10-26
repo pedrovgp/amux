@@ -16,71 +16,116 @@ def make_client(handler, base_url="https://localhost:8824"):
     return AmuxClient(base_url, transport=transport)
 
 
-def test_list_workers_parses_items():
-    seen = {}
+def lane(name="w", status="idle"):
+    # Fleet lanes carry the activity/agent_state fields; worker rows do not.
+    return {"name": name, "activity": "none", "agent_state": status, "status": status, "running": True}
 
+
+def worker_row(name="w", status="idle"):
+    return {"name": name, "lifecycle": "active", "status": status, "running": True}
+
+
+def test_list_sessions_parses_the_bare_array():
     def handler(request):
-        seen["method"] = request.method
-        seen["path"] = request.url.path
-        return httpx.Response(200, json={"items": [{"name": "a"}], "total": 1})
+        assert request.url.path == "/api/sessions"
+        return httpx.Response(200, json=[lane("a"), worker_row("b")])
 
     client = make_client(handler)
     try:
-        assert run(client.list_workers()) == [{"name": "a"}]
+        rows = run(client.list_sessions())
     finally:
         run(client.aclose())
-    assert (seen["method"], seen["path"]) == ("GET", "/api/workers")
+    assert [row["name"] for row in rows] == ["a", "b"]
 
 
-def test_create_worker_sends_the_body():
+def test_find_is_404_for_an_unknown_name():
+    def handler(request):
+        return httpx.Response(200, json=[lane("a")])
+
+    client = make_client(handler)
+    try:
+        with pytest.raises(AmuxError) as excinfo:
+            run(client.find("missing"))
+    finally:
+        run(client.aclose())
+    assert excinfo.value.status == 404
+
+
+def test_create_session_posts_the_lane_contract():
     captured = {}
 
     def handler(request):
-        captured.update(
-            method=request.method,
-            path=request.url.path,
-            body=json.loads(request.content),
-        )
-        return httpx.Response(201, json={"id": "wrk_1", "name": "tg-x"})
+        captured.update(path=request.url.path, body=json.loads(request.content))
+        return httpx.Response(201, json={"ok": True, "name": "tg-x", "starting": True})
 
     client = make_client(handler)
     try:
-        row = run(client.create_worker("tg-x", cwd="/tmp", provider="opencode", backend="tmux"))
+        run(client.create_session("tg-x", cwd="/tmp", provider="opencode"))
     finally:
         run(client.aclose())
-    assert row["id"] == "wrk_1"
     assert captured == {
-        "method": "POST",
-        "path": "/api/workers",
-        "body": {
-            "display_name": "tg-x",
-            "cwd": "/tmp",
-            "provider": "opencode",
-            "backend": "tmux",
-        },
+        "path": "/api/sessions",
+        "body": {"name": "tg-x", "dir": "/tmp", "provider": "opencode", "start": True},
     }
 
 
-def test_send_posts_text_to_the_worker_route():
+def test_send_routes_a_lane_to_sessions():
     captured = {}
 
     def handler(request):
-        captured.update(
-            raw_path=request.url.raw_path.decode(), body=json.loads(request.content)
-        )
+        if request.url.path == "/api/sessions":
+            return httpx.Response(200, json=[lane("w")])
+        captured.update(path=request.url.path, body=json.loads(request.content))
         return httpx.Response(200, json={"ok": True})
 
     client = make_client(handler)
     try:
-        assert run(client.send("my worker", "[from Telegram @x] hi")) == {"ok": True}
+        run(client.send("w", "[from Telegram @x] hi"))
     finally:
         run(client.aclose())
-    assert captured["raw_path"] == "/api/workers/my%20worker/send"
+    assert captured["path"] == "/api/sessions/w/send"
     assert captured["body"] == {"text": "[from Telegram @x] hi"}
+
+
+def test_send_routes_a_worker_row_to_workers():
+    captured = {}
+
+    def handler(request):
+        if request.url.path == "/api/sessions":
+            return httpx.Response(200, json=[worker_row("w")])
+        captured.update(path=request.url.path)
+        return httpx.Response(200, json={"ok": True})
+
+    client = make_client(handler)
+    try:
+        run(client.send("w", "hi"))
+    finally:
+        run(client.aclose())
+    assert captured["path"] == "/api/workers/w/send"
+
+
+def test_stop_and_start_follow_the_substrate():
+    seen = []
+
+    def handler(request):
+        if request.url.path == "/api/sessions":
+            return httpx.Response(200, json=[lane("a"), worker_row("b")])
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"applied": True})
+
+    client = make_client(handler)
+    try:
+        run(client.start("a"))
+        run(client.stop("b"))
+    finally:
+        run(client.aclose())
+    assert seen == ["/api/sessions/a/start", "/api/workers/b/stop"]
 
 
 def test_peek_returns_output():
     def handler(request):
+        if request.url.path == "/api/sessions":
+            return httpx.Response(200, json=[lane("w")])
         assert request.url.params["lines"] == "50"
         return httpx.Response(200, json={"output": "hello\n"})
 
@@ -93,16 +138,18 @@ def test_peek_returns_output():
 
 def test_error_body_text_becomes_the_detail():
     def handler(request):
-        return httpx.Response(404, json={"error": "session 'x' not found"})
+        if request.url.path == "/api/sessions":
+            return httpx.Response(200, json=[lane("w")])
+        return httpx.Response(404, json={"error": "session 'w' not found"})
 
     client = make_client(handler)
     try:
         with pytest.raises(AmuxError) as excinfo:
-            run(client.send("x", "hi"))
+            run(client.send("w", "hi"))
     finally:
         run(client.aclose())
     assert excinfo.value.status == 404
-    assert excinfo.value.detail == "session 'x' not found"
+    assert excinfo.value.detail == "session 'w' not found"
 
 
 def test_unreachable_server_is_an_amux_error():
@@ -119,28 +166,12 @@ def test_unreachable_server_is_an_amux_error():
     assert "unreachable" in excinfo.value.detail
 
 
-def test_start_and_stop_hit_the_right_routes():
-    paths = []
-
-    def handler(request):
-        paths.append(request.url.path)
-        return httpx.Response(200, json={"applied": True})
-
-    client = make_client(handler)
-    try:
-        run(client.start_worker("w"))
-        run(client.stop_worker("w"))
-    finally:
-        run(client.aclose())
-    assert paths == ["/api/workers/w/start", "/api/workers/w/stop"]
-
-
 def test_wait_until_started_polls_until_the_spawn_settles():
     states = iter(
         [
-            {"id": "w", "state": {"state": "starting"}},
-            {"id": "w", "state": {"state": "starting"}},
-            {"id": "w", "state": {"state": "idle"}, "status": "idle"},
+            [lane("w", status="starting")],
+            [lane("w", status="starting")],
+            [lane("w", status="idle")],
         ]
     )
 
@@ -152,22 +183,7 @@ def test_wait_until_started_polls_until_the_spawn_settles():
         row = run(client.wait_until_started("w", timeout=5, interval=0.01))
     finally:
         run(client.aclose())
-    assert row["state"]["state"] == "idle"
-
-
-def test_wait_until_started_returns_on_error_state():
-    def handler(request):
-        return httpx.Response(
-            200,
-            json={"id": "w", "state": {"state": "error", "detail": "herdr missing"}},
-        )
-
-    client = make_client(handler)
-    try:
-        row = run(client.wait_until_started("w", timeout=5, interval=0.01))
-    finally:
-        run(client.aclose())
-    assert row["state"]["detail"] == "herdr missing"
+    assert row["status"] == "idle"
 
 
 def test_todo_cards_keeps_only_open_cards():

@@ -63,7 +63,6 @@ class Config:
     amux_verify: bool = False
     default_workdir: str = field(default_factory=lambda: os.path.expanduser("~"))
     default_provider: str | None = None
-    default_backend: str = "tmux"
     groq_api_key: str | None = None
     groq_model: str = DEFAULT_GROQ_MODEL
     state_dir: Path = field(default_factory=lambda: Path(DEFAULT_STATE_DIR).expanduser())
@@ -206,7 +205,6 @@ def load_config(
         amux_verify=_truthy(env.get("AMUX_TLS_VERIFY")),
         default_workdir=default_workdir,
         default_provider=(env.get("AMUX_DEFAULT_PROVIDER") or "").strip() or None,
-        default_backend=(env.get("AMUX_DEFAULT_BACKEND") or "").strip() or "tmux",
         groq_api_key=(env.get("GROQ_API_KEY") or "").strip() or None,
         groq_model=(env.get("GROQ_TRANSCRIBE_MODEL") or "").strip() or DEFAULT_GROQ_MODEL,
         state_dir=state_dir,

@@ -61,13 +61,12 @@ GROQ_API_KEY=gsk_your_key_here
 # AMUX_TLS_VERIFY=0
 # AMUX_DEFAULT_WORKDIR=/home/you
 # AMUX_DEFAULT_PROVIDER=opencode
-# AMUX_DEFAULT_BACKEND=tmux
 # TELEGRAM_GATEWAY_RELAY_INTERVAL_S=20
 ```
 
-`AMUX_DEFAULT_BACKEND` defaults to `tmux` deliberately: the create API's own
-default is `herdr`, which only starts on a server running a herdr session
-(`AMUX_HERDR_SESSION`) and otherwise parks every new worker in `error`.
+New sessions are created with `POST /api/sessions` — a fleet lane (env file +
+tmux) — because `POST /api/workers` only writes a table row and amux refuses
+sends to a row that has no lane env file.
 
 The gateway reads this file itself at startup (process environment wins), so the
 server does not need a restart for the gateway to see new values.
@@ -118,10 +117,10 @@ journalctl --user -u amux-telegram-gateway -f
 ## Usage
 
 - `/start` or `/menu` — the four-button menu.
-- **🚀 Start agent** — creates and starts a worker named `tg-<MMDD-HHMM>-<hex>`
-  in `AMUX_DEFAULT_WORKDIR` using `AMUX_DEFAULT_PROVIDER` and
-  `AMUX_DEFAULT_BACKEND` (`tmux` by default). It waits for the spawn to settle
-  and reports the real outcome, including a start error's detail.
+- **🚀 Start agent** — creates and starts a fleet lane named
+  `tg-<MMDD-HHMM>-<hex>` in `AMUX_DEFAULT_WORKDIR` using
+  `AMUX_DEFAULT_PROVIDER`. It waits for the spawn to settle and reports the real
+  outcome, including a start error's detail.
 - **👁️ Peek / status** — lists workers with state; tap one to see its last pane
   output.
 - **✍️ Send prompt** — enters a prompt state; type the task (or send a voice
