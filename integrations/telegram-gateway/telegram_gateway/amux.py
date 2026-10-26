@@ -1,0 +1,133 @@
+"""Thin async client for the amux HTTP API.
+
+Only the worker verbs this gateway needs.  Every method raises ``AmuxError``
+carrying the server's own ``error`` text, so the bot can show a real reason
+instead of a status code.
+"""
+from __future__ import annotations
+
+from urllib.parse import quote
+
+import httpx
+
+
+class AmuxError(RuntimeError):
+    """A non-2xx answer or an unreachable server."""
+
+    def __init__(self, status: int, detail: str):
+        self.status = status
+        self.detail = detail
+        super().__init__(f"HTTP {status}: {detail}")
+
+
+class AmuxClient:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        verify: bool = False,
+        timeout: float = 30.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            verify=verify,
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            transport=transport,
+        )
+
+    async def __aenter__(self) -> "AmuxClient":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    # ---- plumbing -------------------------------------------------------
+
+    async def _json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        body: dict | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        try:
+            response = await self._client.request(
+                method, path, params=params, json=body, timeout=timeout
+            )
+        except httpx.HTTPError as exc:
+            raise AmuxError(0, f"amux unreachable at {self.base_url}: {exc}") from exc
+
+        detail = response.text[:400]
+        try:
+            parsed = response.json()
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            detail = str(parsed.get("error") or parsed.get("detail") or detail)
+        if response.status_code >= 400:
+            raise AmuxError(response.status_code, detail)
+        if not isinstance(parsed, dict):
+            raise AmuxError(response.status_code, f"expected a JSON object, got: {detail}")
+        return parsed
+
+    @staticmethod
+    def _key(key: str) -> str:
+        return quote(str(key), safe="")
+
+    # ---- verbs ----------------------------------------------------------
+
+    async def health(self) -> dict:
+        return await self._json("GET", "/health", timeout=10.0)
+
+    async def list_workers(self, limit: int = 200) -> list[dict]:
+        data = await self._json("GET", "/api/workers", params={"limit": limit})
+        items = data.get("items")
+        return items if isinstance(items, list) else []
+
+    async def get_worker(self, key: str) -> dict:
+        return await self._json("GET", f"/api/workers/{self._key(key)}")
+
+    async def create_worker(
+        self,
+        display_name: str,
+        *,
+        cwd: str | None = None,
+        provider: str | None = None,
+    ) -> dict:
+        body: dict = {"display_name": display_name}
+        if cwd:
+            body["cwd"] = cwd
+        if provider:
+            body["provider"] = provider
+        return await self._json("POST", "/api/workers", body=body)
+
+    async def start_worker(self, key: str) -> dict:
+        # Starting can wait on host admission and a provider spawn.
+        return await self._json("POST", f"/api/workers/{self._key(key)}/start", timeout=120.0)
+
+    async def stop_worker(self, key: str) -> dict:
+        return await self._json("POST", f"/api/workers/{self._key(key)}/stop", timeout=60.0)
+
+    async def send(self, key: str, text: str) -> dict:
+        # A send is answered when accepted, not when delivered; the relay's
+        # pane read is the delivery signal.
+        return await self._json(
+            "POST",
+            f"/api/workers/{self._key(key)}/send",
+            body={"text": text},
+            timeout=90.0,
+        )
+
+    async def peek(self, key: str, lines: int = 200) -> str:
+        data = await self._json(
+            "GET", f"/api/workers/{self._key(key)}/peek", params={"lines": lines}
+        )
+        output = data.get("output")
+        return output if isinstance(output, str) else ""

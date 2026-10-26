@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Launcher for the amux Telegram gateway. Keeps the package importable without
+# installation: bin/telegram-gateway -> PYTHONPATH=integrations/telegram-gateway
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$HERE:$PYTHONPATH"
+exec python3 -m telegram_gateway.cli "$@"
