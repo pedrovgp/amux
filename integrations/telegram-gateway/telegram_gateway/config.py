@@ -28,6 +28,13 @@ Optional
 ``TELEGRAM_GATEWAY_STATE_DIR`` default ``~/.amux/telegram-gateway``
 ``TELEGRAM_GATEWAY_RELAY_INTERVAL_S`` default ``20``
 ``TELEGRAM_GATEWAY_LOG_LEVEL`` default ``INFO``
+
+Manager mode (a plain message starts a new agent)
+-------------------------------------------------
+``MANAGER_CWD``                default ``~/Documents/pv/projetos``
+``MANAGER_PROVIDER``           default ``opencode`` (switchable from the menu)
+``MANAGER_MODEL``              default: whatever the server picks for the provider
+``MANAGER_INSTRUCTIONS_FILE``  default: ``manager_prompt.md`` next to this module
 """
 from __future__ import annotations
 
@@ -68,6 +75,15 @@ class Config:
     state_dir: Path = field(default_factory=lambda: Path(DEFAULT_STATE_DIR).expanduser())
     relay_interval_s: float = 20.0
     log_level: str = "INFO"
+    # Manager mode: a plain message (not a quote-reply) starts a new agent here.
+    manager_cwd: str = field(
+        default_factory=lambda: os.path.expanduser("~/Documents/pv/projetos")
+    )
+    manager_provider: str = "opencode"
+    manager_model: str | None = None
+    manager_instructions_file: Path = field(
+        default_factory=lambda: Path(__file__).parent / "manager_prompt.md"
+    )
 
     @property
     def state_path(self) -> Path:
@@ -210,4 +226,13 @@ def load_config(
         state_dir=state_dir,
         relay_interval_s=relay_interval,
         log_level=(env.get("TELEGRAM_GATEWAY_LOG_LEVEL") or "INFO").strip().upper(),
+        manager_cwd=os.path.expanduser(
+            (env.get("MANAGER_CWD") or "").strip() or "~/Documents/pv/projetos"
+        ),
+        manager_provider=(env.get("MANAGER_PROVIDER") or "").strip() or "opencode",
+        manager_model=(env.get("MANAGER_MODEL") or "").strip() or None,
+        manager_instructions_file=Path(
+            (env.get("MANAGER_INSTRUCTIONS_FILE") or "").strip()
+            or (Path(__file__).parent / "manager_prompt.md")
+        ).expanduser(),
     )

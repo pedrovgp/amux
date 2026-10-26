@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .manager import PROVIDERS
+
 PREFIX = "gw:"
 # Telegram caps callback_data at 64 bytes; leave room for the verb prefix.
 MAX_KEY = 52
@@ -56,8 +58,47 @@ def main_menu() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("⏹️ Stop / kill session", callback_data=f"{PREFIX}stop"),
             ],
+            [
+                InlineKeyboardButton("🧠 Manager settings", callback_data=f"{PREFIX}mgr"),
+            ],
         ]
     )
+
+
+def manager_keyboard(
+    provider: str,
+    model: str | None = None,
+    models: list[str] | None = None,
+) -> InlineKeyboardMarkup:
+    """Pick the agent a fresh message starts: provider first, then its models."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{'✅' if p == provider else '○'} {p}", callback_data=f"{PREFIX}mgrp:{p}"
+            )
+        ]
+        for p in PROVIDERS
+    ]
+    if models:
+        for m in models[:8]:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"   {'✅' if m == model else '○'} {m[:40]}",
+                        callback_data=f"{PREFIX}mgrm:{provider}:{m[:40]}",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"   {'✅' if model is None else '○'} server default",
+                    callback_data=f"{PREFIX}mgrm:{provider}:",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Menu", callback_data=f"{PREFIX}menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def sessions_keyboard(workers: list[dict], action: str) -> InlineKeyboardMarkup:

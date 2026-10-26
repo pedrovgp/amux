@@ -20,11 +20,31 @@ Telegram  ⇄  telegram-gateway (this module)  ⇄  amux server (https://localho
 
 | Surface | Behaviour |
 |---|---|
-| `/start`, `/menu` | Inline keyboard: 🚀 new session · 👁️ peek/status · ✍️ send prompt · ⏹️ stop |
-| Text message | Sent to the selected session as `[from Telegram @you] …` |
-| Voice note | Downloaded, transcribed by Groq, echoed as `🗣️ Transcribed: …`, then sent as a prompt; the temp `.ogg` is deleted immediately |
-| Replies | A relay peeks the selected session every ~20s and pushes new output back to the chat |
+| `/start`, `/menu` | Inline keyboard: 🚀 new session · 👁️ peek/status · ✍️ send prompt · ⏹️ stop · 🧠 manager settings |
+| **Plain text or voice note** | Starts a **new manager agent** in `MANAGER_CWD` and replies in that message's thread |
+| **Quote-reply** to a bot message | Stays in the session that message belongs to |
+| Voice note | Downloaded, transcribed by Groq, echoed as `🗣️ Transcribed: …`, then treated like the text would be; the temp `.ogg` is deleted immediately |
+| Replies | A relay peeks the session every ~20s and posts new output **as a reply to your message** |
 | Access | Every message, button and voice note must come from `ALLOWED_TELEGRAM_USER_IDS`; denials are explicit and logged as `security_denied` |
+
+### Manager mode
+
+A message that is not a quote-reply starts a fresh **manager agent**: a fleet
+lane in `~/Documents/pv/projetos`, briefed with `manager_prompt.md` (override
+with `MANAGER_INSTRUCTIONS_FILE`). The role is deliberate: answer questions
+briefly, delegate real work to other lanes through the amux CLI/API
+(`amux board`, `amux send <name> --stdin`, `POST $AMUX_URL/api/board`), research
+is fine, hands-on building rarely is. A non-isolated lane inherits
+`AMUX_URL`/`AMUX_SESSION`, the `amux` CLI and amux MCP, so it can file cards and
+task peers on its own.
+
+Which agent starts is yours to choose: **🧠 Manager settings** lists providers
+(`MANAGER_PROVIDER`, default `opencode`) and each provider's models from
+`GET /api/models`. Idle managers stay running until you stop them (⏹️).
+
+The thread rule is strict and Telegram-shaped: **quote any bot message — the
+answer, the "started" ack — to continue that session; any other message starts
+a new one.**
 
 ## Setup
 
@@ -137,7 +157,12 @@ tail -f ~/.amux/logs/telegram-gateway.log
   owns a Todo/Doing board card, amux's bootstrap restarts it; the confirmation
   says so and names the cards before you commit to the stop, and the result
   reports when a stop was undone.
-- Plain text (outside the prompt state) goes to the selected session.
+- **🧠 Manager settings** — choose which agent a new message starts (provider,
+  then a model from `GET /api/models`, or the server default).
+- **Plain message / voice note** — a new manager agent, answering in that
+  message's thread. **Quote its answer** (or the "started" ack) to keep talking
+  to the same manager; every other message starts another one.
+- `/sessions` picks a session (for the menu actions); `/status` peeks it.
 - `/sessions` picks a session; `/status` peeks the selected one.
 
 Replies from the session are relayed automatically: the gateway finds the last

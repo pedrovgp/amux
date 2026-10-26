@@ -2,6 +2,7 @@ from telegram_gateway.menu import (
     PREFIX,
     format_worker_line,
     main_menu,
+    manager_keyboard,
     sessions_keyboard,
     status_keyboard,
     stop_confirm,
@@ -16,19 +17,38 @@ def callbacks(markup):
     ]
 
 
-def test_main_menu_has_the_four_actions():
+def test_main_menu_has_the_five_actions():
     menu = main_menu()
     assert callbacks(menu) == [
         f"{PREFIX}new",
         f"{PREFIX}peek",
         f"{PREFIX}prompt",
         f"{PREFIX}stop",
+        f"{PREFIX}mgr",
     ]
     labels = [button.text for row in menu.inline_keyboard for button in row]
     assert any("Start" in label for label in labels)
     assert any("Peek" in label for label in labels)
     assert any("Send" in label for label in labels)
     assert any("Stop" in label for label in labels)
+    assert any("Manager" in label for label in labels)
+
+
+def test_manager_keyboard_offers_providers_then_models():
+    markup = manager_keyboard("opencode", None, ["deepseek-v4.1-flash-free", "iceman-contributor-free"])
+    data = callbacks(markup)
+    assert f"{PREFIX}mgrp:opencode" in data
+    assert f"{PREFIX}mgrp:claude" in data
+    assert f"{PREFIX}mgrm:opencode:deepseek-v4.1-flash-free" in data
+    assert f"{PREFIX}mgrm:opencode:" in data  # the server default arm
+    assert data[-1] == f"{PREFIX}menu"
+    assert all(len(d.encode()) <= 64 for d in data)
+
+
+def test_manager_keyboard_marks_the_chosen_model():
+    markup = manager_keyboard("opencode", "iceman", ["deepseek", "iceman"], )
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert any(l.startswith("   ✅ iceman") for l in labels)
 
 
 def test_sessions_keyboard_links_each_worker_and_a_menu():

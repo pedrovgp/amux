@@ -140,19 +140,51 @@ class AmuxClient:
         *,
         cwd: str | None = None,
         provider: str | None = None,
+        model: str | None = None,
+        start: bool = True,
     ) -> dict:
-        """Create a fleet lane (env file + autostart).
+        """Create a fleet lane (env file, autostart unless told otherwise).
 
         ``POST /api/workers`` would only write a table row with no lane env
         file, and the server refuses sends to those; the SPA's own create uses
         ``POST /api/sessions`` for exactly this reason.
         """
-        body: dict = {"name": name, "start": True}
+        body: dict = {"name": name, "start": start}
         if cwd:
             body["dir"] = cwd
         if provider:
             body["provider"] = provider
+        if model:
+            body["model"] = model
         return await self._json("POST", "/api/sessions", body=body, timeout=120.0)
+
+    async def set_instructions(self, name: str, instructions: str) -> dict:
+        """Save standing instructions for a lane.
+
+        Deliberately WITHOUT ``apply``: ``start_session_as`` re-sends the saved
+        instructions as the lane's first prompt when it starts, so briefing a
+        stopped lane and then starting it is one clean turn.
+        """
+        return await self._json(
+            "POST",
+            f"/api/sessions/{self._key(name)}/instructions",
+            body={"instructions": instructions},
+        )
+
+    async def models(self, provider: str | None = None) -> list[dict]:
+        """Model catalog (``GET /api/models``), optionally one provider's."""
+        data = await self._json("GET", "/api/models")
+        rows = data.get("models")
+        if not isinstance(rows, list):
+            return []
+        out = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if provider and row.get("provider") != provider:
+                continue
+            out.append({"provider": row.get("provider"), "id": row.get("id")})
+        return out
 
     async def start(self, name: str) -> dict:
         row = await self.find(name)
@@ -195,6 +227,32 @@ class AmuxClient:
                 continue
             status = str(row.get("status") or "")
             if status and status not in ("starting", "stopping"):
+                return row
+            if time.monotonic() >= deadline:
+                return row
+            await asyncio.sleep(interval)
+
+    async def wait_until_running(
+        self, name: str, *, timeout: float = 60.0, interval: float = 2.0
+    ) -> dict:
+        """Poll until the lane can take a task (or has genuinely failed).
+
+        A lane created with ``start: false`` reads ``stopped``, and a just-started
+        one reads ``starting`` — neither may be mistaken for "ready", which is
+        why this waits for a live status rather than merely "not starting".
+        """
+        deadline = time.monotonic() + timeout
+        row: dict = {}
+        while True:
+            try:
+                row = await self.find(name)
+            except AmuxError:
+                if time.monotonic() >= deadline:
+                    raise
+                await asyncio.sleep(interval)
+                continue
+            status = str(row.get("status") or "").lower()
+            if status in ("idle", "working", "active", "blocked", "busy", "error"):
                 return row
             if time.monotonic() >= deadline:
                 return row

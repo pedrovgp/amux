@@ -22,10 +22,12 @@ from telegram.ext import (
 from .amux import AmuxClient, AmuxError
 from .config import Config
 from .guard import Guard, allow_only
+from .manager import PROVIDERS, create_manager, new_manager_name
 from .menu import (
     PREFIX,
     format_worker_line,
     main_menu,
+    manager_keyboard,
     sessions_keyboard,
     status_keyboard,
     stop_confirm,
@@ -101,14 +103,52 @@ async def _say(
         await message.reply_text(text, reply_markup=reply_markup)
 
 
-async def _send_markdown(bot, chat_id: int, text: str, *, code_block: bool = False) -> None:
-    """Send text as Markdown, falling back to plain text on a parse error."""
+async def _send_markdown(
+    bot,
+    chat_id: int,
+    text: str,
+    *,
+    code_block: bool = False,
+    reply_to: int | None = None,
+) -> list:
+    """Send text as Markdown, falling back to plain text on a parse error.
+
+    Returns the messages sent, so the caller can map their ids back to the
+    session (that map is what a quote-reply is resolved against).
+    """
+    sent = []
     for chunk in chunk_text(text):
         payload = f"```\n{chunk}\n```" if code_block else chunk
         try:
-            await bot.send_message(chat_id, payload, parse_mode=ParseMode.MARKDOWN)
+            message = await bot.send_message(
+                chat_id, payload, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=reply_to
+            )
         except BadRequest:
-            await bot.send_message(chat_id, chunk)
+            message = await bot.send_message(chat_id, chunk, reply_to_message_id=reply_to)
+        sent.append(message)
+    return sent
+
+
+def _session_from_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """The session a quote-reply belongs to, or ``None`` for a fresh message.
+
+    Telegram carries ``reply_to_message.message_id``; the bot records the id of
+    every message it sends for a session, so quoting any of them — the answer,
+    the "started" ack — continues that session.
+    """
+    reply = getattr(update.message, "reply_to_message", None)
+    if reply is None:
+        return None
+    message_id = getattr(reply, "message_id", None)
+    if message_id is None:
+        return None
+    return _state(context).session_for_message(update.effective_chat.id, message_id)
+
+
+def _track(state: GatewayState, chat_id: int, session: str, message) -> None:
+    message_id = getattr(message, "message_id", None)
+    if message_id is not None:
+        state.record_message(chat_id, message_id, session)
 
 
 async def _deliver_prompt(
@@ -167,6 +207,36 @@ async def _report_send_error(
         )
         return
     await message.reply_text(f"❌ amux refused: {exc.detail}")
+
+
+async def _show_manager(update: Update, context: ContextTypes.DEFAULT_TYPE, provider: str | None = None) -> None:
+    """Show (and let the owner change) which agent a fresh message starts."""
+    cfg = _cfg(context)
+    state = _state(context)
+    chat_id = update.effective_chat.id
+    choice = state.manager(
+        chat_id, {"provider": cfg.manager_provider, "model": cfg.manager_model}
+    )
+    models: list[str] = []
+    try:
+        rows = await _client(context).models(provider or choice["provider"])
+        for row in rows:
+            model_id = str(row.get("id") or "")
+            if model_id and model_id not in models:
+                models.append(model_id)
+        models = models[:8]
+    except AmuxError as exc:
+        log.debug("model_catalog_failed provider=%s detail=%s", provider, exc)
+    await _say(
+        update,
+        "🧠 *Manager agent* — the agent a new message starts.\n"
+        f"provider: `{choice['provider']}`\n"
+        f"model: `{choice['model'] or 'server default'}`\n"
+        f"cwd: `{cfg.manager_cwd}`\n\n"
+        "Quote an answer to keep talking to the same manager.",
+        reply_markup=manager_keyboard(choice["provider"], choice["model"], models),
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def _require_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
@@ -395,6 +465,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=status_keyboard(raw),
             parse_mode=ParseMode.MARKDOWN,
         )
+    elif action == "mgr":
+        await _show_manager(update, context)
+    elif action == "mgrp":
+        _state(context).set_manager(update.effective_chat.id, raw, None)
+        await _show_manager(update, context, provider=raw)
+    elif action == "mgrm":
+        provider, _, model = raw.partition(":")
+        _state(context).set_manager(update.effective_chat.id, provider, model or None)
+        await _show_manager(update, context, provider=provider)
     elif action == "stopok":
         chat_id = update.effective_chat.id
         try:
@@ -449,21 +528,106 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     if not text:
         return
-    session = await _require_session(update, context)
-    if not session:
+    session = _session_from_reply(update, context)
+    if session:
+        await _continue_session(update, context, session, text, "text")
         return
+    await _start_manager(update, context, text, source="text")
+
+
+async def _continue_session(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: str,
+    text: str,
+    source: str,
+) -> None:
+    """Deliver a quote-reply to the session it quotes (the same session rule)."""
+    chat_id = update.effective_chat.id
+    state = _state(context)
+    state.set_turn_message(chat_id, session, update.message.message_id)
     log.info(
-        "prompt_text user=%s session=%s chars=%s",
+        "prompt_%s user=%s session=%s chars=%s route=reply",
+        source,
         update.effective_user.id,
         session,
         len(text),
     )
     try:
-        await _deliver_prompt(context, update.effective_chat.id, session, text, _username(update))
+        await _deliver_prompt(context, chat_id, session, text, _username(update))
     except AmuxError as exc:
-        await _report_send_error(update, context, session, exc, "text")
+        await _report_send_error(update, context, session, exc, source)
         return
-    await update.message.reply_text(f"✅ Sent to `{session}`.", parse_mode=ParseMode.MARKDOWN)
+    # No ack here: the agent's answer arrives as a reply to THIS message, which
+    # is the confirmation. One extra line per turn would double the traffic.
+
+
+async def _start_manager(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    source: str,
+) -> None:
+    """A fresh message starts a fresh manager agent and gets its first answer."""
+    cfg = _cfg(context)
+    state = _state(context)
+    client = _client(context)
+    chat_id = update.effective_chat.id
+    choice = state.manager(
+        chat_id, {"provider": cfg.manager_provider, "model": cfg.manager_model}
+    )
+    name = new_manager_name()
+
+    ack = await update.message.reply_text(
+        f"🧠 Starting `{name}` ({choice['provider']}) — reply here to continue it.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    state.record_message(chat_id, ack.message_id, name)
+    state.set_turn_message(chat_id, name, update.message.message_id)
+
+    try:
+        name, row = await create_manager(
+            client, cfg, name=name, provider=choice["provider"], model=choice["model"]
+        )
+    except AmuxError as exc:
+        log.warning(
+            "manager_create_failed name=%s provider=%s status=%s detail=%s",
+            name,
+            choice["provider"],
+            exc.status,
+            exc.detail,
+        )
+        await _edit_or_send(ack, f"❌ Could not start a manager: {exc.detail}")
+        return
+
+    status = str(row.get("status") or "")
+    if status == "error":
+        detail = row.get("error") or "unknown error"
+        log.warning("manager_start_failed name=%s detail=%s", name, detail)
+        await _edit_or_send(ack, f"❌ `{name}` failed to start: {detail}")
+        return
+
+    log.info(
+        "manager_ready name=%s provider=%s model=%s status=%s source=%s",
+        name,
+        choice["provider"],
+        choice["model"] or "(server default)",
+        status,
+        source,
+    )
+    try:
+        await _deliver_prompt(context, chat_id, name, text, _username(update))
+    except AmuxError as exc:
+        await _report_send_error(update, context, name, exc, source)
+
+
+async def _edit_or_send(message, text: str) -> None:
+    """Edit an earlier ack, or send anew when Telegram will not let us edit."""
+    try:
+        await message.edit_text(text)
+    except (BadRequest, TelegramError):
+        await message.reply_text(text)
 
 
 @allow_only
@@ -474,13 +638,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "🎙️ Voice notes need GROQ_API_KEY in ~/.amux/server.env."
         )
         return
-    session = await _require_session(update, context)
-    if not session:
-        return
     log.info(
-        "voice_note user=%s session=%s media_type=%s",
+        "voice_note user=%s media_type=%s",
         update.effective_user.id,
-        session,
         getattr(update.message.voice, "mime_type", "?"),
     )
     try:
@@ -488,21 +648,19 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             update.message.voice, groq_transcriber(cfg.groq_api_key, cfg.groq_model)
         )
     except Exception as exc:  # transcription failures must be visible, not fatal
-        log.warning("voice_transcription_failed user_id=%s error=%s", update.effective_user.id, exc)
+        log.warning("voice_transcription_failed user=%s error=%s", update.effective_user.id, exc)
         await update.message.reply_text(f"❌ Could not transcribe that voice note: {exc}")
         return
     if not transcript:
         await update.message.reply_text("🗣️ Heard nothing in that voice note.")
         return
     await update.message.reply_text(f"🗣️ Transcribed: {transcript}")
-    try:
-        await _deliver_prompt(
-            context, update.effective_chat.id, session, transcript, _username(update)
-        )
-    except AmuxError as exc:
-        await _report_send_error(update, context, session, exc, "voice")
+
+    session = _session_from_reply(update, context)
+    if session:
+        await _continue_session(update, context, session, transcript, "voice")
         return
-    await update.message.reply_text(f"✅ Sent to `{session}`.", parse_mode=ParseMode.MARKDOWN)
+    await _start_manager(update, context, transcript, source="voice")
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +685,9 @@ async def ask_prompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 @allow_only
 async def receive_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
-    session = _state(context).selected(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    state = _state(context)
+    session = state.selected(chat_id)
     if not session:
         await update.message.reply_text("No session selected — /menu")
         return ConversationHandler.END
@@ -538,20 +698,64 @@ async def receive_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session,
             len(text),
         )
+        state.set_turn_message(chat_id, session, update.message.message_id)
         try:
-            await _deliver_prompt(
-                context, update.effective_chat.id, session, text, _username(update)
-            )
+            await _deliver_prompt(context, chat_id, session, text, _username(update))
         except AmuxError as exc:
             await _report_send_error(update, context, session, exc, "prompt")
             return ConversationHandler.END
-        await update.message.reply_text(f"✅ Sent to `{session}`.", parse_mode=ParseMode.MARKDOWN)
+        ack = await update.message.reply_text(
+            f"✅ Sent to `{session}` — reply here to continue it.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        _track(state, chat_id, session, ack)
     return ConversationHandler.END
 
 
 @allow_only
 async def receive_prompt_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await on_voice(update, context)
+    """A voice note inside the ✍️ state goes to the SELECTED session.
+
+    Deliberately not `on_voice`: that handler's no-reply branch starts a fresh
+    manager, which would ignore the session the owner just picked.
+    """
+    cfg = _cfg(context)
+    if not cfg.groq_api_key:
+        await update.message.reply_text(
+            "🎙️ Voice notes need GROQ_API_KEY in ~/.amux/server.env."
+        )
+        return ConversationHandler.END
+    session = _state(context).selected(update.effective_chat.id)
+    if not session:
+        await update.message.reply_text("No session selected — /menu")
+        return ConversationHandler.END
+    try:
+        transcript = await transcribe_voice(
+            update.message.voice, groq_transcriber(cfg.groq_api_key, cfg.groq_model)
+        )
+    except Exception as exc:
+        log.warning("voice_transcription_failed user=%s error=%s", update.effective_user.id, exc)
+        await update.message.reply_text(f"❌ Could not transcribe that voice note: {exc}")
+        return ConversationHandler.END
+    if not transcript:
+        await update.message.reply_text("🗣️ Heard nothing in that voice note.")
+        return ConversationHandler.END
+    await update.message.reply_text(f"🗣️ Transcribed: {transcript}")
+    if transcript:
+        state = _state(context)
+        state.set_turn_message(update.effective_chat.id, session, update.message.message_id)
+        try:
+            await _deliver_prompt(
+                context, update.effective_chat.id, session, transcript, _username(update)
+            )
+        except AmuxError as exc:
+            await _report_send_error(update, context, session, exc, "voice")
+            return ConversationHandler.END
+        ack = await update.message.reply_text(
+            f"✅ Sent to `{session}` — reply here to continue it.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        _track(state, update.effective_chat.id, session, ack)
     return ConversationHandler.END
 
 
@@ -570,34 +774,41 @@ async def relay_once(app: Application) -> None:
     cfg: Config = app.bot_data["cfg"]
     client: AmuxClient = app.bot_data["client"]
     state: GatewayState = app.bot_data["state"]
-    for chat_id, session in state.selections().items():
-        try:
-            raw = await client.peek(session, lines=300)
-        except AmuxError as exc:
-            log.debug("relay_peek_failed chat_id=%s session=%s error=%s", chat_id, session, exc)
-            continue
-        text = extract_reply(raw)
-        if not text:
-            continue
-        last = state.last_relayed(chat_id, session)
-        if text == last:
-            continue
-        new_text = delta_since(last, text)
-        if not new_text.strip():
-            continue
-        try:
-            await _send_markdown(app.bot, chat_id, new_text)
-        except TelegramError as exc:
-            log.warning("relay_send_failed chat_id=%s session=%s error=%s", chat_id, session, exc)
-            continue
-        state.set_last_relayed(chat_id, session, text)
-        log.info(
-            "relay_sent chat_id=%s session=%s chars=%s total=%s",
-            chat_id,
-            session,
-            len(new_text),
-            len(text),
-        )
+    for chat_id, sessions in state.sessions_to_relay().items():
+        for session in sessions:
+            try:
+                raw = await client.peek(session, lines=300)
+            except AmuxError as exc:
+                log.debug("relay_peek_failed chat_id=%s session=%s error=%s", chat_id, session, exc)
+                continue
+            text = extract_reply(raw)
+            if not text:
+                continue
+            last = state.last_relayed(chat_id, session)
+            if text == last:
+                continue
+            new_text = delta_since(last, text)
+            if not new_text.strip():
+                continue
+            # Reply to the message that started this turn, so the answer lands
+            # in the thread the owner can quote to keep talking to this session.
+            reply_to = state.turn_message(chat_id, session)
+            try:
+                sent = await _send_markdown(app.bot, chat_id, new_text, reply_to=reply_to)
+            except TelegramError as exc:
+                log.warning("relay_send_failed chat_id=%s session=%s error=%s", chat_id, session, exc)
+                continue
+            for message in sent:
+                _track(state, chat_id, session, message)
+            state.set_last_relayed(chat_id, session, text)
+            log.info(
+                "relay_sent chat_id=%s session=%s chars=%s total=%s reply_to=%s",
+                chat_id,
+                session,
+                len(new_text),
+                len(text),
+                reply_to,
+            )
 
 
 async def relay_loop(app: Application) -> None:

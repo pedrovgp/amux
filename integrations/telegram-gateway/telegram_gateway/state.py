@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 MAX_RELAYED_PER_CHAT = 10
+MAX_MSG_SESSIONS = 300
 
 
 class GatewayState:
@@ -101,3 +102,84 @@ class GatewayState:
                 relayed.pop(old, None)
         chat["last_relayed"] = relayed
         self._save()
+
+    # ---- message -> session map (the thread rule) -----------------------
+
+    def record_message(self, chat_id: int, message_id: int, session: str) -> None:
+        """Remember that a message we sent belongs to ``session``.
+
+        This is what makes a quote-reply land in the right session: Telegram
+        hands back ``reply_to_message.message_id``, and that id is the only
+        durable link between a chat message and the lane that produced it.
+        """
+        chat = self._chat(chat_id)
+        mapping = chat.get("msg_sessions")
+        if not isinstance(mapping, dict):
+            mapping = {}
+        mapping[str(message_id)] = session
+        while len(mapping) > MAX_MSG_SESSIONS:
+            mapping.pop(next(iter(mapping)))
+        chat["msg_sessions"] = mapping
+        self._save()
+
+    def session_for_message(self, chat_id: int, message_id: int) -> str | None:
+        mapping = self._chat(chat_id).get("msg_sessions")
+        if not isinstance(mapping, dict):
+            return None
+        session = mapping.get(str(message_id))
+        return session if isinstance(session, str) and session else None
+
+    # ---- turn tracking (what the relay replies to) ----------------------
+
+    def set_turn_message(self, chat_id: int, session: str, message_id: int) -> None:
+        chat = self._chat(chat_id)
+        turns = chat.get("turn_msg")
+        if not isinstance(turns, dict):
+            turns = {}
+        turns[session] = int(message_id)
+        chat["turn_msg"] = turns
+        self._save()
+
+    def turn_message(self, chat_id: int, session: str) -> int | None:
+        turns = self._chat(chat_id).get("turn_msg")
+        if not isinstance(turns, dict):
+            return None
+        value = turns.get(session)
+        return int(value) if isinstance(value, int) else None
+
+    def sessions_to_relay(self) -> dict[int, set[str]]:
+        """Every session this chat should have relayed, both modes.
+
+        Mode 1 keeps a *selected* session; manager mode keeps one session per
+        conversation thread (the ``turn_msg`` map). A session appears here as
+        soon as it exists in either, so an answer is never dropped because the
+        chat selected something else later.
+        """
+        out: dict[int, set[str]] = {}
+        for chat_id, session in self.selections().items():
+            out.setdefault(chat_id, set()).add(session)
+        for chat_id, chat in self._data.get("chats", {}).items():
+            turns = chat.get("turn_msg")
+            if not isinstance(turns, dict):
+                continue
+            try:
+                cid = int(chat_id)
+            except ValueError:
+                continue
+            for session in turns:
+                if isinstance(session, str) and session:
+                    out.setdefault(cid, set()).add(session)
+        return out
+
+    # ---- manager agent choice -------------------------------------------
+
+    def set_manager(self, chat_id: int, provider: str, model: str | None = None) -> None:
+        chat = self._chat(chat_id)
+        chat["manager"] = {"provider": provider, "model": model}
+        self._save()
+
+    def manager(self, chat_id: int, defaults: dict | None = None) -> dict:
+        value = self._chat(chat_id).get("manager")
+        if isinstance(value, dict) and value.get("provider"):
+            return {"provider": value["provider"], "model": value.get("model")}
+        return dict(defaults or {})
