@@ -23,7 +23,7 @@ Telegram  ⇄  telegram-gateway (this module)  ⇄  amux server (https://localho
 | `/start`, `/menu` | Inline keyboard: 🚀 new session · 👁️ peek/status · ✍️ send prompt · ⏹️ stop · 🧠 manager settings |
 | **Plain text or voice note** | Starts a **new manager agent** in `MANAGER_CWD` and replies in that message's thread |
 | **Quote-reply** to a bot message | Stays in the session that message belongs to |
-| Voice note | Downloaded, transcribed by Groq, echoed as `🗣️ Transcribed: …`, then treated like the text would be; the temp `.ogg` is deleted immediately |
+| Voice note | Downloaded, transcribed by Groq, echoed as `🗣️ Transcribed: …` **as a reply to the audio**, then treated like the text would be; the agent's answer replies to the transcription (readable), never to the audio bubble, and quoting the transcription continues that session. The temp `.ogg` is deleted immediately |
 | Replies | A relay peeks the session every ~20s and posts new output **as a reply to your message** |
 | Access | Every message, button and voice note must come from `ALLOWED_TELEGRAM_USER_IDS`; denials are explicit and logged as `security_denied` |
 

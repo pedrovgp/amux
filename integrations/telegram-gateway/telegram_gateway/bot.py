@@ -541,11 +541,25 @@ async def _continue_session(
     session: str,
     text: str,
     source: str,
+    *,
+    anchor: int | None = None,
 ) -> None:
-    """Deliver a quote-reply to the session it quotes (the same session rule)."""
+    """Deliver a quote-reply to the session it quotes (the same session rule).
+
+    ``anchor`` is the message the answer should reply to. It differs from the
+    owner's message for a voice note: the answer must attach to the readable
+    TRANSCRIPTION message, never to the audio bubble the owner cannot read
+    back. The transcription is itself a reply to the audio, so the thread
+    still opens at the voice note.
+    """
     chat_id = update.effective_chat.id
     state = _state(context)
-    state.set_turn_message(chat_id, session, update.message.message_id)
+    anchor_id = anchor or update.message.message_id
+    state.set_turn_message(chat_id, session, anchor_id)
+    if anchor is not None:
+        # Quoting the transcription must continue this session, same as
+        # quoting any other bot message.
+        state.record_message(chat_id, anchor, session)
     log.info(
         "prompt_%s user=%s session=%s chars=%s route=reply",
         source,
@@ -568,8 +582,13 @@ async def _start_manager(
     text: str,
     *,
     source: str,
+    anchor: int | None = None,
 ) -> None:
-    """A fresh message starts a fresh manager agent and gets its first answer."""
+    """A fresh message starts a fresh manager agent and gets its first answer.
+
+    ``anchor`` follows the same rule as in ``_continue_session``: a voice
+    note's answer replies to the transcription message, not to the audio.
+    """
     cfg = _cfg(context)
     state = _state(context)
     client = _client(context)
@@ -578,13 +597,17 @@ async def _start_manager(
         chat_id, {"provider": cfg.manager_provider, "model": cfg.manager_model}
     )
     name = new_manager_name()
+    anchor_id = anchor or update.message.message_id
 
     ack = await update.message.reply_text(
         f"🧠 Starting `{name}` ({choice['provider']}) — reply here to continue it.",
         parse_mode=ParseMode.MARKDOWN,
     )
     state.record_message(chat_id, ack.message_id, name)
-    state.set_turn_message(chat_id, name, update.message.message_id)
+    state.set_turn_message(chat_id, name, anchor_id)
+    if anchor is not None:
+        # Quoting the transcription must continue this manager session.
+        state.record_message(chat_id, anchor, name)
 
     try:
         name, row = await create_manager(
@@ -654,13 +677,23 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not transcript:
         await update.message.reply_text("🗣️ Heard nothing in that voice note.")
         return
-    await update.message.reply_text(f"🗣️ Transcribed: {transcript}")
+    # The transcription is posted as a reply TO the audio (so the owner can
+    # read what they said in the thread) and becomes the answer's anchor:
+    # the relay replies to THIS message, never to the unreadable audio bubble.
+    echo = await update.message.reply_text(f"🗣️ Transcribed: {transcript}")
+    anchor = getattr(echo, "message_id", None)
+    log.info(
+        "voice_transcribed user=%s chars=%s anchor=%s",
+        update.effective_user.id,
+        len(transcript),
+        anchor,
+    )
 
     session = _session_from_reply(update, context)
     if session:
-        await _continue_session(update, context, session, transcript, "voice")
+        await _continue_session(update, context, session, transcript, "voice", anchor=anchor)
         return
-    await _start_manager(update, context, transcript, source="voice")
+    await _start_manager(update, context, transcript, source="voice", anchor=anchor)
 
 
 # ---------------------------------------------------------------------------
@@ -740,22 +773,34 @@ async def receive_prompt_voice(update: Update, context: ContextTypes.DEFAULT_TYP
     if not transcript:
         await update.message.reply_text("🗣️ Heard nothing in that voice note.")
         return ConversationHandler.END
-    await update.message.reply_text(f"🗣️ Transcribed: {transcript}")
-    if transcript:
-        state = _state(context)
-        state.set_turn_message(update.effective_chat.id, session, update.message.message_id)
-        try:
-            await _deliver_prompt(
-                context, update.effective_chat.id, session, transcript, _username(update)
-            )
-        except AmuxError as exc:
-            await _report_send_error(update, context, session, exc, "voice")
-            return ConversationHandler.END
-        ack = await update.message.reply_text(
-            f"✅ Sent to `{session}` — reply here to continue it.",
-            parse_mode=ParseMode.MARKDOWN,
+    # Same anchor rule as `on_voice`: the answer replies to the transcription
+    # message, which is itself a reply to the audio.
+    echo = await update.message.reply_text(f"🗣️ Transcribed: {transcript}")
+    anchor = getattr(echo, "message_id", None)
+    log.info(
+        "voice_transcribed user=%s chars=%s anchor=%s route=selected",
+        update.effective_user.id,
+        len(transcript),
+        anchor,
+    )
+    state = _state(context)
+    state.set_turn_message(
+        update.effective_chat.id, session, anchor or update.message.message_id
+    )
+    if anchor is not None:
+        state.record_message(update.effective_chat.id, anchor, session)
+    try:
+        await _deliver_prompt(
+            context, update.effective_chat.id, session, transcript, _username(update)
         )
-        _track(state, update.effective_chat.id, session, ack)
+    except AmuxError as exc:
+        await _report_send_error(update, context, session, exc, "voice")
+        return ConversationHandler.END
+    ack = await update.message.reply_text(
+        f"✅ Sent to `{session}` — reply here to continue it.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    _track(state, update.effective_chat.id, session, ack)
     return ConversationHandler.END
 
 
