@@ -90,7 +90,10 @@ bin/telegram-gateway             # starts long-polling
 `--check` prints the allowed IDs, the amux URL, whether voice is on, and the
 server's health/commit. It exits non-zero on any problem.
 
-### 7. Keep it running (optional, systemd user unit)
+### 7. Keep it running (systemd user unit)
+
+Installed on this box as `amux-telegram-gateway.service` with a persistent venv
+at `~/.local/share/amux-telegram-gateway/venv`:
 
 ```ini
 # ~/.config/systemd/user/amux-telegram-gateway.service
@@ -99,10 +102,14 @@ Description=amux Telegram gateway
 After=network-online.target
 
 [Service]
+Type=simple
 WorkingDirectory=%h/path/to/amux/integrations/telegram-gateway
-ExecStart=%h/path/to/amux/integrations/telegram-gateway/bin/telegram-gateway
+Environment=PYTHONPATH=%h/path/to/amux/integrations/telegram-gateway
+ExecStart=%h/.local/share/amux-telegram-gateway/venv/bin/python -m telegram_gateway.cli
 Restart=always
 RestartSec=5
+StandardOutput=append:%h/.amux/logs/telegram-gateway.log
+StandardError=append:%h/.amux/logs/telegram-gateway.log
 
 [Install]
 WantedBy=default.target
@@ -111,7 +118,8 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now amux-telegram-gateway
-journalctl --user -u amux-telegram-gateway -f
+systemctl --user status amux-telegram-gateway
+tail -f ~/.amux/logs/telegram-gateway.log
 ```
 
 ## Usage
