@@ -60,9 +60,14 @@ GROQ_API_KEY=gsk_your_key_here
 # AMUX_URL=https://localhost:8824
 # AMUX_TLS_VERIFY=0
 # AMUX_DEFAULT_WORKDIR=/home/you
-# AMUX_DEFAULT_PROVIDER=claude
+# AMUX_DEFAULT_PROVIDER=opencode
+# AMUX_DEFAULT_BACKEND=tmux
 # TELEGRAM_GATEWAY_RELAY_INTERVAL_S=20
 ```
+
+`AMUX_DEFAULT_BACKEND` defaults to `tmux` deliberately: the create API's own
+default is `herdr`, which only starts on a server running a herdr session
+(`AMUX_HERDR_SESSION`) and otherwise parks every new worker in `error`.
 
 The gateway reads this file itself at startup (process environment wins), so the
 server does not need a restart for the gateway to see new values.
@@ -114,12 +119,17 @@ journalctl --user -u amux-telegram-gateway -f
 
 - `/start` or `/menu` — the four-button menu.
 - **🚀 Start agent** — creates and starts a worker named `tg-<MMDD-HHMM>-<hex>`
-  in `AMUX_DEFAULT_WORKDIR`, and selects it for the chat.
+  in `AMUX_DEFAULT_WORKDIR` using `AMUX_DEFAULT_PROVIDER` and
+  `AMUX_DEFAULT_BACKEND` (`tmux` by default). It waits for the spawn to settle
+  and reports the real outcome, including a start error's detail.
 - **👁️ Peek / status** — lists workers with state; tap one to see its last pane
   output.
 - **✍️ Send prompt** — enters a prompt state; type the task (or send a voice
   note). `/cancel` leaves it.
-- **⏹️ Stop** — pick a worker, confirm, and it is stopped.
+- **⏹️ Stop** — pick a worker, confirm, and it is stopped. If the worker still
+  owns a Todo/Doing board card, amux's bootstrap restarts it; the confirmation
+  says so and names the cards before you commit to the stop, and the result
+  reports when a stop was undone.
 - Plain text (outside the prompt state) goes to the selected session.
 - `/sessions` picks a session; `/status` peeks the selected one.
 

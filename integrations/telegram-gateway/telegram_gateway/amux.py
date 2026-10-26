@@ -6,6 +6,8 @@ instead of a status code.
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from urllib.parse import quote
 
 import httpx
@@ -48,7 +50,7 @@ class AmuxClient:
 
     # ---- plumbing -------------------------------------------------------
 
-    async def _json(
+    async def _parsed(
         self,
         method: str,
         path: str,
@@ -56,7 +58,7 @@ class AmuxClient:
         params: dict | None = None,
         body: dict | None = None,
         timeout: float | None = None,
-    ) -> dict:
+    ):
         try:
             response = await self._client.request(
                 method, path, params=params, json=body, timeout=timeout
@@ -73,8 +75,22 @@ class AmuxClient:
             detail = str(parsed.get("error") or parsed.get("detail") or detail)
         if response.status_code >= 400:
             raise AmuxError(response.status_code, detail)
+        return parsed
+
+    async def _json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        body: dict | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        parsed = await self._parsed(
+            method, path, params=params, body=body, timeout=timeout
+        )
         if not isinstance(parsed, dict):
-            raise AmuxError(response.status_code, f"expected a JSON object, got: {detail}")
+            raise AmuxError(0, f"expected a JSON object, got: {str(parsed)[:200]}")
         return parsed
 
     @staticmethod
@@ -100,12 +116,15 @@ class AmuxClient:
         *,
         cwd: str | None = None,
         provider: str | None = None,
+        backend: str | None = None,
     ) -> dict:
         body: dict = {"display_name": display_name}
         if cwd:
             body["cwd"] = cwd
         if provider:
             body["provider"] = provider
+        if backend:
+            body["backend"] = backend
         return await self._json("POST", "/api/workers", body=body)
 
     async def start_worker(self, key: str) -> dict:
@@ -114,6 +133,63 @@ class AmuxClient:
 
     async def stop_worker(self, key: str) -> dict:
         return await self._json("POST", f"/api/workers/{self._key(key)}/stop", timeout=60.0)
+
+    async def wait_until_started(
+        self, key: str, *, timeout: float = 25.0, interval: float = 1.5
+    ) -> dict:
+        """Poll until the spawn settles, so the bot reports the real outcome.
+
+        A start answers ``{"state": "starting"}`` before the backend process
+        exists; answering the user from that would say "started" for a worker
+        that later parks in ``error`` (the herdr spawn failure looked exactly
+        like that).  Returns the last row read, even on timeout.
+        """
+        deadline = time.monotonic() + timeout
+        row: dict = {}
+        while True:
+            try:
+                row = await self.get_worker(key)
+            except AmuxError:
+                if time.monotonic() >= deadline:
+                    raise
+                await asyncio.sleep(interval)
+                continue
+            state = row.get("state")
+            slug = state.get("state") if isinstance(state, dict) else row.get("status")
+            if slug not in ("starting", "registered", "stopping"):
+                return row
+            if time.monotonic() >= deadline:
+                return row
+            await asyncio.sleep(interval)
+
+    async def todo_cards(self, session: str) -> list[dict]:
+        """Cards still assigned to a session that will restart it on stop.
+
+        Bootstrap auto-starts any stopped worker that owns a waiting Todo card,
+        so a stop that "fails" is usually this.  A board read failure returns
+        ``[]``: this decorates a stop message, it must not turn a real stop
+        into an error.
+        """
+        try:
+            rows = await self._parsed(
+                "GET", "/api/board", params={"session": session, "done_limit": 0}
+            )
+        except AmuxError:
+            return []
+        if not isinstance(rows, list):
+            return []
+        out = []
+        for row in rows:
+            status = str(row.get("status") or "").lower()
+            if status in ("todo", "doing", "backlog", "blocked"):
+                out.append(
+                    {
+                        "id": row.get("id"),
+                        "title": row.get("title"),
+                        "status": status,
+                    }
+                )
+        return out
 
     async def send(self, key: str, text: str) -> dict:
         # A send is answered when accepted, not when delivered; the relay's

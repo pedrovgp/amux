@@ -94,7 +94,19 @@ def test_load_config_happy_path_and_env_precedence(tmp_path):
     assert cfg.amux_url == "https://localhost:9000"
     assert cfg.amux_verify is False
     assert cfg.relay_interval_s == 30
+    assert cfg.default_backend == "tmux"
     assert cfg.state_path.name == "state.json"
+
+
+def test_default_backend_can_be_overridden(tmp_path):
+    env_file = tmp_path / "server.env"
+    env_file.write_text(
+        "TELEGRAM_GATEWAY_BOT_TOKEN=1:t\n"
+        "ALLOWED_TELEGRAM_USER_IDS=1\n"
+        "AMUX_DEFAULT_BACKEND=herdr\n"
+    )
+    cfg = load_config(environ={}, env_file=env_file, endpoint_file=tmp_path / "e.json")
+    assert cfg.default_backend == "herdr"
 
 
 def test_load_config_defaults_endpoint_when_absent(tmp_path):

@@ -45,14 +45,19 @@ def test_create_worker_sends_the_body():
 
     client = make_client(handler)
     try:
-        row = run(client.create_worker("tg-x", cwd="/tmp", provider="claude"))
+        row = run(client.create_worker("tg-x", cwd="/tmp", provider="opencode", backend="tmux"))
     finally:
         run(client.aclose())
     assert row["id"] == "wrk_1"
     assert captured == {
         "method": "POST",
         "path": "/api/workers",
-        "body": {"display_name": "tg-x", "cwd": "/tmp", "provider": "claude"},
+        "body": {
+            "display_name": "tg-x",
+            "cwd": "/tmp",
+            "provider": "opencode",
+            "backend": "tmux",
+        },
     }
 
 
@@ -128,3 +133,69 @@ def test_start_and_stop_hit_the_right_routes():
     finally:
         run(client.aclose())
     assert paths == ["/api/workers/w/start", "/api/workers/w/stop"]
+
+
+def test_wait_until_started_polls_until_the_spawn_settles():
+    states = iter(
+        [
+            {"id": "w", "state": {"state": "starting"}},
+            {"id": "w", "state": {"state": "starting"}},
+            {"id": "w", "state": {"state": "idle"}, "status": "idle"},
+        ]
+    )
+
+    def handler(request):
+        return httpx.Response(200, json=next(states))
+
+    client = make_client(handler)
+    try:
+        row = run(client.wait_until_started("w", timeout=5, interval=0.01))
+    finally:
+        run(client.aclose())
+    assert row["state"]["state"] == "idle"
+
+
+def test_wait_until_started_returns_on_error_state():
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={"id": "w", "state": {"state": "error", "detail": "herdr missing"}},
+        )
+
+    client = make_client(handler)
+    try:
+        row = run(client.wait_until_started("w", timeout=5, interval=0.01))
+    finally:
+        run(client.aclose())
+    assert row["state"]["detail"] == "herdr missing"
+
+
+def test_todo_cards_keeps_only_open_cards():
+    def handler(request):
+        assert request.url.params["session"] == "m2acp2"
+        return httpx.Response(
+            200,
+            json=[
+                {"id": "AMUX-1", "title": "open", "status": "todo"},
+                {"id": "AMUX-2", "title": "active", "status": "doing"},
+                {"id": "AMUX-3", "title": "done", "status": "done"},
+            ],
+        )
+
+    client = make_client(handler)
+    try:
+        cards = run(client.todo_cards("m2acp2"))
+    finally:
+        run(client.aclose())
+    assert [card["id"] for card in cards] == ["AMUX-1", "AMUX-2"]
+
+
+def test_todo_cards_read_failure_is_not_an_error():
+    def handler(request):
+        return httpx.Response(500, json={"error": "store wedged"})
+
+    client = make_client(handler)
+    try:
+        assert run(client.todo_cards("w")) == []
+    finally:
+        run(client.aclose())

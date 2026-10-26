@@ -118,6 +118,38 @@ async def _deliver_prompt(
     await _client(context).send(session, stamp)
 
 
+async def _report_send_error(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: str,
+    exc: AmuxError,
+    source: str,
+) -> None:
+    """Log a refused send and recover from a session that no longer exists."""
+    user_id = update.effective_user.id if update.effective_user else "-"
+    log.warning(
+        "send_failed session=%s user=%s source=%s status=%s detail=%s",
+        session,
+        user_id,
+        source,
+        exc.status,
+        exc.detail,
+    )
+    message = update.message
+    if message is None:
+        return
+    if exc.status == 404:
+        _state(context).clear(update.effective_chat.id)
+        workers = await _client(context).list_workers()
+        await message.reply_text(
+            f"⚠️ `{session}` no longer exists — pick another session.",
+            reply_markup=sessions_keyboard(workers, "pick") if workers else main_menu(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await message.reply_text(f"❌ amux refused: {exc.detail}")
+
+
 async def _require_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     session = _state(context).selected(update.effective_chat.id)
     if session:
@@ -134,20 +166,52 @@ async def _require_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def _create_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = _cfg(context)
     name = f"tg-{time.strftime('%m%d-%H%M')}-{secrets.token_hex(2)}"
+    client = _client(context)
     try:
-        row = await _client(context).create_worker(
-            name, cwd=cfg.default_workdir, provider=cfg.default_provider
+        row = await client.create_worker(
+            name,
+            cwd=cfg.default_workdir,
+            provider=cfg.default_provider,
+            backend=cfg.default_backend,
         )
         key = row.get("id") or name
-        started = await _client(context).start_worker(key)
+        await client.start_worker(key)
+        # A start answers "starting" before the backend process exists, so wait
+        # for the real state instead of reporting a start that may have failed.
+        worker = await client.wait_until_started(key)
     except AmuxError as exc:
+        log.warning(
+            "session_create_failed name=%s provider=%s backend=%s status=%s detail=%s",
+            name,
+            cfg.default_provider,
+            cfg.default_backend,
+            exc.status,
+            exc.detail,
+        )
         await _say(update, f"❌ Could not start a session: {exc.detail}")
         return
+
+    state = worker.get("state")
+    state = state if isinstance(state, dict) else {}
+    slug = state.get("state") or worker.get("status") or "unknown"
+    if slug == "error":
+        detail = state.get("detail") or "unknown error"
+        log.warning("session_start_failed name=%s detail=%s", name, detail)
+        await _say(
+            update,
+            f"❌ Session `{name}` was created but failed to start: {detail}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     _state(context).select(update.effective_chat.id, name)
-    status = started.get("state") or "started"
+    provider = worker.get("provider") or cfg.default_provider or "server default"
+    backend = worker.get("backend") or cfg.default_backend
+    log.info("session_started name=%s provider=%s backend=%s state=%s", name, provider, backend, slug)
     await _say(
         update,
-        f"🚀 Started `{name}` ({status}).\nSend a message to give it a task.",
+        f"🚀 Started `{name}` ({provider} · {backend}, {slug}).\n"
+        "Send a message to give it a task.",
         reply_markup=status_keyboard(name),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -157,6 +221,7 @@ async def _peek(update: Update, context: ContextTypes.DEFAULT_TYPE, session: str
     try:
         raw = await _client(context).peek(session, lines=200)
     except AmuxError as exc:
+        log.warning("peek_failed session=%s status=%s detail=%s", session, exc.status, exc.detail)
         await _say(update, f"❌ Peek failed: {exc.detail}")
         return
     text = strip_ansi(raw).strip()
@@ -247,9 +312,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
     elif action == "stop":
         if raw:
+            cards = await _client(context).todo_cards(raw)
+            warning = ""
+            if cards:
+                names = ", ".join(str(card["id"]) for card in cards[:5])
+                warning = (
+                    f"\n\n⚠️ {len(cards)} card(s) still assigned ({names}). "
+                    "amux restarts a worker that owns a waiting Todo card, so the "
+                    "stop will be undone until they are moved or closed."
+                )
             await _say(
                 update,
-                f"⏹️ Stop `{raw}`?",
+                f"⏹️ Stop `{raw}`?{warning}",
                 reply_markup=stop_confirm(raw),
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -272,14 +346,51 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode=ParseMode.MARKDOWN,
         )
     elif action == "stopok":
+        chat_id = update.effective_chat.id
         try:
             await _client(context).stop_worker(raw)
         except AmuxError as exc:
+            log.warning(
+                "session_stop_failed session=%s status=%s detail=%s",
+                raw,
+                exc.status,
+                exc.detail,
+            )
             await _say(update, f"❌ Stop failed: {exc.detail}")
             return
+        # A stop answers "applied" before bootstrap considers restarting a
+        # worker that still owns a waiting card. Check the truth, then report it.
+        await asyncio.sleep(3)
+        try:
+            worker = await _client(context).get_worker(raw)
+        except AmuxError:
+            worker = {}
+        if worker.get("running"):
+            cards = await _client(context).todo_cards(raw)
+            if cards:
+                names = ", ".join(str(card["id"]) for card in cards[:5])
+                log.info("session_stop_undone session=%s cards=%s", raw, names)
+                await _say(
+                    update,
+                    f"⏹️ Stop requested, but amux restarted `{raw}`: "
+                    f"{len(cards)} card(s) are still assigned ({names}). "
+                    "Move or close them first.",
+                    reply_markup=main_menu(),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            log.info("session_stop_undone session=%s cards=none", raw)
+            await _say(
+                update,
+                f"⚠️ `{raw}` is still running after the stop (it may be restarting).",
+                reply_markup=main_menu(),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
         state = _state(context)
-        if state.selected(update.effective_chat.id) == raw:
-            state.clear(update.effective_chat.id)
+        if state.selected(chat_id) == raw:
+            state.clear(chat_id)
+        log.info("session_stopped session=%s", raw)
         await _say(update, f"⏹️ Stopped `{raw}`.", reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -294,7 +405,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await _deliver_prompt(context, update.effective_chat.id, session, text, _username(update))
     except AmuxError as exc:
-        await update.message.reply_text(f"❌ amux refused: {exc.detail}")
+        await _report_send_error(update, context, session, exc, "text")
         return
     await update.message.reply_text(f"✅ Sent to `{session}`.", parse_mode=ParseMode.MARKDOWN)
 
@@ -327,7 +438,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context, update.effective_chat.id, session, transcript, _username(update)
         )
     except AmuxError as exc:
-        await update.message.reply_text(f"❌ amux refused: {exc.detail}")
+        await _report_send_error(update, context, session, exc, "voice")
         return
     await update.message.reply_text(f"✅ Sent to `{session}`.", parse_mode=ParseMode.MARKDOWN)
 
@@ -364,7 +475,7 @@ async def receive_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 context, update.effective_chat.id, session, text, _username(update)
             )
         except AmuxError as exc:
-            await update.message.reply_text(f"❌ amux refused: {exc.detail}")
+            await _report_send_error(update, context, session, exc, "prompt")
             return ConversationHandler.END
         await update.message.reply_text(f"✅ Sent to `{session}`.", parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END

@@ -23,6 +23,8 @@ Optional
 ``AMUX_TLS_VERIFY``         ``1`` to verify TLS (the local server is self-signed)
 ``AMUX_DEFAULT_WORKDIR``    default workdir for new sessions (default ``~``)
 ``AMUX_DEFAULT_PROVIDER``   provider for new sessions (omitted -> server default)
+``AMUX_DEFAULT_BACKEND``    backend for new sessions (default ``tmux``; the API's
+                            own default is ``herdr``, which needs AMUX_HERDR_SESSION)
 ``TELEGRAM_GATEWAY_STATE_DIR`` default ``~/.amux/telegram-gateway``
 ``TELEGRAM_GATEWAY_RELAY_INTERVAL_S`` default ``20``
 ``TELEGRAM_GATEWAY_LOG_LEVEL`` default ``INFO``
@@ -61,6 +63,7 @@ class Config:
     amux_verify: bool = False
     default_workdir: str = field(default_factory=lambda: os.path.expanduser("~"))
     default_provider: str | None = None
+    default_backend: str = "tmux"
     groq_api_key: str | None = None
     groq_model: str = DEFAULT_GROQ_MODEL
     state_dir: Path = field(default_factory=lambda: Path(DEFAULT_STATE_DIR).expanduser())
@@ -203,6 +206,7 @@ def load_config(
         amux_verify=_truthy(env.get("AMUX_TLS_VERIFY")),
         default_workdir=default_workdir,
         default_provider=(env.get("AMUX_DEFAULT_PROVIDER") or "").strip() or None,
+        default_backend=(env.get("AMUX_DEFAULT_BACKEND") or "").strip() or "tmux",
         groq_api_key=(env.get("GROQ_API_KEY") or "").strip() or None,
         groq_model=(env.get("GROQ_TRANSCRIBE_MODEL") or "").strip() or DEFAULT_GROQ_MODEL,
         state_dir=state_dir,
