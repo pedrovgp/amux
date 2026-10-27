@@ -90,6 +90,25 @@ a long task is never cut off mid-turn).
 Logs to watch: `idle_stop`, `idle_stop_undone`, `idle_stop_skipped_cards`,
 `revive`, `manager_pinned`, `opencode_model_dropped`.
 
+### Meaningful topic names
+
+A topic you start in General is born named after the lane (`mgr-1027-1536-8b4e`)
+— while OpenCode titles the same conversation from its content a few seconds
+after the first turn. `TELEGRAM_GATEWAY_TOPIC_SYNC_S` (default **60**, `0`
+disables) makes the topic follow that title: every tick, a topic the gateway
+minted for a PINNED session whose recorded name is still the session name is
+renamed once to OpenCode's title (`editForumTopic`, clamped to Telegram's 128
+characters) and recorded in `state.json`.
+
+- **Topics you created by hand are never renamed** (only gateway-minted ones are
+  eligible — the `topic_created` flag in state), and neither are topics opened
+  through `POST /topic`, whose names are deliberate.
+- **A stub waits**: `Untitled session` or an empty title leaves the topic as-is
+  for the next tick, because a topic is renamed only once.
+- No title is read (no process spawned) when there is nothing pending.
+
+Logs to watch: `topic_renamed`, `topic_rename_failed`.
+
 ## Setup
 
 ### 1. Create the gateway's own bot
@@ -127,6 +146,7 @@ GROQ_API_KEY=gsk_your_key_here
 # AMUX_DEFAULT_PROVIDER=opencode
 # TELEGRAM_GATEWAY_RELAY_INTERVAL_S=20
 # TELEGRAM_GATEWAY_IDLE_STOP_S=1800   # 0 disables the idle stop
+# TELEGRAM_GATEWAY_TOPIC_SYNC_S=60     # topic titles follow OpenCode (0 = off)
 ```
 
 New sessions are created with `POST /api/sessions` — a fleet lane (env file +

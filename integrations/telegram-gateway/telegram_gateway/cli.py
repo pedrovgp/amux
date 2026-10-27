@@ -51,6 +51,10 @@ async def _check(cfg: Config) -> int:
         "  idle stop          "
         + (f"{cfg.idle_stop_s:g}s (pinned managers only)" if cfg.idle_stop_s else "off")
     )
+    print(
+        "  topic title sync   "
+        + (f"{cfg.topic_sync_s:g}s" if cfg.topic_sync_s else "off")
+    )
 
     if not os.path.isdir(cfg.default_workdir):
         print(f"  ✗ default workdir does not exist: {cfg.default_workdir}")

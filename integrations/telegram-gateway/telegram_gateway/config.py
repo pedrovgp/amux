@@ -35,6 +35,10 @@ Optional
     no owner message AND no new agent output for this long is stopped (RAM
     freed; its topic binding is kept, so the next message there starts the same
     lane back and OpenCode resumes the same conversation); ``0`` disables
+``TELEGRAM_GATEWAY_TOPIC_SYNC_S`` default ``60`` — how often a gateway-made
+    topic's name is checked against its OpenCode session title (the title is
+    generated from the conversation a few seconds after the first turn, then
+    the topic is renamed ONCE to match); ``0`` disables
 
 Manager mode (a plain message starts a new agent)
 -------------------------------------------------
@@ -58,6 +62,8 @@ DEFAULT_GROQ_MODEL = "whisper-large-v3-turbo"
 DEFAULT_CONTROL_PORT = 8834
 # Owner, 2026-10-27: "30 minutes default." 0 disables the idle stop.
 DEFAULT_IDLE_STOP_S = 1800.0
+# Owner, 2026-10-27: "meaningful names for topics". 0 disables the sync.
+DEFAULT_TOPIC_SYNC_S = 60.0
 
 
 class ConfigError(RuntimeError):
@@ -89,6 +95,9 @@ class Config:
     control_port: int = DEFAULT_CONTROL_PORT
     # Idle stop for PINNED manager lanes; 0 disables it (see module docstring).
     idle_stop_s: float = DEFAULT_IDLE_STOP_S
+    # Topic-title sync (gateway-made topics follow OpenCode's session title);
+    # the loop tick AND the on/off switch — 0 disables.
+    topic_sync_s: float = DEFAULT_TOPIC_SYNC_S
     # Manager mode: a plain message (not a quote-reply) starts a new agent here.
     manager_cwd: str = field(
         default_factory=lambda: os.path.expanduser("~/Documents/pv/projetos")
@@ -253,6 +262,20 @@ def load_config(
         problems.append("TELEGRAM_GATEWAY_IDLE_STOP_S must be 0 (disabled) or positive")
         idle_stop_s = DEFAULT_IDLE_STOP_S
 
+    try:
+        topic_sync_s = float(
+            (env.get("TELEGRAM_GATEWAY_TOPIC_SYNC_S") or "").strip()
+            or DEFAULT_TOPIC_SYNC_S
+        )
+    except ValueError:
+        topic_sync_s = DEFAULT_TOPIC_SYNC_S
+        problems.append(
+            f"TELEGRAM_GATEWAY_TOPIC_SYNC_S is not a number; using {DEFAULT_TOPIC_SYNC_S:g}"
+        )
+    if topic_sync_s < 0:
+        problems.append("TELEGRAM_GATEWAY_TOPIC_SYNC_S must be 0 (disabled) or positive")
+        topic_sync_s = DEFAULT_TOPIC_SYNC_S
+
     if problems:
         raise ConfigError(problems)
 
@@ -270,6 +293,7 @@ def load_config(
         log_level=(env.get("TELEGRAM_GATEWAY_LOG_LEVEL") or "INFO").strip().upper(),
         control_port=control_port,
         idle_stop_s=idle_stop_s,
+        topic_sync_s=topic_sync_s,
         manager_cwd=os.path.expanduser(
             (env.get("MANAGER_CWD") or "").strip() or "~/Documents/pv/projetos"
         ),

@@ -183,3 +183,46 @@ def test_load_config_idle_stop_rejects_garbage_and_negative(tmp_path):
             env_file=env_file,
             endpoint_file=endpoint,
         )
+
+
+def test_load_config_topic_sync_default_override_and_off(tmp_path):
+    """TELEGRAM_GATEWAY_TOPIC_SYNC_S: 60 default, 0 = sync off."""
+    env_file = tmp_path / "server.env"
+    env_file.write_text("TELEGRAM_GATEWAY_BOT_TOKEN=1:t\nALLOWED_TELEGRAM_USER_IDS=1\n")
+    endpoint = tmp_path / "none.json"
+
+    cfg = load_config(environ={}, env_file=env_file, endpoint_file=endpoint)
+    assert cfg.topic_sync_s == 60.0
+
+    cfg = load_config(
+        environ={"TELEGRAM_GATEWAY_TOPIC_SYNC_S": "300"},
+        env_file=env_file,
+        endpoint_file=endpoint,
+    )
+    assert cfg.topic_sync_s == 300.0
+
+    cfg = load_config(
+        environ={"TELEGRAM_GATEWAY_TOPIC_SYNC_S": "0"},
+        env_file=env_file,
+        endpoint_file=endpoint,
+    )
+    assert cfg.topic_sync_s == 0.0  # 0 = off, not a typo
+
+
+def test_load_config_topic_sync_rejects_garbage_and_negative(tmp_path):
+    env_file = tmp_path / "server.env"
+    env_file.write_text("TELEGRAM_GATEWAY_BOT_TOKEN=1:t\nALLOWED_TELEGRAM_USER_IDS=1\n")
+    endpoint = tmp_path / "none.json"
+
+    with pytest.raises(ConfigError, match="TELEGRAM_GATEWAY_TOPIC_SYNC_S"):
+        load_config(
+            environ={"TELEGRAM_GATEWAY_TOPIC_SYNC_S": "soon"},
+            env_file=env_file,
+            endpoint_file=endpoint,
+        )
+    with pytest.raises(ConfigError, match="TELEGRAM_GATEWAY_TOPIC_SYNC_S"):
+        load_config(
+            environ={"TELEGRAM_GATEWAY_TOPIC_SYNC_S": "-1"},
+            env_file=env_file,
+            endpoint_file=endpoint,
+        )

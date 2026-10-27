@@ -35,6 +35,7 @@ from .menu import (
 )
 from .relay import chunk_text, delta_since, extract_reply, strip_ansi
 from .state import GatewayState
+from .topic_titles import clean_title, read_titles
 from .voice import groq_transcriber, transcribe_voice
 
 log = logging.getLogger("telegram_gateway")
@@ -818,7 +819,10 @@ async def _start_manager(
     if forum and thread is None:
         thread = await _create_forum_topic(update, context, name)
     if forum and thread is not None:
-        state.set_topic(chat_id, thread, name)
+        # `created` is what may later be renamed to OpenCode's session title:
+        # only a topic THIS gateway minted (General path), never one adopted
+        # from the owner's hand or opened through POST /topic.
+        state.set_topic(chat_id, thread, name, created=topic is None)
 
     if forum and thread is not None:
         if thread == in_thread:
@@ -1314,6 +1318,107 @@ async def idle_sweep_loop(app: Application) -> None:
             log.exception("idle_sweep_failed")
 
 
+
+# ---------------------------------------------------------------------------
+# topic titles: a gateway-made topic shows its OpenCode session's name
+# ---------------------------------------------------------------------------
+
+# One WARN per rename that fails (retried next tick while it stays eligible).
+_rename_warned: set[tuple[int, int]] = set()
+
+
+async def sync_topic_titles_once(app: Application) -> None:
+    """Rename a gateway-made topic to its OpenCode session's title.
+
+    Owner, 2026-10-27: "use meaningful names for topics — it should match the
+    session name in opencode". A topic is born `mgr-…` (the lane name) while
+    OpenCode titles the same conversation from its content seconds after the
+    first turn; the topic follows that title.
+
+    Eligibility is deliberately narrow, and each guard has a reason:
+
+    - **pinned session** — only an opencode lane has the id that selects its
+      title (legacy/other-provider lanes are never touched).
+    - **topic the GATEWAY minted** — a topic you made by hand, or one a manager
+      opened through ``POST /topic``, keeps the name it was given.
+    - **recorded name still == the session name** — a renamed topic drops out
+      of the sweep here, which is what makes this ONE rename per topic (no
+      churn, no process spawned when nothing is pending) rather than a follower
+      of every later retitle.
+
+    The Bot API cannot read a topic's title back, so `state.topic_names` is the
+    only record of what a topic is called: the rename writes it, and the same
+    field is the dedupe.
+    """
+    cfg: Config = app.bot_data["cfg"]
+    state: GatewayState = app.bot_data["state"]
+    if not cfg.topic_sync_s:
+        return
+    candidates: list[tuple[int, int, str, str]] = []
+    for chat_id, sessions in state.tracked_sessions().items():
+        for session in sessions:
+            thread = state.session_topic(chat_id, session)
+            if thread is None:
+                continue
+            pin = state.pinned(chat_id, session)
+            if not pin:
+                continue
+            if not state.topic_created(chat_id, thread):
+                continue
+            if (state.topic_name(chat_id, thread) or session) != session:
+                continue  # already renamed, or named deliberately elsewhere
+            candidates.append((chat_id, thread, session, pin))
+    if not candidates:
+        return
+    titles = await read_titles(cfg.manager_cwd)
+    bot = app.bot
+    for chat_id, thread, session, pin in candidates:
+        title = clean_title(titles.get(pin))
+        if title is None:
+            # No title yet (OpenCode's title job still running) or a stub:
+            # wait for the real one — a topic is renamed only once.
+            continue
+        try:
+            await bot.edit_forum_topic(chat_id, message_thread_id=thread, name=title)
+        except TelegramError as exc:
+            if (chat_id, thread) not in _rename_warned:
+                _rename_warned.add((chat_id, thread))
+                log.warning(
+                    "topic_rename_failed chat_id=%s thread=%s session=%s "
+                    "title=%s error=%s",
+                    chat_id,
+                    thread,
+                    session,
+                    title,
+                    exc,
+                )
+            continue
+        _rename_warned.discard((chat_id, thread))
+        previous = state.topic_name(chat_id, thread) or session
+        state.set_topic_name(chat_id, thread, title)
+        log.info(
+            "topic_renamed chat_id=%s thread=%s session=%s from=%s to=%s "
+            "source=opencode_title",
+            chat_id,
+            thread,
+            session,
+            previous,
+            title,
+        )
+
+
+async def sync_topic_titles_loop(app: Application) -> None:
+    cfg: Config = app.bot_data["cfg"]
+    while True:
+        await asyncio.sleep(cfg.topic_sync_s)
+        try:
+            await sync_topic_titles_once(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never let one bad cycle kill the loop
+            log.exception("topic_sync_failed")
+
+
 async def post_init(app: Application) -> None:
     cfg: Config = app.bot_data["cfg"]
     client: AmuxClient = app.bot_data["client"]
@@ -1331,14 +1436,16 @@ async def post_init(app: Application) -> None:
         log.info("control_disabled reason=TELEGRAM_GATEWAY_CONTROL_PORT=0")
     app.bot_data["relay_task"] = asyncio.create_task(relay_loop(app))
     app.bot_data["idle_task"] = asyncio.create_task(idle_sweep_loop(app))
+    app.bot_data["title_task"] = asyncio.create_task(sync_topic_titles_loop(app))
     log.info(
         "gateway_started allowed_users=%d amux_url=%s voice=%s relay_interval_s=%s "
-        "idle_stop_s=%s",
+        "idle_stop_s=%s topic_sync_s=%s",
         len(cfg.allowed_user_ids),
         cfg.amux_url,
         "on" if cfg.groq_api_key else "off",
         cfg.relay_interval_s,
         f"{cfg.idle_stop_s:g}" if cfg.idle_stop_s else "off",
+        f"{cfg.topic_sync_s:g}" if cfg.topic_sync_s else "off",
     )
 
 
@@ -1358,6 +1465,13 @@ async def post_shutdown(app: Application) -> None:
         idle_task.cancel()
         try:
             await idle_task
+        except asyncio.CancelledError:
+            pass
+    title_task = app.bot_data.get("title_task")
+    if title_task is not None:
+        title_task.cancel()
+        try:
+            await title_task
         except asyncio.CancelledError:
             pass
     client: AmuxClient = app.bot_data["client"]

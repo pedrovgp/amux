@@ -137,7 +137,13 @@ class GatewayState:
     # ---- forum topics: thread_id -> session (the topic rule) -----------
 
     def set_topic(
-        self, chat_id: int, thread_id: int, session: str, name: str | None = None
+        self,
+        chat_id: int,
+        thread_id: int,
+        session: str,
+        name: str | None = None,
+        *,
+        created: bool = False,
     ) -> None:
         """Bind a forum topic (``message_thread_id``) to ``session``.
 
@@ -148,6 +154,14 @@ class GatewayState:
         ``name`` is the topic's display name; it defaults to the session name
         (the gateway's own convention) and is remembered separately because
         Telegram lets two topics share a name while this map may not.
+
+        ``created`` says the GATEWAY minted this topic (the General path), as
+        opposed to adopting one the owner made by hand or a manager opened
+        through ``POST /topic``. Only a created topic may later be renamed to
+        match its OpenCode session title: an adopted topic's recorded name
+        falls back to the session name, so without this flag "recorded name ==
+        session name" would be true for the owner's own topics too and the
+        sync would overwrite names he chose.
         """
         chat = self._chat(chat_id)
         topics = chat.get("topics")
@@ -159,12 +173,49 @@ class GatewayState:
         if not isinstance(names, dict):
             names = {}
         names[thread] = name if isinstance(name, str) and name else session
+        made = chat.get("topic_created")
+        if not isinstance(made, dict):
+            made = {}
+        if created:
+            made[thread] = True
+        else:
+            made.pop(thread, None)
         # Bound the file: keep the most recently touched topics only.
         while len(topics) > MAX_TOPICS_PER_CHAT:
             old = next(iter(topics))
             topics.pop(old, None)
             names.pop(old, None)
+            made.pop(old, None)
         chat["topics"] = topics
+        chat["topic_names"] = names
+        chat["topic_created"] = made
+        self._save()
+
+    def topic_created(self, chat_id: int, thread_id: int) -> bool:
+        """Did the GATEWAY mint this topic (rather than adopt/name it)?"""
+        made = self._chat(chat_id).get("topic_created")
+        if not isinstance(made, dict):
+            return False
+        return made.get(str(int(thread_id))) is True
+
+    def topic_name(self, chat_id: int, thread_id: int) -> str | None:
+        """The topic's recorded display name, else ``None`` (never tracked)."""
+        names = self._chat(chat_id).get("topic_names")
+        if not isinstance(names, dict):
+            return None
+        value = names.get(str(int(thread_id)))
+        return value if isinstance(value, str) and value else None
+
+    def set_topic_name(self, chat_id: int, thread_id: int, name: str) -> None:
+        """Record a rename. The Bot API cannot READ a topic's title back, so
+        this map is the only record of what a topic is called — and it doubles
+        as the rename's dedupe (the sync only acts while the recorded name is
+        still the session name)."""
+        chat = self._chat(chat_id)
+        names = chat.get("topic_names")
+        if not isinstance(names, dict):
+            names = {}
+        names[str(int(thread_id))] = name
         chat["topic_names"] = names
         self._save()
 
@@ -259,11 +310,15 @@ class GatewayState:
             return []
         names = chat.get("topic_names")
         names = names if isinstance(names, dict) else None
+        made = chat.get("topic_created")
+        made = made if isinstance(made, dict) else None
         dropped = []
         for thread in [t for t, name in topics.items() if name == session]:
             topics.pop(thread, None)
             if names is not None:
                 names.pop(thread, None)
+            if made is not None:
+                made.pop(thread, None)
             try:
                 dropped.append(int(thread))
             except ValueError:
@@ -272,6 +327,8 @@ class GatewayState:
             chat["topics"] = topics
             if names is not None:
                 chat["topic_names"] = names
+            if made is not None:
+                chat["topic_created"] = made
             self._save()
         return dropped
 
