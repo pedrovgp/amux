@@ -1,6 +1,7 @@
 """Manager mode: the thread rule, the manager lane sequence, and reply-to."""
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import httpx
@@ -308,3 +309,45 @@ def test_relay_does_not_repeat_an_unchanged_answer(tmp_path):
     finally:
         run(client.aclose())
     assert len(bot.sent) == 1
+
+
+def test_relay_warns_once_when_the_pane_has_no_boundary(tmp_path, caplog):
+    """A missing boundary used to be a *silent* `continue` — no log line at
+    all. That silence hid the 2026-10-27 missing answers for hours: the agent
+    never stamped `—— answer ——`, the prompt marker had scrolled out of the
+    viewport, and the relay kept quietly skipping every cycle. Now it warns
+    once per stretch (reset by a successful extract), so a sweep sees
+    `relay_no_boundary` instead of a healthy-looking quiet log.
+    """
+    state = GatewayState(tmp_path / "state.json")
+    state.set_turn_message(9, "mgr-abc", 55)
+
+    def handler(request):
+        if request.url.path == "/api/sessions":
+            return httpx.Response(
+                200, json=[{"name": "mgr-abc", "activity": "none", "status": "idle"}]
+            )
+        # pane output with neither the prompt marker nor the sentinel
+        return httpx.Response(200, json={"output": "⠋ telegram topics for mana…\n"})
+
+    client = make_client(handler)
+    bot = FakeBot()
+    app = SimpleNamespace(
+        bot=bot, bot_data={"cfg": None, "client": client, "state": state}
+    )
+    botmod._no_boundary_warned.clear()
+    try:
+        with caplog.at_level(logging.WARNING, logger="telegram_gateway"):
+            run(botmod.relay_once(app))  # first miss: warns
+            run(botmod.relay_once(app))  # still missing: stays quiet
+    finally:
+        run(client.aclose())
+        botmod._no_boundary_warned.clear()
+
+    warns = [
+        r
+        for r in caplog.records
+        if r.name == "telegram_gateway" and "relay_no_boundary" in r.getMessage()
+    ]
+    assert len(warns) == 1, f"expected exactly one WARN, got {len(warns)}"
+    assert bot.sent == []  # and nothing was delivered, honestly

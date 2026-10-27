@@ -961,6 +961,13 @@ async def cancel_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 # ---------------------------------------------------------------------------
 
 
+# Sessions whose pane currently offers NO answer boundary. One WARN per
+# stretch (reset by a successful extract): a miss repeats every relay cycle,
+# and this exact silence hid the 2026-10-27 missing answers — the relay
+# skipped every reply for hours without leaving a single line to sweep.
+_no_boundary_warned: set[tuple[int, str]] = set()
+
+
 async def relay_once(app: Application) -> None:
     cfg: Config = app.bot_data["cfg"]
     client: AmuxClient = app.bot_data["client"]
@@ -974,7 +981,19 @@ async def relay_once(app: Application) -> None:
                 continue
             text = extract_reply(raw)
             if not text:
+                if (chat_id, session) not in _no_boundary_warned:
+                    _no_boundary_warned.add((chat_id, session))
+                    log.warning(
+                        "relay_no_boundary chat_id=%s session=%s pane_chars=%s "
+                        "hint=no '—— answer ——' sentinel in the reply and the "
+                        "[from Telegram @…] prompt marker scrolled out of the "
+                        "viewport — nothing can be delivered until one is visible",
+                        chat_id,
+                        session,
+                        len(raw),
+                    )
                 continue
+            _no_boundary_warned.discard((chat_id, session))
             last = state.last_relayed(chat_id, session)
             if text == last:
                 continue
