@@ -43,6 +43,10 @@ async def _check(cfg: Config) -> int:
     print(f"  groq voice         {'on: ' + cfg.groq_model if cfg.groq_api_key else 'off (GROQ_API_KEY unset)'}")
     print(f"  state file         {cfg.state_path}")
     print(f"  relay interval     {cfg.relay_interval_s:g}s")
+    print(
+        f"  control endpoint   "
+        + (f"127.0.0.1:{cfg.control_port} (POST /topic)" if cfg.control_port else "off")
+    )
 
     if not os.path.isdir(cfg.default_workdir):
         print(f"  ✗ default workdir does not exist: {cfg.default_workdir}")

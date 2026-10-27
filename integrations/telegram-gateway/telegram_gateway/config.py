@@ -28,6 +28,9 @@ Optional
 ``TELEGRAM_GATEWAY_STATE_DIR`` default ``~/.amux/telegram-gateway``
 ``TELEGRAM_GATEWAY_RELAY_INTERVAL_S`` default ``20``
 ``TELEGRAM_GATEWAY_LOG_LEVEL`` default ``INFO``
+``TELEGRAM_GATEWAY_CONTROL_PORT`` default ``8834`` — the gateway's own
+    localhost control endpoint (``POST /topic``), the one path managers may use
+    to open a topic; ``0`` disables it
 
 Manager mode (a plain message starts a new agent)
 -------------------------------------------------
@@ -48,6 +51,7 @@ DEFAULT_ENV_FILE = "~/.amux/server.env"
 DEFAULT_STATE_DIR = "~/.amux/telegram-gateway"
 FALLBACK_AMUX_URL = "https://localhost:8824"
 DEFAULT_GROQ_MODEL = "whisper-large-v3-turbo"
+DEFAULT_CONTROL_PORT = 8834
 
 
 class ConfigError(RuntimeError):
@@ -75,6 +79,8 @@ class Config:
     state_dir: Path = field(default_factory=lambda: Path(DEFAULT_STATE_DIR).expanduser())
     relay_interval_s: float = 20.0
     log_level: str = "INFO"
+    # Gateway-owned control endpoint (127.0.0.1 only); 0 disables it.
+    control_port: int = DEFAULT_CONTROL_PORT
     # Manager mode: a plain message (not a quote-reply) starts a new agent here.
     manager_cwd: str = field(
         default_factory=lambda: os.path.expanduser("~/Documents/pv/projetos")
@@ -211,6 +217,20 @@ def load_config(
         (env.get("TELEGRAM_GATEWAY_STATE_DIR") or "").strip() or DEFAULT_STATE_DIR
     ).expanduser()
 
+    try:
+        control_port = int(
+            (env.get("TELEGRAM_GATEWAY_CONTROL_PORT") or "").strip()
+            or DEFAULT_CONTROL_PORT
+        )
+    except ValueError:
+        control_port = DEFAULT_CONTROL_PORT
+        problems.append(
+            f"TELEGRAM_GATEWAY_CONTROL_PORT is not a number; using {DEFAULT_CONTROL_PORT}"
+        )
+    if not 0 <= control_port <= 65535:
+        problems.append("TELEGRAM_GATEWAY_CONTROL_PORT must be 0 (disabled) or 1-65535")
+        control_port = DEFAULT_CONTROL_PORT
+
     if problems:
         raise ConfigError(problems)
 
@@ -226,6 +246,7 @@ def load_config(
         state_dir=state_dir,
         relay_interval_s=relay_interval,
         log_level=(env.get("TELEGRAM_GATEWAY_LOG_LEVEL") or "INFO").strip().upper(),
+        control_port=control_port,
         manager_cwd=os.path.expanduser(
             (env.get("MANAGER_CWD") or "").strip() or "~/Documents/pv/projetos"
         ),

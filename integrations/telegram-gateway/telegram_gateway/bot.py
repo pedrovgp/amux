@@ -21,6 +21,7 @@ from telegram.ext import (
 
 from .amux import AmuxClient, AmuxError
 from .config import Config
+from .control import ControlServer
 from .guard import Guard, allow_only
 from .manager import PROVIDERS, create_manager, new_manager_name
 from .menu import (
@@ -39,6 +40,16 @@ from .voice import groq_transcriber, transcribe_voice
 log = logging.getLogger("telegram_gateway")
 
 PROMPT = 1
+
+# A burst of identical messages in General (a client retry, a double tap, a
+# forwarded copy) would open one topic per copy: each General message starts a
+# fresh manager by design. An identical repeat inside DUP_WINDOW_S is merged
+# into the session the first copy started instead.
+DUP_WINDOW_S = 30.0
+RECENT_STARTS = "recent_starts"
+MAX_RECENT_STARTS = 100
+# A session in one of these states cannot take the merged prompt.
+DEAD_STATUSES = ("stopped", "stopping", "error")
 
 WELCOME = (
     "🤖 *amux gateway*\n"
@@ -565,6 +576,59 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _say(update, f"⏹️ Stopped `{raw}`.", reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
 
 
+def _now() -> float:
+    """Clock seam: the dedup window is asserted against this in tests."""
+    return time.monotonic()
+
+
+def _record_general_start(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, session: str
+) -> None:
+    """Remember the session a General text message just started.
+
+    Recorded only once the lane is actually up: a start that failed must not
+    swallow the next identical message (it falls through to a fresh attempt).
+    """
+    recent = context.application.bot_data.setdefault(RECENT_STARTS, {})
+    now = _now()
+    for key in [k for k, (_, ts) in recent.items() if now - ts > DUP_WINDOW_S]:
+        recent.pop(key, None)
+    recent[(chat_id, text)] = (session, now)
+    while len(recent) > MAX_RECENT_STARTS:
+        recent.pop(next(iter(recent)))
+
+
+async def _duplicate_general_start(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str
+) -> str | None:
+    """The live session this exact text already started in this chat, if any.
+
+    The record alone is not enough: within the window the lane can still have
+    died (or been stopped from the menu), and a prompt handed to it would be
+    lost. So the session is checked against amux before it is merged into.
+    """
+    recent = context.application.bot_data.get(RECENT_STARTS)
+    if not recent:
+        return None
+    entry = recent.get((chat_id, text))
+    if entry is None:
+        return None
+    session, ts = entry
+    if _now() - ts > DUP_WINDOW_S:
+        recent.pop((chat_id, text), None)
+        return None
+    try:
+        row = await _client(context).find(session)
+    except AmuxError as exc:
+        if exc.status != 0:  # gone from the fleet: the record is stale
+            recent.pop((chat_id, text), None)
+        return None  # unreachable: fall through rather than guess
+    if str(row.get("status") or "").lower() in DEAD_STATUSES:
+        recent.pop((chat_id, text), None)
+        return None
+    return session
+
+
 @allow_only
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
@@ -585,6 +649,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = _session_from_reply(update, context)
     if session:
         await _continue_session(update, context, session, text, "text")
+        return
+    # The same sentence twice in a row is one intent, not two managers: the
+    # burst goes to the session the first copy started (its topic already
+    # exists). A dead or never-started session falls through to a fresh one.
+    duplicate = await _duplicate_general_start(context, update.effective_chat.id, text)
+    if duplicate:
+        log.info(
+            "duplicate_general_merged chat_id=%s session=%s msg=%s",
+            update.effective_chat.id,
+            duplicate,
+            update.message.message_id,
+        )
+        await _continue_session(update, context, duplicate, text, "text")
         return
     await _start_manager(update, context, text, source="text")
 
@@ -753,6 +830,10 @@ async def _start_manager(
         source,
         thread,
     )
+    if source == "text" and in_thread is None:
+        # A General text start: an identical repeat inside DUP_WINDOW_S merges
+        # into this session instead of opening a second topic.
+        _record_general_start(context, chat_id, text, name)
     try:
         await _deliver_prompt(context, chat_id, name, text, _username(update))
     except AmuxError as exc:
@@ -1050,6 +1131,13 @@ async def post_init(app: Application) -> None:
         log.info("amux_health status=%s commit=%s", health.get("status"), health.get("commit"))
     except AmuxError as exc:
         log.warning("amux_unreachable url=%s error=%s", cfg.amux_url, exc)
+    # The tracked topic path managers must use instead of raw createForumTopic.
+    control = ControlServer(app, cfg.control_port)
+    app.bot_data["control"] = control
+    if cfg.control_port:
+        await control.start()
+    else:
+        log.info("control_disabled reason=TELEGRAM_GATEWAY_CONTROL_PORT=0")
     app.bot_data["relay_task"] = asyncio.create_task(relay_loop(app))
     log.info(
         "gateway_started allowed_users=%d amux_url=%s voice=%s relay_interval_s=%s",
@@ -1061,6 +1149,9 @@ async def post_init(app: Application) -> None:
 
 
 async def post_shutdown(app: Application) -> None:
+    control = app.bot_data.get("control")
+    if control is not None:
+        await control.stop()
     task = app.bot_data.get("relay_task")
     if task is not None:
         task.cancel()

@@ -26,6 +26,38 @@ Research, reading files, and answering questions ARE your job.
 - You are NOT isolated: `$AMUX_URL`, the `amux` CLI and amux MCP tools are all
   available to you. Use them.
 
+## Topics: never touch the Bot API
+
+Do **not** call `createForumTopic`, `sendMessage` or any other Bot API method
+yourself — not with `curl`, not with a script, not with the bot token in
+`~/.amux/server.env`. A topic you create outside the gateway is invisible to
+it: nothing binds it to your session in the gateway's own state, so the
+owner's first message in it starts ANOTHER manager, and your answers are
+relayed nowhere. (2026-10-27: that shortcut produced 5 topics for one request.)
+
+When the owner asks for a topic — or you need one to isolate a task — use the
+gateway's own path. It creates the topic, binds it to your session and logs
+`topic_created`:
+
+```
+curl -sS -X POST http://127.0.0.1:8834/topic \
+  -H 'content-type: application/json' \
+  -d '{"session":"'"$AMUX_SESSION"'"}'
+```
+
+Body: `session` (required — your own `$AMUX_SESSION`), `chat_id` (optional; the
+gateway resolves the chat your session lives in — pass `-1004274385104`, the
+forum group, if it cannot), `name` (optional, defaults to the session name).
+
+Answers: `201 {"thread":…,"created":true}` new topic · `200 {"created":false}`
+you already have one (calling twice is safe) · `409 {"error":"name_exists"}`
+another topic already carries that name · `400`/`502` with an `error` field
+otherwise.
+
+After that, do nothing: you never post into the topic yourself. The gateway's
+relay delivers your replies into the topic bound to your session, as long as
+each reply starts with the `—— answer ——` line.
+
 ## Honesty
 
 Never invent a card id, a lane name, or a result you did not read. If a command

@@ -132,22 +132,36 @@ class GatewayState:
 
     # ---- forum topics: thread_id -> session (the topic rule) -----------
 
-    def set_topic(self, chat_id: int, thread_id: int, session: str) -> None:
+    def set_topic(
+        self, chat_id: int, thread_id: int, session: str, name: str | None = None
+    ) -> None:
         """Bind a forum topic (``message_thread_id``) to ``session``.
 
         This is what lets the owner just *write in the topic* to continue a
         session: Telegram hands back ``message_thread_id`` on every message,
         and the topic — not a quote — identifies the manager being talked to.
+
+        ``name`` is the topic's display name; it defaults to the session name
+        (the gateway's own convention) and is remembered separately because
+        Telegram lets two topics share a name while this map may not.
         """
         chat = self._chat(chat_id)
         topics = chat.get("topics")
         if not isinstance(topics, dict):
             topics = {}
-        topics[str(int(thread_id))] = session
+        thread = str(int(thread_id))
+        topics[thread] = session
+        names = chat.get("topic_names")
+        if not isinstance(names, dict):
+            names = {}
+        names[thread] = name if isinstance(name, str) and name else session
         # Bound the file: keep the most recently touched topics only.
         while len(topics) > MAX_TOPICS_PER_CHAT:
-            topics.pop(next(iter(topics)))
+            old = next(iter(topics))
+            topics.pop(old, None)
+            names.pop(old, None)
         chat["topics"] = topics
+        chat["topic_names"] = names
         self._save()
 
     def topic_session(self, chat_id: int, thread_id: int | None) -> str | None:
@@ -172,6 +186,62 @@ class GatewayState:
                     continue
         return None
 
+    def chat_for_session(self, session: str) -> int | None:
+        """The chat this session lives in, or ``None`` (no chat has it).
+
+        The reverse of the topic/turn maps: it lets a caller that knows only a
+        session name — a manager asking the control endpoint for a topic —
+        address the right chat without having been told its id. A chat that
+        holds the session in a topic wins over one that only holds a turn.
+        """
+        chats = self._data.get("chats", {})
+        for pass_topics in (True, False):
+            for chat_id, chat in chats.items():
+                if not isinstance(chat, dict):
+                    continue
+                if pass_topics:
+                    hit = chat.get("topics")
+                    if not (isinstance(hit, dict) and session in hit.values()):
+                        continue
+                else:
+                    hit = chat.get("turn_msg")
+                    if not (isinstance(hit, dict) and session in hit):
+                        continue
+                try:
+                    return int(chat_id)
+                except ValueError:
+                    continue
+        return None
+
+    def thread_for_topic_name(self, chat_id: int, name: str) -> int | None:
+        """The thread of the topic displayed as ``name``, else ``None``.
+
+        Used to refuse a second topic with a name the gateway already gave to
+        another one. Entries written before names were tracked fall back to
+        the session-name convention, which is what every gateway-created topic
+        used.
+        """
+        chat = self._chat(chat_id)
+        names = chat.get("topic_names")
+        names = names if isinstance(names, dict) else {}
+        for thread, value in names.items():
+            if value == name:
+                try:
+                    return int(thread)
+                except ValueError:
+                    continue
+        topics = chat.get("topics")
+        if isinstance(topics, dict):
+            for thread, value in topics.items():
+                if thread in names:
+                    continue  # known by its display name above, not by session
+                if value == name:
+                    try:
+                        return int(thread)
+                    except ValueError:
+                        continue
+        return None
+
     def drop_session_topics(self, chat_id: int, session: str) -> list[int]:
         """Release every topic bound to ``session``; returns the thread ids.
 
@@ -183,15 +253,21 @@ class GatewayState:
         topics = chat.get("topics")
         if not isinstance(topics, dict):
             return []
+        names = chat.get("topic_names")
+        names = names if isinstance(names, dict) else None
         dropped = []
         for thread in [t for t, name in topics.items() if name == session]:
             topics.pop(thread, None)
+            if names is not None:
+                names.pop(thread, None)
             try:
                 dropped.append(int(thread))
             except ValueError:
                 continue
         if dropped:
             chat["topics"] = topics
+            if names is not None:
+                chat["topic_names"] = names
             self._save()
         return dropped
 

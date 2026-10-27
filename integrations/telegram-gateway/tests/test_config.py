@@ -105,3 +105,38 @@ def test_load_config_defaults_endpoint_when_absent(tmp_path):
     cfg = load_config(environ={}, env_file=env_file, endpoint_file=tmp_path / "none.json")
     assert cfg.amux_url == "https://localhost:8824"
     assert cfg.groq_api_key is None
+
+
+def test_load_config_control_port_default_override_and_off(tmp_path):
+    """The control endpoint port: default 8834, env override, 0 disables."""
+    env_file = tmp_path / "server.env"
+    env_file.write_text("TELEGRAM_GATEWAY_BOT_TOKEN=1:t\nALLOWED_TELEGRAM_USER_IDS=1\n")
+    endpoint = tmp_path / "none.json"
+
+    cfg = load_config(environ={}, env_file=env_file, endpoint_file=endpoint)
+    assert cfg.control_port == 8834
+
+    cfg = load_config(
+        environ={"TELEGRAM_GATEWAY_CONTROL_PORT": "9001"},
+        env_file=env_file,
+        endpoint_file=endpoint,
+    )
+    assert cfg.control_port == 9001
+
+    cfg = load_config(
+        environ={"TELEGRAM_GATEWAY_CONTROL_PORT": "0"},
+        env_file=env_file,
+        endpoint_file=endpoint,
+    )
+    assert cfg.control_port == 0  # 0 = endpoint disabled, not a typo
+
+
+def test_load_config_control_port_rejects_garbage(tmp_path):
+    env_file = tmp_path / "server.env"
+    env_file.write_text("TELEGRAM_GATEWAY_BOT_TOKEN=1:t\nALLOWED_TELEGRAM_USER_IDS=1\n")
+    with pytest.raises(ConfigError, match="TELEGRAM_GATEWAY_CONTROL_PORT"):
+        load_config(
+            environ={"TELEGRAM_GATEWAY_CONTROL_PORT": "banana"},
+            env_file=env_file,
+            endpoint_file=tmp_path / "none.json",
+        )
