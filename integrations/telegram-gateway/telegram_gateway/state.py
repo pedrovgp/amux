@@ -10,11 +10,15 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 MAX_RELAYED_PER_CHAT = 10
 MAX_MSG_SESSIONS = 300
 MAX_TOPICS_PER_CHAT = 200
+# Activity stamps, pins and idle markers are keyed by session name: bounded the
+# same way the message map is, so a long-lived chat cannot grow state.json.
+MAX_ACTIVITY_PER_CHAT = 300
 
 
 class GatewayState:
@@ -270,6 +274,128 @@ class GatewayState:
                 chat["topic_names"] = names
             self._save()
         return dropped
+
+    # ---- pin + idle lifecycle (idle stop, same-session revive) -----------
+
+    def set_pinned(self, chat_id: int, session: str, oc_session: str) -> None:
+        """Record the OpenCode conversation this lane is pinned to.
+
+        Only an opencode manager gets a pin, and ONLY a pinned session is ever
+        idle-stopped — the pin is what makes "stop then start" resume the same
+        conversation instead of opening a new one, so an unpinned (legacy, or
+        another provider) lane keeps today's behaviour of running forever.
+        """
+        chat = self._chat(chat_id)
+        pins = chat.get("pinned")
+        if not isinstance(pins, dict):
+            pins = {}
+        pins[session] = oc_session
+        chat["pinned"] = pins
+        self._save()
+
+    def pinned(self, chat_id: int, session: str) -> str | None:
+        pins = self._chat(chat_id).get("pinned")
+        if not isinstance(pins, dict):
+            return None
+        value = pins.get(session)
+        return value if isinstance(value, str) and value else None
+
+    def touch_activity(
+        self, chat_id: int, session: str, kind: str = "owner", at: float | None = None
+    ) -> None:
+        """Stamp the last time a session was ACTIVE: ``owner`` (a prompt we
+        delivered) or ``output`` (new text the relay sent).
+
+        Both count, per the owner's call on 2026-10-27 ("Yes, agent output
+        counts as activity") — a lane still producing answers is never idle.
+        """
+        chat = self._chat(chat_id)
+        activity = chat.get("activity")
+        if not isinstance(activity, dict):
+            activity = {}
+        entry = activity.get(session)
+        if not isinstance(entry, dict):
+            entry = {}
+        entry[kind if kind in ("owner", "output") else "owner"] = float(
+            time.time() if at is None else at
+        )
+        activity[session] = entry
+        while len(activity) > MAX_ACTIVITY_PER_CHAT:
+            activity.pop(next(iter(activity)), None)
+        chat["activity"] = activity
+        self._save()
+
+    def last_activity(self, chat_id: int, session: str) -> float | None:
+        """The newest of the owner/output stamps, or ``None`` if never seen."""
+        entry = self._chat(chat_id).get("activity")
+        if not isinstance(entry, dict):
+            return None
+        value = entry.get(session)
+        if not isinstance(value, dict) or not value:
+            return None
+        stamps = [float(v) for v in value.values() if isinstance(v, (int, float))]
+        return max(stamps) if stamps else None
+
+    def mark_idle_stopped(
+        self, chat_id: int, session: str, at: float | None = None
+    ) -> None:
+        """The sweeper stopped this lane; the topic binding is NOT released.
+
+        The marker is what lets the relay skip the dead pane and the next
+        prompt start the same lane again instead of sending into a stopped one.
+        """
+        chat = self._chat(chat_id)
+        stopped = chat.get("idle_stopped")
+        if not isinstance(stopped, dict):
+            stopped = {}
+        stopped[session] = float(time.time() if at is None else at)
+        while len(stopped) > MAX_ACTIVITY_PER_CHAT:
+            stopped.pop(next(iter(stopped)), None)
+        chat["idle_stopped"] = stopped
+        self._save()
+
+    def clear_idle_stopped(self, chat_id: int, session: str) -> None:
+        chat = self._chat(chat_id)
+        stopped = chat.get("idle_stopped")
+        if isinstance(stopped, dict) and session in stopped:
+            stopped.pop(session, None)
+            chat["idle_stopped"] = stopped
+            self._save()
+
+    def idle_stopped(self, chat_id: int, session: str) -> float | None:
+        stopped = self._chat(chat_id).get("idle_stopped")
+        if not isinstance(stopped, dict):
+            return None
+        value = stopped.get(session)
+        return float(value) if isinstance(value, (int, float)) else None
+
+    def tracked_sessions(self) -> dict[int, set[str]]:
+        """Every session the gateway knows about, for the idle sweep.
+
+        Superset of :meth:`sessions_to_relay`: selections, thread anchors,
+        topic bindings, pins, activity stamps and idle markers all count, so a
+        session cannot fall out of the sweep just because its anchor was
+        trimmed.
+        """
+        out: dict[int, set[str]] = {}
+
+        def add(chat_id, session):
+            if isinstance(session, str) and session:
+                out.setdefault(int(chat_id), set()).add(session)
+
+        for chat_id, session in self.selections().items():
+            add(chat_id, session)
+        for chat_id, chat in self._data.get("chats", {}).items():
+            for key in ("turn_msg", "activity", "pinned", "idle_stopped"):
+                values = chat.get(key)
+                if isinstance(values, dict):
+                    for session in values:
+                        add(chat_id, session)
+            topics = chat.get("topics")
+            if isinstance(topics, dict):
+                for session in topics.values():
+                    add(chat_id, session)
+        return out
 
     # ---- turn tracking (what the relay replies to) ----------------------
 

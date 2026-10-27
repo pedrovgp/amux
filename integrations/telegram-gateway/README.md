@@ -65,6 +65,31 @@ In a forum group the **topic replaces the quote**:
 Voice notes follow the same routing; the transcription stays where the voice
 was sent (readable there), the answer lands in the topic.
 
+### Idle stop, same-session revive
+
+A topic must not cost RAM forever. `TELEGRAM_GATEWAY_IDLE_STOP_S` (default
+**1800** = the owner's 30 minutes, `0` disables) stops a manager lane when BOTH
+have been quiet for that long: you (no message) and the agent (no new output —
+a long task is never cut off mid-turn).
+
+- **Only pinned lanes are ever stopped.** A new opencode manager is created
+  with `flags="--session ses_tg…"`; amux stores that as the lane's `CC_FLAGS`
+  and replays it on every start, so the pin is what makes a restart resume the
+  *same* OpenCode conversation. Managers created before this change, and
+  managers on any other provider, keep running exactly as they always did.
+- **The topic binding is kept.** The stop never releases the topic: the relay
+  stops peeking the dead pane, and your next message there starts the same
+  lane again (`start` → wait → send) and OpenCode reopens the conversation its
+  pin names. Same topic, same session, only the RAM was freed.
+- **Lanes that own a waiting board card are skipped** (`idle_stop_skipped_cards`
+  in the log): amux's bootstrap would restart a stopped worker that owns a
+  Todo/Doing card, so stopping one is a fight nobody wins.
+- ⏹️ Stop from the menu keeps its old meaning: it releases the topic, and the
+  next message there starts a fresh manager.
+
+Logs to watch: `idle_stop`, `idle_stop_undone`, `idle_stop_skipped_cards`,
+`revive`, `manager_pinned`, `opencode_model_dropped`.
+
 ## Setup
 
 ### 1. Create the gateway's own bot
@@ -101,6 +126,7 @@ GROQ_API_KEY=gsk_your_key_here
 # AMUX_DEFAULT_WORKDIR=/home/you
 # AMUX_DEFAULT_PROVIDER=opencode
 # TELEGRAM_GATEWAY_RELAY_INTERVAL_S=20
+# TELEGRAM_GATEWAY_IDLE_STOP_S=1800   # 0 disables the idle stop
 ```
 
 New sessions are created with `POST /api/sessions` — a fleet lane (env file +

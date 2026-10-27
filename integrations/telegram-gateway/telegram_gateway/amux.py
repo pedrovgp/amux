@@ -141,6 +141,7 @@ class AmuxClient:
         cwd: str | None = None,
         provider: str | None = None,
         model: str | None = None,
+        flags: str | None = None,
         start: bool = True,
     ) -> dict:
         """Create a fleet lane (env file, autostart unless told otherwise).
@@ -148,6 +149,12 @@ class AmuxClient:
         ``POST /api/workers`` would only write a table row with no lane env
         file, and the server refuses sends to those; the SPA's own create uses
         ``POST /api/sessions`` for exactly this reason.
+
+        ``flags`` is stored verbatim as the lane's ``CC_FLAGS`` and rides on
+        EVERY later start of that lane (the launch reads the env file), which
+        is how a lane gets pinned to one OpenCode conversation: amux honours
+        explicit flags over ``model`` (AMUX-3114), so a caller that passes
+        ``flags`` must put the model in them itself when it wants one.
         """
         body: dict = {"name": name, "start": start}
         if cwd:
@@ -156,6 +163,8 @@ class AmuxClient:
             body["provider"] = provider
         if model:
             body["model"] = model
+        if flags:
+            body["flags"] = flags
         return await self._json("POST", "/api/sessions", body=body, timeout=120.0)
 
     async def set_instructions(self, name: str, instructions: str) -> dict:

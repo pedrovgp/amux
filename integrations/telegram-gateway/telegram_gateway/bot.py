@@ -23,7 +23,7 @@ from .amux import AmuxClient, AmuxError
 from .config import Config
 from .control import ControlServer
 from .guard import Guard, allow_only
-from .manager import PROVIDERS, create_manager, new_manager_name
+from .manager import PROVIDERS, create_manager, new_manager_name, new_opencode_session_id
 from .menu import (
     PREFIX,
     format_worker_line,
@@ -193,6 +193,27 @@ async def _deliver_prompt(
 ) -> None:
     stamp = f"[from Telegram @{username}] {text}"
     client = _client(context)
+    state = _state(context)
+    if state.idle_stopped(chat_id, session) is not None:
+        # The sweeper stopped this lane; the topic binding survived precisely
+        # so this moment resumes it. The lane's CC_FLAGS carry its pinned
+        # `--session <id>`, so the relaunch opens the SAME OpenCode
+        # conversation — stop freed RAM, nothing about the session was lost.
+        try:
+            await client.start(session)
+            await client.wait_until_started(session)
+        except AmuxError as exc:
+            log.warning(
+                "revive_failed chat_id=%s session=%s status=%s detail=%s",
+                chat_id,
+                session,
+                exc.status,
+                exc.detail,
+            )
+            raise
+        state.clear_idle_stopped(chat_id, session)
+        log.info("revive chat_id=%s session=%s", chat_id, session)
+    state.touch_activity(chat_id, session, "owner")
     # A session can be mid-restart (live row, backend not spawned yet); the
     # bootstrap pass finishes in seconds, so retry once before surfacing it.
     for attempt in (1, 2):
@@ -768,6 +789,29 @@ async def _start_manager(
     forum = bool(getattr(update.effective_chat, "is_forum", False))
     in_thread = _msg_thread(update)
 
+    # Pin an opencode manager to a conversation id we mint: it rides the lane's
+    # CC_FLAGS on EVERY start (amux replays explicit flags verbatim), so an
+    # idle stop only frees RAM and the next message in the topic resumes this
+    # same conversation. Only opencode has a create-or-resume `--session`
+    # flag, and the sweep only ever stops a PINNED session — so other
+    # providers, and every manager created before this change, keep running
+    # exactly as they do today (owner decision 2026-10-27: "Leave them").
+    oc_session = new_opencode_session_id() if choice["provider"] == "opencode" else None
+    flags = f"--session {oc_session}" if oc_session else None
+    if oc_session and choice["model"]:
+        # `--model` in CC_FLAGS reaches the opencode TUI, which rejects the
+        # flag (measured 2026-10-27: prints usage, EXIT=1) and the lane never
+        # starts. amux lets explicit flags win over `model`, so sending BOTH
+        # would still reach the TUI as a bare `--model` — the model is
+        # therefore dropped for opencode until the real fix lands in amux
+        # (owner: "Fix it later, after we make sure the core works").
+        log.warning(
+            "opencode_model_dropped model=%s session=%s",
+            choice["model"],
+            name,
+        )
+        choice = dict(choice, model=None)
+
     # The topic is bound BEFORE the lane exists: an owner message arriving
     # while the lane is still being created must already route somewhere.
     thread = topic if forum else None
@@ -799,7 +843,12 @@ async def _start_manager(
 
     try:
         name, row = await create_manager(
-            client, cfg, name=name, provider=choice["provider"], model=choice["model"]
+            client,
+            cfg,
+            name=name,
+            provider=choice["provider"],
+            model=choice["model"],
+            flags=flags,
         )
     except AmuxError as exc:
         log.warning(
@@ -820,6 +869,12 @@ async def _start_manager(
         _release_topics(state, chat_id, name, reason="manager_start_failed")
         await _edit_or_send(ack, f"❌ `{name}` failed to start: {detail}")
         return
+
+    if oc_session:
+        # Only now that the lane exists: a pin on a lane that failed to start
+        # would make the sweep stop something that never ran.
+        state.set_pinned(chat_id, name, oc_session)
+        log.info("manager_pinned name=%s oc_session=%s", name, oc_session)
 
     log.info(
         "manager_ready name=%s provider=%s model=%s status=%s source=%s topic=%s",
@@ -1055,6 +1110,11 @@ async def relay_once(app: Application) -> None:
     state: GatewayState = app.bot_data["state"]
     for chat_id, sessions in state.sessions_to_relay().items():
         for session in sessions:
+            if state.idle_stopped(chat_id, session) is not None:
+                # The sweeper stopped this lane: its pane is gone, so there is
+                # nothing to peek and no answer to relay. The marker is cleared
+                # by the next prompt (which starts the lane again).
+                continue
             try:
                 raw = await client.peek(session, lines=300)
             except AmuxError as exc:
@@ -1100,6 +1160,9 @@ async def relay_once(app: Application) -> None:
             for message in sent:
                 _track(state, chat_id, session, message)
             state.set_last_relayed(chat_id, session, text)
+            # New agent output IS activity (owner, 2026-10-27): a session still
+            # producing answers is never swept, however long the turn runs.
+            state.touch_activity(chat_id, session, "output")
             log.info(
                 "relay_sent chat_id=%s session=%s chars=%s total=%s reply_to=%s thread=%s",
                 chat_id,
@@ -1123,6 +1186,134 @@ async def relay_loop(app: Application) -> None:
             log.exception("relay_cycle_failed")
 
 
+# ---------------------------------------------------------------------------
+# idle sweep: stop a pinned manager that has been quiet, keep its topic
+# ---------------------------------------------------------------------------
+
+IDLE_SWEEP_TICK_S = 60.0
+# A lane that owns board cards is skipped, and would be skipped every tick:
+# one WARN per stretch (the shape `_no_boundary_warned` uses), so a sweep over
+# the log still shows WHY nothing was stopped.
+_cards_warned: set[tuple[int, str]] = set()
+
+
+async def idle_sweep_once(app: Application) -> None:
+    """Stop pinned manager lanes idle for ``cfg.idle_stop_s`` (owner: 30 min).
+
+    The contract, and the reason each guard exists:
+
+    - **PINNED only.** The pin (`--session <id>` in the lane's CC_FLAGS) is
+      what makes a later start resume the SAME OpenCode conversation, so a
+      session without one (created before this change, or another provider)
+      is never stopped: owner decision 2026-10-27, "Leave them as today".
+    - **Owner silence AND no new output.** Either stamp resets the clock, so a
+      long-running turn is never cut off mid-task.
+    - **Cards first.** amux's bootstrap auto-restarts a stopped worker that
+      owns a waiting Todo/Doing card; stopping one anyway would be undone
+      within a sweep (option B, declined). We skip and say so.
+    - **The topic binding is never touched.** That is the whole feature: the
+      marker recorded here is what the next prompt finds, to start the lane
+      again and resume its conversation.
+    """
+    cfg: Config = app.bot_data["cfg"]
+    client: AmuxClient = app.bot_data["client"]
+    state: GatewayState = app.bot_data["state"]
+    if not cfg.idle_stop_s:
+        return
+    now = time.time()
+    try:
+        rows = await client.list_sessions()
+    except AmuxError as exc:
+        log.debug("idle_sweep_unreachable error=%s", exc)
+        return
+    live = {
+        str(row.get("name")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("name")
+    }
+    for chat_id, sessions in state.tracked_sessions().items():
+        for session in sessions:
+            if not state.pinned(chat_id, session):
+                continue
+            marked = state.idle_stopped(chat_id, session)
+            row = live.get(session)
+            if marked is not None:
+                if row is not None and row.get("running"):
+                    # Something brought it back (amux's own bootstrap): track
+                    # it again instead of fighting it over and over.
+                    state.clear_idle_stopped(chat_id, session)
+                    log.info(
+                        "idle_stop_undone chat_id=%s session=%s reason=running_again",
+                        chat_id,
+                        session,
+                    )
+                continue
+            is_running = None if row is None else row.get("running")
+            if is_running is None and row is not None:
+                continue  # a row that will not say: leave it alone
+            if row is None or is_running is False:
+                # Gone or already stopped (the ⏹️ button, a reboot): mark it
+                # so the relay stops peeking a dead pane and the next prompt
+                # revives the lane instead of sending into a corpse.
+                state.mark_idle_stopped(chat_id, session)
+                log.info(
+                    "idle_stop chat_id=%s session=%s reason=not_running",
+                    chat_id,
+                    session,
+                )
+                continue
+            last = state.last_activity(chat_id, session)
+            if last is None:
+                continue  # no activity recorded: not ours to judge
+            idle = now - last
+            if idle < cfg.idle_stop_s:
+                continue
+            cards = await client.todo_cards(session)
+            if cards:
+                if (chat_id, session) not in _cards_warned:
+                    _cards_warned.add((chat_id, session))
+                    log.warning(
+                        "idle_stop_skipped_cards chat_id=%s session=%s cards=%s "
+                        "hint=amux restarts a stopped worker that owns a waiting card",
+                        chat_id,
+                        session,
+                        ",".join(str(card.get("id")) for card in cards),
+                    )
+                continue
+            _cards_warned.discard((chat_id, session))
+            try:
+                await client.stop(session)
+            except AmuxError as exc:
+                log.warning(
+                    "idle_stop_failed chat_id=%s session=%s status=%s detail=%s",
+                    chat_id,
+                    session,
+                    exc.status,
+                    exc.detail,
+                )
+                continue
+            state.mark_idle_stopped(chat_id, session)
+            log.info(
+                "idle_stop chat_id=%s session=%s idle_s=%.0f threshold_s=%.0f cards=0",
+                chat_id,
+                session,
+                idle,
+                cfg.idle_stop_s,
+            )
+
+
+async def idle_sweep_loop(app: Application) -> None:
+    cfg: Config = app.bot_data["cfg"]
+    while True:
+        await asyncio.sleep(IDLE_SWEEP_TICK_S)
+        try:
+            await idle_sweep_once(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never let one bad cycle kill the loop
+            log.exception("idle_sweep_failed")
+
+
 async def post_init(app: Application) -> None:
     cfg: Config = app.bot_data["cfg"]
     client: AmuxClient = app.bot_data["client"]
@@ -1139,12 +1330,15 @@ async def post_init(app: Application) -> None:
     else:
         log.info("control_disabled reason=TELEGRAM_GATEWAY_CONTROL_PORT=0")
     app.bot_data["relay_task"] = asyncio.create_task(relay_loop(app))
+    app.bot_data["idle_task"] = asyncio.create_task(idle_sweep_loop(app))
     log.info(
-        "gateway_started allowed_users=%d amux_url=%s voice=%s relay_interval_s=%s",
+        "gateway_started allowed_users=%d amux_url=%s voice=%s relay_interval_s=%s "
+        "idle_stop_s=%s",
         len(cfg.allowed_user_ids),
         cfg.amux_url,
         "on" if cfg.groq_api_key else "off",
         cfg.relay_interval_s,
+        f"{cfg.idle_stop_s:g}" if cfg.idle_stop_s else "off",
     )
 
 
@@ -1157,6 +1351,13 @@ async def post_shutdown(app: Application) -> None:
         task.cancel()
         try:
             await task
+        except asyncio.CancelledError:
+            pass
+    idle_task = app.bot_data.get("idle_task")
+    if idle_task is not None:
+        idle_task.cancel()
+        try:
+            await idle_task
         except asyncio.CancelledError:
             pass
     client: AmuxClient = app.bot_data["client"]

@@ -31,6 +31,10 @@ Optional
 ``TELEGRAM_GATEWAY_CONTROL_PORT`` default ``8834`` — the gateway's own
     localhost control endpoint (``POST /topic``), the one path managers may use
     to open a topic; ``0`` disables it
+``TELEGRAM_GATEWAY_IDLE_STOP_S`` default ``1800`` — a pinned manager lane with
+    no owner message AND no new agent output for this long is stopped (RAM
+    freed; its topic binding is kept, so the next message there starts the same
+    lane back and OpenCode resumes the same conversation); ``0`` disables
 
 Manager mode (a plain message starts a new agent)
 -------------------------------------------------
@@ -52,6 +56,8 @@ DEFAULT_STATE_DIR = "~/.amux/telegram-gateway"
 FALLBACK_AMUX_URL = "https://localhost:8824"
 DEFAULT_GROQ_MODEL = "whisper-large-v3-turbo"
 DEFAULT_CONTROL_PORT = 8834
+# Owner, 2026-10-27: "30 minutes default." 0 disables the idle stop.
+DEFAULT_IDLE_STOP_S = 1800.0
 
 
 class ConfigError(RuntimeError):
@@ -81,6 +87,8 @@ class Config:
     log_level: str = "INFO"
     # Gateway-owned control endpoint (127.0.0.1 only); 0 disables it.
     control_port: int = DEFAULT_CONTROL_PORT
+    # Idle stop for PINNED manager lanes; 0 disables it (see module docstring).
+    idle_stop_s: float = DEFAULT_IDLE_STOP_S
     # Manager mode: a plain message (not a quote-reply) starts a new agent here.
     manager_cwd: str = field(
         default_factory=lambda: os.path.expanduser("~/Documents/pv/projetos")
@@ -231,6 +239,20 @@ def load_config(
         problems.append("TELEGRAM_GATEWAY_CONTROL_PORT must be 0 (disabled) or 1-65535")
         control_port = DEFAULT_CONTROL_PORT
 
+    try:
+        idle_stop_s = float(
+            (env.get("TELEGRAM_GATEWAY_IDLE_STOP_S") or "").strip()
+            or DEFAULT_IDLE_STOP_S
+        )
+    except ValueError:
+        idle_stop_s = DEFAULT_IDLE_STOP_S
+        problems.append(
+            f"TELEGRAM_GATEWAY_IDLE_STOP_S is not a number; using {DEFAULT_IDLE_STOP_S:g}"
+        )
+    if idle_stop_s < 0:
+        problems.append("TELEGRAM_GATEWAY_IDLE_STOP_S must be 0 (disabled) or positive")
+        idle_stop_s = DEFAULT_IDLE_STOP_S
+
     if problems:
         raise ConfigError(problems)
 
@@ -247,6 +269,7 @@ def load_config(
         relay_interval_s=relay_interval,
         log_level=(env.get("TELEGRAM_GATEWAY_LOG_LEVEL") or "INFO").strip().upper(),
         control_port=control_port,
+        idle_stop_s=idle_stop_s,
         manager_cwd=os.path.expanduser(
             (env.get("MANAGER_CWD") or "").strip() or "~/Documents/pv/projetos"
         ),

@@ -140,3 +140,46 @@ def test_load_config_control_port_rejects_garbage(tmp_path):
             env_file=env_file,
             endpoint_file=tmp_path / "none.json",
         )
+
+
+def test_load_config_idle_stop_default_override_and_off(tmp_path):
+    """TELEGRAM_GATEWAY_IDLE_STOP_S: 1800 default (owner: 30 min), 0 = off."""
+    env_file = tmp_path / "server.env"
+    env_file.write_text("TELEGRAM_GATEWAY_BOT_TOKEN=1:t\nALLOWED_TELEGRAM_USER_IDS=1\n")
+    endpoint = tmp_path / "none.json"
+
+    cfg = load_config(environ={}, env_file=env_file, endpoint_file=endpoint)
+    assert cfg.idle_stop_s == 1800.0
+
+    cfg = load_config(
+        environ={"TELEGRAM_GATEWAY_IDLE_STOP_S": "900"},
+        env_file=env_file,
+        endpoint_file=endpoint,
+    )
+    assert cfg.idle_stop_s == 900.0
+
+    cfg = load_config(
+        environ={"TELEGRAM_GATEWAY_IDLE_STOP_S": "0"},
+        env_file=env_file,
+        endpoint_file=endpoint,
+    )
+    assert cfg.idle_stop_s == 0.0  # 0 = feature off, not a typo
+
+
+def test_load_config_idle_stop_rejects_garbage_and_negative(tmp_path):
+    env_file = tmp_path / "server.env"
+    env_file.write_text("TELEGRAM_GATEWAY_BOT_TOKEN=1:t\nALLOWED_TELEGRAM_USER_IDS=1\n")
+    endpoint = tmp_path / "none.json"
+
+    with pytest.raises(ConfigError, match="TELEGRAM_GATEWAY_IDLE_STOP_S"):
+        load_config(
+            environ={"TELEGRAM_GATEWAY_IDLE_STOP_S": "banana"},
+            env_file=env_file,
+            endpoint_file=endpoint,
+        )
+    with pytest.raises(ConfigError, match="TELEGRAM_GATEWAY_IDLE_STOP_S"):
+        load_config(
+            environ={"TELEGRAM_GATEWAY_IDLE_STOP_S": "-5"},
+            env_file=env_file,
+            endpoint_file=endpoint,
+        )

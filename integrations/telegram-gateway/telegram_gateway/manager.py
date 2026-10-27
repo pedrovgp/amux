@@ -32,6 +32,22 @@ def new_manager_name(now: time.struct_time | None = None) -> str:
     return f"mgr-{time.strftime('%m%d-%H%M', t)}-{secrets.token_hex(2)}"
 
 
+def new_opencode_session_id(now: time.struct_time | None = None) -> str:
+    """The OpenCode conversation id a new opencode manager will be pinned to.
+
+    OpenCode's ``--session`` takes an id it has never seen and CREATES that
+    conversation (measured 2026-10-27: `opencode run --session
+    ses_amuxprobe0001` came back with `sessionID: ses_amuxprobe0001`), so the
+    id can be minted before the process exists. That is the whole basis of the
+    idle-stop/revive feature: the id rides the lane's ``CC_FLAGS`` on every
+    start, so stopping the lane only frees RAM and starting it again resumes
+    the SAME conversation. Prefix + timestamp keeps ids readable in logs;
+    entropy keeps two lanes created in the same second apart.
+    """
+    t = now or time.localtime()
+    return f"ses_tg{time.strftime('%m%d%H%M', t)}{secrets.token_hex(3)}"
+
+
 def load_instructions(cfg: Config) -> str:
     try:
         text = cfg.manager_instructions_file.read_text(encoding="utf-8")
@@ -52,6 +68,7 @@ async def create_manager(
     name: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    flags: str | None = None,
 ) -> tuple[str, dict]:
     """Create the lane, brief it, start it, and wait until it can take a task."""
     name = name or new_manager_name()
@@ -59,7 +76,12 @@ async def create_manager(
     model = cfg.manager_model if model is None else model
 
     await client.create_session(
-        name, cwd=cfg.manager_cwd, provider=provider, model=model, start=False
+        name,
+        cwd=cfg.manager_cwd,
+        provider=provider,
+        model=model,
+        flags=flags,
+        start=False,
     )
     await client.set_instructions(name, load_instructions(cfg))
     await client.start(name)

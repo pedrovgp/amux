@@ -47,6 +47,10 @@ async def _check(cfg: Config) -> int:
         f"  control endpoint   "
         + (f"127.0.0.1:{cfg.control_port} (POST /topic)" if cfg.control_port else "off")
     )
+    print(
+        "  idle stop          "
+        + (f"{cfg.idle_stop_s:g}s (pinned managers only)" if cfg.idle_stop_s else "off")
+    )
 
     if not os.path.isdir(cfg.default_workdir):
         print(f"  ✗ default workdir does not exist: {cfg.default_workdir}")
