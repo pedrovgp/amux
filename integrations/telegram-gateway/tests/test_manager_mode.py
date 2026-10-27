@@ -234,12 +234,29 @@ def test_a_quote_reply_resolves_to_the_session_it_quotes(tmp_path):
 class FakeBot:
     def __init__(self):
         self.sent = []
+        self.created = []  # (chat_id, name) per create_forum_topic call
 
-    async def send_message(self, chat_id, text, parse_mode=None, reply_to_message_id=None):
+    async def send_message(
+        self,
+        chat_id,
+        text,
+        parse_mode=None,
+        reply_to_message_id=None,
+        message_thread_id=None,
+    ):
         self.sent.append(
-            {"chat_id": chat_id, "text": text, "reply_to": reply_to_message_id}
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "reply_to": reply_to_message_id,
+                "thread": message_thread_id,
+            }
         )
         return SimpleNamespace(message_id=900 + len(self.sent), text=text)
+
+    async def create_forum_topic(self, chat_id, name=None):
+        self.created.append((chat_id, name))
+        return SimpleNamespace(message_thread_id=1000 + len(self.created), name=name)
 
 
 def test_relay_replies_to_the_turn_message_and_records_its_own(tmp_path):
@@ -265,7 +282,7 @@ def test_relay_replies_to_the_turn_message_and_records_its_own(tmp_path):
         run(client.aclose())
 
     assert bot.sent == [
-        {"chat_id": 9, "text": "the answer", "reply_to": 55}
+        {"chat_id": 9, "text": "the answer", "reply_to": 55, "thread": None}
     ]
     # The bot's own message id is now a continuation handle for that session.
     assert state.session_for_message(9, 901) == "mgr-abc"

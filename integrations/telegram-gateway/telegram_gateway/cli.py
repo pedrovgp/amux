@@ -55,8 +55,11 @@ async def _check(cfg: Config) -> int:
             "  ✓ amux health      status=%s commit=%s"
             % (health.get("status"), str(health.get("commit"))[:12])
         )
-        workers = await client.list_workers(limit=5)
-        print(f"  ✓ workers visible  {len(workers)} (limit 5)")
+        # list_workers() was renamed to list_sessions() by f37654bb7 and this
+        # caller was never updated: --check died with an AttributeError on
+        # every run since. test_cli.py now exercises this exact call path.
+        sessions = await client.list_sessions()
+        print(f"  ✓ sessions visible  {len(sessions)}")
     except AmuxError as exc:
         print(f"  ✗ amux unreachable: {exc}")
         problems += 1

@@ -110,21 +110,33 @@ async def _send_markdown(
     *,
     code_block: bool = False,
     reply_to: int | None = None,
+    thread_id: int | None = None,
 ) -> list:
     """Send text as Markdown, falling back to plain text on a parse error.
 
     Returns the messages sent, so the caller can map their ids back to the
     session (that map is what a quote-reply is resolved against).
+    ``thread_id`` posts into a forum topic; ``reply_to`` must be a message of
+    that same thread — the relay enforces this, never across threads.
     """
     sent = []
     for chunk in chunk_text(text):
         payload = f"```\n{chunk}\n```" if code_block else chunk
         try:
             message = await bot.send_message(
-                chat_id, payload, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=reply_to
+                chat_id,
+                payload,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_to_message_id=reply_to,
+                message_thread_id=thread_id,
             )
         except BadRequest:
-            message = await bot.send_message(chat_id, chunk, reply_to_message_id=reply_to)
+            message = await bot.send_message(
+                chat_id,
+                chunk,
+                reply_to_message_id=reply_to,
+                message_thread_id=thread_id,
+            )
         sent.append(message)
     return sent
 
@@ -143,6 +155,20 @@ def _session_from_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> s
     if message_id is None:
         return None
     return _state(context).session_for_message(update.effective_chat.id, message_id)
+
+
+def _msg_thread(update: Update) -> int | None:
+    """The forum topic this message was posted in, else ``None``.
+
+    ``None`` means General, or a chat without topics: Telegram only sets
+    ``message_thread_id`` for messages inside a topic of a forum group. This
+    is the topic rule's whole discriminator — General starts a session, a
+    topic continues the one bound to it.
+    """
+    if not getattr(update.effective_chat, "is_forum", False):
+        return None
+    message = update.effective_message or update.message
+    return getattr(message, "message_thread_id", None) or None
 
 
 def _track(state: GatewayState, chat_id: int, session: str, message) -> None:
@@ -193,6 +219,17 @@ async def _report_send_error(
         rows = await _client(context).list_sessions()
         if not any(row.get("name") == session for row in rows):
             _state(context).clear(update.effective_chat.id)
+            for thread in _state(context).drop_session_topics(
+                update.effective_chat.id, session
+            ):
+                # A dead session's topic must become adoptable again, so the
+                # owner's next message there starts a fresh manager.
+                log.info(
+                    "topic_released chat_id=%s thread=%s session=%s reason=session_gone",
+                    update.effective_chat.id,
+                    thread,
+                    session,
+                )
             await message.reply_text(
                 f"⚠️ `{session}` no longer exists — pick another session.",
                 reply_markup=sessions_keyboard(rows, "pick") if rows else main_menu(),
@@ -233,7 +270,8 @@ async def _show_manager(update: Update, context: ContextTypes.DEFAULT_TYPE, prov
         f"provider: `{choice['provider']}`\n"
         f"model: `{choice['model'] or 'server default'}`\n"
         f"cwd: `{cfg.manager_cwd}`\n\n"
-        "Quote an answer to keep talking to the same manager.",
+        "In a topic group, every new message opens a new topic with its own "
+        "manager; message inside a topic to continue that manager.",
         reply_markup=manager_keyboard(choice["provider"], choice["model"], models),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -519,6 +557,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         state = _state(context)
         if state.selected(chat_id) == raw:
             state.clear(chat_id)
+        # The topic outlives the session but must not stay bound to it: the
+        # next message there starts a fresh manager instead of hitting a
+        # stopped lane forever.
+        _release_topics(state, chat_id, raw, reason="stopped")
         log.info("session_stopped session=%s", raw)
         await _say(update, f"⏹️ Stopped `{raw}`.", reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
 
@@ -528,6 +570,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     if not text:
         return
+    thread = _msg_thread(update)
+    if thread is not None:
+        # The topic identifies the session — no reply or quote needed.
+        session = _state(context).topic_session(update.effective_chat.id, thread)
+        if session:
+            await _continue_session(update, context, session, text, "text")
+            return
+        # An unmapped topic (owner-made, or state loss) adopts a new manager.
+        await _start_manager(update, context, text, source="text", topic=thread)
+        return
+    # General (or a private chat): a quote-reply continues, anything else
+    # starts a fresh manager — in a forum group it gets its own topic.
     session = _session_from_reply(update, context)
     if session:
         await _continue_session(update, context, session, text, "text")
@@ -555,7 +609,11 @@ async def _continue_session(
     chat_id = update.effective_chat.id
     state = _state(context)
     anchor_id = anchor or update.message.message_id
-    state.set_turn_message(chat_id, session, anchor_id)
+    # The anchor's thread is recorded with it: the relay may only reply to an
+    # anchor inside the session's own topic, never across threads.
+    state.set_turn_message(
+        chat_id, session, anchor_id, thread=_msg_thread(update)
+    )
     if anchor is not None:
         # Quoting the transcription must continue this session, same as
         # quoting any other bot message.
@@ -576,6 +634,33 @@ async def _continue_session(
     # is the confirmation. One extra line per turn would double the traffic.
 
 
+async def _create_forum_topic(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, name: str
+) -> int | None:
+    """Create the group topic a session will live in; ``None`` on failure.
+
+    Failure is never fatal: the session falls back to the plain General
+    behavior (today's pre-topic mode), and ``topic_create_failed`` is the
+    sweep signal for the fallback ever being taken.
+    """
+    chat_id = update.effective_chat.id
+    try:
+        topic = await context.application.bot.create_forum_topic(chat_id, name=name)
+    except TelegramError as exc:
+        log.warning(
+            "topic_create_failed chat_id=%s name=%s error=%s", chat_id, name, exc
+        )
+        return None
+    thread = getattr(topic, "message_thread_id", None)
+    if thread is None:
+        log.warning(
+            "topic_create_failed chat_id=%s name=%s detail=no thread id", chat_id, name
+        )
+        return None
+    log.info("topic_created chat_id=%s thread=%s name=%s", chat_id, thread, name)
+    return int(thread)
+
+
 async def _start_manager(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -583,11 +668,16 @@ async def _start_manager(
     *,
     source: str,
     anchor: int | None = None,
+    topic: int | None = None,
 ) -> None:
     """A fresh message starts a fresh manager agent and gets its first answer.
 
     ``anchor`` follows the same rule as in ``_continue_session``: a voice
     note's answer replies to the transcription message, not to the audio.
+
+    In a forum group the session gets its own topic named after it: ``topic``
+    is an existing topic to adopt (a message arrived inside one), ``None``
+    means create one (the message arrived in General).
     """
     cfg = _cfg(context)
     state = _state(context)
@@ -598,13 +688,34 @@ async def _start_manager(
     )
     name = new_manager_name()
     anchor_id = anchor or update.message.message_id
+    forum = bool(getattr(update.effective_chat, "is_forum", False))
+    in_thread = _msg_thread(update)
 
-    ack = await update.message.reply_text(
-        f"🧠 Starting `{name}` ({choice['provider']}) — reply here to continue it.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    # The topic is bound BEFORE the lane exists: an owner message arriving
+    # while the lane is still being created must already route somewhere.
+    thread = topic if forum else None
+    if forum and thread is None:
+        thread = await _create_forum_topic(update, context, name)
+    if forum and thread is not None:
+        state.set_topic(chat_id, thread, name)
+
+    if forum and thread is not None:
+        if thread == in_thread:
+            ack_text = (
+                f"🧠 Starting `{name}` ({choice['provider']}) — send messages in "
+                "this topic to continue it."
+            )
+        else:
+            ack_text = (
+                f"🧠 Starting `{name}` ({choice['provider']}) — continuing in "
+                f"its own topic."
+            )
+    else:
+        ack_text = f"🧠 Starting `{name}` ({choice['provider']}) — reply here to continue it."
+
+    ack = await update.message.reply_text(ack_text, parse_mode=ParseMode.MARKDOWN)
     state.record_message(chat_id, ack.message_id, name)
-    state.set_turn_message(chat_id, name, anchor_id)
+    state.set_turn_message(chat_id, name, anchor_id, thread=in_thread)
     if anchor is not None:
         # Quoting the transcription must continue this manager session.
         state.record_message(chat_id, anchor, name)
@@ -621,6 +732,7 @@ async def _start_manager(
             exc.status,
             exc.detail,
         )
+        _release_topics(state, chat_id, name, reason="manager_create_failed")
         await _edit_or_send(ack, f"❌ Could not start a manager: {exc.detail}")
         return
 
@@ -628,21 +740,35 @@ async def _start_manager(
     if status == "error":
         detail = row.get("error") or "unknown error"
         log.warning("manager_start_failed name=%s detail=%s", name, detail)
+        _release_topics(state, chat_id, name, reason="manager_start_failed")
         await _edit_or_send(ack, f"❌ `{name}` failed to start: {detail}")
         return
 
     log.info(
-        "manager_ready name=%s provider=%s model=%s status=%s source=%s",
+        "manager_ready name=%s provider=%s model=%s status=%s source=%s topic=%s",
         name,
         choice["provider"],
         choice["model"] or "(server default)",
         status,
         source,
+        thread,
     )
     try:
         await _deliver_prompt(context, chat_id, name, text, _username(update))
     except AmuxError as exc:
         await _report_send_error(update, context, name, exc, source)
+
+
+def _release_topics(state: GatewayState, chat_id: int, session: str, *, reason: str) -> None:
+    """Free a dead manager's topics so the next message can adopt them."""
+    for thread in state.drop_session_topics(chat_id, session):
+        log.info(
+            "topic_released chat_id=%s thread=%s session=%s reason=%s",
+            chat_id,
+            thread,
+            session,
+            reason,
+        )
 
 
 async def _edit_or_send(message, text: str) -> None:
@@ -689,6 +815,17 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         anchor,
     )
 
+    thread = _msg_thread(update)
+    if thread is not None:
+        # Same topic rule as text: the topic picks the session, no quote.
+        session = _state(context).topic_session(update.effective_chat.id, thread)
+        if session:
+            await _continue_session(update, context, session, transcript, "voice", anchor=anchor)
+            return
+        await _start_manager(
+            update, context, transcript, source="voice", anchor=anchor, topic=thread
+        )
+        return
     session = _session_from_reply(update, context)
     if session:
         await _continue_session(update, context, session, transcript, "voice", anchor=anchor)
@@ -731,7 +868,13 @@ async def receive_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session,
             len(text),
         )
-        state.set_turn_message(chat_id, session, update.message.message_id)
+        state = _state(context)
+        state.set_turn_message(
+            chat_id,
+            session,
+            update.message.message_id,
+            thread=_msg_thread(update),
+        )
         try:
             await _deliver_prompt(context, chat_id, session, text, _username(update))
         except AmuxError as exc:
@@ -785,7 +928,10 @@ async def receive_prompt_voice(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     state = _state(context)
     state.set_turn_message(
-        update.effective_chat.id, session, anchor or update.message.message_id
+        update.effective_chat.id,
+        session,
+        anchor or update.message.message_id,
+        thread=_msg_thread(update),
     )
     if anchor is not None:
         state.record_message(update.effective_chat.id, anchor, session)
@@ -837,9 +983,17 @@ async def relay_once(app: Application) -> None:
                 continue
             # Reply to the message that started this turn, so the answer lands
             # in the thread the owner can quote to keep talking to this session.
+            # In a forum topic the answer goes INTO the topic; the anchor is
+            # only reused when it was posted inside that very topic — a turn 1
+            # anchor in General must never become a cross-thread reply.
+            thread_id = state.session_topic(chat_id, session)
             reply_to = state.turn_message(chat_id, session)
+            if thread_id is not None and state.turn_thread(chat_id, session) != thread_id:
+                reply_to = None
             try:
-                sent = await _send_markdown(app.bot, chat_id, new_text, reply_to=reply_to)
+                sent = await _send_markdown(
+                    app.bot, chat_id, new_text, reply_to=reply_to, thread_id=thread_id
+                )
             except TelegramError as exc:
                 log.warning("relay_send_failed chat_id=%s session=%s error=%s", chat_id, session, exc)
                 continue
@@ -847,12 +1001,13 @@ async def relay_once(app: Application) -> None:
                 _track(state, chat_id, session, message)
             state.set_last_relayed(chat_id, session, text)
             log.info(
-                "relay_sent chat_id=%s session=%s chars=%s total=%s reply_to=%s",
+                "relay_sent chat_id=%s session=%s chars=%s total=%s reply_to=%s thread=%s",
                 chat_id,
                 session,
                 len(new_text),
                 len(text),
                 reply_to,
+                thread_id,
             )
 
 

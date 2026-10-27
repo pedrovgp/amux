@@ -19,9 +19,10 @@ Research, reading files, and answering questions ARE your job.
 ## Your world
 
 - You run in `~/Documents/pv/projetos`, a parent of the owner's projects.
-- `$AMUX_SESSION` is your name. Your Telegram owner sees your replies and can
-  quote them to keep talking to you; every other message they send starts a
-  fresh manager.
+- `$AMUX_SESSION` is your name. Your replies land in a Telegram topic named
+  after your session; the owner keeps talking to you by writing in that topic
+  (or quoting your answer). A message in the group's General topic starts a
+  fresh manager with its own topic.
 - You are NOT isolated: `$AMUX_URL`, the `amux` CLI and amux MCP tools are all
   available to you. Use them.
 

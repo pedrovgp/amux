@@ -21,7 +21,7 @@ Telegram  ⇄  telegram-gateway (this module)  ⇄  amux server (https://localho
 | Surface | Behaviour |
 |---|---|
 | `/start`, `/menu` | Inline keyboard: 🚀 new session · 👁️ peek/status · ✍️ send prompt · ⏹️ stop · 🧠 manager settings |
-| **Plain text or voice note** | Starts a **new manager agent** in `MANAGER_CWD` and replies in that message's thread |
+| **Plain text or voice note** | Starts a **new manager agent** in `MANAGER_CWD`. In a forum group (Topics enabled) each manager gets **its own topic**; elsewhere it replies in that message's thread |
 | **Quote-reply** to a bot message | Stays in the session that message belongs to |
 | Voice note | Downloaded, transcribed by Groq, echoed as `🗣️ Transcribed: …` **as a reply to the audio**, then treated like the text would be; the agent's answer replies to the transcription (readable), never to the audio bubble, and quoting the transcription continues that session. The temp `.ogg` is deleted immediately |
 | Replies | A relay peeks the session every ~20s and posts new output **as a reply to your message** |
@@ -45,6 +45,25 @@ Which agent starts is yours to choose: **🧠 Manager settings** lists providers
 The thread rule is strict and Telegram-shaped: **quote any bot message — the
 answer, the "started" ack — to continue that session; any other message starts
 a new one.**
+
+### Forum topics (groups with Topics enabled)
+
+In a forum group the **topic replaces the quote**:
+
+- **General** → a fresh manager; the gateway creates a topic named after the
+  session (`mgr-…`) and every answer lands in it.
+- **Inside a topic** → the message continues that topic's session. No reply or
+  quote needed — the topic *is* the session selector.
+- **An unmapped topic** (created by hand, or state loss) → a fresh manager
+  that adopts the topic.
+- Answers post with `message_thread_id`; an anchor outside the topic (turn 1
+  of a new topic, or a quote from General) is never replied across threads —
+  the answer goes in plain, inside the topic.
+- A stopped or dead session **releases its topic**, so the next message there
+  starts a fresh manager instead of hitting a dead lane.
+
+Voice notes follow the same routing; the transcription stays where the voice
+was sent (readable there), the answer lands in the topic.
 
 ## Setup
 

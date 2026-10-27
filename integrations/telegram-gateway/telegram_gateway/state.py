@@ -14,6 +14,7 @@ from pathlib import Path
 
 MAX_RELAYED_PER_CHAT = 10
 MAX_MSG_SESSIONS = 300
+MAX_TOPICS_PER_CHAT = 200
 
 
 class GatewayState:
@@ -129,23 +130,114 @@ class GatewayState:
         session = mapping.get(str(message_id))
         return session if isinstance(session, str) and session else None
 
+    # ---- forum topics: thread_id -> session (the topic rule) -----------
+
+    def set_topic(self, chat_id: int, thread_id: int, session: str) -> None:
+        """Bind a forum topic (``message_thread_id``) to ``session``.
+
+        This is what lets the owner just *write in the topic* to continue a
+        session: Telegram hands back ``message_thread_id`` on every message,
+        and the topic — not a quote — identifies the manager being talked to.
+        """
+        chat = self._chat(chat_id)
+        topics = chat.get("topics")
+        if not isinstance(topics, dict):
+            topics = {}
+        topics[str(int(thread_id))] = session
+        # Bound the file: keep the most recently touched topics only.
+        while len(topics) > MAX_TOPICS_PER_CHAT:
+            topics.pop(next(iter(topics)))
+        chat["topics"] = topics
+        self._save()
+
+    def topic_session(self, chat_id: int, thread_id: int | None) -> str | None:
+        if thread_id is None:
+            return None
+        topics = self._chat(chat_id).get("topics")
+        if not isinstance(topics, dict):
+            return None
+        session = topics.get(str(int(thread_id)))
+        return session if isinstance(session, str) and session else None
+
+    def session_topic(self, chat_id: int, session: str) -> int | None:
+        """The thread id ``session`` answers in, or ``None`` (no topic)."""
+        topics = self._chat(chat_id).get("topics")
+        if not isinstance(topics, dict):
+            return None
+        for thread, name in topics.items():
+            if name == session:
+                try:
+                    return int(thread)
+                except ValueError:
+                    continue
+        return None
+
+    def drop_session_topics(self, chat_id: int, session: str) -> list[int]:
+        """Release every topic bound to ``session``; returns the thread ids.
+
+        Used when a session dies (create failure, 404 send, confirmed stop):
+        the topic must become adoptable again, so the owner's next message in
+        it starts a fresh manager instead of hitting a dead lane forever.
+        """
+        chat = self._chat(chat_id)
+        topics = chat.get("topics")
+        if not isinstance(topics, dict):
+            return []
+        dropped = []
+        for thread in [t for t, name in topics.items() if name == session]:
+            topics.pop(thread, None)
+            try:
+                dropped.append(int(thread))
+            except ValueError:
+                continue
+        if dropped:
+            chat["topics"] = topics
+            self._save()
+        return dropped
+
     # ---- turn tracking (what the relay replies to) ----------------------
 
-    def set_turn_message(self, chat_id: int, session: str, message_id: int) -> None:
+    def set_turn_message(
+        self, chat_id: int, session: str, message_id: int, thread: int | None = None
+    ) -> None:
+        """Anchor of the current turn: its id AND the thread it was posted in.
+
+        ``thread`` (forum topic id, ``None`` outside a topic) is what makes
+        cross-thread replies impossible: the relay only reuses an anchor whose
+        thread matches the session's topic, otherwise it posts the answer into
+        the topic unanchored rather than replying into the wrong thread.
+        """
         chat = self._chat(chat_id)
         turns = chat.get("turn_msg")
         if not isinstance(turns, dict):
             turns = {}
-        turns[session] = int(message_id)
+        turns[session] = {
+            "id": int(message_id),
+            "thread": int(thread) if thread is not None else None,
+        }
         chat["turn_msg"] = turns
         self._save()
 
     def turn_message(self, chat_id: int, session: str) -> int | None:
+        value = self._turn(chat_id, session)
+        if isinstance(value, dict):
+            value = value.get("id")
+        return int(value) if isinstance(value, int) else None
+
+    def turn_thread(self, chat_id: int, session: str) -> int | None:
+        """The thread the current turn's anchor was posted in (``None`` if not
+        in a topic, or a legacy entry written before threads were tracked)."""
+        value = self._turn(chat_id, session)
+        if not isinstance(value, dict):
+            return None
+        thread = value.get("thread")
+        return int(thread) if isinstance(thread, int) else None
+
+    def _turn(self, chat_id: int, session: str):
         turns = self._chat(chat_id).get("turn_msg")
         if not isinstance(turns, dict):
             return None
-        value = turns.get(session)
-        return int(value) if isinstance(value, int) else None
+        return turns.get(session)
 
     def sessions_to_relay(self) -> dict[int, set[str]]:
         """Every session this chat should have relayed, both modes.
