@@ -6112,3 +6112,33 @@ FIX: the watchdog wakes through POST /api/sessions/<w>/send with an explicit
   action=wake_failed with the response body and pages the owner once per
   stall. SCHED-812 exports STALL_WAKE_ORIGIN=amux-helper. Isolated lanes' own
   reminders should be kind=tmux, which owner-configured schedules deliver.
+
+## The gateway cannot deliver a long answer, and the agent is never told
+AREA: telegram-gateway
+SEVERITY: degrades
+STATUS: open (fix rides with progress/tg-idle-stop-opencode-resume.md step 6/7)
+DATE: 2026-10-27
+SESSION: mgr-1027-1127-fcb6
+CARD: none (board off for this worker)
+SYMPTOM: a ~40-line answer (the idle-stop plan) never reached Telegram. The relay
+  keys on the `—— answer ——` sentinel inside a 300-line pane capture
+  (`extract_reply`, relay.py); once the answer plus its tool output scrolled past
+  that window the sentinel was gone, so `relay_once` found no boundary and sent
+  nothing. Log shows the last real delivery at 11:45:50 (239 chars) and
+  `relay_no_boundary ... session=mgr-1027-1127-fcb6 pane_chars=13337` at 11:46:10
+  and again 12:26:56 — while the owner waited and finally asked "Any answer?"
+  at 14:39. The WARN is emitted once per session-stretch, so after 11:46 the
+  failure stopped repeating in the log too: a long answer fails silently in both
+  directions.
+COST: ~2h35 of the owner's time waiting for an answer that existed the whole
+  time; the agent believed it had replied and could not learn otherwise — no
+  signal reaches the pane, and the dedupe set (`_no_boundary_warned`) suppresses
+  the only log line that would have shown it.
+FIX: (1) the relay must look further back than the viewport for the sentinel —
+  the pane history holds it (`tmux capture-pane -S -300` and up), or the answer
+  must be delivered in chunks the window can always contain; (2) a
+  `relay_no_boundary` stretch must surface to the AGENT too (a line into the pane
+  or a state flag it can read), not only to the log — a delivery failure the
+  sender cannot see is the shape this file keeps collecting; (3) manager
+  guidance stays "keep answers phone-short", but the harness must not lose an
+  answer that already exists.
