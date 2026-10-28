@@ -6,7 +6,7 @@ import logging
 import secrets
 import time
 
-from telegram import InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
@@ -19,16 +19,25 @@ from telegram.ext import (
     filters,
 )
 
-from .amux import AmuxClient, AmuxError
+from .amux import AmuxClient, AmuxError, session_id_from_flags
 from .config import Config
 from .control import ControlServer
 from .guard import Guard, allow_only
 from .manager import PROVIDERS, create_manager, new_manager_name, new_opencode_session_id
 from .menu import (
+    EFFORTS,
     PREFIX,
+    control_button,
+    control_keyboard,
+    ctl_key,
+    effort_keyboard,
+    effort_supported,
     format_worker_line,
     main_menu,
     manager_keyboard,
+    model_keyboard,
+    session_effort,
+    session_model,
     sessions_keyboard,
     status_keyboard,
     stop_confirm,
@@ -41,6 +50,7 @@ from .voice import groq_transcriber, transcribe_voice
 log = logging.getLogger("telegram_gateway")
 
 PROMPT = 1
+ASK = 2  # the ✏️ rename / ⌨️ custom-model prompt conversation
 
 # A burst of identical messages in General (a client retry, a double tap, a
 # forwarded copy) would open one topic per copy: each General message starts a
@@ -189,6 +199,142 @@ def _track(state: GatewayState, chat_id: int, session: str, message) -> None:
         state.record_message(chat_id, message_id, session)
 
 
+# ---------------------------------------------------------------------------
+# session identity: topic -> pin -> CURRENT lane name
+# ---------------------------------------------------------------------------
+
+RENAMING = "renaming"  # bot_data: {(chat_id, old_name): new_name} while a PATCH runs
+
+
+def _renaming(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.application.bot_data.setdefault(RENAMING, {})
+
+
+async def _resolve_topic_session(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, thread: int
+) -> str | None:
+    """The live session a topic addresses, or ``None`` (a fresh binding).
+
+    The **pin** is the identity: ``topic_pins`` holds the opencode conversation
+    id from the lane's ``CC_FLAGS --session ses_…``, which a rename never
+    touches, so the topic keeps addressing its session through any number of
+    renames — here or in the dashboard. Resolution goes
+
+        topic -> pin -> CURRENT lane name (``GET /api/sessions``, flags match)
+
+    and the name recorded at bind time is the fallback for three cases: an
+    unpinned/legacy session (never had a pin), amux being unreachable (a WARN
+    and the stored name — an API blip must NOT be read as "the session is
+    gone"), and a lane that vanished from the list (the stored name then 404s
+    into the existing release path, which is what frees the topic).
+
+    ``None`` means genuinely unbound — only THAT adopts a new manager.
+    """
+    state = _state(context)
+    client = _client(context)
+    stored = state.topic_session(chat_id, thread)
+    pin = state.topic_pin(chat_id, thread)
+    if not stored and not pin:
+        return None
+    pending = _renaming(context).get((chat_id, stored))
+    if pending:
+        # Mid-rename: the lane is between two names, neither of which may be
+        # listed right now. Address where it is going rather than releasing a
+        # topic whose session still exists.
+        return pending
+    if not pin:
+        return stored
+    try:
+        rows = await client.list_sessions()
+    except AmuxError as exc:
+        log.warning(
+            "topic_resolve_unreachable chat_id=%s thread=%s pin=%s stored=%s "
+            "status=%s detail=%s",
+            chat_id,
+            thread,
+            pin,
+            stored,
+            exc.status,
+            exc.detail,
+        )
+        return stored
+    live = {
+        str(row.get("name")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("name")
+    }
+    for name, row in live.items():
+        if session_id_from_flags(row.get("flags")) != pin:
+            continue
+        if stored and stored != name and stored not in live:
+            # A rename this gateway did not perform (dashboard, CLI): repair
+            # every map that names the old lane, then let the topic title
+            # follow. The `stored not in live` guard stops the repair from
+            # stealing maps that belong to a live lane of the old name.
+            rebound = state.rebind_pin(chat_id, pin, name)
+            if rebound:
+                stale, threads = rebound
+                log.info(
+                    "session_renamed old=%s new=%s source=pin_resolve chat_id=%s",
+                    stale,
+                    name,
+                    chat_id,
+                )
+                await _follow_topic_titles(
+                    context, chat_id, threads, name, source="pin_resolve"
+                )
+        return name
+    return stored
+
+
+async def _follow_topic_titles(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    threads: list[int],
+    new_name: str,
+    *,
+    source: str,
+) -> None:
+    """Make every topic of a renamed session show the new name.
+
+    The edit is the visible half of a rename; releasing ``topic_created`` is
+    the other half — without it the OpenCode title sync would see
+    "recorded name == session name" again on its next tick and rename the
+    topic straight back, undoing the owner's choice. A failed edit is a WARN
+    (the recorded title then still matches what Telegram shows).
+    """
+    state = _state(context)
+    bot = context.application.bot
+    for thread in threads:
+        previous = state.topic_name(chat_id, thread)
+        try:
+            await bot.edit_forum_topic(
+                chat_id, message_thread_id=thread, name=new_name
+            )
+        except TelegramError as exc:
+            log.warning(
+                "topic_title_update_failed chat_id=%s thread=%s session=%s "
+                "title=%s error=%s",
+                chat_id,
+                thread,
+                new_name,
+                new_name,
+                exc,
+            )
+            continue
+        state.set_topic_name(chat_id, thread, new_name)
+        state.release_topic_title(chat_id, thread)
+        log.info(
+            "topic_renamed chat_id=%s thread=%s session=%s from=%s to=%s source=%s",
+            chat_id,
+            thread,
+            new_name,
+            previous or "(unknown)",
+            new_name,
+            source,
+        )
+
+
 async def _deliver_prompt(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, session: str, text: str, username: str
 ) -> None:
@@ -249,6 +395,31 @@ async def _report_send_error(
     if message is None:
         return
     if exc.status == 404:
+        chat_id = update.effective_chat.id
+        pending = _renaming(context)
+        # A 404 while THIS gateway is renaming the same session is the rename
+        # window, not a dead lane: releasing the topic here would orphan it and
+        # the next message would open a SECOND manager beside the renamed one.
+        moving_to = pending.get((chat_id, session)) or next(
+            (
+                new
+                for (cid, _old), new in pending.items()
+                if cid == chat_id and new == session
+            ),
+            None,
+        )
+        if moving_to:
+            log.info(
+                "send_deferred_rename chat_id=%s session=%s moving_to=%s",
+                chat_id,
+                session,
+                moving_to,
+            )
+            await message.reply_text(
+                f"⌛ `{session}` is being renamed — give it a second and send again.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
         rows = await _client(context).list_sessions()
         if not any(row.get("name") == session for row in rows):
             _state(context).clear(update.effective_chat.id)
@@ -307,6 +478,590 @@ async def _show_manager(update: Update, context: ContextTypes.DEFAULT_TYPE, prov
         "manager; message inside a topic to continue that manager.",
         reply_markup=manager_keyboard(choice["provider"], choice["model"], models),
         parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ---------------------------------------------------------------------------
+# session control: the panel a topic (or /ctl) opens — Milestone 8
+# ---------------------------------------------------------------------------
+
+
+def _back_keyboard(session: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back", callback_data=f"{PREFIX}ctl:{ctl_key(session)}"
+                )
+            ]
+        ]
+    )
+
+
+async def _target_session(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> str | None:
+    """The session a slash command addresses.
+
+    In a forum topic that is the TOPIC's session (pin-resolved, so it survives
+    renames); in General or a private chat it is the chat's selected session —
+    the same split plain messages and commands already follow.
+    """
+    thread = _msg_thread(update)
+    if thread is not None:
+        return await _resolve_topic_session(context, update.effective_chat.id, thread)
+    return _state(context).selected(update.effective_chat.id)
+
+
+async def _show_control(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: str,
+    *,
+    note: str | None = None,
+) -> None:
+    """The panel itself: identity, state, and the six things you can do."""
+    try:
+        row = await _client(context).find(session)
+    except AmuxError as exc:
+        log.warning(
+            "control_session_failed session=%s status=%s detail=%s",
+            session,
+            exc.status,
+            exc.detail,
+        )
+        await _say(
+            update,
+            f"❌ `{session}`: {exc.detail}",
+            reply_markup=main_menu(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    provider = str(row.get("provider") or "?")
+    model = session_model(row)
+    effort = session_effort(row)
+    state_line = "🟢 running" if row.get("running") else "⚪ stopped"
+    lines = [f"🎛 *Session control* — `{session}`"]
+    if note:
+        lines.append(note)
+    lines += [
+        f"provider: `{provider}` · {state_line}",
+        f"model: `{model or 'server default'}`",
+    ]
+    if effort_supported(provider):
+        lines.append(f"effort: `{effort or 'default'}`")
+    await _say(
+        update,
+        "\n".join(lines),
+        reply_markup=control_keyboard(session),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+def _model_ids(models: list[dict]) -> list[str]:
+    """De-duplicated ids, in catalog order — the indexes the buttons carry.
+
+    Shared by the render and the tap: an index that means one thing when drawn
+    and another when pressed would apply an id the owner never saw.
+    """
+    out: list[str] = []
+    for entry in models:
+        model_id = str(entry.get("id") or "")
+        if model_id and model_id not in out:
+            out.append(model_id)
+    return out
+
+
+async def _provider_models(client: AmuxClient, provider: str) -> list[dict]:
+    """The catalog for ONE provider; an unknown provider gets nothing.
+
+    ``models(None)`` is the whole mixed catalog, which must not be offered as
+    if it were this provider's list.
+    """
+    if not provider:
+        return []
+    return await client.models(provider)
+
+
+async def _show_models(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: str
+) -> None:
+    """The provider's catalog from ``GET /api/models``, current one marked."""
+    client = _client(context)
+    try:
+        row = await client.find(session)
+        provider = str(row.get("provider") or "")
+        models = await _provider_models(client, provider)
+    except AmuxError as exc:
+        log.warning(
+            "control_models_failed session=%s status=%s detail=%s",
+            session,
+            exc.status,
+            exc.detail,
+        )
+        await _say(update, f"❌ model list failed: {exc.detail}")
+        return
+    ids = _model_ids(models)
+    current = session_model(row)
+    lines = [f"🤖 *Model* — `{session}`", f"current: `{current or 'server default'}`"]
+    if not ids:
+        # No catalog rows for this provider — opencode has none (its models
+        # live in the worker's own config), so the id has to be typed.
+        lines += [
+            "",
+            f"amux's catalog has no `{provider or '?'}` models. Type the full "
+            "id with ⌨️ Custom model id… — the same shape "
+            "`provider/model` that `opencode models` prints.",
+        ]
+    await _say(
+        update,
+        "\n".join(lines),
+        reply_markup=model_keyboard(session, ids, current),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _pick_model(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: str, index: str
+) -> None:
+    """Apply the model the tapped row named (an index into the list shown)."""
+    if not index:
+        await _apply_model(update, context, session, "")
+        return
+    client = _client(context)
+    try:
+        row = await client.find(session)
+        models = await _provider_models(client, str(row.get("provider") or ""))
+    except AmuxError as exc:
+        log.warning(
+            "model_pick_failed session=%s index=%s status=%s detail=%s",
+            session,
+            index,
+            exc.status,
+            exc.detail,
+        )
+        await _say(update, f"❌ model pick failed: {exc.detail}")
+        return
+    ids = _model_ids(models)
+    try:
+        model = ids[int(index)]
+    except (ValueError, IndexError):
+        # The catalog moved between the render and the tap: re-render instead
+        # of applying an id the owner never saw.
+        log.warning(
+            "model_pick_stale session=%s index=%s available=%s",
+            session,
+            index,
+            len(ids),
+        )
+        await _show_models(update, context, session)
+        return
+    await _apply_model(update, context, session, model)
+
+
+async def _apply_model(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: str, model: str
+) -> None:
+    client = _client(context)
+    try:
+        result = await client.config(session, model=model)
+    except AmuxError as exc:
+        log.warning(
+            "session_model_failed session=%s model=%s status=%s detail=%s",
+            session,
+            model or "(default)",
+            exc.status,
+            exc.detail,
+        )
+        await _say(
+            update,
+            f"❌ model change refused: {exc.detail}",
+            reply_markup=_back_keyboard(session),
+        )
+        return
+    log.info(
+        "session_model_set session=%s model=%s mode=%s applied=%s",
+        session,
+        model or "(default)",
+        result.get("mode"),
+        result.get("applied"),
+    )
+    message = str(result.get("message") or f"model set to {model or 'server default'}")
+    await _show_control(update, context, session, note=f"✅ {message}")
+
+
+async def _show_effort(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: str
+) -> None:
+    try:
+        row = await _client(context).find(session)
+    except AmuxError as exc:
+        log.warning(
+            "control_effort_failed session=%s status=%s detail=%s",
+            session,
+            exc.status,
+            exc.detail,
+        )
+        await _say(update, f"❌ effort list failed: {exc.detail}")
+        return
+    provider = str(row.get("provider") or "")
+    if not effort_supported(provider):
+        # Say WHY instead of writing a flag the lane's CLI cannot parse.
+        log.warning(
+            "session_effort_unsupported session=%s provider=%s",
+            session,
+            provider or "(unknown)",
+        )
+        await _say(
+            update,
+            f"🧠 `{provider or '?'}` has no effort switch amux can drive. "
+            "amux applies `--effort` to claude lanes only (the dashboard's own "
+            "rule); other providers take their reasoning level from the model, "
+            "and opencode's CLI would reject the flag outright.",
+            reply_markup=_back_keyboard(session),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    current = session_effort(row)
+    await _say(
+        update,
+        f"🧠 *Effort* — `{session}`\ncurrent: `{current or 'provider default'}`",
+        reply_markup=effort_keyboard(session, current),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _apply_effort(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: str, level: str
+) -> None:
+    if level and level not in EFFORTS:
+        log.warning("session_effort_invalid session=%s level=%s", session, level)
+        await _say(
+            update,
+            f"❌ unknown effort `{level}` — one of: {', '.join(EFFORTS)}",
+            reply_markup=_back_keyboard(session),
+        )
+        return
+    client = _client(context)
+    try:
+        row = await client.find(session)
+        if not effort_supported(str(row.get("provider") or "")):
+            log.warning(
+                "session_effort_unsupported session=%s provider=%s",
+                session,
+                row.get("provider"),
+            )
+            await _show_effort(update, context, session)
+            return
+        result = await client.config(session, effort=level)
+    except AmuxError as exc:
+        log.warning(
+            "session_effort_failed session=%s level=%s status=%s detail=%s",
+            session,
+            level or "(default)",
+            exc.status,
+            exc.detail,
+        )
+        await _say(
+            update,
+            f"❌ effort change refused: {exc.detail}",
+            reply_markup=_back_keyboard(session),
+        )
+        return
+    log.info(
+        "session_effort_set session=%s effort=%s mode=%s applied=%s",
+        session,
+        level or "(default)",
+        result.get("mode"),
+        result.get("applied"),
+    )
+    message = str(result.get("message") or f"effort set to {level or 'default'}")
+    await _show_control(update, context, session, note=f"✅ {message}")
+
+
+async def _interrupt(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: str
+) -> None:
+    """Escape into the pane: stop the CURRENT turn, never the lane.
+
+    Deliberately a different verb from ⏹️ stop: the owner's "make it stop
+    thinking" must not tear down the session, its topic binding or its
+    conversation.
+    """
+    client = _client(context)
+    try:
+        result = await client.keys(session, "Escape")
+    except AmuxError as exc:
+        log.warning(
+            "session_interrupt_failed session=%s status=%s detail=%s",
+            session,
+            exc.status,
+            exc.detail,
+        )
+        await _say(
+            update,
+            f"❌ interrupt failed: {exc.detail}",
+            reply_markup=_back_keyboard(session),
+        )
+        return
+    effect = str(result.get("effect") or ("interrupted" if result.get("ok") else "unknown"))
+    log.info(
+        "session_interrupted session=%s effect=%s detail=%s",
+        session,
+        effect,
+        result.get("message"),
+    )
+    await _show_control(
+        update, context, session, note=f"⚡ current turn interrupted ({effect})"
+    )
+
+
+async def _apply_rename(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    old: str,
+    new: str,
+    *,
+    source: str,
+) -> None:
+    """``PATCH config {"rename": …}``, then carry the name through everything.
+
+    The server's rename cascade moves the lane (env file, tmux session,
+    worktree, board); the GATEWAY's own maps are keyed by the old name, so
+    without this second cascade the topic would keep its pin (fine) while the
+    turn anchor, activity stamps, pins, dedupe and quote map all pointed at a
+    name the fleet no longer has. Both halves are required — that is the point
+    of the feature.
+    """
+    new = " ".join((new or "").split())
+    state = _state(context)
+    chat_id = update.effective_chat.id
+    if not new:
+        await _say(update, "❌ a name cannot be empty.")
+        return
+    if new == old:
+        await _say(update, f"ℹ️ `{old}` already has that name.", parse_mode=ParseMode.MARKDOWN)
+        return
+    # The rename window: an in-flight message must not read a 404 mid-PATCH as
+    # a dead session and release the topic (see _report_send_error).
+    pending = _renaming(context)
+    pending[(chat_id, old)] = new
+    client = _client(context)
+    try:
+        result = await client.config(old, rename=new)
+    except AmuxError as exc:
+        log.warning(
+            "session_rename_failed old=%s new=%s status=%s detail=%s",
+            old,
+            new,
+            exc.status,
+            exc.detail,
+        )
+        await _say(
+            update,
+            f"❌ rename refused: {exc.detail}",
+            reply_markup=_back_keyboard(old),
+        )
+        return
+    finally:
+        pending.pop((chat_id, old), None)
+    new = str(result.get("name") or new)
+
+    threads = state.rename_session(chat_id, old, new)
+    # In-memory maps the cascade cannot reach (bot_data, one-WARN-per-stretch).
+    recent = context.application.bot_data.get(RECENT_STARTS)
+    if isinstance(recent, dict):
+        for key in [k for k, (value, _ts) in recent.items() if value == old]:
+            recent.pop(key, None)
+    _no_boundary_warned.discard((chat_id, old))
+    _cards_warned.discard((chat_id, old))
+    await _follow_topic_titles(context, chat_id, threads, new, source=source)
+    log.info(
+        "session_renamed old=%s new=%s source=%s topics=%s",
+        old,
+        new,
+        source,
+        len(threads),
+    )
+    await _show_control(update, context, new, note=f"✅ renamed to `{new}`")
+
+
+# ---- the ✏️ rename / ⌨️ custom-model prompt conversation --------------------
+
+PENDING_ASK = "pending_ask"
+
+
+def _pending_ask(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.application.bot_data.setdefault(PENDING_ASK, {})
+
+
+def _ask_session(data: str, verb: str) -> str:
+    return (data or "").removeprefix(PREFIX + verb)
+
+
+async def _ask(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, session: str, prompt: str
+) -> int:
+    query = update.callback_query
+    if query is not None:
+        try:
+            await query.answer()
+        except TelegramError:
+            pass
+    _pending_ask(context)[(update.effective_chat.id, update.effective_user.id)] = {
+        "action": action,
+        "session": session,
+    }
+    await _say(update, prompt, parse_mode=ParseMode.MARKDOWN)
+    return ASK
+
+
+@allow_only
+async def ask_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _ask_session(update.callback_query.data, "ctlr:")
+    return await _ask(
+        update,
+        context,
+        "rename",
+        session,
+        f"✏️ Send the new name for `{session}` (or /cancel).",
+    )
+
+
+@allow_only
+async def ask_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _ask_session(update.callback_query.data, "ctlc:")
+    return await _ask(
+        update,
+        context,
+        "model",
+        session,
+        f"⌨️ Send the model id for `{session}` (or /cancel).",
+    )
+
+
+@allow_only
+async def receive_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    key = (update.effective_chat.id, update.effective_user.id)
+    pending = _pending_ask(context).pop(key, None)
+    if not pending:
+        await update.message.reply_text("Nothing was being asked — /menu")
+        return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    log.info(
+        "ask_answer user=%s session=%s action=%s chars=%s",
+        update.effective_user.id,
+        pending["session"],
+        pending["action"],
+        len(text),
+    )
+    if pending["action"] == "rename":
+        await _apply_rename(
+            update, context, pending["session"], text, source="rename_prompt"
+        )
+    else:
+        await _apply_model(update, context, pending["session"], text)
+    return ConversationHandler.END
+
+
+@allow_only
+async def cancel_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    key = (update.effective_chat.id, update.effective_user.id)
+    dropped = _pending_ask(context).pop(key, None)
+    log.info(
+        "ask_cancelled user=%s action=%s",
+        update.effective_user.id,
+        dropped["action"] if dropped else "-",
+    )
+    await update.message.reply_text("Cancelled.", reply_markup=main_menu())
+    return ConversationHandler.END
+
+
+# ---- slash commands (shortcuts over the same panel) -----------------------
+
+
+@allow_only
+async def ctl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info(
+        "command ctl user=%s chat=%s",
+        update.effective_user.id,
+        update.effective_chat.id,
+    )
+    session = await _target_session(update, context)
+    if not session:
+        log.info(
+            "control_no_session user=%s chat=%s",
+            update.effective_user.id,
+            update.effective_chat.id,
+        )
+        await _say(
+            update,
+            "No session here yet — send a message in a topic, or /sessions to pick one.",
+        )
+        return
+    await _show_control(update, context, session)
+
+
+@allow_only
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info(
+        "command model user=%s chat=%s args=%s",
+        update.effective_user.id,
+        update.effective_chat.id,
+        context.args,
+    )
+    session = await _target_session(update, context)
+    if not session:
+        await _say(update, "No session selected — /sessions")
+        return
+    if context.args:
+        await _apply_model(update, context, session, context.args[0])
+        return
+    await _show_models(update, context, session)
+
+
+@allow_only
+async def effort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info(
+        "command effort user=%s chat=%s args=%s",
+        update.effective_user.id,
+        update.effective_chat.id,
+        context.args,
+    )
+    session = await _target_session(update, context)
+    if not session:
+        await _say(update, "No session selected — /sessions")
+        return
+    if context.args:
+        await _apply_effort(update, context, session, context.args[0].lower())
+        return
+    await _show_effort(update, context, session)
+
+
+@allow_only
+async def name_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """``/name <new>`` now, ``/name`` alone → ask for it (entry point)."""
+    log.info(
+        "command name user=%s chat=%s args=%s",
+        update.effective_user.id,
+        update.effective_chat.id,
+        context.args,
+    )
+    session = await _target_session(update, context)
+    if not session:
+        await _say(update, "No session selected — /sessions")
+        return ConversationHandler.END
+    if context.args:
+        await _apply_rename(
+            update, context, session, " ".join(context.args), source="command"
+        )
+        return ConversationHandler.END
+    return await _ask(
+        update,
+        context,
+        "rename",
+        session,
+        f"✏️ Send the new name for `{session}` (or /cancel).",
     )
 
 
@@ -545,6 +1300,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         provider, _, model = raw.partition(":")
         _state(context).set_manager(update.effective_chat.id, provider, model or None)
         await _show_manager(update, context, provider=provider)
+    elif action == "ctl":
+        await _show_control(update, context, raw)
+    elif action == "ctlm":
+        await _show_models(update, context, raw)
+    elif action == "ctlp":
+        session, _, index = raw.partition(":")
+        await _pick_model(update, context, session, index)
+    elif action == "ctle":
+        await _show_effort(update, context, raw)
+    elif action == "ctlf":
+        session, _, level = raw.partition(":")
+        await _apply_effort(update, context, session, level)
+    elif action == "ctli":
+        await _interrupt(update, context, raw)
+    elif action in ("ctlr", "ctlc"):
+        # The prompt conversation owns both as entry points, registered before
+        # this handler: reaching here means that wiring broke. Log it (a button
+        # that does nothing must be impossible to mistake for silence) and fall
+        # back to the panel rather than leaving the tap unanswered.
+        log.warning(
+            "ask_entry_missed action=%s target=%s chat=%s",
+            action,
+            raw,
+            update.effective_chat.id,
+        )
+        await _show_control(update, context, raw)
     elif action == "stopok":
         chat_id = update.effective_chat.id
         try:
@@ -658,8 +1439,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     thread = _msg_thread(update)
     if thread is not None:
-        # The topic identifies the session — no reply or quote needed.
-        session = _state(context).topic_session(update.effective_chat.id, thread)
+        # The topic identifies the session — no reply or quote needed. The
+        # binding resolves through its pin, so a rename (ours or the
+        # dashboard's) cannot orphan it.
+        session = await _resolve_topic_session(context, update.effective_chat.id, thread)
         if session:
             await _continue_session(update, context, session, text, "text")
             return
@@ -838,7 +1621,15 @@ async def _start_manager(
     else:
         ack_text = f"🧠 Starting `{name}` ({choice['provider']}) — reply here to continue it."
 
-    ack = await update.message.reply_text(ack_text, parse_mode=ParseMode.MARKDOWN)
+    ack = await update.message.reply_text(
+        ack_text,
+        parse_mode=ParseMode.MARKDOWN,
+        # The topic's control panel, one tap away from the message that binds
+        # it. It survives the failure edit below (Telegram keeps the markup
+        # when edit_text carries none) — tapping it then reports the missing
+        # session, which is the honest answer anyway.
+        reply_markup=control_button(name),
+    )
     state.record_message(chat_id, ack.message_id, name)
     state.set_turn_message(chat_id, name, anchor_id, thread=in_thread)
     if anchor is not None:
@@ -958,7 +1749,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     thread = _msg_thread(update)
     if thread is not None:
         # Same topic rule as text: the topic picks the session, no quote.
-        session = _state(context).topic_session(update.effective_chat.id, thread)
+        session = await _resolve_topic_session(context, update.effective_chat.id, thread)
         if session:
             await _continue_session(update, context, session, transcript, "voice", anchor=anchor)
             return
@@ -1090,10 +1881,9 @@ async def receive_prompt_voice(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-@allow_only
-async def cancel_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Cancelled.", reply_markup=main_menu())
-    return ConversationHandler.END
+# /cancel for BOTH conversations is `cancel_ask` — one handler, registered as
+# the conversation's single fallback, so a tap of /cancel can never clear one
+# state and leave the other's pending entry behind.
 
 
 # ---------------------------------------------------------------------------
@@ -1494,14 +2284,26 @@ def build_application(cfg: Config) -> Application:
         entry_points=[
             CallbackQueryHandler(ask_prompt, pattern=r"^gw:prompt$"),
             CommandHandler("prompt", ask_prompt_command),
+            # ✏️ rename / ⌨️ custom model: ask, then apply on the next message.
+            CallbackQueryHandler(ask_rename, pattern=r"^gw:ctlr:"),
+            CallbackQueryHandler(ask_model, pattern=r"^gw:ctlc:"),
+            CommandHandler("name", name_command),
         ],
         states={
             PROMPT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_prompt),
                 MessageHandler(filters.VOICE, receive_prompt_voice),
-            ]
+            ],
+            ASK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ask),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_prompt)],
+        fallbacks=[
+            # ONE cancel for both states: while a state is active the fallbacks
+            # are checked in order, so a second CommandHandler("cancel") would
+            # shadow the pending-ask cleanup and leave a stale prompt behind.
+            CommandHandler("cancel", cancel_ask),
+        ],
         per_chat=True,
         per_user=True,
         allow_reentry=True,
@@ -1511,6 +2313,9 @@ def build_application(cfg: Config) -> Application:
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("sessions", sessions_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("ctl", ctl_command))
+    app.add_handler(CommandHandler("model", model_command))
+    app.add_handler(CommandHandler("effort", effort_command))
     app.add_handler(conversation)
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^gw:"))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))

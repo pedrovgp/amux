@@ -12,6 +12,21 @@ Callback data vocabulary (all under the ``gw:`` prefix so one handler owns it):
     gw:stop:<session>       ask for stop confirmation
     gw:stopok:<session>     stop it
     gw:cancel               dismiss
+
+Session control (Milestone 8 — the topic's own panel):
+
+    gw:ctl:<session>        the panel (also its "back")
+    gw:ctlm:<session>       model list for the session's provider
+    gw:ctlp:<session>:<i>   pick model index i from the list just shown
+                            (empty i = server default)
+    gw:ctlc:<session>       ask for a custom model id (conversation)
+    gw:ctle:<session>       effort levels
+    gw:ctlf:<session>:<lvl> pick an effort level (empty = provider default)
+    gw:ctlr:<session>       ask for a new name (conversation)
+    gw:ctli:<session>       interrupt the current turn (Escape in the pane)
+
+Every payload is kept ≤ 64 bytes (Telegram's cap): ``gw:ctlp:`` (8) +
+:data:`MAX_CTL_KEY` (40) + ``:`` + ``xhigh`` (5) = 54.
 """
 from __future__ import annotations
 
@@ -22,10 +37,68 @@ from .manager import PROVIDERS
 PREFIX = "gw:"
 # Telegram caps callback_data at 64 bytes; leave room for the verb prefix.
 MAX_KEY = 52
+# The control payloads carry a session AND a second token (model index, effort
+# level), so the session is capped tighter than MAX_KEY.
+MAX_CTL_KEY = 40
+
+# The server's own list (session_verbs::VALID_EFFORTS), in ascending order.
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# amux applies `--effort` to CLAUDE only — the dashboard's rule
+# (app.js `provider === 'claude'`) and the safe one: `opencode --effort high`
+# prints usage and exits 1, so writing the flag into CC_FLAGS would kill the
+# lane at its next launch instead of changing how it thinks.
+EFFORT_PROVIDERS = ("claude",)
 
 
 def _key(session: str) -> str:
     return session[:MAX_KEY]
+
+
+def ctl_key(session: str) -> str:
+    return session[:MAX_CTL_KEY]
+
+
+def effort_supported(provider: str | None) -> bool:
+    return (provider or "").lower() in EFFORT_PROVIDERS
+
+
+def flag_value(flags, name: str) -> str | None:
+    """``--name value`` or ``--name=value`` from a flag string, else ``None``."""
+    if not isinstance(flags, str) or not flags:
+        return None
+    tokens = flags.split()
+    equals = name + "="
+    for i, token in enumerate(tokens):
+        if token == name:
+            return tokens[i + 1] if i + 1 < len(tokens) else None
+        if token.startswith(equals):
+            return token[len(equals):] or None
+    return None
+
+
+def session_model(row: dict) -> str:
+    """The model a row is configured for, where its provider keeps it.
+
+    Same precedence the dashboard uses (app.js `sessionConfiguredModel`):
+    the ``--model`` flag, then the live agent's own report, then the row's
+    model field. Empty means the provider default — for opencode that is the
+    honest answer: the model lives in the worker's own config, not in amux.
+    """
+    for value in (
+        flag_value(row.get("flags"), "--model"),
+        row.get("active_model"),
+        row.get("model"),
+    ):
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def session_effort(row: dict) -> str:
+    """The ``--effort`` the lane carries (claude-only; ``""`` = default)."""
+    if not effort_supported(row.get("provider")):
+        return ""
+    return flag_value(row.get("flags"), "--effort") or ""
 
 
 def _worker_status(worker: dict) -> str:
@@ -140,3 +213,107 @@ def status_keyboard(session: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# session control (Milestone 8): the panel a topic opens
+# ---------------------------------------------------------------------------
+
+
+def control_button(session: str) -> InlineKeyboardMarkup:
+    """The 🎛 button riding on a topic ack (and any other one-off message)."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🎛 Session control", callback_data=f"{PREFIX}ctl:{ctl_key(session)}"
+                )
+            ]
+        ]
+    )
+
+
+def control_keyboard(session: str) -> InlineKeyboardMarkup:
+    """Panel root: model, effort, rename, interrupt, stop — one session."""
+    key = ctl_key(session)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🤖 Model", callback_data=f"{PREFIX}ctlm:{key}"),
+                InlineKeyboardButton("🧠 Effort", callback_data=f"{PREFIX}ctle:{key}"),
+            ],
+            [
+                InlineKeyboardButton("✏️ Rename", callback_data=f"{PREFIX}ctlr:{key}"),
+                InlineKeyboardButton(
+                    "⚡ Interrupt", callback_data=f"{PREFIX}ctli:{key}"
+                ),
+            ],
+            [
+                # Stop reuses the existing confirm (card warning + buttons)
+                # rather than growing a second one.
+                InlineKeyboardButton("🔴 Stop", callback_data=f"{PREFIX}stop:{key}"),
+            ],
+            [InlineKeyboardButton("⬅️ Menu", callback_data=f"{PREFIX}menu")],
+        ]
+    )
+
+
+def model_keyboard(session: str, models: list[str], current: str) -> InlineKeyboardMarkup:
+    """The provider's catalog, current one marked, plus default and custom.
+
+    An EMPTY list is not a reason to hide the page: `GET /api/models` carries
+    no opencode rows at all (measured 2026-10-28), so that is exactly when the
+    custom-id escape hatch matters — the same "Custom model ID…" the dashboard
+    offers when the catalog cannot name a choice.
+    """
+    key = ctl_key(session)
+    rows = []
+    for i, model in enumerate(models[:8]):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{'✅' if model == current else '○'} {model[:44]}",
+                    callback_data=f"{PREFIX}ctlp:{key}:{i}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"{'✅' if not current else '○'} server default",
+                callback_data=f"{PREFIX}ctlp:{key}:",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "⌨️ Custom model id…", callback_data=f"{PREFIX}ctlc:{key}"
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"{PREFIX}ctl:{key}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def effort_keyboard(session: str, current: str) -> InlineKeyboardMarkup:
+    key = ctl_key(session)
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{'✅' if level == current else '○'} {level}",
+                callback_data=f"{PREFIX}ctlf:{key}:{level}",
+            )
+        ]
+        for level in EFFORTS
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"{'✅' if not current else '○'} provider default",
+                callback_data=f"{PREFIX}ctlf:{key}:",
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"{PREFIX}ctl:{key}")])
+    return InlineKeyboardMarkup(rows)

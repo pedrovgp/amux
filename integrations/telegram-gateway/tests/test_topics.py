@@ -136,6 +136,7 @@ class FakeMessage:
                 "message_id": sent.message_id,
                 "text": text,
                 "reply_to": self.message_id,
+                "reply_markup": reply_markup,
                 "obj": sent,
             }
         )
@@ -179,6 +180,7 @@ def fake_update(message, *, forum=True, chat_id=CHAT):
         effective_message=message,
         effective_chat=chat,
         effective_user=SimpleNamespace(id=1, username="owner"),
+        callback_query=None,
     )
 
 

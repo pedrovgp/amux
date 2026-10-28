@@ -35,6 +35,39 @@ class GatewayState:
             return
         if isinstance(data, dict) and isinstance(data.get("chats"), dict):
             self._data = data
+            # Migration: every topic whose session is pinned gets the id as its
+            # stable identity, so a later rename cannot orphan the topic.
+            if self._migrate_topic_pins():
+                self._save()
+
+    def _migrate_topic_pins(self) -> bool:
+        """Write ``topic_pins[thread] = ses_id`` for pin-known bindings.
+
+        Runs once on load (and at the two write sites — ``set_topic`` when a
+        pin already exists, ``set_pinned`` when the pin arrives after the
+        topic). Entries are added, never removed: the name in ``topics`` stays
+        as the fallback binding for when amux is unreachable.
+        """
+        changed = False
+        for chat in self._data.get("chats", {}).values():
+            if not isinstance(chat, dict):
+                continue
+            topics = chat.get("topics")
+            pinned = chat.get("pinned")
+            if not isinstance(topics, dict) or not isinstance(pinned, dict):
+                continue
+            pins_map = chat.get("topic_pins")
+            pins_map = dict(pins_map) if isinstance(pins_map, dict) else {}
+            touched = False
+            for thread, session in topics.items():
+                pin = pinned.get(session)
+                if isinstance(pin, str) and pin and pins_map.get(thread) != pin:
+                    pins_map[thread] = pin
+                    touched = True
+            if touched:
+                chat["topic_pins"] = pins_map
+                changed = True
+        return changed
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,6 +195,9 @@ class GatewayState:
         falls back to the session name, so without this flag "recorded name ==
         session name" would be true for the owner's own topics too and the
         sync would overwrite names he chose.
+
+        When the session already has a pin, ``topic_pins`` records it beside
+        the name — that id is what a later rename resolves through.
         """
         chat = self._chat(chat_id)
         topics = chat.get("topics")
@@ -180,16 +216,40 @@ class GatewayState:
             made[thread] = True
         else:
             made.pop(thread, None)
+        # The stable identity, when the session already has one: the pin is
+        # what survives a rename, so it is written alongside the name rather
+        # than instead of it (the name stays the unreachable-amux fallback).
+        pins_map = chat.get("topic_pins")
+        pins_map = pins_map if isinstance(pins_map, dict) else {}
+        pin = self.pinned(chat_id, session)
+        if pin:
+            pins_map[thread] = pin
+        else:
+            pins_map.pop(thread, None)
         # Bound the file: keep the most recently touched topics only.
         while len(topics) > MAX_TOPICS_PER_CHAT:
             old = next(iter(topics))
             topics.pop(old, None)
             names.pop(old, None)
             made.pop(old, None)
+            pins_map.pop(old, None)
         chat["topics"] = topics
         chat["topic_names"] = names
         chat["topic_created"] = made
+        chat["topic_pins"] = pins_map
         self._save()
+
+    def topic_pin(self, chat_id: int, thread_id: int) -> str | None:
+        """The opencode conversation id this topic is stably bound to.
+
+        ``None`` for a topic bound before pins existed, or one whose session is
+        unpinned (another provider, a legacy lane): those resolve by NAME.
+        """
+        pins_map = self._chat(chat_id).get("topic_pins")
+        if not isinstance(pins_map, dict):
+            return None
+        value = pins_map.get(str(int(thread_id)))
+        return value if isinstance(value, str) and value else None
 
     def topic_created(self, chat_id: int, thread_id: int) -> bool:
         """Did the GATEWAY mint this topic (rather than adopt/name it)?"""
@@ -219,7 +279,32 @@ class GatewayState:
         chat["topic_names"] = names
         self._save()
 
+    def release_topic_title(self, chat_id: int, thread_id: int) -> None:
+        """Hand a topic's title over to whoever just named it (the owner).
+
+        The OpenCode title sync only edits a topic it MINTED (`topic_created`),
+        and dedupes on "recorded name == session name". A session rename
+        satisfies that identity again — so without this release the sync would
+        retitle the topic back to OpenCode's session title on its next tick and
+        silently undo the owner's rename. Popping the flag says: this title now
+        belongs to the human, stop following.
+        """
+        chat = self._chat(chat_id)
+        made = chat.get("topic_created")
+        if not isinstance(made, dict) or str(int(thread_id)) not in made:
+            return
+        made.pop(str(int(thread_id)), None)
+        chat["topic_created"] = made
+        self._save()
+
     def topic_session(self, chat_id: int, thread_id: int | None) -> str | None:
+        """The NAME this topic is bound to (the fallback identity).
+
+        Not the resolved live session: a pin-bound topic can name a lane that
+        was renamed after the binding was written. The caller that must talk to
+        the fleet resolves through ``topic_pin`` first — see the gateway's
+        topic resolver.
+        """
         if thread_id is None:
             return None
         topics = self._chat(chat_id).get("topics")
@@ -229,10 +314,27 @@ class GatewayState:
         return session if isinstance(session, str) and session else None
 
     def session_topic(self, chat_id: int, session: str) -> int | None:
-        """The thread id ``session`` answers in, or ``None`` (no topic)."""
-        topics = self._chat(chat_id).get("topics")
-        if not isinstance(topics, dict):
-            return None
+        """The thread id ``session`` answers in, or ``None`` (no topic).
+
+        The PIN is looked for first: after a rename the name in ``topics`` can
+        be one step behind (a rename made outside the gateway, which has no
+        cascade to run), while ``topic_pins`` still names the conversation this
+        lane carries. The name match below is the fallback for unpinned and
+        legacy sessions — and the safety net for a topic bound by name only.
+        """
+        chat = self._chat(chat_id)
+        pin = self.pinned(chat_id, session)
+        topics = chat.get("topics")
+        topics = topics if isinstance(topics, dict) else {}
+        if pin:
+            pins_map = chat.get("topic_pins")
+            if isinstance(pins_map, dict):
+                for thread, value in pins_map.items():
+                    if value == pin:
+                        try:
+                            return int(thread)
+                        except ValueError:
+                            continue
         for thread, name in topics.items():
             if name == session:
                 try:
@@ -240,6 +342,92 @@ class GatewayState:
                 except ValueError:
                     continue
         return None
+
+    def rename_session(self, chat_id: int, old: str, new: str) -> list[int]:
+        """Rekey every session-keyed map in this chat from ``old`` to ``new``.
+
+        The rename cascade the panel's ✏️ runs after ``PATCH config
+        {"rename": …}`` succeeds — and the same repair when a rename is made
+        OUTSIDE the gateway (dashboard/CLI): without it the topic survives the
+        rename (it is pin-bound) while the turn anchor, activity stamps, pins,
+        dedupe and quote map keep addressing a name the fleet no longer has.
+
+        Returns the threads bound to the session (by the new name OR by pin),
+        so the caller can follow the Telegram topic title along. ``topic_names``
+        is deliberately NOT rewritten here: it is the only record of what a
+        topic is actually called in Telegram, and the caller updates it when
+        (and only when) the title edit lands.
+        """
+        if not old or not new or old == new:
+            return []
+        chat = self._chat(chat_id)
+        changed = False
+        if chat.get("session") == old:
+            chat["session"] = new
+            changed = True
+        for key in ("pinned", "activity", "idle_stopped", "turn_msg", "last_relayed"):
+            mapping = chat.get(key)
+            if isinstance(mapping, dict) and old in mapping:
+                mapping[new] = mapping.pop(old)
+                changed = True
+        topics = chat.get("topics")
+        if isinstance(topics, dict):
+            for thread, value in list(topics.items()):
+                if value == old:
+                    topics[thread] = new
+                    changed = True
+        mapping = chat.get("msg_sessions")
+        if isinstance(mapping, dict):
+            for message_id, value in list(mapping.items()):
+                if value == old:
+                    mapping[message_id] = new
+                    changed = True
+        if changed:
+            self._save()
+
+        pin = self.pinned(chat_id, new)
+        threads: set[int] = set()
+        if isinstance(topics, dict):
+            for thread, value in topics.items():
+                if value == new:
+                    try:
+                        threads.add(int(thread))
+                    except ValueError:
+                        continue
+        if pin:
+            pins_map = chat.get("topic_pins")
+            if isinstance(pins_map, dict):
+                for thread, value in pins_map.items():
+                    if value == pin:
+                        try:
+                            threads.add(int(thread))
+                        except ValueError:
+                            continue
+        return sorted(threads)
+
+    def rebind_pin(
+        self, chat_id: int, pin: str, live_name: str
+    ) -> tuple[str, list[int]] | None:
+        """Catch this chat's maps up with a lane renamed OUTSIDE the gateway.
+
+        Returns ``(stale_name, threads)`` that were rewritten, or ``None``
+        when nothing needed to move. Only runs when the stored name is NOT a
+        live session — the guard that keeps a rename from stealing maps that
+        belong to a different, live lane of the same name.
+        """
+        if not pin or not live_name:
+            return None
+        pins = self._chat(chat_id).get("pinned")
+        if not isinstance(pins, dict):
+            return None
+        stale = next(
+            (name for name, value in pins.items() if value == pin and name != live_name),
+            None,
+        )
+        if not isinstance(stale, str) or not stale:
+            return None
+        threads = self.rename_session(chat_id, stale, live_name)
+        return stale, threads
 
     def chat_for_session(self, session: str) -> int | None:
         """The chat this session lives in, or ``None`` (no chat has it).
@@ -256,7 +444,19 @@ class GatewayState:
                     continue
                 if pass_topics:
                     hit = chat.get("topics")
-                    if not (isinstance(hit, dict) and session in hit.values()):
+                    bound = isinstance(hit, dict) and session in hit.values()
+                    if not bound:
+                        # Pin-bound: the name in `topics` may already be stale,
+                        # but the conversation id still points at this chat.
+                        pinned = chat.get("pinned")
+                        pin = (
+                            pinned.get(session)
+                            if isinstance(pinned, dict)
+                            else None
+                        )
+                        pins_map = chat.get("topic_pins")
+                        bound = bool(pin) and isinstance(pins_map, dict) and pin in pins_map.values()
+                    if not bound:
                         continue
                 else:
                     hit = chat.get("turn_msg")
@@ -303,6 +503,10 @@ class GatewayState:
         Used when a session dies (create failure, 404 send, confirmed stop):
         the topic must become adoptable again, so the owner's next message in
         it starts a fresh manager instead of hitting a dead lane forever.
+
+        Matches by name AND by pin, because a pin-bound topic's name can be
+        stale (rename made outside the gateway) and a topic left bound to a
+        name nobody has would never be released.
         """
         chat = self._chat(chat_id)
         topics = chat.get("topics")
@@ -312,13 +516,22 @@ class GatewayState:
         names = names if isinstance(names, dict) else None
         made = chat.get("topic_created")
         made = made if isinstance(made, dict) else None
+        pins_map = chat.get("topic_pins")
+        pins_map = pins_map if isinstance(pins_map, dict) else None
+        pinned = chat.get("pinned")
+        pin = pinned.get(session) if isinstance(pinned, dict) else None
+        bound = {t for t, name in topics.items() if name == session}
+        if pin and pins_map is not None:
+            bound |= {t for t, value in pins_map.items() if value == pin}
         dropped = []
-        for thread in [t for t, name in topics.items() if name == session]:
+        for thread in sorted(bound):
             topics.pop(thread, None)
             if names is not None:
                 names.pop(thread, None)
             if made is not None:
                 made.pop(thread, None)
+            if pins_map is not None:
+                pins_map.pop(thread, None)
             try:
                 dropped.append(int(thread))
             except ValueError:
@@ -329,6 +542,8 @@ class GatewayState:
                 chat["topic_names"] = names
             if made is not None:
                 chat["topic_created"] = made
+            if pins_map is not None:
+                chat["topic_pins"] = pins_map
             self._save()
         return dropped
 
@@ -348,6 +563,20 @@ class GatewayState:
             pins = {}
         pins[session] = oc_session
         chat["pinned"] = pins
+        # The topic bound to this session learns its stable identity. This is
+        # the usual order — the topic is created BEFORE the lane exists, so the
+        # binding was written as a name and only now becomes a pin.
+        topics = chat.get("topics")
+        pins_map = chat.get("topic_pins")
+        pins_map = pins_map if isinstance(pins_map, dict) else {}
+        touched = False
+        if isinstance(topics, dict):
+            for thread, value in topics.items():
+                if value == session and pins_map.get(thread) != oc_session:
+                    pins_map[thread] = oc_session
+                    touched = True
+        if touched:
+            chat["topic_pins"] = pins_map
         self._save()
 
     def pinned(self, chat_id: int, session: str) -> str | None:

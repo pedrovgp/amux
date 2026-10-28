@@ -22,6 +22,7 @@ Telegram  ⇄  telegram-gateway (this module)  ⇄  amux server (https://localho
 |---|---|
 | `/start`, `/menu` | Inline keyboard: 🚀 new session · 👁️ peek/status · ✍️ send prompt · ⏹️ stop · 🧠 manager settings |
 | **Plain text or voice note** | Starts a **new manager agent** in `MANAGER_CWD`. In a forum group (Topics enabled) each manager gets **its own topic**; elsewhere it replies in that message's thread |
+| **🎛 Session control** | Every topic ack carries the panel button (or `/ctl`): model, effort, ✏️ rename, ⚡ interrupt, 🔴 stop — for THAT topic's session. A rename moves the topic with it (the binding is the OpenCode conversation id, not the name) |
 | **Quote-reply** to a bot message | Stays in the session that message belongs to |
 | Voice note | Downloaded, transcribed by Groq, echoed as `🗣️ Transcribed: …` **as a reply to the audio**, then treated like the text would be; the agent's answer replies to the transcription (readable), never to the audio bubble, and quoting the transcription continues that session. The temp `.ogg` is deleted immediately |
 | Replies | A relay peeks the session every ~20s and posts new output **as a reply to your message** |
@@ -229,6 +230,34 @@ tail -f ~/.amux/logs/telegram-gateway.log
   to the same manager; every other message starts another one.
 - `/sessions` picks a session (for the menu actions); `/status` peeks it.
 - `/sessions` picks a session; `/status` peeks the selected one.
+
+### Session control (the 🎛 panel)
+
+In a forum topic the topic IS the session, so every control addresses the
+topic's own session; in General or a private chat the commands address the
+selected one. Each topic ack carries a **🎛 Session control** button, and
+`/ctl` opens the same panel anywhere.
+
+- **🤖 Model** — the provider's list from `GET /api/models`, the current one
+  marked, plus *server default*. The catalog has no opencode rows, so an
+  uncatalogued provider offers **⌨️ Custom model id…** instead (type the full
+  `provider/model` id). `/model <id>` applies one directly; `/model` alone
+  opens the list. A non-claude model change is applied by amux restarting the
+  lane — the conversation resumes, nothing is lost.
+- **🧠 Effort** — low/medium/high/xhigh/max for **claude lanes only** (the
+  dashboard's own rule). `opencode` has no `--effort` flag — its CLI would
+  exit on it — so the panel says so instead of writing a flag that would kill
+  the lane at its next start. `/effort <level>` applies one directly.
+- **✏️ Rename** — asks for the new name, PATCHes the lane's config, then moves
+  the session through **every** gateway map (topic, pin, anchors, activity,
+  dedupe, quote map, selection) and retitles the Telegram topic. The topic is
+  bound to the OpenCode conversation id, so a rename made in the dashboard
+  keeps the topic attached too — the next message in it follows the lane to its
+  new name. `/name <new>` renames directly.
+- **⚡ Interrupt** — presses Escape in the pane: it stops the current turn and
+  leaves the lane, its topic and its conversation alone (logged as
+  `session_interrupted`).
+- **🔴 Stop** — the existing confirm, with the board-card warning.
 
 Replies from the session are relayed automatically: the gateway finds the last
 `[from Telegram @…]` marker in the pane and sends everything after it, stripping

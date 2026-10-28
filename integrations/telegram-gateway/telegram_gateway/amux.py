@@ -39,6 +39,30 @@ def is_lane(row: dict) -> bool:
     return LANE_MARKER in row
 
 
+def session_id_from_flags(flags) -> str | None:
+    """The opencode conversation id a lane's ``CC_FLAGS`` pins it to.
+
+    ``--session ses_…`` rides the lane's flags on EVERY start, which is what
+    makes it a stable identity: a rename rewrites the env file's name and the
+    tmux session, never this token. Both spellings are read
+    (``--session x`` and ``--session=x``); anything else — no flag, an empty
+    value — is ``None`` (an unpinned lane has no id to resolve through).
+    """
+    if not isinstance(flags, str) or not flags:
+        return None
+    tokens = flags.split()
+    for i, token in enumerate(tokens):
+        if token == "--session" and i + 1 < len(tokens):
+            value = tokens[i + 1]
+        elif token.startswith("--session="):
+            value = token.split("=", 1)[1]
+        else:
+            continue
+        if value.startswith("ses_"):
+            return value
+    return None
+
+
 class AmuxClient:
     def __init__(
         self,
@@ -178,6 +202,43 @@ class AmuxClient:
             "POST",
             f"/api/sessions/{self._key(name)}/instructions",
             body={"instructions": instructions},
+        )
+
+    async def config(self, name: str, **fields) -> dict:
+        """One config PATCH: ``PATCH /api/sessions/<n>/config`` (lanes) or
+        ``PATCH /api/workers/<n>/config`` (rows), chosen by ``_base()`` like
+        every other verb.
+
+        The server refuses a body naming **more than one setting**
+        (``one_setting_per_patch``), so callers pass exactly one of ``model``,
+        ``effort``, ``rename`` — the 400 it returns is surfaced as an
+        ``AmuxError`` like any other. Long timeout: a non-claude model/effort
+        change is applied by RESTARTING the lane, which is the slow path the
+        server answers with ``j200_slow_ok``.
+        """
+        row = await self.find(name)
+        return await self._json(
+            "PATCH",
+            f"{self._base(row)}/{self._key(name)}/config",
+            body=dict(fields),
+            timeout=120.0,
+        )
+
+    async def keys(self, name: str, keys: str) -> dict:
+        """Press keys in the session's pane: ``POST /api/workers/<n>/keys``.
+
+        The body is ``{"keys": "Escape"}`` (``session_verbs::keys_verb`` reads
+        ``body_str(body, "keys")``); ``Escape``/``C-c`` are special-cased
+        server-side into an INTERRUPT of the current turn, and every other key
+        is raw ``tmux send-keys``. Deliberately NOT ``/api/sessions/<n>/keys``:
+        the workers spelling resolves a name or a ULID through one handler, so
+        a lane and a worker row are addressed the same way here.
+        """
+        return await self._json(
+            "POST",
+            f"/api/workers/{self._key(name)}/keys",
+            body={"keys": keys},
+            timeout=30.0,
         )
 
     async def models(self, provider: str | None = None) -> list[dict]:
