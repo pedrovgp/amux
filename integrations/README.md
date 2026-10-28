@@ -71,6 +71,11 @@ Document:
 
 ## Available integrations
 
+Most entries below are MCP server entries in `mcp.json`; the **Telegram
+gateway** is not — it is a standalone supervised Python service with its own
+bot.
+
 | Integration | Status | MCP package |
 |-------------|--------|-------------|
 | [Google Docs](./google-docs/) | deprecated: use the built-in Google connector | `@modelcontextprotocol/server-gdrive` (archived upstream) |
+| [Telegram gateway](./telegram-gateway/) | beta, on branch `feat/telegram-gateway` (not on `main` yet) — overview in [docs/telegram-gateway.md](../docs/telegram-gateway.md) | none — standalone supervised Python service (see note above) |
