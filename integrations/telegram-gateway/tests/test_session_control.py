@@ -23,8 +23,9 @@ import httpx
 import pytest
 from telegram.ext import ConversationHandler
 
-from telegram_gateway import bot as botmod
+from telegram_gateway import bot as botmod, opencode_api
 from telegram_gateway.amux import AmuxClient, session_id_from_flags
+from telegram_gateway.opencode_api import OcError
 from telegram_gateway.state import GatewayState
 
 from test_topics import (
@@ -39,6 +40,23 @@ from test_topics import (
 )
 
 PIN = "ses_tg10280000abcdef"
+
+
+class NoOc:
+    """The default API entry point in tests: no OpenCode server, ever.
+
+    Without it a pinned opencode lane would run the REAL discovery (``ss`` +
+    ``/proc``) from inside the suite — the offline rule for Milestone 9 is
+    that discovery and transport are always something a test hands in.
+    """
+
+    def __init__(self, exc: Exception | None = None):
+        self.exc = exc or OcError(0, "no opencode serve (offline test)")
+        self.calls: list[tuple] = []
+
+    async def client_for(self, lane=None, pin=None):
+        self.calls.append((lane, pin))
+        raise self.exc
 
 
 # ---- fakes -----------------------------------------------------------------
@@ -171,11 +189,17 @@ class FakeAmux:
         await self.client.aclose()
 
 
-def ctl_app(cfg, state, fake, bot=None):
+def ctl_app(cfg, state, fake, bot=None, oc=None):
     """The shape `sync_topic_titles_once` / loops read: bot_data at the top."""
     return SimpleNamespace(
         bot=bot or CtlBot(),
-        bot_data={"cfg": cfg, "client": fake.client, "state": state, "guard": None},
+        bot_data={
+            "cfg": cfg,
+            "client": fake.client,
+            "state": state,
+            "guard": None,
+            "oc_api": oc or NoOc(),
+        },
     )
 
 
@@ -189,9 +213,13 @@ def buttons(markup):
 def _clean_warn_dedupe():
     botmod._cards_warned.clear()
     botmod._no_boundary_warned.clear()
+    botmod._oc_fallback_warned.clear()
+    opencode_api.reset_warn_dedupe()
     yield
     botmod._cards_warned.clear()
     botmod._no_boundary_warned.clear()
+    botmod._oc_fallback_warned.clear()
+    opencode_api.reset_warn_dedupe()
 
 
 # ---- amux client verbs -----------------------------------------------------
@@ -371,15 +399,17 @@ def test_tracked_sessions_keeps_names_for_pin_bound_topics(tmp_path):
 # ---- the resolver: pin -> current name, name fallback ----------------------
 
 
-def context_for(cfg, state, client, bot=None, args=()):
+def context_for(cfg, state, client, bot=None, args=(), oc=None):
     """The fake app context, in the (cfg, state, client) order this file uses.
 
     ``test_topics.fake_context`` takes (cfg, client, state); swapping here is
     cheaper than misreading an argument list in 25 tests. ``args`` mirrors what
-    PTB puts on the context for a command with arguments.
+    PTB puts on the context for a command with arguments. ``oc`` is the
+    OpenCode API entry point (``NoOc`` by default — offline).
     """
     context = fake_context(cfg, client, state, bot or CtlBot())
     context.args = list(args)
+    context.application.bot_data["oc_api"] = oc or NoOc()
     return context
 
 

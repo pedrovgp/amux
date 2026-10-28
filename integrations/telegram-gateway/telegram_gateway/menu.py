@@ -17,13 +17,19 @@ Session control (Milestone 8 — the topic's own panel):
 
     gw:ctl:<session>        the panel (also its "back")
     gw:ctlm:<session>       model list for the session's provider
+    gw:ctlm:<session>:<p>   the same list, page p (a re-render only: the
+                            source is re-derived, never trusted from a tap)
     gw:ctlp:<session>:<i>   pick model index i from the list just shown
-                            (empty i = server default)
+                            (empty i = server default) — AMUX's catalog
+    gw:ctlo:<session>:<i>   pick model index i from OPENCODE's own catalog
+                            (Milestone 9; a pick resolves its index only
+                            against the list it was rendered from)
     gw:ctlc:<session>       ask for a custom model id (conversation)
     gw:ctle:<session>       effort levels
     gw:ctlf:<session>:<lvl> pick an effort level (empty = provider default)
     gw:ctlr:<session>       ask for a new name (conversation)
-    gw:ctli:<session>       interrupt the current turn (Escape in the pane)
+    gw:ctli:<session>       interrupt the current turn (OpenCode API when it
+                            is reachable, Escape in the pane otherwise)
 
 Every payload is kept ≤ 64 bytes (Telegram's cap): ``gw:ctlp:`` (8) +
 :data:`MAX_CTL_KEY` (40) + ``:`` + ``xhigh`` (5) = 54.
@@ -40,13 +46,18 @@ MAX_KEY = 52
 # The control payloads carry a session AND a second token (model index, effort
 # level), so the session is capped tighter than MAX_KEY.
 MAX_CTL_KEY = 40
+# One page of model rows. Telegram would take far more, but a list you cannot
+# see past is not a list — 10 rows plus the nav/default/custom/back rows keeps
+# a 74-model catalog (opencode + opencode-go, measured 2026-10-28) reachable.
+MODEL_PAGE_SIZE = 10
 
 # The server's own list (session_verbs::VALID_EFFORTS), in ascending order.
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # amux applies `--effort` to CLAUDE only — the dashboard's rule
 # (app.js `provider === 'claude'`) and the safe one: `opencode --effort high`
 # prints usage and exits 1, so writing the flag into CC_FLAGS would kill the
-# lane at its next launch instead of changing how it thinks.
+# lane at its next launch instead of changing how it thinks. An opencode lane
+# gets its effort from ITS OWN server instead (Milestone 9, opencode_api).
 EFFORT_PROVIDERS = ("claude",)
 
 
@@ -258,29 +269,79 @@ def control_keyboard(session: str) -> InlineKeyboardMarkup:
     )
 
 
-def model_keyboard(session: str, models: list[str], current: str) -> InlineKeyboardMarkup:
+def _page(value) -> int:
+    """A page number from callback text: digits (or a sign), else page 0."""
+    try:
+        return max(0, int(str(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def model_keyboard(
+    session: str,
+    models: list[str],
+    current: str,
+    page: int = 0,
+    *,
+    current_index: int | None = None,
+    verb: str = "ctlp",
+) -> InlineKeyboardMarkup:
     """The provider's catalog, current one marked, plus default and custom.
 
     An EMPTY list is not a reason to hide the page: `GET /api/models` carries
     no opencode rows at all (measured 2026-10-28), so that is exactly when the
     custom-id escape hatch matters — the same "Custom model ID…" the dashboard
     offers when the catalog cannot name a choice.
+
+    - Rows carry a GLOBAL index into ``models`` (the tap re-reads the same
+      list), so a page boundary never renumbers a row.
+    - ``page`` is clamped to the list: a stale page tap re-renders the last
+      real page instead of an empty one. The paging buttons only say "render
+      again" (``gw:ctlm``) — the source is re-derived at render time, never
+      read back from a tap.
+    - ``current_index`` marks by position instead of by id: OpenCode's own
+      catalog holds the SAME id under two providers (``opencode`` and
+      ``opencode-go``) and only one of them is the session's model.
+    - ``verb`` names the list these rows were rendered from: ``ctlp`` is
+      amux's catalog, ``ctlo`` OpenCode's. A pick resolves its index only
+      against the list on screen — resolving it against the other catalog
+      could apply a model the owner never saw.
     """
     key = ctl_key(session)
+    pages = max(1, (len(models) + MODEL_PAGE_SIZE - 1) // MODEL_PAGE_SIZE)
+    page = min(_page(page), pages - 1)
+    start = page * MODEL_PAGE_SIZE
     rows = []
-    for i, model in enumerate(models[:8]):
+    for i, model in enumerate(models[start:start + MODEL_PAGE_SIZE], start=start):
+        marked = i == current_index if current_index is not None else model == current
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"{'✅' if model == current else '○'} {model[:44]}",
-                    callback_data=f"{PREFIX}ctlp:{key}:{i}",
+                    f"{'✅' if marked else '○'} {model[:44]}",
+                    callback_data=f"{PREFIX}{verb}:{key}:{i}",
                 )
             ]
         )
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton(
+                    "⬅️ prev", callback_data=f"{PREFIX}ctlm:{key}:{page - 1}"
+                )
+            )
+        if page < pages - 1:
+            nav.append(
+                InlineKeyboardButton(
+                    "next ➡️", callback_data=f"{PREFIX}ctlm:{key}:{page + 1}"
+                )
+            )
+        if nav:
+            rows.append(nav)
     rows.append(
         [
             InlineKeyboardButton(
-                f"{'✅' if not current else '○'} server default",
+                f"{'✅' if current_index is None and not current else '○'} server default",
                 callback_data=f"{PREFIX}ctlp:{key}:",
             )
         ]
@@ -296,8 +357,19 @@ def model_keyboard(session: str, models: list[str], current: str) -> InlineKeybo
     return InlineKeyboardMarkup(rows)
 
 
-def effort_keyboard(session: str, current: str) -> InlineKeyboardMarkup:
+def effort_keyboard(
+    session: str,
+    current: str,
+    levels: list[str] | None = None,
+) -> InlineKeyboardMarkup:
+    """The effort dial: amux's ``EFFORTS`` (claude) or an opencode model's own
+    ``variants`` from ``GET /api/model`` — whatever the caller just listed.
+
+    ``current`` is marked wherever it sits; an unknown-to-us level (a variant
+    we did not render) simply marks nothing rather than inventing a row.
+    """
     key = ctl_key(session)
+    offered = list(levels) if levels is not None else list(EFFORTS)
     rows = [
         [
             InlineKeyboardButton(
@@ -305,7 +377,7 @@ def effort_keyboard(session: str, current: str) -> InlineKeyboardMarkup:
                 callback_data=f"{PREFIX}ctlf:{key}:{level}",
             )
         ]
-        for level in EFFORTS
+        for level in offered
     ]
     rows.append(
         [

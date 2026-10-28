@@ -238,25 +238,38 @@ topic's own session; in General or a private chat the commands address the
 selected one. Each topic ack carries a **🎛 Session control** button, and
 `/ctl` opens the same panel anywhere.
 
-- **🤖 Model** — the provider's list from `GET /api/models`, the current one
-  marked, plus *server default*. The catalog has no opencode rows, so an
-  uncatalogued provider offers **⌨️ Custom model id…** instead (type the full
-  `provider/model` id). `/model <id>` applies one directly; `/model` alone
-  opens the list. A non-claude model change is applied by amux restarting the
-  lane — the conversation resumes, nothing is lost.
-- **🧠 Effort** — low/medium/high/xhigh/max for **claude lanes only** (the
-  dashboard's own rule). `opencode` has no `--effort` flag — its CLI would
-  exit on it — so the panel says so instead of writing a flag that would kill
-  the lane at its next start. `/effort <level>` applies one directly.
+- **🤖 Model** — an **opencode** lane reads ITS OWN server: the lane's
+  `opencode serve` child is found (`ss -tlnp` → `/proc` → lane name + the
+  `--session` pin) and authenticated with its `OPENCODE_PASSWORD`, and
+  `GET /api/model` lists its catalog — 74 models across `opencode` and
+  `opencode-go` (measured), current one marked by provider *and* id, paged 10
+  at a time. Picking one POSTs `{"model": {providerID, id, variant}}` to
+  `/api/session/<id>/model`: model AND effort in **one call, no restart**.
+  Every other lane — and any discovery/auth/API failure — keeps amux's
+  `GET /api/models` + config PATCH (a restart that resumes the conversation),
+  where an uncatalogued provider still offers **⌨️ Custom model id…** (type
+  the full `provider/model` id). `/model <id>` applies one directly; `/model`
+  alone opens the list.
+- **🧠 Effort** — for an opencode lane the levels are the current model's own
+  `variants` from `GET /api/model` (e.g. `low/medium/high/xhigh/max`, kimi's
+  `low/high/max`; `mimo-v2.6-flash` has none, and the panel says so instead of
+  offering a dead dial), applied with the same one POST as the model. claude
+  keeps amux's low/medium/high/xhigh/max config PATCH (the dashboard's own
+  rule — opencode's CLI has no `--effort`, and the flag would ride `CC_FLAGS`
+  to the lane's next launch, so an amux effort PATCH is never the fallback).
+  `/effort <level>` applies one directly.
+- **⚡ Interrupt** — prefers OpenCode's own `POST /api/session/<id>/interrupt`
+  (the TUI's own interrupt) and otherwise presses Escape in the pane: both
+  stop the current turn and leave the lane, its topic and its conversation
+  alone. Logged `session_interrupted … path=oc_api|keys`; every API failure
+  falls back to the Escape path with one `oc_api_fallback` WARN per stretch,
+  so a button is never left dead.
 - **✏️ Rename** — asks for the new name, PATCHes the lane's config, then moves
   the session through **every** gateway map (topic, pin, anchors, activity,
   dedupe, quote map, selection) and retitles the Telegram topic. The topic is
   bound to the OpenCode conversation id, so a rename made in the dashboard
   keeps the topic attached too — the next message in it follows the lane to its
   new name. `/name <new>` renames directly.
-- **⚡ Interrupt** — presses Escape in the pane: it stops the current turn and
-  leaves the lane, its topic and its conversation alone (logged as
-  `session_interrupted`).
 - **🔴 Stop** — the existing confirm, with the board-card warning.
 
 Replies from the session are relayed automatically: the gateway finds the last

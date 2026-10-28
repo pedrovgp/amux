@@ -19,6 +19,7 @@ from telegram.ext import (
     filters,
 )
 
+from . import opencode_api
 from .amux import AmuxClient, AmuxError, session_id_from_flags
 from .config import Config
 from .control import ControlServer
@@ -84,6 +85,80 @@ def _client(context: ContextTypes.DEFAULT_TYPE) -> AmuxClient:
 
 def _state(context: ContextTypes.DEFAULT_TYPE) -> GatewayState:
     return context.application.bot_data["state"]
+
+
+# ---------------------------------------------------------------------------
+# the OpenCode serve API (Milestone 9) — model, effort, interrupt
+# ---------------------------------------------------------------------------
+
+
+def _oc_api(context: ContextTypes.DEFAULT_TYPE):
+    """The OpenCode API entry point: the real module by default.
+
+    Tests inject a fake at ``bot_data["oc_api"]`` — the panel's offline rule:
+    no test may run ``ss``, read ``/proc`` or open a socket, so discovery is
+    always something a test can hand in.
+    """
+    return context.application.bot_data.get("oc_api") or opencode_api
+
+
+# One WARN per (session) stretch: a dead serve must be sweepable
+# (`oc_api_fallback`) without flooding the log on every tap.
+_oc_fallback_warned: set[str] = set()
+
+
+def _oc_fallback_warn(session: str, op: str, exc) -> None:
+    if session in _oc_fallback_warned:
+        return
+    _oc_fallback_warned.add(session)
+    log.warning(
+        "oc_api_fallback op=%s session=%s detail=%s",
+        op,
+        session,
+        getattr(exc, "detail", None) or "OpenCode server unreachable",
+    )
+
+
+def _oc_fallback_ok(session: str) -> None:
+    _oc_fallback_warned.discard(session)
+
+
+async def _oc_client(
+    context: ContextTypes.DEFAULT_TYPE, row: dict, op: str
+) -> tuple | None:
+    """``(client, pin)`` when this row is an opencode lane with a live serve.
+
+    ``None`` means "run today's path" — not an opencode lane, no pin (an
+    unpinned lane has no conversation id to address), or discovery/auth
+    failed (WARNed here and, for the reason, by ``opencode_api``).
+    """
+    if str(row.get("provider") or "").lower() != "opencode":
+        return None
+    pin = session_id_from_flags(row.get("flags"))
+    if not pin:
+        return None
+    name = str(row.get("name") or "?")
+    try:
+        client = await _oc_api(context).client_for(lane=name, pin=pin)
+    except AmuxError as exc:
+        _oc_fallback_warn(name, op, exc)
+        return None
+    if client is None:
+        return None  # an entry point that answered "nothing" is not a client
+    return client, pin
+
+
+def _oc_expected(row: dict) -> bool:
+    """True when this row SHOULD reach its own OpenCode server.
+
+    Used to tell "there is no dial here" (an unpinned or non-opencode lane,
+    which gets Milestone 8's honest refusal) apart from "the dial exists but
+    its server did not answer" — the owner deserves the second reason, not
+    the first.
+    """
+    return str(row.get("provider") or "").lower() == "opencode" and bool(
+        session_id_from_flags(row.get("flags"))
+    )
 
 
 def _username(update: Update) -> str:
@@ -540,6 +615,21 @@ async def _show_control(
     provider = str(row.get("provider") or "?")
     model = session_model(row)
     effort = session_effort(row)
+    show_effort = effort_supported(provider)
+    # An opencode lane reports its own model AND its own effort (a variant of
+    # that model) from its serve API; the row can only ever show the flags.
+    oc = await _oc_client(context, row, "control")
+    if oc:
+        try:
+            sess = await oc[0].get_session(oc[1])
+        except AmuxError as exc:
+            _oc_fallback_warn(session, "control", exc)
+        else:
+            oc_model = sess.get("model") or {}
+            model = str(oc_model.get("id") or model)
+            effort = str(oc_model.get("variant") or "")
+            show_effort = True
+            _oc_fallback_ok(session)
     state_line = "🟢 running" if row.get("running") else "⚪ stopped"
     lines = [f"🎛 *Session control* — `{session}`"]
     if note:
@@ -548,7 +638,7 @@ async def _show_control(
         f"provider: `{provider}` · {state_line}",
         f"model: `{model or 'server default'}`",
     ]
-    if effort_supported(provider):
+    if show_effort:
         lines.append(f"effort: `{effort or 'default'}`")
     await _say(
         update,
@@ -572,6 +662,71 @@ def _model_ids(models: list[dict]) -> list[str]:
     return out
 
 
+def _oc_refs(models: list[dict]) -> list[dict]:
+    """OpenCode's rows de-duped by ``(providerID, id)``, catalog order.
+
+    The same id exists under both ``opencode`` and ``opencode-go`` (measured:
+    ``claude-haiku-5-5``, ``gemini-4-argon``), so id-only dedupe would drop a
+    model and a provider-blind index would apply the wrong one. The render and
+    the tap both build this list, so position always means the same row.
+    """
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for row in models:
+        if not isinstance(row, dict):
+            continue
+        key = (str(row.get("providerID") or ""), str(row.get("id") or ""))
+        if not key[1] or key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def _oc_entry(refs: list[dict], model: dict) -> dict | None:
+    """The catalog row for a session's ``model`` block, or None."""
+    model_id = str(model.get("id") or "")
+    provider_id = str(model.get("providerID") or "")
+    return next(
+        (
+            row
+            for row in refs
+            if row.get("id") == model_id and row.get("providerID") == provider_id
+        ),
+        None,
+    )
+
+
+def _resolve_oc_model(refs: list[dict], model: str, current: dict) -> dict | None:
+    """The catalog row a requested id names, or None (not in this catalog).
+
+    ``provider/id`` (what ``gw:ctlo`` resolves to) matches exactly; a bare id
+    — typed at ``/model`` — matches only if OpenCode's catalog has it, and
+    when both providers carry it the session's own provider wins, so a
+    switch never silently changes provider. An id the catalog cannot name is
+    NOT an error: that is the custom-id escape hatch, and it keeps today's
+    amux PATCH.
+    """
+    wanted = str(model or "")
+    if not wanted:
+        return None
+    if "/" in wanted:
+        provider_id, _, model_id = wanted.partition("/")
+        return next(
+            (
+                ref
+                for ref in refs
+                if ref.get("providerID") == provider_id and ref.get("id") == model_id
+            ),
+            None,
+        )
+    matches = [ref for ref in refs if ref.get("id") == wanted]
+    if not matches:
+        return None
+    own = str(current.get("providerID") or "")
+    return next((ref for ref in matches if ref.get("providerID") == own), matches[0])
+
+
 async def _provider_models(client: AmuxClient, provider: str) -> list[dict]:
     """The catalog for ONE provider; an unknown provider gets nothing.
 
@@ -584,13 +739,78 @@ async def _provider_models(client: AmuxClient, provider: str) -> list[dict]:
 
 
 async def _show_models(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, session: str
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: str,
+    page: int | str = 0,
 ) -> None:
-    """The provider's catalog from ``GET /api/models``, current one marked."""
+    """The provider's catalog, current one marked.
+
+    An opencode lane with a pin reads ITS OWN server (``GET /api/model``:
+    this is where the model list and the effort variants both live); every
+    other case — and any API failure — keeps amux's ``GET /api/models``,
+    whose opencode section is empty by construction.
+    """
     client = _client(context)
     try:
         row = await client.find(session)
-        provider = str(row.get("provider") or "")
+    except AmuxError as exc:
+        log.warning(
+            "control_models_failed session=%s status=%s detail=%s",
+            session,
+            exc.status,
+            exc.detail,
+        )
+        await _say(update, f"❌ model list failed: {exc.detail}")
+        return
+    provider = str(row.get("provider") or "")
+    oc = await _oc_client(context, row, "models")
+    if oc:
+        try:
+            models = await oc[0].list_models(provider)
+            sess = await oc[0].get_session(oc[1])
+        except AmuxError as exc:
+            _oc_fallback_warn(session, "models", exc)
+        else:
+            _oc_fallback_ok(session)
+            refs = _oc_refs(models)
+            model = sess.get("model") or {}
+            current = str(model.get("id") or "")
+            current_index = next(
+                (
+                    i
+                    for i, ref in enumerate(refs)
+                    if ref.get("id") == model.get("id")
+                    and ref.get("providerID") == model.get("providerID")
+                ),
+                None,
+            )
+            lines = [
+                f"🤖 *Model* — `{session}`",
+                f"current: `{current or 'server default'}`",
+            ]
+            if not refs:
+                lines += [
+                    "",
+                    f"OpenCode's server lists no `{provider or '?'}` models. "
+                    "Type the full id with ⌨️ Custom model id… — the same "
+                    "shape `provider/model` that `opencode models` prints.",
+                ]
+            await _say(
+                update,
+                "\n".join(lines),
+                reply_markup=model_keyboard(
+                    session,
+                    [str(ref.get("id") or "") for ref in refs],
+                    current,
+                    page,
+                    current_index=current_index,
+                    verb="ctlo",
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    try:
         models = await _provider_models(client, provider)
     except AmuxError as exc:
         log.warning(
@@ -604,6 +824,14 @@ async def _show_models(
     ids = _model_ids(models)
     current = session_model(row)
     lines = [f"🤖 *Model* — `{session}`", f"current: `{current or 'server default'}`"]
+    if _oc_expected(row):
+        # The OpenCode catalog exists but its server did not answer — say so,
+        # so an empty list is not read as "there are no models".
+        lines += [
+            "",
+            "⚠️ this lane's OpenCode server is unreachable right now — "
+            "showing amux's catalog instead.",
+        ]
     if not ids:
         # No catalog rows for this provider — opencode has none (its models
         # live in the worker's own config), so the id has to be typed.
@@ -616,7 +844,7 @@ async def _show_models(
     await _say(
         update,
         "\n".join(lines),
-        reply_markup=model_keyboard(session, ids, current),
+        reply_markup=model_keyboard(session, ids, current, page),
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -659,10 +887,165 @@ async def _pick_model(
     await _apply_model(update, context, session, model)
 
 
+async def _pick_oc_model(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: str, index: str
+) -> None:
+    """Apply index i from the OPENCODE list on screen (``gw:ctlo``).
+
+    The index is resolved ONLY against OpenCode's own catalog — amux's has
+    different rows, so resolving it there could apply a model the owner never
+    saw. Unresolvable (API gone, index stale) says so and re-renders instead
+    of guessing; only a successfully resolved ``provider/id`` reaches
+    ``_apply_model``, which applies it and falls back to today's PATCH if the
+    API refuses mid-flight.
+    """
+    if not index:
+        await _apply_model(update, context, session, "")
+        return
+    client = _client(context)
+    try:
+        row = await client.find(session)
+    except AmuxError as exc:
+        log.warning(
+            "model_pick_failed session=%s index=%s status=%s detail=%s",
+            session,
+            index,
+            exc.status,
+            exc.detail,
+        )
+        await _say(update, f"❌ model pick failed: {exc.detail}")
+        return
+    oc = await _oc_client(context, row, "pick")
+    if oc is None:
+        # The list rendered came from the API, so this index has no meaning
+        # in amux's catalog. The owner's tap deserves an explanation, not a
+        # model from a list they were never shown.
+        await _say(
+            update,
+            "❌ this list came from the OpenCode server, which is unreachable "
+            "right now — tap 🤖 Model to reload it.",
+            reply_markup=_back_keyboard(session),
+        )
+        return
+    try:
+        models = await oc[0].list_models(str(row.get("provider") or ""))
+    except AmuxError as exc:
+        _oc_fallback_warn(session, "pick", exc)
+        await _say(
+            update,
+            f"❌ model pick failed: {exc.detail}",
+            reply_markup=_back_keyboard(session),
+        )
+        return
+    refs = _oc_refs(models)
+    try:
+        ref = refs[int(index)]
+    except (ValueError, IndexError):
+        log.warning(
+            "model_pick_stale session=%s index=%s available=%s",
+            session,
+            index,
+            len(refs),
+        )
+        await _show_models(update, context, session)
+        return
+    await _apply_model(
+        update,
+        context,
+        session,
+        f"{ref.get('providerID')}/{ref.get('id')}",
+    )
+
+
+async def _oc_apply_model(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: str,
+    row: dict,
+    oc: tuple,
+    model: str,
+) -> bool:
+    """Hot-switch model AND effort through the lane's own server.
+
+    Returns True when the request is fully handled; False means "fall back to
+    today's amux PATCH" — either the id is not in this server's catalog (the
+    owner typed a custom id, which the PATCH applies verbatim) or the API
+    failed part-way. In both cases ``model`` is exactly what was asked for,
+    so the fallback applies the RIGHT id, never an index against another list.
+    """
+    oc_client, pin = oc
+    provider = str(row.get("provider") or "")
+    try:
+        catalog = await oc_client.list_models(provider)
+        sess = await oc_client.get_session(pin)
+    except AmuxError as exc:
+        _oc_fallback_warn(session, "model", exc)
+        return False
+    current = sess.get("model") or {}
+    target = _resolve_oc_model(_oc_refs(catalog), model, current)
+    if target is None:
+        return False  # not catalogued here: the typed-id PATCH owns it
+    variants = [str(v) for v in target.get("variants") or []]
+    current_variant = str(current.get("variant") or "")
+    # Carry the effort over only when the new model HAS that dial; otherwise
+    # the server's own default for the new model is the honest answer.
+    variant = current_variant if current_variant in variants else None
+    try:
+        await oc_client.set_model(
+            pin,
+            str(target.get("providerID") or ""),
+            str(target.get("id") or ""),
+            variant,
+        )
+    except AmuxError as exc:
+        _oc_fallback_warn(session, "model", exc)
+        return False
+    _oc_fallback_ok(session)
+    log.info(
+        "session_model_set session=%s model=%s provider=%s variant=%s path=oc_api",
+        session,
+        target.get("id"),
+        target.get("providerID"),
+        variant or "(default)",
+    )
+    note = f"✅ model set to `{target.get('id')}`"
+    if variant:
+        note += f" · effort `{variant}`"
+    await _show_control(update, context, session, note=note)
+    return True
+
+
 async def _apply_model(
     update: Update, context: ContextTypes.DEFAULT_TYPE, session: str, model: str
 ) -> None:
+    """Apply ``model`` (``""`` = server default) to the session.
+
+    An opencode lane whose serve API answers gets a HOT switch — model and
+    effort in one POST, no restart. Everything else, and every API failure,
+    keeps amux's config PATCH (today's behavior: a non-claude change restarts
+    the lane and the conversation resumes).
+    """
     client = _client(context)
+    try:
+        row = await client.find(session)
+    except AmuxError as exc:
+        log.warning(
+            "session_model_failed session=%s model=%s status=%s detail=%s",
+            session,
+            model or "(default)",
+            exc.status,
+            exc.detail,
+        )
+        await _say(
+            update,
+            f"❌ model change refused: {exc.detail}",
+            reply_markup=_back_keyboard(session),
+        )
+        return
+    if model:
+        oc = await _oc_client(context, row, "model")
+        if oc and await _oc_apply_model(update, context, session, row, oc, model):
+            return
     try:
         result = await client.config(session, model=model)
     except AmuxError as exc:
@@ -680,7 +1063,7 @@ async def _apply_model(
         )
         return
     log.info(
-        "session_model_set session=%s model=%s mode=%s applied=%s",
+        "session_model_set session=%s model=%s mode=%s applied=%s path=amux",
         session,
         model or "(default)",
         result.get("mode"),
@@ -705,6 +1088,58 @@ async def _show_effort(
         await _say(update, f"❌ effort list failed: {exc.detail}")
         return
     provider = str(row.get("provider") or "")
+    # An opencode lane's effort levels are the current model's `variants`
+    # (GET /api/model on its own server) — Milestone 9's whole point: the
+    # dial exists, it was only never reachable from here.
+    oc = await _oc_client(context, row, "effort")
+    if oc:
+        try:
+            sess = await oc[0].get_session(oc[1])
+            catalog = await oc[0].list_models(provider)
+        except AmuxError as exc:
+            _oc_fallback_warn(session, "effort", exc)
+            await _say(
+                update,
+                f"❌ effort list failed: {exc.detail}",
+                reply_markup=_back_keyboard(session),
+            )
+            return
+        _oc_fallback_ok(session)
+        model = sess.get("model") or {}
+        entry = _oc_entry(_oc_refs(catalog), model)
+        variants = [str(v) for v in (entry or {}).get("variants") or []]
+        current = str(model.get("variant") or "")
+        if current not in variants:
+            current = ""  # "default"/unknown reads as the provider default
+        model_id = str(model.get("id") or "?")
+        if not variants:
+            await _say(
+                update,
+                f"🧠 `{model_id}` reports no effort levels — OpenCode gives "
+                "this model no dial, so there is nothing to set.",
+                reply_markup=_back_keyboard(session),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        await _say(
+            update,
+            f"🧠 *Effort* — `{session}`\nmodel: `{model_id}`\n"
+            f"current: `{current or 'provider default'}`",
+            reply_markup=effort_keyboard(session, current, levels=variants),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if _oc_expected(row):
+        # The dial exists (its levels live on the OpenCode server) but that
+        # server did not answer: report the truth rather than the stale
+        # "opencode has no effort switch" reason.
+        await _say(
+            update,
+            "❌ effort list unavailable — this lane's OpenCode server is "
+            "unreachable right now.",
+            reply_markup=_back_keyboard(session),
+        )
+        return
     if not effort_supported(provider):
         # Say WHY instead of writing a flag the lane's CLI cannot parse.
         log.warning(
@@ -734,6 +1169,101 @@ async def _show_effort(
 async def _apply_effort(
     update: Update, context: ContextTypes.DEFAULT_TYPE, session: str, level: str
 ) -> None:
+    """Set the effort: a variant of the current model on opencode, the
+    ``--effort`` config PATCH on claude — the two paths Milestone 8 and 9 own
+    respectively. Never an effort PATCH on an opencode lane: the flag would
+    ride ``CC_FLAGS`` to the next launch and kill it there.
+    """
+    client = _client(context)
+    try:
+        row = await client.find(session)
+    except AmuxError as exc:
+        log.warning(
+            "session_effort_failed session=%s level=%s status=%s detail=%s",
+            session,
+            level or "(default)",
+            exc.status,
+            exc.detail,
+        )
+        await _say(
+            update,
+            f"❌ effort change refused: {exc.detail}",
+            reply_markup=_back_keyboard(session),
+        )
+        return
+    provider = str(row.get("provider") or "")
+    oc = await _oc_client(context, row, "effort")
+    if oc:
+        oc_client, pin = oc
+        try:
+            sess = await oc_client.get_session(pin)
+            catalog = await oc_client.list_models(provider)
+        except AmuxError as exc:
+            _oc_fallback_warn(session, "effort", exc)
+            await _say(
+                update,
+                f"❌ effort change refused: {exc.detail}",
+                reply_markup=_back_keyboard(session),
+            )
+            return
+        model = sess.get("model") or {}
+        entry = _oc_entry(_oc_refs(catalog), model)
+        variants = [str(v) for v in (entry or {}).get("variants") or []]
+        if level and level not in variants:
+            # The level must exist on THIS model: a stale tap (the model
+            # changed underneath) is refused before any POST.
+            log.warning("session_effort_invalid session=%s level=%s", session, level)
+            await _say(
+                update,
+                f"❌ unknown effort `{level}` — "
+                f"one of: {', '.join(variants) or '(this model has none)'}",
+                reply_markup=_back_keyboard(session),
+            )
+            return
+        try:
+            await oc_client.set_model(
+                pin,
+                str(model.get("providerID") or ""),
+                str(model.get("id") or ""),
+                level or None,
+            )
+        except AmuxError as exc:
+            _oc_fallback_warn(session, "effort", exc)
+            await _say(
+                update,
+                f"❌ effort change refused: {exc.detail}",
+                reply_markup=_back_keyboard(session),
+            )
+            return
+        _oc_fallback_ok(session)
+        log.info(
+            "session_effort_set session=%s effort=%s path=oc_api",
+            session,
+            level or "(default)",
+        )
+        await _show_control(
+            update, context, session, note=f"✅ effort set to `{level or 'default'}`"
+        )
+        return
+    if _oc_expected(row):
+        # Pinned opencode lane whose serve API did not answer: say THAT
+        # instead of the stale "opencode has no effort" reason, and never
+        # fall through to a PATCH that would kill the lane at its next start.
+        await _say(
+            update,
+            "❌ effort unavailable — this lane's OpenCode server is "
+            "unreachable right now.",
+            reply_markup=_back_keyboard(session),
+        )
+        return
+    if not effort_supported(provider):
+        log.warning(
+            "session_effort_unsupported session=%s provider=%s",
+            session,
+            provider,
+        )
+        await _show_effort(update, context, session)
+        return
     if level and level not in EFFORTS:
         log.warning("session_effort_invalid session=%s level=%s", session, level)
         await _say(
@@ -742,17 +1272,7 @@ async def _apply_effort(
             reply_markup=_back_keyboard(session),
         )
         return
-    client = _client(context)
     try:
-        row = await client.find(session)
-        if not effort_supported(str(row.get("provider") or "")):
-            log.warning(
-                "session_effort_unsupported session=%s provider=%s",
-                session,
-                row.get("provider"),
-            )
-            await _show_effort(update, context, session)
-            return
         result = await client.config(session, effort=level)
     except AmuxError as exc:
         log.warning(
@@ -769,7 +1289,7 @@ async def _apply_effort(
         )
         return
     log.info(
-        "session_effort_set session=%s effort=%s mode=%s applied=%s",
+        "session_effort_set session=%s effort=%s mode=%s applied=%s path=amux",
         session,
         level or "(default)",
         result.get("mode"),
@@ -782,13 +1302,41 @@ async def _apply_effort(
 async def _interrupt(
     update: Update, context: ContextTypes.DEFAULT_TYPE, session: str
 ) -> None:
-    """Escape into the pane: stop the CURRENT turn, never the lane.
+    """Stop the CURRENT turn, never the lane.
 
     Deliberately a different verb from ⏹️ stop: the owner's "make it stop
     thinking" must not tear down the session, its topic binding or its
-    conversation.
+    conversation. The preferred transport is OpenCode's own
+    ``POST /api/session/<id>/interrupt`` (the TUI's own interrupt); every
+    other lane, and any API failure, keeps pressing Escape into the pane —
+    both end in ``session_interrupted``, with ``path=`` naming which ran.
     """
     client = _client(context)
+    try:
+        row = await client.find(session)
+    except AmuxError:
+        row = None  # the keys path below reports the failure it actually hits
+    if row is not None:
+        oc = await _oc_client(context, row, "interrupt")
+        if oc:
+            try:
+                result = await oc[0].interrupt(oc[1])
+            except AmuxError as exc:
+                _oc_fallback_warn(session, "interrupt", exc)
+            else:
+                _oc_fallback_ok(session)
+                log.info(
+                    "session_interrupted session=%s path=oc_api interrupted=%s",
+                    session,
+                    result.get("interrupted"),
+                )
+                await _show_control(
+                    update,
+                    context,
+                    session,
+                    note="⚡ current turn interrupted (OpenCode API)",
+                )
+                return
     try:
         result = await client.keys(session, "Escape")
     except AmuxError as exc:
@@ -806,7 +1354,7 @@ async def _interrupt(
         return
     effect = str(result.get("effect") or ("interrupted" if result.get("ok") else "unknown"))
     log.info(
-        "session_interrupted session=%s effect=%s detail=%s",
+        "session_interrupted session=%s effect=%s path=keys detail=%s",
         session,
         effect,
         result.get("message"),
@@ -1303,10 +1851,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif action == "ctl":
         await _show_control(update, context, raw)
     elif action == "ctlm":
-        await _show_models(update, context, raw)
+        # `raw` is the session, optionally `:<page>` — the page only says
+        # "render again": the source (amux vs OpenCode) is re-derived at
+        # render time, never read back from a tap.
+        session, _, page = raw.partition(":")
+        await _show_models(update, context, session, page)
     elif action == "ctlp":
         session, _, index = raw.partition(":")
         await _pick_model(update, context, session, index)
+    elif action == "ctlo":
+        session, _, index = raw.partition(":")
+        await _pick_oc_model(update, context, session, index)
     elif action == "ctle":
         await _show_effort(update, context, raw)
     elif action == "ctlf":
