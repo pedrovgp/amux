@@ -13,6 +13,7 @@ The owner runs a Topics-enabled group with the bot. The contract:
 """
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import httpx
@@ -279,13 +280,49 @@ def test_general_message_creates_manager_and_its_topic(tmp_path):
 
     # the ack went back in General (a reply) and points at the topic
     assert message.replies and "own topic" in message.replies[0]["text"]
-    # turn 1's anchor is the owner's General message (no thread): the relay
-    # must post the first answer in-topic WITHOUT a cross-thread reply.
-    assert state.turn_message(CHAT, session) == 100
-    assert state.turn_thread(CHAT, session) is None
+
+    # Task 3 (owner, 2026-10-29): the topic STARTS with the prompt that created
+    # it — posted plain, verbatim, into the new thread — and that posted copy
+    # becomes the turn anchor, so the first answer replies to it INSIDE the
+    # topic instead of to a General anchor the relay had to drop.
+    assert bot.sent == [
+        {"chat_id": CHAT, "text": "start a research task", "reply_to": None,
+         "thread": 1001}
+    ]
+    assert state.turn_message(CHAT, session) == 901  # FakeBot's first send id
+    assert state.turn_thread(CHAT, session) == 1001
+    assert state.session_for_message(CHAT, 901) == session  # quoting it continues
 
     # the prompt reached the lane
     assert sent and sent[0]["text"] == "[from Telegram @owner] start a research task"
+
+
+def test_the_prompt_echo_is_logged_for_a_sweep(tmp_path, caplog):
+    """`prompt_echoed session=… thread=… msg_id=…` — the Task-3 sweep line."""
+    cfg = make_cfg(tmp_path)
+    state = GatewayState(tmp_path / "state.json")
+    sent, created = [], []
+    client = make_manager_amux(sent, created)
+    bot = FakeBot()
+    message = FakeMessage(message_id=105, text="open a topic for this", thread=None)
+
+    try:
+        with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+            run(
+                botmod.on_text(
+                    fake_update(message), fake_context(cfg, client, state, bot)
+                )
+            )
+    finally:
+        run(client.aclose())
+
+    session = created[0]
+    echoes = [r.getMessage() for r in caplog.records if "prompt_echoed" in r.getMessage()]
+    assert len(echoes) == 1, echoes
+    assert f"session={session}" in echoes[0]
+    assert "thread=1001" in echoes[0] and "msg_id=901" in echoes[0]
+    # …and the message it names is the one sitting in the topic
+    assert bot.sent[0]["thread"] == 1001
 
 
 def test_message_in_a_mapped_topic_continues_that_session(tmp_path):
@@ -335,6 +372,8 @@ def test_message_in_an_unmapped_topic_adopts_a_manager(tmp_path):
     # ack landed inside that topic (a reply to the in-topic message)
     assert message.replies and "this topic" in message.replies[0]["text"]
     assert state.turn_thread(CHAT, created[0]) == 777
+    assert bot.sent == []  # Task 3: adoption never echoes — the owner already
+    # typed inside the topic he made
     assert sent and sent[0]["text"] == "[from Telegram @owner] topic made by hand"
 
 
@@ -357,6 +396,7 @@ def test_non_forum_chat_never_touches_topics(tmp_path):
     assert state.session_topic(9, created[0]) is None
     # old contract kept: a private chat gets the reply-in-thread ack
     assert message.replies and "reply here" in message.replies[0]["text"]
+    assert bot.sent == []  # Task 3: no topic, no echo — the ack is the only reply
 
 
 def test_topic_creation_failure_falls_back_to_general(tmp_path):
@@ -432,13 +472,20 @@ def test_voice_in_general_opens_the_topic_for_the_transcript_session(
     # transcription echoed in General (readable where the voice was sent)...
     assert message.replies[0]["text"] == "🗣️ Transcribed: assunto falado"
     transcription_id = message.replies[0]["message_id"]
-    # ...the session gets a topic, and the transcript is its turn anchor
+    # ...the session gets a topic, and the TRANSCRIPT — never the audio — is
+    # posted into it as the turn anchor (Task 3): the first answer replies to
+    # that copy inside the topic.
     session = created[0]
     assert bot.created == [(CHAT, session)]
     assert state.topic_session(CHAT, 1001) == session
-    assert state.turn_message(CHAT, session) == transcription_id
-    assert state.turn_thread(CHAT, session) is None  # General -> no reply across
+    assert bot.sent == [
+        {"chat_id": CHAT, "text": "assunto falado", "reply_to": None, "thread": 1001}
+    ]
+    assert state.turn_message(CHAT, session) == 901
+    assert state.turn_thread(CHAT, session) == 1001
+    # quoting the General transcription still continues the same session
     assert state.session_for_message(CHAT, transcription_id) == session
+    assert state.session_for_message(CHAT, 901) == session
     assert sent and sent[0]["text"] == "[from Telegram @owner] assunto falado"
 
 

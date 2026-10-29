@@ -52,19 +52,23 @@ a new one.**
 In a forum group the **topic replaces the quote**:
 
 - **General** → a fresh manager; the gateway creates a topic named after the
-  session (`mgr-…`) and every answer lands in it.
+  session (`mgr-…`) and posts your message into it as its **first message**
+  (logged as `prompt_echoed`) — a topic always opens with the prompt that
+  created it, and the first answer replies to that copy, inside the topic.
 - **Inside a topic** → the message continues that topic's session. No reply or
   quote needed — the topic *is* the session selector.
 - **An unmapped topic** (created by hand, or state loss) → a fresh manager
-  that adopts the topic.
-- Answers post with `message_thread_id`; an anchor outside the topic (turn 1
-  of a new topic, or a quote from General) is never replied across threads —
-  the answer goes in plain, inside the topic.
+  that adopts the topic. Nothing is echoed there: you already typed inside it.
+- Answers post with `message_thread_id`; an anchor still outside the topic (a
+  quote from General, a duplicate merged into this session) is never replied
+  across threads — the answer goes in plain, inside the topic.
 - A stopped or dead session **releases its topic**, so the next message there
   starts a fresh manager instead of hitting a dead lane.
 
 Voice notes follow the same routing; the transcription stays where the voice
-was sent (readable there), the answer lands in the topic.
+was sent (readable there), and the **transcription — never the audio** — is
+what a new topic opens with, so its first message is always text you can
+read; the answer lands in the topic.
 
 ### Idle stop, same-session revive
 

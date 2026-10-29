@@ -2106,6 +2106,55 @@ async def _create_forum_topic(
     return int(thread)
 
 
+async def _echo_prompt_into_topic(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    thread: int,
+    text: str,
+    session: str,
+) -> int | None:
+    """Post the owner's prompt INSIDE the topic it just minted (Task 3).
+
+    Verbatim and plain — never ``parse_mode``, so quotes, underscores or a
+    code block in the prompt cannot make Telegram reject or reformat the one
+    message that is supposed to be the owner's own words. Returns its id, or
+    ``None`` on any failure, in which case the caller keeps today's anchor (the
+    owner's message in General) instead of inventing one.
+
+    Gateway code only: a manager never sends this — a second copy would fight
+    with the ``[from Telegram @…]`` marker the pane already carries. For a
+    voice note ``text`` is the TRANSCRIPTION (computed before the anchor is
+    set), never the audio: the audio bubble is unreadable, the transcript is
+    what the turn was about.
+    """
+    chat_id = update.effective_chat.id
+    try:
+        sent = await context.application.bot.send_message(
+            chat_id, text, message_thread_id=thread
+        )
+    except TelegramError as exc:
+        log.warning(
+            "prompt_echo_failed chat_id=%s thread=%s session=%s error=%s",
+            chat_id,
+            thread,
+            session,
+            exc,
+        )
+        return None
+    message_id = getattr(sent, "message_id", None)
+    if message_id is None:
+        return None
+    log.info(
+        "prompt_echoed session=%s thread=%s msg_id=%s chars=%s",
+        session,
+        thread,
+        message_id,
+        len(text),
+    )
+    return int(message_id)
+
+
 async def _start_manager(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2162,13 +2211,32 @@ async def _start_manager(
     # The topic is bound BEFORE the lane exists: an owner message arriving
     # while the lane is still being created must already route somewhere.
     thread = topic if forum else None
+    fresh_topic = False
     if forum and thread is None:
         thread = await _create_forum_topic(update, context, name)
+        fresh_topic = thread is not None
     if forum and thread is not None:
         # `created` is what may later be renamed to OpenCode's session title:
         # only a topic THIS gateway minted (General path), never one adopted
         # from the owner's hand or opened through POST /topic.
         state.set_topic(chat_id, thread, name, created=topic is None)
+
+    # Owner, 2026-10-29: "the topic must start with the prompt that created
+    # it" — a minted topic used to show only its ANSWER, so scrolling up never
+    # showed what started it. For the fresh-General case (and ONLY it — adoption,
+    # dedup/merge, quote-reply and non-forum chats must not echo), the owner's
+    # prompt becomes the topic's FIRST message and the turn's anchor: the first
+    # answer then replies to it inside the topic, which is exactly where the
+    # relay's cross-thread rule used to have to drop `reply_to`.
+    anchor_thread = in_thread
+    if fresh_topic and thread is not None:
+        echoed = await _echo_prompt_into_topic(
+            update, context, thread=thread, text=text, session=name
+        )
+        if echoed is not None:
+            anchor_id = echoed
+            anchor_thread = thread
+            state.record_message(chat_id, echoed, name)
 
     if forum and thread is not None:
         if thread == in_thread:
@@ -2194,7 +2262,7 @@ async def _start_manager(
         reply_markup=control_button(name),
     )
     state.record_message(chat_id, ack.message_id, name)
-    state.set_turn_message(chat_id, name, anchor_id, thread=in_thread)
+    state.set_turn_message(chat_id, name, anchor_id, thread=anchor_thread)
     if anchor is not None:
         # Quoting the transcription must continue this manager session.
         state.record_message(chat_id, anchor, name)

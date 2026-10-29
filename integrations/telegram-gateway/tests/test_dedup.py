@@ -127,6 +127,12 @@ def test_identical_general_messages_open_one_topic_and_one_session(
     assert len(first.replies) == 1
     assert second.replies == []
 
+    # …and only the FRESH message was echoed into the topic (Task 3): the
+    # merged duplicate continues an existing session, so it must not post a
+    # second copy of the same sentence into the topic the first one opened.
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["text"] == TEXT and bot.sent[0]["thread"] == 1001
+
     # the merged turn anchors on the duplicate, so its answer is relayed too
     assert state.turn_message(CHAT, session) == 101
 
