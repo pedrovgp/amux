@@ -11,6 +11,7 @@ from telegram import Update
 
 from .amux import AmuxClient, AmuxError
 from .config import Config, ConfigError, load_config
+from . import single
 
 log = logging.getLogger("telegram_gateway")
 
@@ -107,11 +108,44 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         return asyncio.run(_check(cfg))
 
+    return _run(cfg)
+
+
+def _run(cfg: Config) -> int:
+    """Start long-polling — only if this state dir has no other poller.
+
+    The lock is taken BEFORE the Application exists, so a stray manual start
+    (a pane, a second terminal) fails loudly with ``gateway_already_running``
+    instead of quietly becoming the second ``getUpdates`` consumer Telegram
+    later reports as ``Conflict: terminated by other getUpdates request``.
+    systemd's stop/start cannot trip it: the old process releases the flock as
+    it exits, before the new one starts.
+    """
+    try:
+        lock = single.acquire(cfg.lock_path)
+    except single.AlreadyRunning as exc:
+        log.error(
+            "gateway_already_running pid=%s path=%s detail=%s",
+            exc.holder,
+            exc.path,
+            exc,
+        )
+        print(
+            f"telegram-gateway: already running (pid {exc.holder or 'unknown'}) — "
+            "a second getUpdates consumer would steal updates from the first; "
+            f"refusing to start. Lock: {exc.path}",
+            file=sys.stderr,
+        )
+        return 3
+
     # Imported late so --check and the tests never build an Application.
     from .bot import build_application
 
-    app = build_application(cfg)
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    try:
+        app = build_application(cfg)
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    finally:
+        lock.close()
     return 0
 
 

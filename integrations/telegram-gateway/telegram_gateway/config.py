@@ -140,6 +140,15 @@ class Config:
     def state_path(self) -> Path:
         return self.state_dir / "state.json"
 
+    @property
+    def lock_path(self) -> Path:
+        """The single-instance lock (see ``telegram_gateway.single``).
+
+        Beside ``state.json`` so every gateway started with this state dir —
+        service or a manual run — contends for the same file.
+        """
+        return self.state_dir / "gateway.pid"
+
 
 def parse_env_file(path: str | os.PathLike[str]) -> dict[str, str]:
     """Parse a ``KEY=VALUE`` env file.

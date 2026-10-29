@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Conflict, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -43,6 +44,7 @@ from .menu import (
     status_keyboard,
     stop_confirm,
 )
+from .pollwatch import PollWatch, default_watch
 from .relay import (
     chunk_text,
     delta_since,
@@ -3034,8 +3036,66 @@ async def post_shutdown(app: Application) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_application(cfg: Config) -> Application:
-    app = Application.builder().token(cfg.bot_token).build()
+async def on_poll_error(update, context) -> None:
+    """PTB's error handler: a conflict gets vitals, everything else its traceback.
+
+    Before this, PTB logged *"No error handlers are registered, logging
+    exception"* and dumped a raw traceback (measured 7× on 2026-10-28/29):
+    no duration, no attempt count, no way to see that polling resumed. A
+    ``Conflict`` now logs ``telegram_conflict`` with the watch's vitals —
+    ``attempt`` (PTB retries the long-poll on its own, so a competitor that
+    HOLDS the token shows a growing count), ``down_s`` (time since the first
+    conflict of this stretch) and ``pid`` (which instance is being crowded out,
+    so a stray second start is visible in the same line).
+
+    Any other error keeps a full traceback: registering a handler must make
+    conflicts *readable*, never make handler failures quieter than they were.
+    """
+    app = getattr(context, "application", None)
+    watch = getattr(app, "bot_data", {}).get("poll_watch") if app else None
+    error = getattr(context, "error", None)
+    if isinstance(error, Conflict):
+        note = watch.note() if watch is not None else {}
+        log.warning(
+            "telegram_conflict attempt=%s down_s=%.1f since=%s last_ok=%s "
+            "pid=%s detail=%s",
+            note.get("attempt", 1),
+            note.get("down_s", 0.0),
+            f"{note['first']:.0f}" if note.get("first") else "-",
+            f"{note['last_success']:.0f}" if note.get("last_success") else "-",
+            os.getpid(),
+            error,
+        )
+        return
+    log.error(
+        "telegram_error update=%s error=%s",
+        getattr(update, "update_id", None),
+        error,
+        exc_info=error if isinstance(error, BaseException) else None,
+    )
+
+
+def build_application(
+    cfg: Config,
+    *,
+    request=None,
+    get_updates_request: PollWatch | None = None,
+) -> Application:
+    """Build the bot — and, with it, the two instruments Task 2 owes.
+
+    ``get_updates_request`` is a :class:`~telegram_gateway.pollwatch.PollWatch`
+    wrapping the request PTB uses for ``getUpdates`` ONLY, so the conflict
+    WARN/recovery pair is measured from the real poll statuses; the seams
+    (``request``, ``get_updates_request``) exist so tests can point both at
+    ``httpx.MockTransport`` without a socket.
+    """
+    watch = get_updates_request or default_watch()
+    builder = Application.builder().token(cfg.bot_token).get_updates_request(watch)
+    if request is not None:
+        builder = builder.request(request)
+    app = builder.build()
+    app.add_error_handler(on_poll_error)
+    app.bot_data["poll_watch"] = watch
     app.bot_data["cfg"] = cfg
     app.bot_data["guard"] = Guard(frozenset(cfg.allowed_user_ids), log)
     app.bot_data["client"] = AmuxClient(cfg.amux_url, verify=cfg.amux_verify)
