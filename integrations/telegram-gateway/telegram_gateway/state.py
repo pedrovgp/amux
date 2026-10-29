@@ -14,6 +14,10 @@ import time
 from pathlib import Path
 
 MAX_RELAYED_PER_CHAT = 10
+# The API path's dedupe is keyed by OpenCode's own message id (one entry per
+# relayed session) — bounded separately and generously: evicting one would
+# reset that session's bootstrap and risk re-sending its last answer.
+MAX_OC_RELAYED_PER_CHAT = 100
 MAX_MSG_SESSIONS = 300
 MAX_TOPICS_PER_CHAT = 200
 # Activity stamps, pins and idle markers are keyed by session name: bounded the
@@ -139,6 +143,31 @@ class GatewayState:
             for old in list(relayed)[: len(relayed) - MAX_RELAYED_PER_CHAT]:
                 relayed.pop(old, None)
         chat["last_relayed"] = relayed
+        self._save()
+
+    def oc_relayed_id(self, chat_id: int, session: str) -> str | None:
+        """The OpenCode message id the API path has already relayed.
+
+        The pane scrape keyed dedupe on TEXT (``last_relayed``); the API path
+        keys it on the message id, which cannot drift when an answer grows or
+        is re-rendered. ``None`` means "never relayed through the API" — the
+        relay then bootstraps (see ``relay.plan_opencode_relay``).
+        """
+        relayed = self._chat(chat_id).get("oc_relayed")
+        if isinstance(relayed, dict):
+            value = relayed.get(session)
+            return value if isinstance(value, str) and value else None
+        return None
+
+    def set_oc_relayed_id(self, chat_id: int, session: str, message_id: str) -> None:
+        chat = self._chat(chat_id)
+        relayed = chat.get("oc_relayed")
+        if not isinstance(relayed, dict):
+            relayed = {}
+        relayed[session] = str(message_id)
+        while len(relayed) > MAX_OC_RELAYED_PER_CHAT:
+            relayed.pop(next(iter(relayed)))
+        chat["oc_relayed"] = relayed
         self._save()
 
     # ---- message -> session map (the thread rule) -----------------------
@@ -365,7 +394,14 @@ class GatewayState:
         if chat.get("session") == old:
             chat["session"] = new
             changed = True
-        for key in ("pinned", "activity", "idle_stopped", "turn_msg", "last_relayed"):
+        for key in (
+            "pinned",
+            "activity",
+            "idle_stopped",
+            "turn_msg",
+            "last_relayed",
+            "oc_relayed",
+        ):
             mapping = chat.get(key)
             if isinstance(mapping, dict) and old in mapping:
                 mapping[new] = mapping.pop(old)

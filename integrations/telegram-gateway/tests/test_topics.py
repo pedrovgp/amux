@@ -481,7 +481,14 @@ def make_relay_app(state, bot):
         )
 
     client = AmuxClient("https://localhost:8824", transport=httpx.MockTransport(handler))
-    app = SimpleNamespace(bot=bot, bot_data={"cfg": None, "client": client, "state": state})
+    app = SimpleNamespace(
+        bot=bot,
+        bot_data={
+            "cfg": Config(bot_token="1:test-token", allowed_user_ids=frozenset({1})),
+            "client": client,
+            "state": state,
+        },
+    )
     return app, client
 
 

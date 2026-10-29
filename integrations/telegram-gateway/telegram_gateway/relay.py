@@ -11,6 +11,7 @@ after it is the session's answer to the prompt that carried the marker.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 MARKER = "[from Telegram @"
@@ -131,3 +132,100 @@ def delta_since(last: str | None, text: str) -> str:
     if last and text.startswith(last):
         return text[len(last):].lstrip("\n")
     return text
+
+
+# ---------------------------------------------------------------------------
+# the OpenCode API path: which messages of a session still owe a send
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RelayPlan:
+    """What one API read of a session still owes the chat.
+
+    ``items`` are ``(open_code_message_id, text)`` pairs, OLDEST FIRST: the
+    relay sends them in order and records the last id it managed to send, so a
+    failure in the middle retries the rest on the next cycle instead of
+    skipping it. ``adopt_id`` is the id to record WITHOUT sending (the
+    bootstrap case). ``reason`` says why nothing is in ``items`` — a sweep
+    should be able to read the silence.
+    """
+
+    items: list[tuple[str, str]] = field(default_factory=list)
+    adopt_id: str | None = None
+    reason: str | None = None
+
+
+def _assistant_text(message: dict) -> str | None:
+    """The text of a COMPLETED assistant message, or ``None``.
+
+    ``reasoning`` parts are dropped (the owner never sees them in Telegram
+    either — they are not the answer), text parts are joined, and a message
+    still streaming (no ``time.completed``) is not relayed: half an answer is
+    worse than one answer a cycle later.
+    """
+    if str(message.get("type") or "") != "assistant":
+        return None
+    if not isinstance(message.get("time"), dict) or not message["time"].get("completed"):
+        return None
+    parts = message.get("content")
+    if not isinstance(parts, list):
+        return None
+    text = "\n".join(
+        str(part.get("text") or "")
+        for part in parts
+        if isinstance(part, dict) and str(part.get("type") or "") == "text"
+    ).strip()
+    return text or None
+
+
+def plan_opencode_relay(
+    messages: list[dict],
+    *,
+    since_id: str | None = None,
+    pane_text: str | None = None,
+) -> RelayPlan:
+    """Decide what a newest-first OpenCode message page still owes the chat.
+
+    - **``since_id`` given** (the normal case): every COMPLETED assistant
+      message NEWER than it, oldest first — the message id is the dedupe now,
+      not pane text, so a growing answer cannot be mistaken for a repeat. The
+      id missing from the window means "I cannot tell what is new", and a
+      flood is worse than a stall: nothing is sent and ``reason`` says why.
+    - **``since_id`` None** (first API read for this session): bootstrap. The
+      newest completed answer is sent UNLESS the pane already relayed it (its
+      text is contained in the answer) — that is the switch-over case, where
+      the pane's last block IS this answer. Older history is baselined
+      (``adopt_id``), never dumped into the chat.
+    """
+    if not messages:
+        return RelayPlan(reason="no_messages")
+    if since_id:
+        index = next(
+            (i for i, m in enumerate(messages) if str(m.get("id") or "") == since_id),
+            None,
+        )
+        if index is None:
+            return RelayPlan(reason="since_id_not_in_window")
+        newer = messages[:index]
+        items = []
+        for message in newer:
+            text = _assistant_text(message)
+            if text:
+                items.append((str(message.get("id")), text))
+        items.reverse()  # newest-first page -> send order
+        return RelayPlan(items=items)
+    newest = None
+    for message in messages:
+        text = _assistant_text(message)
+        if text:
+            newest = (str(message.get("id")), text)
+            break
+    if newest is None:
+        return RelayPlan(reason="no_completed_answer")
+    pane = (pane_text or "").strip()
+    if pane and pane in newest[1]:
+        # The pane already delivered this answer: adopt its id so the next
+        # cycle only looks for something NEWER, and send nothing.
+        return RelayPlan(adopt_id=newest[0], reason="already_relayed_by_pane")
+    return RelayPlan(items=[newest])

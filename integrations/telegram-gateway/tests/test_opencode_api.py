@@ -34,8 +34,11 @@ from telegram_gateway.opencode_api import (
     OcServer,
     OpencodeClient,
     client_for,
+    client_for_service,
     discover_servers,
     find_server,
+    service_endpoint,
+    service_password,
 )
 
 from test_session_control import (
@@ -829,3 +832,154 @@ def test_an_unpinned_opencode_lane_keeps_todays_refusal(tmp_path):
         run(amux.aclose())
     assert oc.calls == []
     assert "no effort switch" in texts(update)[-1]
+
+
+# ---- Task 1 (owner, 2026-10-28): the SHARED service the relay reads from ---
+
+
+def write_service_json(tmp_path, text, name="service.json") -> Path:
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_service_password_prefers_the_explicit_value_and_reads_the_file(tmp_path):
+    file_pw = write_service_json(tmp_path, '{"password": "  file-pw  "}')
+    assert service_password(path=file_pw) == "file-pw"
+    assert service_password(password=" env-pw ", path=file_pw) == "env-pw"  # env wins
+    assert service_password(password="", path=file_pw) == "file-pw"  # empty falls through
+    assert service_password(path=tmp_path / "absent.json") is None
+    assert service_password(path=write_service_json(tmp_path, "{ not json", "bad.json")) is None
+    assert service_password(path=write_service_json(tmp_path, "{}", "empty.json")) is None
+    assert service_password(
+        path=write_service_json(tmp_path, '{"password": ""}', "blank.json")
+    ) is None
+
+
+def test_service_endpoint_prefers_the_env_url_and_never_scans(tmp_path):
+    """`AMUX_OPENCODE_SERVICE_URL` set → that URL, no `ss`, no /proc."""
+    file_pw = write_service_json(tmp_path, '{"password": "file-pw"}')
+    base, pw = service_endpoint(
+        url="http://127.0.0.1:49374/",
+        service_json=file_pw,
+        proc_root=str(tmp_path / "no-such-proc"),
+        ss_output="",  # would be parsed only if the URL branch did not win
+    )
+    assert base == "http://127.0.0.1:49374"
+    assert pw == "file-pw"
+
+
+def test_service_endpoint_finds_the_shared_service_and_skips_lane_children(tmp_path):
+    """Discovery picks `opencode serve --service`, never a lane's own child.
+
+    Measured shape (2026-10-28): pid 2605614 `opencode serve --service` on
+    127.0.0.1:49374, with five `serve --stdio --port 0` children listening
+    beside it — those belong to individual lanes and are NOT the relay's
+    source, so the `--service` argv is the discriminator.
+    """
+    root = tmp_path / "proc"
+    write_proc(
+        root, 100,
+        cmdline=b"/usr/bin/opencode\x00serve\x00--stdio\x00--port\x000",
+        environ=b"OPENCODE_PASSWORD=lane-pw\x00AMUX_SESSION=mgr-a\x00",
+    )
+    write_proc(root, 260, cmdline=b"/usr/bin/opencode\x00serve\x00--service")
+    ss = "\n".join(
+        [
+            'LISTEN 0 512 127.0.0.1:46373 0.0.0.0:* users:(("opencode",pid=100,fd=8))',
+            'LISTEN 0 512 127.0.0.1:49374 0.0.0.0:* users:(("opencode",pid=260,fd=10))',
+        ]
+    )
+    base, pw = service_endpoint(
+        service_json=write_service_json(tmp_path, '{"password": "shared-pw"}'),
+        proc_root=str(root),
+        ss_output=ss,
+    )
+    assert base == "http://127.0.0.1:49374"  # the --service, not the lane child
+    assert pw == "shared-pw"
+
+
+def test_service_endpoint_reports_what_is_actually_missing(tmp_path):
+    """No password and no service are DIFFERENT failures — never conflated."""
+    with pytest.raises(OcError, match="no password"):
+        service_endpoint(
+            url="http://127.0.0.1:1", service_json=tmp_path / "absent.json"
+        )
+    with pytest.raises(OcError, match="serve --service"):
+        service_endpoint(
+            service_json=write_service_json(tmp_path, '{"password": "pw"}'),
+            proc_root=str(tmp_path / "empty-proc"),
+            ss_output="",
+        )
+
+
+def test_client_for_service_builds_a_client_from_url_and_password():
+    paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"data": [], "cursor": {}})
+
+    client = run(
+        client_for_service(
+            url="http://127.0.0.1:46373",
+            password="pw",
+            transport=httpx.MockTransport(handler),
+        )
+    )
+    try:
+        assert run(client.messages(PIN)) == []
+    finally:
+        run(client.aclose())
+    assert paths == [f"/api/session/{PIN}/message"]
+
+
+def test_messages_are_newest_first_and_page_back_until_the_relayed_id():
+    def row(msg_id):
+        return {"id": msg_id, "type": "assistant", "time": {"completed": 3}}
+
+    pages = {
+        "0": [row("msg_3"), row("msg_2")],
+        "2": [row("msg_1"), row("msg_0")],
+    }
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor") or "0"
+        seen.append(
+            {"limit": request.url.params.get("limit"), "cursor": cursor}
+        )
+        nxt = {"next": "2"} if cursor == "0" else {}
+        return httpx.Response(200, json={"data": pages[cursor], "cursor": nxt})
+
+    client = OpencodeClient(
+        "http://127.0.0.1:46373", "pw", transport=httpx.MockTransport(handler)
+    )
+    try:
+        out = run(client.messages(PIN, since_id="msg_1", page_limit=2))
+        assert [m["id"] for m in out] == ["msg_3", "msg_2", "msg_1", "msg_0"]
+        assert seen == [
+            {"limit": "2", "cursor": "0"},
+            {"limit": "2", "cursor": "2"},  # cursor.next walked OLDER
+        ]
+        # …and a relayed id already on page one costs exactly ONE request.
+        seen.clear()
+        run(client.messages(PIN, since_id="msg_3", page_limit=2))
+        assert len(seen) == 1
+    finally:
+        run(client.aclose())
+
+
+def test_messages_raises_when_the_session_is_gone():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "session not found"})
+
+    client = OpencodeClient(
+        "http://127.0.0.1:46373", "pw", transport=httpx.MockTransport(handler)
+    )
+    try:
+        with pytest.raises(OcError) as excinfo:
+            run(client.messages(PIN))
+    finally:
+        run(client.aclose())
+    assert excinfo.value.status == 404  # the relay reads this as "fall back to pane"

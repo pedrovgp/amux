@@ -43,7 +43,13 @@ from .menu import (
     status_keyboard,
     stop_confirm,
 )
-from .relay import chunk_text, delta_since, extract_reply, strip_ansi
+from .relay import (
+    chunk_text,
+    delta_since,
+    extract_reply,
+    plan_opencode_relay,
+    strip_ansi,
+)
 from .state import GatewayState
 from .topic_titles import clean_title, read_titles
 from .voice import groq_transcriber, transcribe_voice
@@ -2449,14 +2455,191 @@ async def receive_prompt_voice(update: Update, context: ContextTypes.DEFAULT_TYP
 # Sessions whose pane currently offers NO answer boundary. One WARN per
 # stretch (reset by a successful extract): a miss repeats every relay cycle,
 # and this exact silence hid the 2026-10-27 missing answers — the relay
-# skipped every reply for hours without leaving a single line to sweep.
+# skipped every reply for hours without leaving a single line to sweep. Every
+# REPEAT now also logs its cycle count (`relay_no_boundary cycles=N`), so a
+# miss that never ends reads as a growing number instead of one stale line.
 _no_boundary_warned: set[tuple[int, str]] = set()
+_no_boundary_cycles: dict[tuple[int, str], int] = {}
+
+# The API path's own one-WARN-per-stretch bookkeeping: `relay_source=api`
+# while the OpenCode service answers, `relay_api_unavailable` when it does not
+# (and the pane scrape takes over). Once per stretch each — the relay ticks
+# every 20s, so per-cycle logging would bury everything else in the file.
+_api_source: set[tuple[int, str]] = set()
+_api_unavailable: set[tuple[int, str]] = set()
+# `since_id` fell outside the fetched window: nothing is sent on purpose (a
+# flood is worse than a stall), and this says so instead of looking like a
+# quiet, healthy relay.
+_api_window_missed: set[tuple[int, str]] = set()
+
+
+def _relay_pin(state: GatewayState, chat_id: int, session: str) -> str | None:
+    """The OpenCode conversation id to read for this session, else ``None``.
+
+    Only a PINNED opencode manager has one — the ``--session ses_…`` minted at
+    create, which is both the lane's resume key and the API's session id — so
+    legacy managers and every non-opencode provider keep the pane scrape
+    untouched (owner, 2026-10-28: "Legacy or unpinned opencode lanes, and any
+    non-opencode provider … keep the pane path unchanged"). The topic's pin is
+    the fallback for a session whose name no longer matches its map entry.
+    """
+    pin = state.pinned(chat_id, session)
+    if pin:
+        return pin
+    thread = state.session_topic(chat_id, session)
+    if thread is not None:
+        return state.topic_pin(chat_id, thread)
+    return None
+
+
+def _note_api_source(chat_id: int, session: str, pin: str) -> None:
+    """The OpenCode service delivered: log it once, close any pane miss."""
+    key = (chat_id, session)
+    if key not in _api_source:
+        _api_source.add(key)
+        log.info(
+            "relay_source chat_id=%s session=%s source=api pin=%s",
+            chat_id,
+            session,
+            pin,
+        )
+    _api_unavailable.discard(key)
+    if key in _no_boundary_warned:
+        # Delivery resumed through the API: the pane's miss stretch is over.
+        _no_boundary_warned.discard(key)
+        log.info(
+            "relay_boundary_recovered chat_id=%s session=%s cycles=%s source=api",
+            chat_id,
+            session,
+            _no_boundary_cycles.pop(key, 0),
+        )
+
+
+def _note_api_unavailable(chat_id: int, session: str, exc) -> None:
+    """Failure is a FALLBACK, not silence: the pane path runs right after this."""
+    key = (chat_id, session)
+    _api_source.discard(key)
+    if key in _api_unavailable:
+        return
+    _api_unavailable.add(key)
+    status = getattr(exc, "status", 0)
+    detail = getattr(exc, "detail", None) or str(exc)
+    log.warning(
+        "relay_api_unavailable chat_id=%s session=%s error=%s fallback=pane",
+        chat_id,
+        session,
+        f"HTTP {status}: {detail}" if status else detail,
+    )
+
+
+def _note_api_window(chat_id: int, session: str, since_id: str, fetched: int) -> None:
+    key = (chat_id, session)
+    if key in _api_window_missed:
+        return
+    _api_window_missed.add(key)
+    log.warning(
+        "relay_api_window_missed chat_id=%s session=%s since=%s fetched=%s "
+        "hint=the relayed message id is not in the fetched history — nothing "
+        "sent on purpose; reset the session's relay state to re-bootstrap",
+        chat_id,
+        session,
+        since_id,
+        fetched,
+    )
+
+
+async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
+    """Relay an answer from the OpenCode service; ``False`` = use the pane.
+
+    This is Task 1's replacement channel (owner, 2026-10-28): the service
+    returns the conversation as JSON — no viewport, no ANSI, no chrome, no
+    sentinel scrolling out of a 50-row pane — so a 1,994-char answer arrives
+    whole. EVERY failure (no service, auth, 404, timeout, unreachable) returns
+    ``False`` after one WARN, and the caller then runs today's pane scrape:
+    failure must never become silence.
+    """
+    try:
+        client = await oc.client_for_service(
+            url=cfg.opencode_service_url,
+            password=cfg.opencode_service_password,
+            service_json=cfg.opencode_service_json,
+        )
+    except AmuxError as exc:
+        _note_api_unavailable(chat_id, session, exc)
+        return False
+    since = state.oc_relayed_id(chat_id, session)
+    try:
+        messages = await client.messages(pin, since_id=since)
+    except AmuxError as exc:
+        _note_api_unavailable(chat_id, session, exc)
+        return False
+    finally:
+        close = getattr(client, "aclose", None)
+        if close is not None:
+            await close()
+    _note_api_source(chat_id, session, pin)
+    plan = plan_opencode_relay(
+        messages, since_id=since, pane_text=state.last_relayed(chat_id, session)
+    )
+    # Same anchor rule as the pane path: INTO the topic, and only a reply to
+    # an anchor that lives in that very topic (never across threads).
+    thread_id = state.session_topic(chat_id, session)
+    reply_to = state.turn_message(chat_id, session)
+    if thread_id is not None and state.turn_thread(chat_id, session) != thread_id:
+        reply_to = None
+    stored = since
+    for message_id, text in plan.items:
+        try:
+            sent = await _send_markdown(
+                app.bot, chat_id, text, reply_to=reply_to, thread_id=thread_id
+            )
+        except TelegramError as exc:
+            log.warning(
+                "relay_send_failed chat_id=%s session=%s error=%s", chat_id, session, exc
+            )
+            # `stored` stops at the last message that DID go out, so the rest
+            # is retried on the next cycle instead of skipped forever.
+            break
+        for message in sent:
+            _track(state, chat_id, session, message)
+        stored = message_id
+        state.touch_activity(chat_id, session, "output")
+        log.info(
+            "relay_sent chat_id=%s session=%s chars=%s total=%s reply_to=%s "
+            "thread=%s source=api",
+            chat_id,
+            session,
+            len(text),
+            len(text),
+            reply_to,
+            thread_id,
+        )
+    if plan.reason == "since_id_not_in_window":
+        _note_api_window(chat_id, session, since or "-", len(messages))
+    else:
+        # Progress (or a healthy read): the window stretch is over.
+        _api_window_missed.discard((chat_id, session))
+    if stored != since:
+        if stored:
+            state.set_oc_relayed_id(chat_id, session, stored)
+        if plan.adopt_id and not plan.items:
+            log.info(
+                "relay_api_baseline chat_id=%s session=%s msg_id=%s reason=%s",
+                chat_id,
+                session,
+                plan.adopt_id,
+                plan.reason,
+            )
+    return True
 
 
 async def relay_once(app: Application) -> None:
     cfg: Config = app.bot_data["cfg"]
     client: AmuxClient = app.bot_data["client"]
     state: GatewayState = app.bot_data["state"]
+    # Same injection rule as the panel's `_oc_api`: tests hand in a fake, the
+    # production bot runs the real module (no test may run `ss` or read /proc).
+    oc = app.bot_data.get("oc_api") or opencode_api
     for chat_id, sessions in state.sessions_to_relay().items():
         for session in sessions:
             if state.idle_stopped(chat_id, session) is not None:
@@ -2464,26 +2647,49 @@ async def relay_once(app: Application) -> None:
                 # nothing to peek and no answer to relay. The marker is cleared
                 # by the next prompt (which starts the lane again).
                 continue
+            pin = _relay_pin(state, chat_id, session)
+            if pin and await _relay_api(app, oc, cfg, state, chat_id, session, pin):
+                continue  # the service answered; the pane stays out of this cycle
             try:
-                raw = await client.peek(session, lines=300)
+                raw = await client.peek(session, lines=cfg.peek_lines)
             except AmuxError as exc:
                 log.debug("relay_peek_failed chat_id=%s session=%s error=%s", chat_id, session, exc)
                 continue
             text = extract_reply(raw)
+            key = (chat_id, session)
             if not text:
-                if (chat_id, session) not in _no_boundary_warned:
-                    _no_boundary_warned.add((chat_id, session))
-                    log.warning(
-                        "relay_no_boundary chat_id=%s session=%s pane_chars=%s "
-                        "hint=no '—— answer ——' sentinel in the reply and the "
-                        "[from Telegram @…] prompt marker scrolled out of the "
-                        "viewport — nothing can be delivered until one is visible",
-                        chat_id,
-                        session,
-                        len(raw),
-                    )
+                cycles = _no_boundary_cycles.get(key, 0) + 1
+                _no_boundary_cycles[key] = cycles
+                _no_boundary_warned.add(key)
+                # Every repeat is logged with its cycle count (owner,
+                # 2026-10-28): a miss that never ends must read as a GROWING
+                # number a sweep can catch, not as one stale line.
+                log.warning(
+                    "relay_no_boundary cycles=%s chat_id=%s session=%s "
+                    "pane_chars=%s peek_lines=%s hint=no '—— answer ——' sentinel "
+                    "in the reply and the [from Telegram @…] prompt marker "
+                    "scrolled out of the viewport — nothing can be delivered "
+                    "until one is visible",
+                    cycles,
+                    chat_id,
+                    session,
+                    len(raw),
+                    cfg.peek_lines,
+                )
                 continue
-            _no_boundary_warned.discard((chat_id, session))
+            if key in _no_boundary_warned:
+                # The boundary is back after a miss: say so, with how many
+                # cycles the silence lasted, so the log shows it ENDED.
+                _no_boundary_warned.discard(key)
+                log.info(
+                    "relay_boundary_recovered chat_id=%s session=%s cycles=%s "
+                    "source=pane",
+                    chat_id,
+                    session,
+                    _no_boundary_cycles.pop(key, 0),
+                )
+            else:
+                _no_boundary_cycles.pop(key, None)
             last = state.last_relayed(chat_id, session)
             if text == last:
                 continue

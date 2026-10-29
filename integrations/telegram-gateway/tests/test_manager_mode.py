@@ -275,7 +275,11 @@ def test_relay_replies_to_the_turn_message_and_records_its_own(tmp_path):
     bot = FakeBot()
     app = SimpleNamespace(
         bot=bot,
-        bot_data={"cfg": None, "client": client, "state": state},
+        bot_data={
+            "cfg": Config(bot_token="1:t", allowed_user_ids=frozenset({1})),
+            "client": client,
+            "state": state,
+        },
     )
     try:
         run(botmod.relay_once(app))
@@ -302,7 +306,14 @@ def test_relay_does_not_repeat_an_unchanged_answer(tmp_path):
 
     client = make_client(handler)
     bot = FakeBot()
-    app = SimpleNamespace(bot=bot, bot_data={"cfg": None, "client": client, "state": state})
+    app = SimpleNamespace(
+        bot=bot,
+        bot_data={
+            "cfg": Config(bot_token="1:t", allowed_user_ids=frozenset({1})),
+            "client": client,
+            "state": state,
+        },
+    )
     try:
         run(botmod.relay_once(app))
         run(botmod.relay_once(app))  # same pane: nothing new to say
@@ -311,43 +322,66 @@ def test_relay_does_not_repeat_an_unchanged_answer(tmp_path):
     assert len(bot.sent) == 1
 
 
-def test_relay_warns_once_when_the_pane_has_no_boundary(tmp_path, caplog):
+def test_relay_counts_every_no_boundary_miss_and_logs_the_recovery(
+    tmp_path, caplog
+):
     """A missing boundary used to be a *silent* `continue` — no log line at
     all. That silence hid the 2026-10-27 missing answers for hours: the agent
     never stamped `—— answer ——`, the prompt marker had scrolled out of the
-    viewport, and the relay kept quietly skipping every cycle. Now it warns
-    once per stretch (reset by a successful extract), so a sweep sees
-    `relay_no_boundary` instead of a healthy-looking quiet log.
+    viewport, and the relay kept quietly skipping every cycle.
+
+    The first miss still carries the full hint, but EVERY repeat now logs its
+    cycle count too (owner, 2026-10-28: "log `relay_no_boundary cycles=N` when a
+    miss repeats") — a permanent miss must read as a growing number a sweep can
+    catch — and a boundary found again closes the stretch with
+    `relay_boundary_recovered cycles=N`, so the log shows the silence ENDED.
     """
     state = GatewayState(tmp_path / "state.json")
     state.set_turn_message(9, "mgr-abc", 55)
+
+    panes = iter(
+        [
+            "⠋ telegram topics for mana…\n",  # no boundary
+            "⠋ telegram topics for mana…\n",  # still none
+            "—— answer ——\nthe answer\n",     # back
+        ]
+    )
 
     def handler(request):
         if request.url.path == "/api/sessions":
             return httpx.Response(
                 200, json=[{"name": "mgr-abc", "activity": "none", "status": "idle"}]
             )
-        # pane output with neither the prompt marker nor the sentinel
-        return httpx.Response(200, json={"output": "⠋ telegram topics for mana…\n"})
+        return httpx.Response(200, json={"output": next(panes)})
 
     client = make_client(handler)
     bot = FakeBot()
     app = SimpleNamespace(
-        bot=bot, bot_data={"cfg": None, "client": client, "state": state}
+        bot=bot,
+        bot_data={
+            "cfg": Config(bot_token="1:t", allowed_user_ids=frozenset({1})),
+            "client": client,
+            "state": state,
+        },
     )
     botmod._no_boundary_warned.clear()
+    botmod._no_boundary_cycles.clear()
     try:
-        with caplog.at_level(logging.WARNING, logger="telegram_gateway"):
-            run(botmod.relay_once(app))  # first miss: warns
-            run(botmod.relay_once(app))  # still missing: stays quiet
+        with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+            run(botmod.relay_once(app))  # first miss
+            run(botmod.relay_once(app))  # repeat: logged with its count
+            run(botmod.relay_once(app))  # boundary back: recovery + delivery
     finally:
         run(client.aclose())
         botmod._no_boundary_warned.clear()
+        botmod._no_boundary_cycles.clear()
 
-    warns = [
-        r
-        for r in caplog.records
-        if r.name == "telegram_gateway" and "relay_no_boundary" in r.getMessage()
+    messages = [r.getMessage() for r in caplog.records if r.name == "telegram_gateway"]
+    misses = [m for m in messages if "relay_no_boundary" in m]
+    assert [m.split()[1] for m in misses] == ["cycles=1", "cycles=2"], misses
+    assert "hint=" in misses[0]  # the full diagnosis rides the FIRST miss
+    recovered = [m for m in messages if "relay_boundary_recovered" in m]
+    assert len(recovered) == 1 and "cycles=2" in recovered[0], recovered
+    assert bot.sent == [
+        {"chat_id": 9, "text": "the answer", "reply_to": 55, "thread": None}
     ]
-    assert len(warns) == 1, f"expected exactly one WARN, got {len(warns)}"
-    assert bot.sent == []  # and nothing was delivered, honestly

@@ -27,7 +27,20 @@ Optional
                             own default is ``herdr``, which needs AMUX_HERDR_SESSION)
 ``TELEGRAM_GATEWAY_STATE_DIR`` default ``~/.amux/telegram-gateway``
 ``TELEGRAM_GATEWAY_RELAY_INTERVAL_S`` default ``20``
+``TELEGRAM_GATEWAY_PEEK_LINES`` default ``2000`` — how far back the reply relay
+    peeks a pane when it must fall back to the scrape. A pane viewport is ~50
+    rows and opencode's history buffer is 2000 lines, so 300 lines lost long
+    answers the moment the ``—— answer ——`` sentinel scrolled out of the
+    window (the 2026-10-28 silence); the default now reaches the whole buffer.
 ``TELEGRAM_GATEWAY_LOG_LEVEL`` default ``INFO``
+``AMUX_OPENCODE_SERVICE_URL``   the shared ``opencode serve --service`` base
+    URL. Unset (the default) → the relay discovers the listening socket of a
+    process running ``opencode serve --service`` each time it needs one, and
+    falls back to the pane when there is none. Never a hardcoded port: that
+    service is a child of a TUI and can die with it.
+``AMUX_OPENCODE_SERVICE_PASSWORD`` overrides ``~/.config/opencode/service.json``
+    (``password`` field) for that same service — the amux serve client's own
+    contract (``crates/amux-server/src/opencode/serve.rs``).
 ``TELEGRAM_GATEWAY_CONTROL_PORT`` default ``8834`` — the gateway's own
     localhost control endpoint (``POST /topic``), the one path managers may use
     to open a topic; ``0`` disables it
@@ -64,6 +77,13 @@ DEFAULT_CONTROL_PORT = 8834
 DEFAULT_IDLE_STOP_S = 1800.0
 # Owner, 2026-10-27: "meaningful names for topics". 0 disables the sync.
 DEFAULT_TOPIC_SYNC_S = 60.0
+# Relay fallback peek depth (owner, 2026-10-28, "peek substantially further
+# back … default well above 300"): tmux's own history limit is 2000 lines, so
+# this reaches the entire buffer a long answer can still be hiding in.
+DEFAULT_PEEK_LINES = 2000
+MIN_PEEK_LINES = 50
+# The shared opencode service's password file (amux's serve client contract).
+DEFAULT_SERVICE_JSON = "~/.config/opencode/service.json"
 
 
 class ConfigError(RuntimeError):
@@ -90,6 +110,14 @@ class Config:
     groq_model: str = DEFAULT_GROQ_MODEL
     state_dir: Path = field(default_factory=lambda: Path(DEFAULT_STATE_DIR).expanduser())
     relay_interval_s: float = 20.0
+    # Pane depth for the relay's fallback scrape (see module docstring).
+    peek_lines: int = DEFAULT_PEEK_LINES
+    # The shared `opencode serve --service` the relay reads answers from.
+    opencode_service_url: str | None = None
+    opencode_service_password: str | None = None
+    opencode_service_json: Path = field(
+        default_factory=lambda: Path(DEFAULT_SERVICE_JSON).expanduser()
+    )
     log_level: str = "INFO"
     # Gateway-owned control endpoint (127.0.0.1 only); 0 disables it.
     control_port: int = DEFAULT_CONTROL_PORT
@@ -230,6 +258,22 @@ def load_config(
         problems.append("TELEGRAM_GATEWAY_RELAY_INTERVAL_S is not a number; using 20")
     relay_interval = max(5.0, relay_interval)
 
+    try:
+        peek_lines = int(
+            (env.get("TELEGRAM_GATEWAY_PEEK_LINES") or "").strip() or DEFAULT_PEEK_LINES
+        )
+    except ValueError:
+        peek_lines = DEFAULT_PEEK_LINES
+        problems.append(
+            f"TELEGRAM_GATEWAY_PEEK_LINES is not a number; using {DEFAULT_PEEK_LINES}"
+        )
+    if peek_lines < MIN_PEEK_LINES:
+        problems.append(
+            f"TELEGRAM_GATEWAY_PEEK_LINES must be at least {MIN_PEEK_LINES}; "
+            f"using {DEFAULT_PEEK_LINES}"
+        )
+        peek_lines = DEFAULT_PEEK_LINES
+
     state_dir = Path(
         (env.get("TELEGRAM_GATEWAY_STATE_DIR") or "").strip() or DEFAULT_STATE_DIR
     ).expanduser()
@@ -290,6 +334,11 @@ def load_config(
         groq_model=(env.get("GROQ_TRANSCRIBE_MODEL") or "").strip() or DEFAULT_GROQ_MODEL,
         state_dir=state_dir,
         relay_interval_s=relay_interval,
+        peek_lines=peek_lines,
+        opencode_service_url=(env.get("AMUX_OPENCODE_SERVICE_URL") or "").strip() or None,
+        opencode_service_password=(env.get("AMUX_OPENCODE_SERVICE_PASSWORD") or "").strip()
+        or None,
+        opencode_service_json=Path(DEFAULT_SERVICE_JSON).expanduser(),
         log_level=(env.get("TELEGRAM_GATEWAY_LOG_LEVEL") or "INFO").strip().upper(),
         control_port=control_port,
         idle_stop_s=idle_stop_s,

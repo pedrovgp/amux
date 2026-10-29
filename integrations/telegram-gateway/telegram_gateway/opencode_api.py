@@ -1,4 +1,15 @@
-"""OpenCode's own HTTP API: model, effort and interrupt for opencode lanes.
+"""OpenCode's own HTTP API: model, effort, interrupt — and message history.
+
+Two different servers live here, both on random localhost ports:
+
+* a lane's own ``opencode serve --stdio --port 0`` child (model, effort,
+  interrupt — Milestone 9), found through its pin;
+* the shared ``opencode serve --service`` (Task 1, owner 2026-10-28), which
+  answers ``GET /api/session/<id>/message`` for ANY conversation and is what
+  the reply relay reads answers from — see :func:`service_endpoint` and
+  :meth:`OpencodeClient.messages`.
+
+Milestone 9's story:
 
 amux can PATCH a lane's config and press Escape in its pane (Milestone 8), but
 both are indirect: a model change restarts the lane, and opencode has no
@@ -37,11 +48,13 @@ logs one WARN per (event, target) stretch: a dead serve must be sweepable
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
@@ -53,6 +66,13 @@ log = logging.getLogger("telegram_gateway")
 OC_USER = "opencode"
 DEFAULT_TIMEOUT_S = 10.0
 SS_TIMEOUT_S = 5.0
+# The shared `opencode serve --service` password file (amux's serve client
+# contract: crates/amux-server/src/opencode/serve.rs, password_from_service_json).
+DEFAULT_SERVICE_JSON = "~/.config/opencode/service.json"
+# One read of `/api/session/<id>/message`: newest-first, so a long answer needs
+# no viewport. Paging stops at `since_id`; the ceiling only guards a runaway.
+MESSAGE_PAGE_LIMIT = 100
+MESSAGE_MAX_PAGES = 10
 # The pin lives on the TUI (one level above the serve child); walk a little
 # further only to survive an extra wrapper, never into an unrelated process.
 MAX_ANCESTORS = 3
@@ -310,6 +330,119 @@ async def client_for(
 
 
 # ---------------------------------------------------------------------------
+# the SHARED `opencode serve --service` (the relay's answer source)
+# ---------------------------------------------------------------------------
+
+
+def service_password(
+    *, password: str | None = None, path: str | Path = DEFAULT_SERVICE_JSON
+) -> str | None:
+    """The shared service's Basic-auth password, or ``None``.
+
+    An explicit value (``AMUX_OPENCODE_SERVICE_PASSWORD``, which is what the
+    config carries) wins; else the ``password`` field of
+    ``~/.config/opencode/service.json`` — the same parse amux's own serve
+    client does (`password_from_service_json` in serve.rs). Pure: a missing or
+    malformed file is ``None``, never an exception.
+    """
+    if password and password.strip():
+        return password.strip()
+    try:
+        raw = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        value = json.loads(raw).get("password")
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def service_endpoint(
+    *,
+    url: str | None = None,
+    password: str | None = None,
+    service_json: str | Path = DEFAULT_SERVICE_JSON,
+    proc_root: str = "/proc",
+    ss_output: str | None = None,
+) -> tuple[str, str]:
+    """``(base_url, password)`` of the shared service, or :class:`OcError`.
+
+    Order (owner, 2026-10-28): ``AMUX_OPENCODE_SERVICE_URL`` if set → else the
+    listening socket of a process running ``opencode serve --service`` → else
+    a failure, which the relay turns into ``relay_api_unavailable`` and a pane
+    fallback. **The port is never hardcoded**: that service is a child of a
+    TUI (measured 2026-10-28: pid 2605614, 127.0.0.1:49374), it can die with
+    its parent, and the next one binds a new random port.
+
+    Deliberately silent on failure — the caller owns the one-WARN-per-stretch
+    log line, so a dead service cannot double-report.
+    """
+    pw = service_password(password=password, path=service_json)
+    if not pw:
+        raise OcError(
+            0,
+            "no password: AMUX_OPENCODE_SERVICE_PASSWORD unset and "
+            f"{service_json} has no password field",
+        )
+    if url:
+        return url.rstrip("/"), pw
+    if ss_output is None:
+        ss_output = _run_ss()
+    for port, pid in _ss_listeners(ss_output):
+        try:
+            argv = _argv(proc_root, pid)
+        except OSError:
+            continue
+        if "serve" not in argv or "--service" not in argv:
+            continue  # a lane's `serve --stdio --port 0` child is NOT the shared service
+        return f"http://127.0.0.1:{port}", pw
+    raise OcError(
+        0, "no `opencode serve --service` listening (set AMUX_OPENCODE_SERVICE_URL)"
+    )
+
+
+async def client_for_service(
+    *,
+    url: str | None = None,
+    password: str | None = None,
+    service_json: str | Path = DEFAULT_SERVICE_JSON,
+    proc_root: str = "/proc",
+    ss_output: str | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> "OpencodeClient":
+    """A client for the SHARED service, which holds every session's history.
+
+    Unlike :func:`client_for` (one lane's own ``serve --stdio`` child, found
+    through its pin) this addresses the one ``opencode serve --service`` that
+    answers ``/api/session/<id>/message`` for any conversation — the endpoint
+    the relay reads answers from. ``url``+``password`` short-circuit discovery
+    entirely (the offline rule: a test never runs ``ss`` or reads ``/proc``).
+    """
+    try:
+        if url and password:
+            base, pw = url.rstrip("/"), password.strip()
+        else:
+            base, pw = await asyncio.to_thread(
+                service_endpoint,
+                url=url,
+                password=password,
+                service_json=service_json,
+                proc_root=proc_root,
+                ss_output=ss_output,
+            )
+    except OcError:
+        raise
+    except Exception as exc:  # a discovery bug must surface as a fallback
+        raise OcError(0, f"discovery failed: {exc}") from exc
+    if not pw:
+        raise OcError(0, "no password for the opencode service")
+    return OpencodeClient(base, pw, transport=transport)
+
+
+# ---------------------------------------------------------------------------
 # the client
 # ---------------------------------------------------------------------------
 
@@ -360,9 +493,11 @@ class OpencodeClient:
 
     # ---- plumbing -------------------------------------------------------
 
-    async def _parsed(self, method: str, path: str, *, body: dict | None = None):
+    async def _parsed(
+        self, method: str, path: str, *, body: dict | None = None, params: dict | None = None
+    ):
         try:
-            response = await self._client.request(method, path, json=body)
+            response = await self._client.request(method, path, json=body, params=params)
         except httpx.HTTPError as exc:
             raise OcError(
                 0, f"opencode serve unreachable at {self.base_url}: {exc}"
@@ -378,8 +513,10 @@ class OpencodeClient:
             raise OcError(response.status_code, detail)
         return parsed
 
-    async def _json(self, method: str, path: str, *, body: dict | None = None) -> dict:
-        parsed = await self._parsed(method, path, body=body)
+    async def _json(
+        self, method: str, path: str, *, body: dict | None = None, params: dict | None = None
+    ) -> dict:
+        parsed = await self._parsed(method, path, body=body, params=params)
         if not isinstance(parsed, dict):
             raise OcError(0, f"expected a JSON object, got: {str(parsed)[:200]}")
         return parsed
@@ -476,3 +613,52 @@ class OpencodeClient:
             raise
         _ok(event, target)
         return parsed
+
+    async def messages(
+        self,
+        ses_id: str,
+        *,
+        since_id: str | None = None,
+        page_limit: int = MESSAGE_PAGE_LIMIT,
+        max_pages: int = MESSAGE_MAX_PAGES,
+    ) -> list[dict]:
+        """``GET /api/session/<id>/message`` — durable history, NEWEST FIRST.
+
+        This is the relay's answer source (Task 1, owner 2026-10-28): the
+        endpoint amux's own serve client reads turn outcomes from, returned
+        opaquely enough here that only ``type``/``time``/``content`` matter.
+        The page is ordered newest-first and ``cursor.next`` walks OLDER, so
+        paging stops as soon as ``since_id`` is in hand — the relay only ever
+        needs what is NEWER than what it already sent — or when the history
+        runs out / ``max_pages`` is reached. The result is flattened in API
+        order: index 0 is the newest message.
+        """
+        event, target = "oc_api_messages_failed", ses_id
+        out: list[dict] = []
+        cursor = ""
+        try:
+            for _ in range(max(1, max_pages)):
+                params: dict = {"limit": page_limit}
+                if cursor:
+                    params["cursor"] = cursor
+                parsed = await self._json(
+                    "GET", f"/api/session/{_key(ses_id)}/message", params=params
+                )
+                data = parsed.get("data")
+                if not isinstance(data, list):
+                    raise OcError(
+                        0, f"no message list for {ses_id}: {str(parsed)[:200]}"
+                    )
+                page = [item for item in data if isinstance(item, dict)]
+                out.extend(page)
+                if since_id and any(str(m.get("id") or "") == since_id for m in page):
+                    break  # everything newer than the relayed id is in hand
+                nxt = parsed.get("cursor")
+                cursor = str(nxt.get("next") or "") if isinstance(nxt, dict) else ""
+                if not cursor:
+                    break
+        except AmuxError as exc:
+            _warn(event, target, exc)
+            raise
+        _ok(event, target)
+        return out
