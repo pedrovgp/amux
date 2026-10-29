@@ -6142,3 +6142,29 @@ FIX: (1) the relay must look further back than the viewport for the sentinel —
   sender cannot see is the shape this file keeps collecting; (3) manager
   guidance stays "keep answers phone-short", but the harness must not lose an
   answer that already exists.
+
+## Manager lanes are groupless, so the delegation their own prompt commands is refused
+AREA: boundaries
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-10-27
+SESSION: mgr-1027-1028-6f19
+CARD: none (board is off for this worker — board API refuses with board_off; an amux lane must file the card)
+SYMPTOM: The Telegram gateway's manager prompt tells every manager "amux send
+  <name> --stdin — task a lane". A manager (mgr-1027-1028-6f19) tried exactly
+  that to hand an owner-approved gateway fix to the lane that built the feature
+  (mgr-1027-0822-cba5) and got: "send to mgr-1027-0822-cba5 FAILED: worker
+  group boundary refused ... Worker messages must stay within a shared group.
+  Do not retry or reroute to another outside-group worker." Gateway-created
+  manager lanes get no tags (manager.py create_session posts name/dir/provider/
+  model only), so no manager is ever in a group and no manager can delegate to
+  any lane — the shipped prompt and the shipped boundary contradict.
+COST: ~10 min of the owner's approved task round-trip burned on the refusal;
+  without a workaround the owner had to either relay the task by hand from
+  Telegram or accept the manager building it itself, against its standing
+  instruction.
+FIX: (1) tag gateway-created manager lanes into a shared group at creation
+  (e.g. tags=tggw in create_manager), or (2) make the shipped manager prompt
+  say how to form a shared group (PATCH /api/sessions/<name>/config
+  {"tags": ...}) before the first send. Workaround used this session: PATCHed
+  tags=tggw onto both lanes, after which the same send passed.
