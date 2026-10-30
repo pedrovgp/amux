@@ -167,8 +167,18 @@ verify() {
   build="$(printf '%s' "$h" | field build)"
   pid="$(printf '%s' "$h" | field pid)"
   say "health commit=$commit build=$build pid=$pid"
-  [ "${commit:0:${#SHORT}}" = "$SHORT" ] || {
-    say "health reports commit '$commit', expected '$SHORT'"; return 1; }
+  # The commit check applies only when THIS run built the artifact: then health
+  # proving it runs $SHORT proves the build really was $REF (and not a stale
+  # artifact that survived a failed build). With --skip-build the artifact was
+  # built earlier, possibly from a different commit — a script-only commit moves
+  # HEAD without changing the binary — so the md5 check is the honest one and a
+  # commit mismatch is reported, not failed.
+  if [ "$SKIP_BUILD" = "0" ]; then
+    [ "${commit:0:${#SHORT}}" = "$SHORT" ] || {
+      say "health reports commit '$commit', expected '$SHORT'"; return 1; }
+  elif [ "${commit:0:${#SHORT}}" != "$SHORT" ]; then
+    say "note: live commit '$commit' differs from HEAD '$SHORT' — expected with --skip-build"
+  fi
   [ -n "$pid" ] || { say "health carried no pid"; return 1; }
   exe_md5="$(md5sum "/proc/$pid/exe" 2>/dev/null | cut -d' ' -f1)"
   say "running exe md5=$exe_md5 installed md5=$built_md5"
@@ -178,8 +188,17 @@ verify() {
 }
 
 if restart_and_wait && verify; then
-  say "verified: $SHORT is live"
-  verdict "ok commit=$SHORT md5=$built_md5 pid=$(health_json | field pid)"
+  # Report what the SERVER says it is running, not what we asked for: in
+  # --skip-build mode those differ, and a verdict line that names the wrong one
+  # is the kind of log that sends the next reader after the wrong commit.
+  live_commit="$(health_json | field commit)"
+  live_pid="$(health_json | field pid)"
+  say "verified: live commit=$live_commit md5=$built_md5"
+  if [ "${live_commit:0:${#SHORT}}" = "$SHORT" ]; then
+    verdict "ok commit=$live_commit md5=$built_md5 pid=$live_pid"
+  else
+    verdict "ok commit=$live_commit built_from=$SHORT md5=$built_md5 pid=$live_pid"
+  fi
   exit 0
 fi
 
