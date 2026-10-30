@@ -241,6 +241,21 @@ pub(crate) fn tmux_fleet_shim_dir() -> PathBuf {
     home().join("shims").join("tmux-fleet")
 }
 
+/// Bring the installed fleet shims up to this build's bytes. They were written
+/// only when a worker launched, so a deploy that fixed a shim left every
+/// running worker on the old copy until some unrelated launch: 13b4d3a6b (a
+/// shim exec'ing another copy of itself) was live for minutes with the old
+/// copies still installed. Called at server start. A home with no shim dir
+/// yet is left alone; the first launch creates it.
+pub(crate) fn refresh_fleet_shims(dir: &Path) -> std::io::Result<bool> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    install_shims(dir, &["pkill", "pgrep"], PKILL_GUARD_SHIM)?;
+    install_shims(dir, &["tmux"], TMUX_FLEET_SHIM)?;
+    Ok(true)
+}
+
 /// The shell exports that put the fleet tmux shim first on a worker's PATH.
 /// Goes last in the launch line so a profile that reorders PATH cannot bury it.
 pub(crate) fn tmux_fleet_exports(name: &str) -> String {
@@ -1367,8 +1382,13 @@ pub(crate) async fn run_cmd(
     }
 }
 
+/// Every tmux command here goes through the control connection when it can
+/// (`backend::tmux_ctl`), and inside a send is added to its profile.
 async fn tmux(args: &[&str]) -> Option<std::process::Output> {
-    run_cmd("tmux", args, OP_TIMEOUT).await
+    let t = std::time::Instant::now();
+    let (out, control) = crate::backend::tmux_ctl::run_traced(args, OP_TIMEOUT).await;
+    crate::api::send_profile::note_tmux(args.first().copied().unwrap_or(""), t.elapsed().as_micros() as u64, control);
+    out
 }
 
 /// Workers with a live tmux session (`amux-<name>`), by worker name. The
@@ -1529,6 +1549,7 @@ pub(crate) fn empty_composer_verdict(now: f64, grace_until: f64, redelivered_at:
 }
 
 async fn sleep_ms(ms: u64) {
+    crate::api::send_profile::note_sleep(ms);
     tokio::time::sleep(Duration::from_millis(ms)).await;
 }
 
@@ -9440,12 +9461,26 @@ fn steer_row_source(conn: &rusqlite::Connection, id: &str) -> (Option<String>, O
 /// noticed later.
 const NON_COALESCING_GUARDS: &[&str] = &["board-progress"];
 
+/// The suffix the scheduler puts on a `wake` delivery's guard
+/// (`sched:<id>:wake`). A wake is the text a shell schedule PRINTED for one
+/// event, and the script closed that event before printing it, so nothing will
+/// ever send it again: it carries content, like a board note.
+///
+/// MEASURED (AF-1047, 2026-10-30). SCHED-917's 09:43:44Z run delivered "W-a69b53
+/// fired: ... cancelled"; the lane was mid-turn, so it waited under
+/// `sched:SCHED-917`. The 09:47:57Z run's "W-425051 EXPIRED" then rewrote that
+/// row in place (queued_at 09:43:46, text from 09:47), and the lane never
+/// learned its watched CI run had been cancelled. The suffix keeps the
+/// `sched:` prefix, so `is_schedule_guard` and the isolation gate still treat it
+/// as the owner's schedule.
+pub(crate) const WAKE_GUARD_SUFFIX: &str = ":wake";
+
 /// Whether `guard` names a content-bearing producer (see
 /// [`NON_COALESCING_GUARDS`]). Guards stay non-empty for these, so the isolation
 /// gate above still refuses them into a raw-agent lane — the coalescing is what
 /// is switched off, not the producer identity.
 fn non_coalescing(guard: &str) -> bool {
-    NON_COALESCING_GUARDS.contains(&guard)
+    NON_COALESCING_GUARDS.contains(&guard) || (is_schedule_guard(guard) && guard.ends_with(WAKE_GUARD_SUFFIX))
 }
 
 /// py:8595 _steer_enqueue — durable queue row + message.queued event.
@@ -13610,6 +13645,23 @@ async fn send_text_inner_bound(
     delivery: Option<&str>,
     queue_id: &mut Option<String>,
 ) -> (bool, String) {
+    // Profiled (owner, 2026-10-29): GET /api/debug/send-profile and the
+    // `send_profile` / `send_slow` log lines say where each send's time went.
+    // Boxed: `profiled` moves its future through two task-local scopes, and
+    // a debug build copies a by-value send future at each move. Unboxed, a
+    // board-drive pickup overflowed the 2 MiB maintenance stack (AF-1014).
+    crate::api::send_profile::profiled(name, text.chars().count(),
+        Box::pin(send_text_inner_bound_body(state, name, text, mode, delivery, queue_id))).await
+}
+
+async fn send_text_inner_bound_body(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    mode: SendMode,
+    delivery: Option<&str>,
+    queue_id: &mut Option<String>,
+) -> (bool, String) {
     // Serialise per lane. Taken before any pane state is read, because the
     // decisions below (is it generating? is a picker up?) are read-then-act on
     // the same composer this is about to clear.
@@ -13617,6 +13669,7 @@ async fn send_text_inner_bound(
     let waited = std::time::Instant::now();
     let _send_guard = lock.lock().await;
     let waited_ms = waited.elapsed().as_millis();
+    crate::api::send_profile::mark("lane_lock");
     if waited_ms > 250 {
         // Countable: a sweep can see how often two producers aim at one lane.
         tracing::info!(
@@ -14405,6 +14458,7 @@ async fn send_text_inner_bound(
             );
         }
     }
+    crate::api::send_profile::mark("prechecks");
     if from_steering {
         let draft_frame = tmux_capture(name, 15).await;
         if composer_state(&draft_frame).typed().is_some() {
@@ -14446,6 +14500,7 @@ async fn send_text_inner_bound(
     // 2026-09-24, MSG-68711 "i dont see it @/Users/.../x.png"): the cursor ends
     // on the mention, Claude Code offers the completion, and the Enter below
     // accepts it instead of submitting. The owner had to press Enter again.
+    crate::api::send_profile::mark("cleared");
     // One trailing space closes the picker; the submitted turn is trimmed.
     let staged = close_trailing_mention(&text);
     if staged.len() != text.len() {
@@ -14513,6 +14568,7 @@ async fn send_text_inner_bound(
         tracing::debug!(session = %name, paste_settle_ms = settle_ms, verdict = "multiline_paste_settle",
             "multi-line paste: waiting before Enter so the paste is folded first");
     }
+    crate::api::send_profile::mark("typed");
     sleep_ms(settle_ms).await;
     // Only reachable if picker-shaped text was TYPED, which `use_paste` now
     // prevents. Kept as a belt-and-braces closer rather than deleted: if a
@@ -14531,6 +14587,7 @@ async fn send_text_inner_bound(
         sleep_ms(60).await;
     }
     send_key(name, "Enter").await;
+    crate::api::send_profile::mark("entered");
     // ------------------------------------------------------------------
     // THE EVIDENCE GATE (AMUX-2629). Everything above proves only that bytes
     // reached the pty. "sent" is a claim about Claude Code's state, so it is
@@ -14559,6 +14616,7 @@ async fn send_text_inner_bound(
     // launch-videos at 21:30:36Z. So no retry and no idle watcher for them.
     let is_slash = is_slash_command(&text);
     let (first, retried) = verify_submitted(name, &text, sent_at, !generating && !is_slash).await;
+    crate::api::send_profile::mark("verified");
     if is_slash {
         // The verifier reads "stuck" whenever it never saw the composer come
         // back empty. A panel (/btw, /status) HIDES the composer, so that read
@@ -21943,7 +22001,7 @@ mod rate_limit_hold_tests {
         assert!(!owner_passes_rate_limit_hold(SendOrigin::Owner, true), "the steering drain waits for the reset");
         assert!(!owner_passes_rate_limit_hold(SendOrigin::Automation, false), "peers and schedules are held");
         let src = include_str!("session_verbs.rs");
-        let body = &src[src.find("async fn send_text_inner_bound(").unwrap()..];
+        let body = &src[src.find("async fn send_text_inner_bound_body(").unwrap()..];
         assert!(body.contains("if owner_passes_rate_limit_hold(origin, from_steering) {"), "the send path uses the rule");
     }
 
@@ -21953,7 +22011,7 @@ mod rate_limit_hold_tests {
     #[test]
     fn the_send_path_checks_the_hold_before_its_first_keystroke() {
         let src = include_str!("session_verbs.rs");
-        let body = &src[src.find("async fn send_text_inner_bound(").unwrap()..];
+        let body = &src[src.find("async fn send_text_inner_bound_body(").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
         let hold = body.find("rate_limit_hold_for(name,").expect("send path must call the hold");
         let esc = body.find("send_key(name, \"Escape\").await;\n            esc_at").unwrap();
@@ -31837,6 +31895,8 @@ pub fn compose_worker_context(name: &str, isolated: bool) -> String {
         format!("{block}\n\n{BOARD_OFF_CONTEXT}")
     } else { block };
     let block = format!("{block}\n\n{MEMORY_VERB_CONTEXT}\n\n{MESSAGES_CONTEXT}");
+    let velocity = crate::api::velocity::context_section(name);
+    let block = if velocity.is_empty() { block } else { format!("{block}\n\n{velocity}") };
     let file = worker_rules_file(name);
     format!(
         "{block}\n\n# Browser profile selection and recovery\n\n{}\n\n# Links to what you build\n\n{}\n\n# Keeping this scoped context current\n\n\
@@ -31962,7 +32022,7 @@ pub(crate) fn workers_with_changed_context(workers: &[String]) -> (usize, Vec<St
         }
         let Ok(on_disk) = std::fs::read_to_string(worker_rules_file(w)) else { continue };
         compared += 1;
-        if compose_worker_context(w, false) != on_disk {
+        if crate::api::velocity::without_section(&compose_worker_context(w, false)) != crate::api::velocity::without_section(&on_disk) {
             changed.push(w.clone());
         }
     }
@@ -53781,6 +53841,27 @@ mod steer_coalescing_tests {
         );
     }
 
+    /// AF-1047: two wake events from one schedule, both pending for a lane
+    /// mid-turn, are two messages. The plain `sched:` guard (a recurring prompt
+    /// fire) still coalesces: that is the control.
+    #[tokio::test]
+    async fn two_wakes_from_one_schedule_both_survive_until_delivery() {
+        let (st, _d) = store().await;
+        let wake = format!("sched:SCHED-917{WAKE_GUARD_SUFFIX}");
+        assert!(is_schedule_guard(&wake), "a wake is still the owner's schedule");
+        steer_enqueue_store(&st, "lane", "W-a69b53 fired: cancelled", &wake, "").await.unwrap();
+        steer_enqueue_store(&st, "lane", "W-425051 EXPIRED unfired", &wake, "").await.unwrap();
+        let got = pending(&st, "lane");
+        assert_eq!(got.len(), 2, "both wakes must be pending, got {got:?}");
+        assert!(got.contains(&"W-a69b53 fired: cancelled".to_string()), "the FIRST wake survived");
+        steer_enqueue_store(&st, "lane", "daily audit, fire 1", "sched:SCHED-773", "").await.unwrap();
+        steer_enqueue_store(&st, "lane", "daily audit, fire 2", "sched:SCHED-773", "").await.unwrap();
+        let got = pending(&st, "lane");
+        assert_eq!(got.len(), 3, "two wakes plus ONE coalesced prompt fire, got {got:?}");
+        assert!(got.contains(&"daily audit, fire 2".to_string()) && !got.contains(&"daily audit, fire 1".to_string()),
+            "a recurring prompt fire still coalesces to its newest text: {got:?}");
+    }
+
     /// CONTROL 1, and the reason this is an allowlist rather than a deletion:
     /// coalescing is CORRECT for a nudge. auto-compact re-evaluates one
     /// condition hundreds of times and the reader wants one pending answer with
@@ -57366,4 +57447,22 @@ pub(crate) async fn relaunch_key_workers_onto_subscription(state: &AppState) -> 
         }
     }
     (considered, relaunched)
+}
+
+#[cfg(test)]
+mod refresh_fleet_shims_tests {
+    use super::*;
+
+    #[test]
+    fn server_start_replaces_a_stale_installed_shim_and_creates_no_dir() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("shims").join("tmux-fleet");
+        assert!(!refresh_fleet_shims(&dir).unwrap(), "no shim dir: nothing to refresh");
+        assert!(!dir.exists(), "server start created a shim dir nobody launched");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pgrep"), "#!/bin/bash\n# an older amux pkill/pgrep guard\n").unwrap();
+        assert!(refresh_fleet_shims(&dir).unwrap());
+        assert_eq!(std::fs::read_to_string(dir.join("pgrep")).unwrap(), PKILL_GUARD_SHIM, "the stale pgrep shim was kept");
+        assert_eq!(std::fs::read_to_string(dir.join("tmux")).unwrap(), TMUX_FLEET_SHIM);
+    }
 }

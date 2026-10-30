@@ -1521,6 +1521,18 @@ window.addEventListener('online', () => {
   // true here because nothing had failed yet. Drain on the event itself, which
   // is the browser telling us the network is back.
   try { _syncBackoffReset(); _scheduleSyncRetry(); } catch (e) {}
+  // A read that failed while the network was down keeps the pill on "Sync
+  // error" until a read succeeds, and _onClientResume only resyncs when the
+  // data is over _SSE_REFRESH_MS old (and not at all in a hidden tab): the pill
+  // said "Sync error" over a running sync (LC-SYNC-PROGRESS, ios-safari, run
+  // 41010141601). Reconnecting with a read error outstanding re-reads once.
+  // Not on focus or visibility, so a persisting failure is no retry loop, and
+  // never for a 401 (session-load-failure.spec.ts).
+  if ((_sessionLoadError && _sessionLoadError.status !== 401) || _boardReadError || _syncReadError) {
+    // Plain text: engines format an object argument differently in the console.
+    console.info('[amux] reconnect resync after a failed read verdict=resume_resync_read_error');
+    try { _resyncEverything(); } catch (e) {}
+  }
 });
 // Migrate localStorage keys from cc_ to amux_
 ['offline_queue','sessions_cache','drafts'].forEach(k => {
@@ -4664,16 +4676,30 @@ function _syncSetPhase(phase) { _syncPhase = phase; _syncPhaseAt = Date.now(); }
 // after_reset says whether that already happened since the last good read:
 // 1 on a later timeout means reopening did not help.
 let _upqResetSinceOk = false;
-function _upqListBounded(ms = 5000) {
+// STORAGE THAT STAYED DEAD COSTS EVERY SEND 5 SECONDS (AF-1008). Messages wait
+// for this read, and in the Mac app a reopened connection kept hanging for
+// hours: 2,368 timeouts from one Amux-Desktop client, after_reset=1 on nearly
+// all of them, each one a pass that held what the user had typed for 5s.
+// Once a read has timed out even after a reset, a pass waits 250ms instead.
+// The hung read keeps running, and if it ever completes it clears the flag,
+// so storage that is slow rather than dead gets the full 5s on the next pass.
+const _UPQ_DEAD_MS = 250;
+function _upqListBounded(ms) {
+  if (ms == null) ms = _upqResetSinceOk ? _UPQ_DEAD_MS : 5000;
   let timer;
+  // A timer that fires far past its bound means the page was frozen while the
+  // read waited (AF-1036: an upload-list timeout landed in the same millisecond
+  // as a 255 s frozen-page "stall"). Give the read one fresh window instead.
+  let t0 = Date.now(), rearmed = false;
   return Promise.race([
     _upqList().then(rows => { _upqResetSinceOk = false; return rows; }).catch(() => []),
-    new Promise(resolve => { timer = setTimeout(() => {
+    new Promise(resolve => { const fire = () => {
+      if (!rearmed && Date.now() - t0 > ms + 10000) { rearmed = true; t0 = Date.now(); timer = setTimeout(fire, ms); return; }
       _outboxDiagnostic('outbox_upload_list_timeout', {waited_ms:ms, after_reset:_upqResetSinceOk ? 1 : 0, hidden:typeof document !== 'undefined' && document.hidden ? 1 : 0});
       _idb.reset('upload_list_timeout');
       _upqResetSinceOk = true;
       resolve([]);
-    }, ms); }),
+    }; timer = setTimeout(fire, ms); }),
   ]).finally(() => clearTimeout(timer));
 }
 // A FROZEN HOLDER IS PRE-EMPTED, NOT WAITED OUT (Ethan, 2026-10-23: the Mac
@@ -4732,9 +4758,20 @@ function runSyncBanner(quiet = false) {
   // A re-arming timeout, not setInterval: the outbox unit sandboxes provide
   // only setTimeout (tests/dashboard-outage-recovery.mjs).
   let watch = null;
+  // A FROZEN PAGE IS NOT A STALLED PASS (AF-1036). A sleeping Mac or a
+  // suspended app stops every timer, so the first check after waking saw the
+  // whole freeze as time in one phase: outbox_flight_stalled phase=deliver,
+  // stalled_ms 255778, queued 0, from a visible tab the moment it woke. A gap
+  // between checks far past their 5 s cadence means the page was not running;
+  // the phase clock restarts, and a pass truly stuck after waking still
+  // reports _SYNC_STALL_MS later.
+  let lastCheck = Date.now();
   const check = () => {
     watch = null;
     if (_syncFlightToken !== token) return;
+    const gap = Date.now() - lastCheck;
+    lastCheck = Date.now();
+    if (gap > 15000) { _syncPhaseAt = Date.now(); watch = setTimeout(check, 5000); return; }
     // Uploads report progress as they go; a long upload is not a stall.
     if (/^upload/.test(_syncPhase) || Date.now() - _syncPhaseAt < _SYNC_STALL_MS) { watch = setTimeout(check, 5000); return; }
     _outboxDiagnostic('outbox_flight_stalled', {phase:_syncPhase, stalled_ms:Date.now() - _syncPhaseAt,
@@ -8316,6 +8353,69 @@ function _cardBoardActive(name) {
   });
   return n;
 }
+// OWNER REQUESTS ON THE WORKER CARD (AF-1060). Ethan asked "is it done" by
+// message four times in a day; the requests ledger already knew. The card shows
+// how many of his asks are open and how many are on main but not yet live, from
+// GET /api/task-history/requests (the same rules as `amux requests`). One fetch
+// per worker every two minutes, three at a time; the template reads the cache
+// so a re-render never waits on it.
+const _ownerReqCache = {};
+const _ownerReqQueue = [];
+let _ownerReqInFlight = 0;
+const _OWNER_REQ_TTL_MS = 120000;
+function _ownerReqWant(name) {
+  const c = _ownerReqCache[name];
+  if ((c && (Date.now() - c.at) < _OWNER_REQ_TTL_MS) || _ownerReqQueue.includes(name)) return;
+  _ownerReqQueue.push(name);
+  _ownerReqPump();
+}
+function _ownerReqPump() {
+  while (_ownerReqInFlight < 3 && _ownerReqQueue.length) {
+    const name = _ownerReqQueue.shift();
+    _ownerReqInFlight++;
+    _ownerReqCache[name] = Object.assign({}, _ownerReqCache[name], { at: Date.now() });
+    fetch(API + '/api/task-history/requests?session=' + encodeURIComponent(name))
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (!d || d.measured === false) return;
+        _ownerReqCache[name] = { at: Date.now(), data: d };
+        document.querySelectorAll('[data-owner-req="' + CSS.escape(name) + '"]').forEach(el => { el.innerHTML = _ownerReqInner(name, el.dataset.trail === '1'); });
+      })
+      .catch(() => {})
+      .finally(() => { _ownerReqInFlight--; _ownerReqPump(); });
+  }
+}
+// A stable wrapper that LEADS the card's meta line; a fetch that lands fills
+// it in place, so the count never appears on a second row (css-mobile.md).
+// First, not last: on a 375px card a long meta line runs past the edge, and
+// the owner's asks are the part he acts on (seen live 2026-10-30: 6 of 36 lines
+// had the count clipped when it came last).
+function _ownerReqHTML(name, trail) {
+  return `<span class="mc-req-wrap" data-owner-req="${esc(name)}" data-trail="${trail ? 1 : 0}">${_ownerReqInner(name, trail)}</span>`;
+}
+function _ownerReqInner(name, trail) {
+  const d = (_ownerReqCache[name] || {}).data;
+  const open = d ? d.counts.open : 0;
+  const onMain = d ? d.counts.on_main : 0;
+  if (!open && !onMain) return '';
+  const parts = [];
+  if (open) parts.push(`<span class="mc-req-open">${open}</span> ${open === 1 ? 'ask' : 'asks'} open`);
+  if (onMain) parts.push(`<span class="mc-req-main">${onMain}</span> ${d.deploys ? 'on main' : 'landed'}`);
+  return `<span class="mc-req" role="button" tabindex="0" `
+    + `title="Your requests to ${esc(name)}: tap for the list" `
+    + `onclick="event.stopPropagation();_ownerReqShow('${escJs(name)}')">${parts.join(' · ')}</span>` + (trail ? ' · ' : '');
+}
+function _ownerReqShow(name) {
+  const d = (_ownerReqCache[name] || {}).data;
+  if (!d) return;
+  const label = { 'open': 'open', 'on-main': d.deploys ? 'on main, not live yet' : 'landed in ' + (d.repo || 'its repo'), 'live': 'live', 'closed': 'closed' };
+  const rows = d.requests.filter(r => r.status === 'open' || r.status === 'on-main').map(r =>
+    `<div style="padding:var(--space-2) 0;border-top:1px solid var(--border);">`
+    + `<div style="font-size:var(--fs-sm);color:var(--dim);">${esc(r.id)} · ${esc(label[r.status] || r.status)}${r.evidence ? ' · ' + esc(r.evidence) : ''} · ${esc(String(r.age_h))}h ago</div>`
+    + `<div>${esc(r.text)}</div></div>`).join('');
+  showAlertHtml('Your requests to ' + name, rows || '<div>Nothing open.</div>');
+}
+
 function _cardBoardStatusCounts(name) {
   const counts = {};
   (boardItems || []).forEach(c => {
@@ -9109,6 +9209,7 @@ function render() {
                queue look like a stalled worker. Spell out the nonzero board
                columns from the SSE-synced boardItems instead. */
             if (s.isolated) return '';
+            _ownerReqWant(s.name);
             const byStatus = _cardBoardStatusCounts(s.name);
             const d = byStatus.doing || 0;
             const todo = byStatus.todo || 0;
@@ -9137,7 +9238,8 @@ function render() {
             if (needsYou) parts.push(`<span class="mc-total">${needsYou}</span> needs you`);
             if (review) parts.push(`<span class="mc-total">${review}</span> review`);
             if (done) parts.push(`<span class="mc-total">${done}</span> done`);
-            return parts.length ? `<span class="meta-count" title="Board status breakdown; parked or review work does not mean this worker is running">${parts.join(' · ')}</span>` : '';
+            // Inside the one meta line, never a second row (css-mobile.md).
+            return `<span class="meta-count" title="Board status breakdown; parked or review work does not mean this worker is running">${_ownerReqHTML(s.name, parts.length > 0)}${parts.join(' · ')}</span>`;
           })()}
           ${!online ? '<span class="cached-badge">cached</span>' : ''}
         </div>` : ''}
@@ -14835,7 +14937,10 @@ async function _steeringEdit(msgId) {
     + ' onkeydown="if(event.key===\'Enter\'&&(event.metaKey||event.ctrlKey)){event.preventDefault();_modalClose(true)}">'
     + esc(m.text) + '</textarea>'
     + '<div style="font-size:var(--fs-xs);color:var(--dim);margin-top:var(--space-1-5);">Still delivers at the worker\'s next pause. ⌘↩ saves.</div>', 'Save');
-  setTimeout(() => { const t = document.getElementById('steer-edit-input'); if (t) { t.focus(); t.setSelectionRange(t.value.length, t.value.length); } }, 30);
+  // Only when nothing has focused it yet: moving the caret under a selection
+  // someone already made turned a replace into an append ("draft onedraft
+  // two", steering-edit.spec.ts on desktop, run 41039786358).
+  setTimeout(() => { const t = document.getElementById('steer-edit-input'); if (t && document.activeElement !== t) { t.focus(); t.setSelectionRange(t.value.length, t.value.length); } }, 30);
   if (!await shown) return;
   const text = (document.getElementById('steer-edit-input')?.value || '').replace(/\s+$/, '');
   if (!text.trim()) { showToast('Empty. Use ✕ to remove the message instead'); return; }
@@ -17997,7 +18102,11 @@ function _syncUrlHash() {
   if (window._peekSplitChild || window._peekEmbed) return;
   _whereSoon();
   const cur = location.hash;
-  if (cur && cur !== '#' && !/^#(view|peek)=/.test(cur)) return;
+  // A folder's address (#path= with no file open) gives way to a worker opened
+  // over it, so a reload shows the worker; an open file keeps its own.
+  const fo = document.getElementById('file-overlay');
+  const folderOnly = /^#path=/.test(cur || '') && peekSession && !(fo && fo.classList.contains('active'));
+  if (cur && cur !== '#' && !/^#(view|peek)=/.test(cur) && !folderOnly) return;
   try {
     let hash = '';
     if (peekSession) {
@@ -18656,7 +18765,7 @@ async function _psfViewFile(filePath) {
       // Same as the file overlay: load from the file's own URL so in-page
       // anchors and relative links stay inside the document (see _htmlPreviewUrl).
       const _pu = _htmlPreviewUrl(data.path || filePath);
-      if (_pu) iframe.src = _authUrl(_pu); else iframe.srcdoc = data.content;
+      _htmlSiteFrame(iframe, data.path || filePath, () => { if (_pu) iframe.src = _authUrl(_pu); else iframe.srcdoc = data.content; });
     } else if (data.content != null) {
       content.className = 'file-overlay-body file-code';
       content.innerHTML = typeof _fileHighlightHTML === 'function' ? _fileHighlightHTML(data) : '<pre>' + esc(data.content) + '</pre>';
@@ -23891,7 +24000,18 @@ function _expandAtMentions(text) {
   const hints = mentioned.map(n =>
     `  @${n} → POST ${base}/api/sessions/${n}/send  {"text":"<msg>"}`
   ).join('\n');
-  return rewritten + '\n\n[amux: @-mentions above are amux workers, NOT files. Reach them via HTTP API, never tmux directly]\n' + hints;
+  return rewritten + _MENTION_NOTE + hints;
+}
+const _MENTION_NOTE = '\n\n[amux: @-mentions above are amux workers, NOT files. Reach them via HTTP API, never tmux directly]\n';
+// The text as typed: _expandAtMentions undone. The worker gets the note; the
+// owner's own Messages show what they wrote, and the sent copy matches the
+// local one (owner, 2026-10-29: the peek's Messages showed one send twice,
+// "direct?" beside the note-carrying echo).
+function _mentionNoteStrip(text) {
+  const s = String(text || '');
+  const i = s.indexOf(_MENTION_NOTE.trimEnd());
+  if (i < 0) return s;
+  return s.slice(0, i).replace(/`(@[\w][\w.-]*)`/g, '$1');
 }
 
 // ── @mention helpers ──
@@ -23952,6 +24072,44 @@ function _atGenPick(i) {
   cur.dd.classList.remove('open');
   inp.focus();
 }
+// Where the caret is in a textarea, in px from the textarea's top-left
+// (scroll applied): a mirror div with the same box and font, the text up to
+// the caret, and a marker after it.
+function _caretXY(ta) {
+  const cs = getComputedStyle(ta), m = document.createElement('div');
+  for (const k of ['boxSizing', 'width', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'borderTopWidth', 'borderRightWidth',
+    'borderBottomWidth', 'borderLeftWidth', 'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'lineHeight', 'tabSize', 'textIndent', 'wordSpacing'])
+    m.style[k] = cs[k];
+  Object.assign(m.style, { position: 'absolute', visibility: 'hidden', top: '0', left: '-9999px', whiteSpace: 'pre-wrap', overflowWrap: 'break-word', overflow: 'hidden' });
+  m.textContent = ta.value.slice(0, ta.selectionStart);
+  const mark = document.createElement('span');
+  mark.textContent = '\u200b';
+  m.appendChild(mark);
+  document.body.appendChild(m);
+  const lh = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.4 || 18;
+  const out = { x: mark.offsetLeft - ta.scrollLeft, y: mark.offsetTop - ta.scrollTop, h: lh };
+  m.remove();
+  return out;
+}
+// In a tall textarea (the markdown editor) the list opens at the caret, not
+// under the whole box, where the status bar covered it (owner, 2026-10-29,
+// MSG-100765: "this should autocomplete dropdown the worker"). Above the line
+// when there is no room below. A one-line input keeps the dropdown.
+function _atPlaceAtCaret(inp, dd) {
+  const reset = () => { dd.style.top = dd.style.left = dd.style.right = dd.style.bottom = dd.style.width = ''; dd.classList.remove('ac-at-caret'); };
+  if (inp.tagName !== 'TEXTAREA') return reset();
+  const c = _caretXY(inp);
+  if (inp.clientHeight < c.h * 4) return reset();
+  const wrap = dd.parentElement, wr = wrap.getBoundingClientRect(), ir = inp.getBoundingClientRect();
+  const w = Math.min(360, wr.width - 8);
+  const x = Math.max(4, Math.min(ir.left - wr.left + c.x, wr.width - w - 4));
+  const below = ir.top - wr.top + c.y + c.h;
+  dd.classList.add('ac-at-caret');
+  dd.style.width = w + 'px'; dd.style.left = x + 'px'; dd.style.right = 'auto';
+  const room = wr.height - below, need = Math.min(dd.scrollHeight || 180, 180);
+  if (room >= need || below < need) { dd.style.top = below + 'px'; dd.style.bottom = 'auto'; }
+  else { dd.style.top = 'auto'; dd.style.bottom = (wr.height - (below - c.h)) + 'px'; }
+}
 function _atAttach(inp) {
   if (!inp || inp._atWired) return;
   inp._atWired = true;
@@ -23967,6 +24125,7 @@ function _atAttach(inp) {
     _atGenCur = { inp, dd };
     sel = -1;
     if (!_atRender(inp, dd, '_atGenPick')) dd.classList.remove('open');
+    else _atPlaceAtCaret(inp, dd);
   });
   inp.addEventListener('keydown', (e) => {
     if (!dd.classList.contains('open')) return;
@@ -26987,7 +27146,7 @@ function _cmdHistItemHTML(e, ctx) {
   const session = typeof e === 'string' ? '' : (e.session || '');
   const origin = typeof e === 'string' ? '' : (e.origin || '');
   const ts = typeof e === 'string' ? '' : (e.time ? new Date(e.time).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '');
-  const safe = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const safe = _mentionNoteStrip(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   // Highlight the active PEEK message search (Ethan: "all search should have
   // highlighting to show where it is"). Read from the input rather than a
   // global, because this row builder is shared by the peek list and there is
@@ -27443,7 +27602,7 @@ function _mergeUnechoed(serverRows, session) {
   // mentions; the local row keeps only what was typed. Compared as typed text,
   // MSG-92727 (two screenshots) never matched its echo and showed a second,
   // ghost "queued" row beside the delivered one (2026-10-22).
-  const canonical = text => String(text || '').replace(/^\[\d{1,2}:\d{2}\s*(?:AM|PM)?\]\s*/i, '')
+  const canonical = text => _mentionNoteStrip(text).replace(/^\[\d{1,2}:\d{2}\s*(?:AM|PM)?\]\s*/i, '')
     .replace(/(?:\s+@\/\S+)+\s*$/, '').trim();
   const echoed = local => serverRows.some(row =>
     (row.session || '') === (local.session || '')
@@ -29912,7 +30071,7 @@ function _renderFileBody(data, mode) {
     body.appendChild(iframe);
     _bindReadPosFrame(iframe, data.path);   // resume reading position
     const _purl = _htmlPreviewUrl(data.path);   // own URL: anchors/links stay in the document
-    if (_purl) iframe.src = _authUrl(_purl); else iframe.srcdoc = data.content;
+    _htmlSiteFrame(iframe, data.path, () => { if (_purl) iframe.src = _authUrl(_purl); else iframe.srcdoc = data.content; });
     iframe.onload = function() {
       // Bind anchor links to scroll within the iframe. Cross-origin under the
       // sandbox above → contentDocument access throws; the try/catch makes this a
@@ -29979,7 +30138,7 @@ function _fileBindAnchors(container) {
 // textarea Save, ⌘S and the unsaved-changes guard read) and #file-body (the
 // preview Find, Read Aloud, read position and links use) move into the panes
 // for a markdown file and back for anything else.
-const _mdx = { path: null, mode: 'preview', tab: 'preview', loaded: false, timer: 0, histFor: null, against: null, base: '' };
+const _mdx = { path: null, mode: 'preview', tab: 'preview', loaded: false, timer: 0, histFor: null, against: null, base: '', opened: null, autosave: 0 };
 const _MDX_MODES = ['edit', 'preview', 'split'];
 
 function _mdxEls() {
@@ -30021,6 +30180,7 @@ function _mdxShow(data, mode) {
     ta.setSelectionRange(0, 0);
     ta.scrollTop = 0;
     _mdx.base = ta.value;
+    _mdx.opened = ta.value;
     _mdx.path = data.path;
     _mdx.loaded = true;
     _mdx.against = null;
@@ -30233,13 +30393,52 @@ function _mdxStatus() {
   const save = document.getElementById('file-save-btn');
   if (save) save.style.display = _fileEditable(_fileData) && (_mdx.mode !== 'preview' || dirty) ? '' : 'none';
 }
-// Every change to the source: highlight now, the preview a beat later.
+// Every change to the source: highlight now, the preview a beat later, and a
+// save once typing pauses (owner, 2026-10-29: "make sure edits are saved as
+// they happen"). Not a new note (it is named on its first save) and not while
+// a conflict waits on a choice.
+const _MDX_AUTOSAVE_MS = 1000;
 function _mdxChanged() {
   _mdxHighlight();
   _mdxStatus();
   clearTimeout(_mdx.timer);
   _mdx.timer = setTimeout(() => { if (_mdx.tab === 'diff') _mdxRenderDiff(); else _mdxRenderPreview(); }, 150);
+  clearTimeout(_mdx.autosave);
+  _mdx.autosave = setTimeout(_mdxAutosave, _MDX_AUTOSAVE_MS);
 }
+function _mdxAutosave() {
+  clearTimeout(_mdx.autosave);
+  if (!_mdxActive() || !_fileData || _fileData._isNew || _fileData.conflict || !_fileEditable(_fileData) || !_fileEditDirty()) return;
+  _fileSave();
+}
+// Another person's (or a worker's) save shows up while this copy has nothing
+// unsaved: the file is checked every few seconds while it is open and in view,
+// at the cost of a 304. With unsaved edits it is left alone: the next save
+// merges.
+const _MDX_FOLLOW_MS = 4000;
+async function _mdxFollow() {
+  if (!_mdxActive() || document.hidden || !_fileData || !_fileData.etag || _fileData._isNew || _fileData.conflict || _fileEditDirty()) return;
+  const path = _fileData.path, had = _fileData.etag;
+  let r;
+  try { r = await fetch(API + '/api/file/raw?path=' + encodeURIComponent(path), { headers: _authHeaders({ 'If-None-Match': had }), cache: 'no-store' }); } catch (e) { return; }
+  if (!r || r.status !== 200 || !_fileData || _fileData.path !== path || _fileData.etag !== had || _fileEditDirty()) return;
+  const text = await r.text(), etag = r.headers.get('etag');
+  const ta = document.getElementById('file-edit-ta');
+  if (!ta || text === ta.value) { if (etag) _fileData.etag = etag; return; }
+  const at = ta.selectionStart;
+  ta.value = text;
+  try { ta.setSelectionRange(Math.min(at, text.length), Math.min(at, text.length)); } catch (e) {}
+  _fileData.content = text;
+  _mdx.opened = text;
+  if (etag) _fileData.etag = etag;
+  _mdxHighlight(); _mdxStatus(); _mdxRenderPreview();
+  const d = document.getElementById('mdx-dirty');
+  if (d) d.textContent = 'Updated';
+  try { window._clientDebug?.('file-collab', { verdict: 'file_followed', measured: true, n_considered: 1 }); } catch (_) {}
+}
+setInterval(_mdxFollow, _MDX_FOLLOW_MS);
+// Leaving the page or hiding it saves what is pending, rather than waiting.
+document.addEventListener('visibilitychange', () => { if (document.hidden && _mdx.autosave) _mdxAutosave(); });
 
 // ── Editing commands ──
 function _mdxIndent() { return parseInt(localStorage.getItem('amux_mdx_indent') || '2', 10) === 4 ? 4 : 2; }
@@ -30405,8 +30604,11 @@ function _mdxDiffLines(a, b) {
 function _mdxRenderDiff() {
   const alt = document.getElementById('mdx-alt'), ta = document.getElementById('file-edit-ta');
   if (!alt || !ta || !_fileData) return;
-  const base = _mdx.against ? _mdx.against.content : (_fileData.content || '');
-  const what = _mdx.against ? 'commit ' + esc(_mdx.against.short) + ' (' + esc(_mdx.against.subject) + ')' : 'the saved file';
+  // With autosave the saved file is the text shown, so Diff compares with the
+  // file as it was opened (or as it last arrived from elsewhere).
+  const base = _mdx.against ? _mdx.against.content : (_mdx.opened != null ? _mdx.opened : (_fileData.content || ''));
+  const what = _mdx.against ? (_mdx.against.label ? esc(_mdx.against.label) : 'commit ' + esc(_mdx.against.short) + ' (' + esc(_mdx.against.subject) + ')')
+    : (_mdx.opened != null ? 'the file as you opened it' : 'the saved file');
   const rows = _mdxDiffLines(base, ta.value);
   const add = rows.filter(r => r[0] === '+').length, del = rows.filter(r => r[0] === '-').length;
   let h = '<div class="mdx-diff-head">' + (add || del ? '<b class="mdx-add">+' + add + '</b> <b class="mdx-del">−' + del + '</b> against ' + what
@@ -31982,15 +32184,28 @@ function _feRecordOpen(path) {
 // showed the folder (Ethan, 2026-10-26: "when i close and re-open it doesnt open
 // the file"). A link to anything else (#peek=, #issue=) is left alone; closing
 // the file puts back the folder, or nothing when the Files view is not showing.
+// A file opened over a worker or a view takes the address too, and closing it
+// puts that address back (owner, 2026-10-29: "when i refresh an open md file
+// it goes to the worker view"): the address had stayed #peek=<worker>.
+let _fileHashUnder = null;
 function _fileHashSync(path) {
   try {
     const h = location.hash;
-    if (h && !h.startsWith('#path=') && h !== '#view=files') return;
     // A split pane's page (?peekEmbed=) is addressed by its worker and tab; a
     // file opened from its Chat must not rewrite that address.
     if (/[?&]peekEmbed=/.test(location.search)) return;
-    const want = path ? '#path=' + _encodeHashPath(path)
+    const own = !h || h.startsWith('#path=') || h === '#view=files';
+    // A close while the address moved to something else (a card link): what
+    // the file covered is gone, and must not come back on a later close (land
+    // review F1).
+    if (!own && !/^#(peek|view)=/.test(h)) { if (!path) _fileHashUnder = null; return; }
+    if (path && !own) _fileHashUnder = h;
+    let want = path ? '#path=' + _encodeHashPath(path)
       : (activeView === 'files' && _filesPath && _filesPath !== '/' ? '#path=' + _encodeHashPath(_filesPath) : '');
+    if (!path && _fileHashUnder) { want = _fileHashUnder; _fileHashUnder = null; }
+    // Closed while the address moved elsewhere: what the file covered is
+    // gone already, and it must not be put back by a later close (land review F1).
+    if (!path && !own) { _fileHashUnder = null; return; }
     if (h !== want) history.replaceState(history.state, '', location.pathname + location.search + want);
   } catch (e) {}
 }
@@ -32328,6 +32543,127 @@ function _fileSave() {
   _fileSaveChain = (_fileSaveChain || Promise.resolve()).catch(() => {}).then(_fileSaveOnce).finally(() => { _fileSaveWaiting--; });
   return _fileSaveChain;
 }
+// ── Two people, one file (owner, 2026-10-29) ──
+// A save refused because the file changed since it was loaded is merged, line
+// by line, three ways: the text it was loaded as (_fileData.content), the text
+// being saved, and the file now. Edits to different lines merge and save on
+// their own. Edits to the same lines are a conflict: nothing is overwritten,
+// autosave stops, and a bar offers Keep mine, Take theirs and the differences.
+function _merge3(base, mine, theirs) {
+  if (mine === theirs || theirs === base) return { clean: true, text: mine };
+  if (mine === base) return { clean: true, text: theirs };
+  const B = base.split('\n');
+  const hunks = x => {
+    const out = []; let i = 0, cur = null;
+    for (const r of _mdxDiffLines(base, x)) {
+      if (r[0] === ' ') { if (cur) { out.push(cur); cur = null; } i++; continue; }
+      if (!cur) cur = { s: i, e: i, lines: [] };
+      if (r[0] === '-') { i++; cur.e = i; } else cur.lines.push(r[3]);
+    }
+    if (cur) out.push(cur);
+    return out;
+  };
+  const ha = hunks(mine), hb = hunks(theirs), out = [];
+  let pos = 0, ia = 0, ib = 0;
+  const same = (a, b) => a.s === b.s && a.e === b.e && a.lines.join('\n') === b.lines.join('\n');
+  const clash = (a, b) => (a.s < b.e && b.s < a.e) || a.s === b.s;
+  while (ia < ha.length || ib < hb.length) {
+    const a = ha[ia], b = hb[ib];
+    let h;
+    if (a && b && clash(a, b)) {
+      if (!same(a, b)) return { clean: false, text: mine };
+      h = a; ia++; ib++;
+    } else if (a && (!b || a.s < b.s)) { h = a; ia++; } else { h = b; ib++; }
+    out.push(...B.slice(pos, h.s), ...h.lines);
+    pos = h.e;
+  }
+  out.push(...B.slice(pos));
+  return { clean: true, text: out.join('\n') };
+}
+async function _fileReconcile(mine) {
+  const path = _fileData && _fileData.path;
+  if (!path) return;
+  let now = null;
+  try {
+    const r = await fetch(API + '/api/file?path=' + encodeURIComponent(path), { headers: _authHeaders(), cache: 'no-store' });
+    if (r.ok) now = await r.json();
+  } catch (e) {}
+  if (!now || typeof now.content !== 'string' || !_fileData || _fileData.path !== path) {
+    showToast('This file changed elsewhere and could not be read; your edits are kept unsaved');
+    return;
+  }
+  const ta = document.getElementById('file-edit-ta');
+  // Merged with what the editor holds NOW: typing while the file was read
+  // must not drop the merge and then overwrite their change on the next save
+  // (land review F1, F3).
+  const cur = ta ? ta.value : mine;
+  const m = _merge3(_fileData.content || '', cur, now.content);
+  try { window._clientDebug?.('file-collab', { verdict: m.clean ? 'file_merged' : 'file_conflict', measured: true, n_considered: 1 }); } catch (_) {}
+  // The file now is the base from here on.
+  _fileData.content = now.content;
+  _fileData.etag = now.etag || null;
+  if (m.clean) {
+    if (ta && m.text !== cur) {
+      const at = ta.selectionStart, line = cur.slice(0, at).split('\n').length - 1, col = at - cur.lastIndexOf('\n', at - 1) - 1;
+      ta.value = m.text;
+      const L = m.text.split('\n'); let off = 0;
+      for (let k = 0; k < Math.min(line, L.length - 1); k++) off += L[k].length + 1;
+      const c = off + Math.min(col, (L[Math.min(line, L.length - 1)] || '').length);
+      try { ta.setSelectionRange(c, c); } catch (e) {}
+      if (_mdxActive()) _mdxChanged();
+    }
+    showToast('Merged with changes made elsewhere');
+    _fileSave();
+    return;
+  }
+  _fileData.conflict = { theirs: now.content };
+  _fileConflictBar(true);
+}
+function _fileConflictBar(on) {
+  let bar = document.getElementById('file-conflict');
+  if (!on) { if (bar) bar.hidden = true; return; }
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'file-conflict';
+    bar.className = 'file-conflict';
+    bar.setAttribute('role', 'alert');
+    bar.innerHTML = '<span>Someone else changed the same lines while you edited. Nothing was overwritten.</span>'
+      + '<button type="button" class="btn" onclick="_fileConflictResolve(\'diff\')">Show their version</button>'
+      + '<button type="button" class="btn" onclick="_fileConflictResolve(\'theirs\')">Take theirs</button>'
+      + '<button type="button" class="btn btn-primary" onclick="_fileConflictResolve(\'mine\')">Keep mine</button>';
+    const ov = document.getElementById('file-overlay');
+    const host = document.getElementById('mdx') || ov;
+    if (host && host.parentNode) host.parentNode.insertBefore(bar, host); else if (ov) ov.appendChild(bar);
+  }
+  bar.hidden = false;
+}
+function _fileConflictResolve(how) {
+  const c = _fileData && _fileData.conflict, ta = document.getElementById('file-edit-ta');
+  if (!c || !ta) { _fileConflictBar(false); return; }
+  if (how === 'diff') {
+    if (_mdxActive()) {
+      _mdx.against = { label: 'their version', content: c.theirs };
+      if (_mdx.mode === 'edit') _mdxSetMode(_mdxWide() ? 'split' : 'preview', false);
+      _mdxSetTab('diff');
+    }
+    return;
+  }
+  delete _fileData.conflict;
+  _fileConflictBar(false);
+  // Diff goes back to the file as opened, not "their version" (land review F2).
+  if (typeof _mdx !== 'undefined' && _mdx.against && _mdx.against.label === 'their version') {
+    _mdx.against = null;
+    if (_mdx.tab === 'diff') _mdxRenderDiff();
+  }
+  try { window._clientDebug?.('file-collab', { verdict: 'file_conflict_' + how, measured: true, n_considered: 1 }); } catch (_) {}
+  if (how === 'theirs') {
+    ta.value = c.theirs;
+    if (_mdxActive()) _mdxChanged();
+    return;
+  }
+  _fileSave();   // mine, over the version just read
+}
+
 async function _fileSaveOnce() {
   if (_xlsxEd) { await _xlsxSave(); return; }
   if (!_fileEditable(_fileData)) return;
@@ -32361,11 +32697,21 @@ async function _fileSaveOnce() {
         }
       } catch (e) { sent = false; }
     }
+    // The version this text was edited from, so a save never replaces a newer
+    // one (owner, 2026-10-29: "proper collision reconcilation etc. handled for
+    // multiple users in a workspace"). Without it the last save won silently.
+    let refused = null;
     if (!sent) r = await apiCall(API + '/api/file', {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({path: _fileData.path, content})
+      body: JSON.stringify({path: _fileData.path, content, expected_etag: _fileData.etag || undefined}),
+      _onRefused: (status, body) => { refused = { status, body }; }
     });
+    if (!r && refused && refused.status === 409 && refused.body && refused.body.code === 'file_changed') {
+      btn.textContent = 'Save'; btn.classList.remove('saving');
+      await _fileReconcile(content);
+      return;
+    }
     if (!r) {  // offline-queued (or error) — reflect locally; the PUT replays on reconnect
       _fileData.content = content;
       btn.textContent = online ? 'Error' : 'Queued';
@@ -32376,6 +32722,7 @@ async function _fileSaveOnce() {
     const d = await r.json();
     if (d.ok) {
       _fileData.content = content;
+      if (d.etag) _fileData.etag = d.etag;
       if (_fileData._isNew) {
         _fileData._isNew = false;
         // Auto-name from first line if this was an auto-named scratchpad note
@@ -33071,7 +33418,9 @@ async function loadFiles(path) {
     if (openFile) {
       try { amuxTrack('file_hash_kept_open_file', {measured: true, n_considered: 1}); } catch (_) {}
       history.replaceState({}, '', location.pathname + location.search + '#path=' + _encodeHashPath(openFile));
-    } else {
+    } else if (!/^#peek=/.test(location.hash)) {
+      // A worker opened while this listing loaded keeps its address: the
+      // folder written late made a reload show the folder, not the worker.
       history.replaceState({}, '', location.pathname + (path && path !== '/' ? '#path=' + _encodeHashPath(path) : ''));
     }
   } catch(e) {}
@@ -37362,6 +37711,9 @@ document.addEventListener('click', e => {
   if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
   const a = e.target.closest && e.target.closest('a[href]');
   if (!a || a.hasAttribute('download') || a.closest('#file-body iframe')) return;
+  // A worker tagged in markdown has its own handler (_bindMdFileLinks): it
+  // closes the file it sits in first, so the worker is not opened beneath it.
+  if (a.classList.contains('md-worker-link')) return;
   if (!_ownLinkHash(a.getAttribute('href'))) return;
   e.preventDefault(); e.stopPropagation();
   _openOwnLink(a.href, 'anchor');
@@ -40328,9 +40680,9 @@ function switchView(view) {
   if (view === 'terminal') _termInit();
   if (view === 'graph') _graphInit();
   if (view === 'map') { _mapLoad(); _mapInit(); if (_mapSwState()) _mapSwToggle(true); }
-  if (view === 'metrics') { _metricsLoad(); _metricsApplySidebarState(); try { const m = localStorage.getItem('amux_metrics_mode'); if (m && ['system','host','resources','disk'].includes(m)) _metricsSetMode(m); } catch(e) {} } // always refresh on tab switch
+  if (view === 'metrics') { _metricsLoad(); _metricsApplySidebarState(); try { const m = localStorage.getItem('amux_metrics_mode'); if (m && ['system','host','resources','velocity','disk'].includes(m)) _metricsSetMode(m); } catch(e) {} } // always refresh on tab switch
   if (view === 'cost') _costLoad();
-  if (view === 'disk') _reclaimLoad(); else if (typeof _reclaimStopPolling === 'function') _reclaimStopPolling();
+  if (view === 'disk') _reclaimLoad(); else { if (typeof _reclaimStopPolling === 'function') _reclaimStopPolling(); if (typeof _tierStopPolling === 'function') _tierStopPolling(); }
   if (view === 'browser') _bwInit(); else if (typeof _bwStopLive === 'function') _bwStopLive();
 
   if (view === 'journal') _journalInit();
@@ -44975,7 +45327,20 @@ function _bindMdFileLinks(container) {
       e.preventDefault();
       e.stopPropagation();
       _mdBeacon('md_worker_link_opened', { known: _mdWorkerKnown(w.dataset.worker) ? 1 : 0 });
+      // The file closes first: it covers the worker view, and the worker
+      // opened beneath it (owner, 2026-10-29: "when i @ a worker and click it
+      // it should open that worker"). Back (‹, ⌘[) returns to the file, as
+      // _nav records each as a place. Unsaved edits keep the file open.
+      const fo = document.getElementById('file-overlay');
+      if (fo && fo.classList.contains('active') && container.closest('#file-overlay')) {
+        // The file is a place now, however soon after opening it the link is
+        // clicked, so Back finds it.
+        if (typeof _navNote === 'function') { clearTimeout(_nav.timer); _navNote(); }
+        closeFilePreview();
+        if (fo.classList.contains('active')) { _mdBeacon('md_worker_link_kept_file', { reason: 'unsaved' }); return; }
+      }
       if (typeof openPeek === 'function') openPeek(w.dataset.worker);
+      if (typeof _navSoon === 'function') _navSoon();
       return;
     }
     const a = e.target.closest && e.target.closest('.md-file-link');
@@ -52028,6 +52393,7 @@ function connectSSE() {
     if (_initialLoad) { _initialLoad = false; render(); }
     if (_sseGraceUntil) _sseGraceUntil = 0;
     if (!_liveSSE) { _liveSSE = true; updateConnectionStatus(); }
+    if (_pollTimer) _stopPollingFallback();
     if (!online) setOnline(true);
     // On reconnect after being offline / zombie: catch up on anything we missed.
     // Note: _sseRetries is reset above, so we key off wasOffline alone.
@@ -52209,13 +52575,38 @@ function connectSSE() {
   };
 }
 
+// POLLING IS A DETOUR, NOT A DESTINATION (hog RCA 20261030-044026). Three
+// failed reconnects, which one deploy restart can cause, put a window on this
+// 5 s poll, and nothing ever tried the stream again or stopped the timer: the
+// Mac app's windows fetched the whole board (536 ms of server time each) about
+// 2,360 times an hour, one of them still on code two deploys old because the
+// reload hint rides the stream. While polling, the stream is retried every
+// _SSE_RETRY_FROM_POLL_MS, and its first message ends the poll.
+const _SSE_RETRY_FROM_POLL_MS = 30000;
+let _pollStartedAt = 0;
+let _sseRetryFromPollAt = 0;
 function enablePollingFallback() {
   _sseFallback = true;
   if (_sse) { _sse.close(); _sse = null; }
   fetchSessions(); fetchBoard(); _runDeltaSync();
+  if (!_pollStartedAt) _pollStartedAt = Date.now();
+  _sseRetryFromPollAt = Date.now() + _SSE_RETRY_FROM_POLL_MS;
   if (!_pollTimer) _pollTimer = setInterval(() => {
     fetchSessions(); fetchBoard();
+    if (!_sse && Date.now() >= _sseRetryFromPollAt) {
+      _sseRetryFromPollAt = Date.now() + _SSE_RETRY_FROM_POLL_MS;
+      _sseFallback = false; _sseRetries = 0;
+      connectSSE();
+    }
   }, 5000);
+}
+function _stopPollingFallback() {
+  if (!_pollTimer) return;
+  clearInterval(_pollTimer); _pollTimer = null;
+  _sseFallback = false;
+  const polledMs = _pollStartedAt ? Date.now() - _pollStartedAt : 0;
+  _pollStartedAt = 0;
+  console.info('[amux] stream back; polling stopped verdict=sse_recovered_from_polling polled_ms=' + polledMs);
 }
 
 // ── Freshness watchdog & resume handlers ───────────────────────────────────
@@ -58134,6 +58525,7 @@ function _metricsSetMode(mode) {
   document.getElementById('metricsmode-system')?.classList.toggle('active', mode === 'system');
   document.getElementById('metricsmode-host')?.classList.toggle('active', mode === 'host');
   document.getElementById('metricsmode-resources')?.classList.toggle('active', mode === 'resources');
+  document.getElementById('metricsmode-velocity')?.classList.toggle('active', mode === 'velocity');
   document.getElementById('metricsmode-disk')?.classList.toggle('active', mode === 'disk');
   const mc = document.getElementById('metrics-content');
   const hc = document.getElementById('host-content');
@@ -58141,11 +58533,69 @@ function _metricsSetMode(mode) {
   if (mc) mc.style.display = mode === 'system' ? '' : 'none';
   if (hc) hc.style.display = mode === 'host' ? '' : 'none';
   if (rc) rc.style.display = mode === 'resources' ? '' : 'none';
+  const vc = document.getElementById('velocity-content');
+  if (vc) vc.style.display = mode === 'velocity' ? '' : 'none';
   const sb = document.getElementById('metrics-sidebar');
   if (sb) sb.style.display = (mode === 'system') ? '' : 'none';
   if (mode === 'disk') _reclaimLoad(); else _reclaimStopPolling();
   if (mode === 'host') _hostLoad();
   if (mode === 'resources') _resourcesLoad();
+  if (mode === 'velocity') _velocityLoad();
+}
+
+// ── Velocity (Metrics > Velocity) ─────────────────────────────────────────
+// Where each worker's time goes, what wastes it and who can fix it, and when
+// its open cards land (docs/design/worker-velocity.md, /api/velocity). The
+// fleet list first; a row opens that worker's breakdown and projection.
+let _velocityWorker = null;
+
+function _velocityLoad() {
+  const el = document.getElementById('velocity-content');
+  if (!el) return;
+  if (_velocityWorker) return _velocityShowWorker(_velocityWorker);
+  el.innerHTML = '<div style="color:var(--dim);font-size:var(--fs-lg);padding:var(--space-10);text-align:center;">Loading velocity…</div>';
+  fetch(API + '/api/velocity?days=30').then(r => r.ok ? r.json() : null).then(d => {
+    if (!d || !Array.isArray(d.workers)) { el.innerHTML = '<div style="color:var(--red);padding:var(--space-5);">Velocity did not load.</div>'; return; }
+    const rows = d.workers.map(w => `<div class="metrics-card velocity-row" data-velocity-worker="${esc(w.worker)}" onclick="_velocityShowWorker(this.dataset.velocityWorker)" style="cursor:pointer;">
+        <div class="reclaim-safe-head">${esc(w.worker)}</div>
+        <div class="reclaim-safe-text">${w.finished_cards} finished (${w.finished_per_day}/day) · ${w.finished_share_of_time}% of time on finished work · ${w.wasted_hours} h wasted · top: ${esc(w.top_bottleneck || '–')}</div>
+      </div>`).join('');
+    el.innerHTML = `<div class="metrics-section-title">Velocity, last ${d.window_days} days · most wasted hours first</div>${rows || '<div class="metrics-card reclaim-safe-text">No worker has enough history yet.</div>'}`;
+  }).catch(() => { el.innerHTML = '<div style="color:var(--red);padding:var(--space-5);">Velocity did not load.</div>'; });
+}
+
+function _velocityShowWorker(name) {
+  _velocityWorker = name;
+  const el = document.getElementById('velocity-content');
+  if (!el) return;
+  el.innerHTML = '<div style="color:var(--dim);font-size:var(--fs-lg);padding:var(--space-10);text-align:center;">Loading ' + esc(name) + '…</div>';
+  const w = encodeURIComponent(name);
+  Promise.all([
+    fetch(API + '/api/velocity/' + w + '?days=30').then(r => r.ok ? r.json() : null),
+    fetch(API + '/api/velocity/' + w + '/projection?days=30&include=backlog').then(r => r.ok ? r.json() : null),
+  ]).then(([s, p]) => {
+    if (!s) { el.innerHTML = '<div style="color:var(--red);padding:var(--space-5);">Velocity did not load.</div>'; return; }
+    const back = `<button class="btn" id="velocity-back" style="white-space:nowrap;flex-shrink:0;" onclick="_velocityWorker=null;_velocityLoad()">All workers</button>`;
+    const fmt = v => v == null ? '–' : Math.round(v);
+    const m = (s.per_finished_card || {}).minutes || {}, t = (s.per_finished_card || {}).tokens || {};
+    const waste = (s.waste || []).slice().sort((a, b) => b.hours - a.hours).map(x =>
+      `<div class="reclaim-safe-text velocity-waste" data-kind="${esc(x.kind)}" style="margin-bottom:var(--space-2);"><b>${esc(x.kind)}</b> (${esc(x.owner || '–')}) · ${x.attempts} attempts · ${x.hours} h · ${x.share_of_time}%<br><span style="color:var(--dim);">${esc(x.what_it_means || '')}</span></div>`).join('');
+    const waits = (s.waited_on || []).map(x => `<div class="reclaim-safe-text" style="overflow-wrap:anywhere;">${x.hours} h · ${esc(x.waiting)}</div>`).join('');
+    let proj = '';
+    if (p && p.measured) {
+      const cards = (p.cards || []).map(c => `<div class="reclaim-safe-text velocity-card" data-card="${esc(c.card)}" style="overflow-wrap:anywhere;margin-top:var(--space-2);">${esc(c.card)} · ${esc(c.status)} · ~${fmt(c.minutes_p50)} min${(c.blocked_by || []).length ? ' · waits on ' + esc(c.blocked_by.join(', ')) : ''}${c.over_estimate ? ` · <span style="color:var(--red);">over estimate: ${c.over_estimate.elapsed_minutes} of ${c.over_estimate.expected_minutes_p75} min</span>` : ''}<br><span style="color:var(--dim);">${esc((c.title || '').slice(0, 90))}</span></div>`).join('');
+      const fb = p.finish_by || {}, cal = p.calibration, pace = p.pace;
+      proj = `<div class="metrics-section-title">When the open cards land (${p.n_considered}, with backlog)</div>
+        <div class="metrics-card"><div class="reclaim-safe-text" id="velocity-finish">${pace ? `At the recent pace (${pace.days_per_finished_card} days per finished card): by ${esc((fb.p50 || '').slice(0, 10))}, ${esc((fb.p75 || '').slice(0, 10))} if slower.` : 'No pace yet: no finished cards in the window.'} Work time ${fmt(p.work_minutes.p50)} min${cal ? `, scaled ${cal.actual_over_estimate}x (past cards against their estimates)` : ''}.${(p.blocked_by_outside || []).length ? ' Waits on ' + esc(p.blocked_by_outside.join(', ')) + ' outside this queue; the dates assume it lands in time.' : ''}</div>${cards}</div>`;
+    } else if (p) {
+      proj = `<div class="metrics-card reclaim-safe-text">${esc(p.why_unmeasured || 'No projection.')}</div>`;
+    }
+    el.innerHTML = `<div class="metrics-section-title" style="display:flex;align-items:center;gap:var(--space-2);">${back}<span>${esc(name)}, last ${s.window_days} days</span></div>
+      <div class="metrics-card"><div class="reclaim-safe-text" id="velocity-summary">Finished ${s.finished_cards} of ${s.cards} cards (${s.finished_per_day}/day), ${s.attempts_per_card} attempts per card. ${s.finished_share_of_time}% of ${s.hours.total} h went to attempts that finished. A finished card: ${fmt(m.p50)} min median (${fmt(m.p25)} to ${fmt(m.p75)}), ${fmt(t.p50)} tokens.</div></div>
+      <div class="metrics-section-title">Waste, by who can fix it</div><div class="metrics-card">${waste || '<div class="reclaim-safe-text">None.</div>'}</div>
+      ${waits ? `<div class="metrics-section-title">What parked work waited on</div><div class="metrics-card">${waits}</div>` : ''}
+      ${proj}`;
+  }).catch(() => { el.innerHTML = '<div style="color:var(--red);padding:var(--space-5);">Velocity did not load.</div>'; });
 }
 
 // ── Worker Resources (Metrics > Resources) ─────────────────────────────────
@@ -58435,6 +58885,7 @@ async function _reclaimLoad() {
     const [scan, quar] = await Promise.all([
       fetch(API + '/api/reclaim/scan/latest').then(r => r.ok ? r.json() : null).catch(() => null),
       fetch(API + '/api/reclaim/quarantine').then(r => r.ok ? r.json() : null).catch(() => null),
+      _tierLoad(),
     ]);
     _reclaimScan = scan;
     _reclaimQuarantine = quar;
@@ -58754,6 +59205,10 @@ function _reclaimRender() {
     </div>
   </div>`;
 
+  // With a scan, the tiers panel follows the scan's own warnings: above them
+  // it pushed the snapshot note below a phone's fold (reclaim-snapshot-context,
+  // red on 3189c6825).
+  if (!scan) html += _tierPanel();
   if (!scan) html += _reclaimActionsPanel(findings);
 
   if (!scan) {
@@ -58835,6 +59290,8 @@ function _reclaimRender() {
       </div>
     </div>`;
   }
+
+  html += _tierPanel();
 
   // What the scan did NOT look at. Shown next to the results rather than
   // behind a separate view, because a home-directory total that silently omits
@@ -59284,6 +59741,281 @@ function _torrentRender() {
       </div>` : ''}
     </div>`;
   }).join('');
+}
+
+// ── Storage tiers (api/tiering.rs) ─────────────────────────────────────────
+// Ethan, 2026-10-29: watched folders move between this Mac and a chosen cold
+// drive by how recently they were used, configured here in the Disk tab. The
+// server owns every decision and every refusal; this panel shows them and
+// queues requests. Polls only while a move or a run is in flight.
+let _tier = null;
+let _tierTimer = null;
+const _tierOpen = {};
+const _TIER_WHERE = {
+  mac: 'On this Mac', hdd: 'On the cold drive', hdd_unavailable: 'On the cold drive, which is not connected',
+  moving: 'Moving', missing: 'Missing', foreign_link: 'A symlink amux did not create', not_a_folder: 'Not a folder',
+};
+
+async function _tierLoad() {
+  const prev = _tier;
+  const r = await fetch(API + '/api/tiering').then(r => r.ok ? r.json() : null).catch(() => null);
+  _tier = r;
+  const busy = !!(r && (r.ticking || (r.folders || []).some(f => f.op)));
+  if (busy && !_tierTimer) _tierTimer = setInterval(_tierPoll, 2000);
+  if (!busy) _tierStopPolling();
+  // Say when a move finishes, so a click that took minutes does not end in silence.
+  for (const f of (r?.folders || [])) {
+    const was = (prev?.folders || []).find(x => x.path === f.path);
+    if (was?.op && !f.op) {
+      if (f.last_move && f.last_move.at >= was.op.started_at) showToast(f.path + ': ' + f.last_move.text);
+      else if (f.last_refusal) showToast(f.path + ': not moved. ' + f.last_refusal.text);
+    }
+  }
+  return r;
+}
+
+function _tierStopPolling() {
+  if (_tierTimer) { clearInterval(_tierTimer); _tierTimer = null; }
+}
+
+async function _tierPoll() {
+  await _tierLoad();
+  _tierRefresh();
+}
+
+function _tierRefresh() {
+  const el = document.getElementById('tier-status');
+  if (el) el.outerHTML = _tierStatusHtml();
+}
+
+// TB once past a terabyte: an 18 TB drive read as "18543.23 GB free".
+function _tierBytes(b) {
+  return b >= 1e12 ? (b / 1e12).toFixed(1) + ' TB' : _fmtBytes(b);
+}
+
+function _tierPanel() {
+  return `<div id="tier-panel">${_tierStatusHtml()}${_tierFormHtml()}</div>`;
+}
+
+function _tierStatusHtml() {
+  const t = _tier;
+  let h = '<div id="tier-status"><div class="metrics-section-title" style="margin-top:var(--space-3);" id="tier-title">Storage tiers</div>';
+  if (!t) return h + '<div class="metrics-card reclaim-safe-text" id="tier-unloaded">Storage tiers did not load.</div></div>';
+  if (!t.measured) return h + `<div class="metrics-card reclaim-safe-text" id="tier-unmeasured">Not measured: ${esc(t.why_unmeasured || 'no status')}</div></div>`;
+  const c = t.cold_root;
+  const vols = t.volumes || [];
+  h += '<div class="metrics-card reclaim-safe-card" id="tier-drive"><div class="reclaim-safe-head">Cold drive</div>';
+  if (c) {
+    h += `<div class="reclaim-safe-text" id="tier-drive-text" style="overflow-wrap:anywhere;"><code>${esc(c.path)}</code>, ${c.available
+      ? `${_tierBytes(c.free)} free of ${_tierBytes(c.total)}`
+      : '<b style="color:var(--red);">not connected</b>'}${c.same_disk_as_mac ? '. <b>This is the same disk as the Mac, so a move frees nothing.</b>' : ''}</div>`;
+  } else {
+    h += '<div class="reclaim-safe-text" id="tier-drive-text" style="overflow-wrap:anywhere;">Pick a drive for folders you are not using. A watched folder moves there after it sits idle, leaves a link behind so every path still works, and comes back when it is used.</div>';
+  }
+  h += `<div class="reclaim-actions-row">
+    <select class="input" id="tier-drive-pick" aria-label="Cold drive" style="max-width:100%;">
+      ${vols.map(v => `<option value="${esc(v.path)}/amux-tier"${c && c.path.startsWith(v.path + '/') ? ' selected' : ''}>${esc(v.path)} (${_tierBytes(v.free)} free)</option>`).join('')}
+      <option value=""${c && !vols.some(v => c.path.startsWith(v.path + '/')) ? ' selected' : ''}>Another folder</option>
+    </select>
+    <button class="btn" id="tier-drive-save" onclick="_tierSetDrive()">${c ? 'Change drive' : 'Use this drive'}</button>
+    <label class="reclaim-safe-text" style="display:flex;align-items:center;gap:var(--space-1-5);white-space:nowrap;"><input type="checkbox" id="tier-auto"${t.auto ? ' checked' : ''} onchange="_tierSetAuto(this.checked)"> Move automatically</label>
+    <button class="btn" id="tier-run" onclick="_tierRunNow()"${t.ticking ? ' disabled' : ''}>${t.ticking ? 'Checking' : 'Check now'}</button>
+  </div>`;
+  const pol = t.policy || {};
+  h += `<div class="reclaim-safe-text">Policy: a folder idle for its set days moves to the drive. It comes back on any write, or after reads on
+    <input class="input" id="tier-recall" type="number" min="1" max="7" value="${pol.recall_read_days || 3}" style="width:56px;" aria-label="Read days before a folder comes back">
+    separate days within ${pol.read_window_days || 7}. A pass that reads nearly every file at once, like a backup, does not count.
+    When this Mac drops under <input class="input" id="tier-low" type="number" min="1" max="90" value="${pol.pressure_free_pct || 15}" style="width:56px;" aria-label="Low-space level, percent free">% free,
+    the coldest folders move out sooner until <input class="input" id="tier-target" type="number" min="2" max="90" value="${pol.target_free_pct || 25}" style="width:56px;" aria-label="Target free space, percent">% is free.
+    A folder that just came back stays at least ${pol.residency_hours ?? 24} hours.
+    <button class="btn" id="tier-policy-save" onclick="_tierSavePolicy()">Save policy</button></div>`;
+  const lt = t.last_tick;
+  h += `<div class="reclaim-safe-text" id="tier-last-run">${t.auto ? `Checks every ${Math.round((t.interval_s || 300) / 60)} minutes.` : 'Automatic moves are off; the buttons below still work.'}
+    ${lt ? ` Last check ${esc(timeAgo(lt.at))}: ${lt.moved} moved, ${lt.refused} refused${lt.resumed ? `, ${lt.resumed} resumed` : ''}${lt.pressure ? ', with the Mac low on space' : ''}.` : ' No check has run yet.'}</div></div>`;
+  const fs = t.folders || [];
+  const top = fs.filter(f => !f.parent);
+  h += '<div id="tier-folders" class="reclaim-safe-grid" style="margin-top:var(--space-2-5);">';
+  if (!top.length) h += '<div class="metrics-card reclaim-safe-text" id="tier-empty">No watched folders yet. Add one below.</div>';
+  for (const f of top) h += f.each_subfolder ? _tierRootCard(f, fs.filter(k => k.parent === f.path)) : _tierFolderCard(f);
+  return h + '</div></div>';
+}
+
+// A folder that keeps growing: it never moves itself, each subfolder does.
+// Children sit in a collapsed list so hundreds of runs do not bury the panel.
+function _tierRootCard(f, kids) {
+  const on = w => kids.filter(k => k.location === w);
+  const sum = list => list.reduce((a, k) => a + (k.stats?.bytes || 0), 0);
+  const moving = on('moving').length, mac = on('mac'), hdd = on('hdd');
+  const p = escJs(f.path);
+  const openKey = 'tier-open:' + f.path;
+  const open = !!_tierOpen[openKey];
+  return `<div class="metrics-card reclaim-safe-card tier-root" data-tier-path="${esc(f.path)}" data-tier-root="1">
+    <div class="reclaim-safe-head" style="word-break:break-all;">${esc(f.path)}</div>
+    <div class="reclaim-safe-text" data-tier-summary><b>${kids.length} subfolder${kids.length === 1 ? '' : 's'}</b>, each moved on its own:
+      ${mac.length} on this Mac (${_tierBytes(sum(mac))}), ${hdd.length} on the cold drive (${_tierBytes(sum(hdd))})${moving ? `, ${moving} moving` : ''}.</div>
+    <div class="reclaim-safe-text">A subfolder moves out after ${f.idle_days} idle day${f.idle_days === 1 ? '' : 's'}${f.promote_on_use ? ' and comes back when used' : ''}. New subfolders are picked up as they appear.</div>
+    ${kids.length ? `<details data-tier-kids ${open ? 'open' : ''} ontoggle="_tierOpen['${escJs(openKey)}']=this.open">
+      <summary class="reclaim-safe-text" style="cursor:pointer;min-height:44px;display:flex;align-items:center;">Show subfolders</summary>
+      <div class="reclaim-safe-grid" style="margin-top:var(--space-2);">${kids.map(_tierFolderCard).join('')}</div>
+    </details>` : ''}
+    <div class="reclaim-actions-row"><button class="btn" data-tier-act="edit-days" onclick="_tierEditDays('${p}',${Number(f.idle_days)})">Change idle days</button><button class="btn" data-tier-act="unwatch" onclick="_tierRemove('${p}')">Stop watching</button></div>
+  </div>`;
+}
+
+function _tierFolderCard(f) {
+  const st = f.stats, op = f.op, where = f.location;
+  const state = op
+    ? (op.kind === 'to_hdd' ? 'Moving to the cold drive' : 'Bringing back to this Mac') + (op.phase === 'queued' ? ', queued' : `, ${op.phase} step`)
+    : (_TIER_WHERE[where] || where);
+  const size = st ? `${_tierBytes(st.bytes)} in ${Number(st.files).toLocaleString()} files` : 'Size not measured yet';
+  const used = st ? (st.last_used ? `last used ${timeAgo(st.last_used)}` : 'no use recorded') + (st.complete ? '' : ' (count still partial)') : '';
+  const p = escJs(f.path);
+  let btns = '';
+  if (!op && where === 'mac') btns += `<button class="btn" data-tier-act="to-hdd" onclick="_tierMove('${p}','hdd')">Move to cold drive</button>`;
+  if (!op && where === 'hdd') btns += `<button class="btn" data-tier-act="to-mac" onclick="_tierMove('${p}','mac')">Bring back to this Mac</button>`;
+  if (!f.parent) btns += `<button class="btn" data-tier-act="edit-days" onclick="_tierEditDays('${p}',${Number(f.idle_days)})">Change idle days</button>`;
+  if (!op && !f.parent) btns += `<button class="btn" data-tier-act="unwatch" onclick="_tierRemove('${p}')">Stop watching</button>`;
+  const notes = [];
+  if (where === 'hdd' && !op) {
+    const today = Math.floor(Date.now() / 86400000), win = _tier?.policy?.read_window_days || 7;
+    const n = (f.read_days || []).filter(d => d > today - win).length;
+    notes.push(`<div class="reclaim-safe-text" data-tier-note="reads">Reads seen on ${n} of the last ${win} days; it comes back at ${_tier?.policy?.recall_read_days || 3}, or on any write.</div>`);
+  }
+  if (f.last_refusal) notes.push(`<div class="reclaim-safe-text" data-tier-note="refused" style="color:var(--red);overflow-wrap:anywhere;">Not moved ${esc(timeAgo(f.last_refusal.at))}: ${esc(f.last_refusal.text)}</div>`);
+  if (f.last_error) notes.push(`<div class="reclaim-safe-text" data-tier-note="error" style="color:var(--red);overflow-wrap:anywhere;">Last step failed, retrying: ${esc(f.last_error.text)}</div>`);
+  if (f.last_move && !f.last_error) notes.push(`<div class="reclaim-safe-text" data-tier-note="moved" style="overflow-wrap:anywhere;">${esc(timeAgo(f.last_move.at))}: ${esc(f.last_move.text)}</div>`);
+  return `<div class="metrics-card reclaim-safe-card tier-folder" data-tier-path="${esc(f.path)}" data-tier-location="${esc(where)}">
+    <div class="reclaim-safe-head" style="word-break:break-all;">${esc(f.path)}</div>
+    <div class="reclaim-safe-text"><b data-tier-state>${esc(state)}</b>. ${esc(size)}${used ? ', ' + esc(used) : ''}.</div>
+    <div class="reclaim-safe-text">Moves out after ${f.idle_days} idle day${f.idle_days === 1 ? '' : 's'}${f.promote_on_use ? ', comes back when used' : ''}.</div>
+    ${notes.join('')}
+    ${btns ? `<div class="reclaim-actions-row">${btns}</div>` : ''}
+  </div>`;
+}
+
+function _tierFormHtml() {
+  return `<div class="metrics-card reclaim-safe-card" id="tier-add" style="margin-top:var(--space-2-5);">
+    <div class="reclaim-safe-head">Watch a folder</div>
+    <div class="reclaim-actions-row">
+      <input class="input" id="tier-add-path" placeholder="~/Dev/mixpeek/customers/primis" spellcheck="false" autocapitalize="off" style="flex:1 1 180px;min-width:0;" onkeydown="if(event.key==='Enter')_tierAdd()">
+      <label class="reclaim-safe-text" style="display:flex;align-items:center;gap:var(--space-1-5);white-space:nowrap;">Move after <input class="input" id="tier-add-days" type="number" min="1" max="3650" value="14" style="width:72px;"> idle days</label>
+      <button class="btn" id="tier-add-btn" onclick="_tierAdd()">Watch</button>
+    </div>
+    <label class="reclaim-safe-text" style="display:flex;align-items:center;gap:var(--space-1-5);min-height:44px;"><input type="checkbox" id="tier-add-each">
+      Move each subfolder on its own, for folders that keep growing, like run outputs</label>
+    <div class="reclaim-safe-text" id="tier-add-msg" role="status"></div>
+  </div>`;
+}
+
+async function _tierCall(method, url, body) {
+  try {
+    const r = await fetch(API + url, {method, headers: {'Content-Type': 'application/json'}, body: body ? JSON.stringify(body) : undefined});
+    let j = null;
+    try { j = await r.json(); } catch (e) {}
+    return {ok: r.ok, status: r.status, j};
+  } catch (e) {
+    return {ok: false, status: 0, j: {error: 'Could not reach the server: ' + String(e)}};
+  }
+}
+
+async function _tierAdd() {
+  const input = document.getElementById('tier-add-path');
+  const msg = document.getElementById('tier-add-msg');
+  const btn = document.getElementById('tier-add-btn');
+  const path = (input?.value || '').trim();
+  const days = parseInt(document.getElementById('tier-add-days')?.value, 10);
+  msg.style.color = 'var(--red)';
+  if (!path) { msg.textContent = 'Type the folder path first.'; return; }
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const each = !!document.getElementById('tier-add-each')?.checked;
+  const r = await _tierCall('POST', '/api/tiering/folders', {path, idle_days: days, each_subfolder: each});
+  btn.disabled = false;
+  if (!r.ok) { msg.textContent = r.j?.error || `Could not add it (HTTP ${r.status}).`; return; }
+  msg.style.color = '';
+  msg.textContent = '';
+  input.value = '';
+  const eachBox = document.getElementById('tier-add-each');
+  if (eachBox) eachBox.checked = false;
+  _tier = r.j;
+  _tierRefresh();
+  showToast('Watching ' + path);
+  await _tierLoad();
+  _tierRefresh();
+}
+
+async function _tierMove(path, to) {
+  // Disable this card's buttons before the request, so a double click queues one move.
+  document.querySelectorAll('.tier-folder').forEach(card => {
+    if (card.dataset.tierPath === path) card.querySelectorAll('button').forEach(b => { b.disabled = true; });
+  });
+  const r = await _tierCall('POST', '/api/tiering/move', {path, to});
+  if (!r.ok) showToast(r.j?.error || `Move refused (HTTP ${r.status})`);
+  await _tierLoad();
+  _tierRefresh();
+}
+
+async function _tierEditDays(path, current) {
+  const root = (_tier?.folders || []).find(f => f.path === path && f.each_subfolder);
+  const v = await showPrompt(root ? `Move each subfolder of ${path} out after how many idle days?` : `Move ${path} out after how many idle days?`, '14', String(current || ''));
+  if (v == null || v === '') return;
+  const days = Number(v);
+  if (!Number.isInteger(days) || days < 1 || days > 3650) { showToast('Idle days must be a whole number from 1 to 3650'); return; }
+  const r = await _tierCall('PATCH', '/api/tiering/folders', {path, idle_days: days});
+  if (!r.ok) { showToast(r.j?.error || `Could not change the idle days (HTTP ${r.status})`); return; }
+  _tier = r.j;
+  showToast(`Now moves out after ${days} idle day${days === 1 ? '' : 's'}`);
+  _tierRefresh();
+}
+
+async function _tierRemove(path) {
+  const root = (_tier?.folders || []).find(f => f.path === path && f.each_subfolder);
+  const msg = root
+    ? `Stop watching ${path} and its subfolders? Every file stays exactly where it is now, including subfolders on the cold drive.`
+    : `Stop watching ${path}? Its files stay exactly where they are now.`;
+  if (!(await showConfirm(msg, 'Stop watching'))) return;
+  const r = await _tierCall('DELETE', '/api/tiering/folders?path=' + encodeURIComponent(path));
+  if (!r.ok) { showToast(r.j?.error || `Could not stop watching (HTTP ${r.status})`); return; }
+  _tier = r.j;
+  _tierRefresh();
+}
+
+async function _tierSetDrive() {
+  let p = document.getElementById('tier-drive-pick')?.value || '';
+  if (!p) {
+    p = await showPrompt('Folder on the cold drive', '/Volumes/YourDrive/amux-tier', _tier?.cold_root?.path || '');
+    if (!p) return;
+  }
+  const r = await _tierCall('PUT', '/api/tiering/config', {cold_root: p});
+  if (!r.ok) { showToast(r.j?.error || `Could not set the drive (HTTP ${r.status})`); return; }
+  _tier = r.j;
+  _tierRefresh();
+  showToast('Cold drive set to ' + p);
+}
+
+async function _tierSetAuto(on) {
+  const r = await _tierCall('PUT', '/api/tiering/config', {auto: on});
+  if (!r.ok) showToast(r.j?.error || 'Could not change automatic moves');
+  else _tier = r.j;
+  _tierRefresh();
+}
+
+async function _tierSavePolicy() {
+  const num = id => parseInt(document.getElementById(id)?.value, 10);
+  const r = await _tierCall('PUT', '/api/tiering/config', {
+    recall_read_days: num('tier-recall'), pressure_free_pct: num('tier-low'), target_free_pct: num('tier-target'),
+  });
+  if (!r.ok) { showToast(r.j?.error || `Could not save the policy (HTTP ${r.status})`); return; }
+  _tier = r.j;
+  _tierRefresh();
+  showToast('Policy saved');
+}
+
+async function _tierRunNow() {
+  const r = await _tierCall('POST', '/api/tiering/run');
+  showToast(r.j?.started ? 'Checking watched folders' : 'A check is already running');
+  await _tierLoad();
+  _tierRefresh();
 }
 
 function _fmtBytes(b) {
@@ -61027,7 +61759,10 @@ async function _pagesEnter() {
   const open = /[#&]open=([0-9a-f]{32})(?:&|$)/.exec(h);
   const add = /[#&]add-internal=(\d{1,5})(?:&|$)/.exec(h);
   await _pubList();
-  if (open) { _pubOpenInternal(open[1]); return; }
+  // &at=<path> opens it at that page: an app page opened in a tab of its own
+  // without its session is sent here (apps_origin.rs).
+  const at = /[#&]at=([^&]*)/.exec(h);
+  if (open) { let p = null; try { p = at ? decodeURIComponent(at[1]) : null; } catch (_) {} _pubOpenInternal(open[1], p); return; }
   if (add) {
     const port = parseInt(add[1], 10);
     const have = _pubLinks.find(l => l.kind === 'internal' && l.port === port);
@@ -61317,36 +62052,126 @@ async function _pubHandoff(id) {
   const d = await _pubFetch('/' + encodeURIComponent(id) + '/open', { method: 'POST' });
   return d.url;
 }
-async function _pubOpenInternal(id) {
+async function _pubOpenInternal(id, at) {
   const l = _pubLinks.find(x => x.id === id);
   if (!l) return;
   if (l.pending) { showToast('Approve it first: it does not open until you do.'); return; }
   let url;
-  try { url = await _pubHandoff(id); } catch (e) { showToast('Could not open: ' + e.message); return; }
+  try { url = _appUrlAt(await _pubHandoff(id), at); } catch (e) { showToast('Could not open: ' + e.message); return; }
   if (_pagesMounted) { _pagesMounted.destroy(); _pagesMounted = null; }
   _pagesCur = 'app:' + id; _pagesMeta = null;
   document.getElementById('pages-list-wrap').style.display = 'none';
   document.getElementById('pages-open').style.display = 'flex';
   document.getElementById('pages-page-actions').style.display = 'none';
   document.getElementById('pages-title').textContent = _pubName(l);
+  const where = l.file ? l.file : 'port ' + l.port;
+  const status = document.getElementById('pages-status');
+  const back = document.getElementById('pages-app-back');
+  // Pages the app went through, so Back shows only when there is a page to go back to.
+  const trail = [];
+  let goingBack = false;
   const standalone = document.getElementById('pages-standalone');
   standalone.href = '#';
-  // Each handoff opens once, so a new tab asks for its own.
+  // Each handoff opens once, so a new tab asks for its own, at the page shown.
   standalone.onclick = async (e) => {
     e.preventDefault();
     const w = window.open('', '_blank');
-    try { const u = await _pubHandoff(id); if (w) { w.opener = null; w.location = u; } }
+    try { const u = _appUrlAt(await _pubHandoff(id), trail[trail.length - 1]); if (w) { w.opener = null; w.location = u; } }
     catch (err) { if (w) w.close(); showToast('Could not open: ' + err.message); }
   };
-  document.getElementById('pages-status').textContent = l.file ? l.file : 'port ' + l.port;
+  status.textContent = where;
   const host = document.getElementById('pages-frame');
   const f = document.createElement('iframe');
   f.className = 'pub-app-frame';
   f.title = _pubName(l);
   f.src = url;
   host.replaceChildren(f);
-  _pagesMounted = { destroy() { f.remove(); } };
+  _appFrameWatch(f, {
+    nav(p) {
+      if (goingBack && trail.length > 1) trail.pop(); else if (trail[trail.length - 1] !== p) trail.push(p);
+      goingBack = false;
+      status.textContent = p === '/' ? where : p;
+      status.title = where + ' ' + p;
+      if (back) back.style.display = trail.length > 1 ? '' : 'none';
+    },
+    async reopen(p) {
+      try { _appFrameReplace(f, _appUrlAt(await _pubHandoff(id), p)); }
+      catch (e) { showToast('Could not open the page again: ' + e.message); }
+    },
+  });
+  if (back) {
+    back.style.display = 'none';
+    back.onclick = () => { if (trail.length > 1) { goingBack = true; history.back(); } };
+  }
+  _pagesMounted = { destroy() { f.remove(); if (back) back.style.display = 'none'; } };
   _pagesFit();
+}
+// Pages on the apps origin (static_files/app_viewer.js) tell the frame that
+// holds them which page they are on, and a page whose session is gone asks to
+// be opened again. Only a message from a frame registered here counts.
+const _appFrames = new Map();
+function _appFrameWatch(f, hooks) {
+  for (const k of _appFrames.keys()) if (!k.isConnected) _appFrames.delete(k);
+  _appFrames.set(f, Object.assign({ reopens: [] }, hooks));
+}
+// Load `url` in place of the page the frame shows, so the "opening again" page
+// does not stay in history (Back from the reopened page would land on it and
+// reopen it again).
+function _appFrameReplace(f, url) {
+  try { f.contentWindow.location.replace(url); } catch (_) { f.src = url; }
+}
+function _appPathOk(p) {
+  return typeof p === 'string' && p.startsWith('/') && !p.startsWith('//') && !p.includes('\\');
+}
+window.addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || typeof d !== 'object' || !(d.amux_app_nav || d.amux_app_reopen)) return;
+  for (const [f, h] of _appFrames) {
+    if (f.contentWindow !== e.source) continue;
+    const p = _appPathOk(d.at) ? d.at : '/';
+    if (d.amux_app_nav) { if (h.nav) h.nav(p); return; }
+    // At most three reopens a minute, so a page that cannot open does not loop.
+    const now = Date.now();
+    h.reopens = h.reopens.filter(t => now - t < 60000);
+    if (h.reopens.length >= 3) { showToast('This page did not open again. Open it from Apps.'); return; }
+    h.reopens.push(now);
+    h.reopen(p);
+    return;
+  }
+});
+// A handoff URL opens the app's first page; point it at page `at` instead.
+// The one-time token stays in the query (apps_origin.rs takes it out).
+function _appUrlAt(url, at) {
+  if (!_appPathOk(at) || at === '/') return url;
+  const u = new URL(url);
+  const m = /^\/app\/[0-9a-f]{32}/.exec(u.pathname);
+  if (!m) return url;
+  const t = new URL(at, 'https://x.invalid');
+  const q = new URLSearchParams(t.search);
+  for (const [k, v] of u.searchParams) q.set(k, v);
+  u.pathname = m[0] + t.pathname;
+  u.search = q.toString();
+  u.hash = t.hash;
+  return u.toString();
+}
+// An HTML file in the Files tab opens as part of its folder's website on the
+// apps origin, so its relative CSS, scripts and links work and the pages run
+// sandboxed, away from the dashboard. `fallback` shows the file alone when
+// amux will not serve its folder.
+async function _htmlSiteFrame(iframe, path, fallback) {
+  const mint = (p) => _pubFetch('/site-view', { method: 'POST', body: JSON.stringify({ path: p }) });
+  let view;
+  try { view = await mint(path); } catch (e) { fallback(); return; }
+  iframe.src = view.url;
+  _appFrameWatch(iframe, {
+    async reopen(p) {
+      const page = p.split(/[?#]/)[0];
+      let file = page === '/' ? path : view.root + decodeURIComponent(page);
+      if (file.endsWith('/')) file += 'index.html';
+      try { view = await mint(file); _appFrameReplace(iframe, view.url + p.slice(page.length)); }
+      catch (e) { fallback(); }
+    },
+  });
 }
 async function _pubRevoke(id) {
   const l = _pubLinks.find(x => x.id === id);
@@ -67253,6 +68078,7 @@ function _cvSelect(sel, auto) {
   if (sel === '@unread') return _cvRenderUnread();
   if (sel.indexOf('@search:') === 0) return _cvLoadFeed('/api/conversations/search?q=' + encodeURIComponent(sel.slice(8)), 'Search: ' + sel.slice(8), 'Messages you can read that contain this text');
   _cv.posts = []; _cv.lastId = 0; _cv.readId = 0; _cv.info = null; _cv.history = [];
+  _cv.restoreScroll = true; _cv.unreadFrom = null;
   if (sel.indexOf('w:') === 0) _cvLoadWorkerHistory(sel);
   document.getElementById('cv-title').textContent = _cvFindName(sel);
   document.getElementById('cv-meta').textContent = '';
@@ -67312,6 +68138,13 @@ async function _cvPollOnce(full) {
   // it again now that the names are here.
   if (!hadInfo) { const inp = document.getElementById('cv-input'); if (inp && /(^|\s)@[\w.\-]*$/.test(inp.value.slice(0, inp.selectionStart))) _cvOnInput(inp); }
   if (full) _cv.posts = d.posts || [];
+  // The first post someone else wrote after your read mark, captured before
+  // this load marks the conversation read (_cvMarkRead below).
+  if (full && _cv.restoreScroll) {
+    const lr = Number(d.last_read || 0), me = _cvMeKey();
+    const first = lr ? (d.posts || []).find(p => typeof p.id === 'number' && p.id > lr && p.author_key !== me) : null;
+    _cv.unreadFrom = first ? first.id : null;
+  }
   else if ((d.posts || []).length) {
     // Merged by id and kept in order; the optimistic pending posts stay last.
     const byId = new Map(_cv.posts.filter(p => typeof p.id === 'number').map(p => [p.id, p]));
@@ -67702,6 +68535,7 @@ async function _cvOpenThreadOrScroll(conv, id) {
 }
 // ── Older history: scrolling to the top loads the page before it ──
 async function _cvOnScroll(box) {
+  if (!_cv.restoreScroll) _cvSavePosition(box);
   if (box.scrollTop > 60 || _cv.loadingOlder || !_cv.info || !_cv.info.has_more || !_cv.posts.length || _cv.sel[0] === '@') return;
   _cv.loadingOlder = true;
   const sel = _cv.sel, first = _cv.posts[0].id, h0 = box.scrollHeight;
@@ -67833,17 +68667,54 @@ function _cvRenderPosts(scroll) {
     .concat(_cv.pending.filter(q => q.conv === _cv.sel).map(q => ({ ...q, id: 'q' + q.ts, pending: true,
       author_key: _cvMeKey(), author_name: (_cv.list && _cv.list.me && _cv.list.me.name) || 'you', mentions: [], deliveries: [] })));
   if (!all.length) {
+    _cv.restoreScroll = false;
     const sel = _cv.sel || '';
     box.innerHTML = '<div class="cv-empty">' + (sel.indexOf('w:') === 0 ? 'Send ' + esc(sel.slice(2)) + ' a message. It will reply here.'
       : sel.indexOf('p:') === 0 ? 'Start a direct message.' : 'No messages yet. Say hello, or @mention a worker to give it a task.') + '</div>';
     return;
   }
   let html = '', day = '';
-  for (const p of all) { const dl = _cvDayLabel(p.ts); if (dl !== day) { day = dl; html += '<div class="cv-day">' + esc(dl) + '</div>'; } html += _cvPostHtml(p, false); }
+  for (const p of all) {
+    const dl = _cvDayLabel(p.ts); if (dl !== day) { day = dl; html += '<div class="cv-day">' + esc(dl) + '</div>'; }
+    if (_cv.unreadFrom && p.id === _cv.unreadFrom) html += '<div class="cv-unread-line" role="separator"><span>New</span></div>';
+    html += _cvPostHtml(p, false);
+  }
   _cvEditBeforeRender();
   box.innerHTML = html;
   _cvEditAfterRender(box);
+  if (_cv.restoreScroll) { _cv.restoreScroll = false; _cvRestoreScroll(box); return; }
   if (scroll || nearBottom) box.scrollTop = box.scrollHeight;
+}
+// WHERE YOU LEFT OFF (Ethan, 2026-10-29: "when i open messages it should scroll
+// to where i left off"). Opening a conversation goes, in order, to the first
+// message someone else sent since your last read (under a "New" line), else to
+// the post you were reading when you scrolled up and left, else the end. The
+// place is kept per conversation in this browser (amux_cv_pos).
+function _cvPositions() { try { return JSON.parse(localStorage.getItem('amux_cv_pos') || '{}'); } catch (e) { return {}; } }
+function _cvRestoreScroll(box) {
+  const pos = _cvPositions()[_cv.sel];
+  const at = id => box.querySelector('.cv-post[data-id="' + CSS.escape(String(id)) + '"]');
+  const unread = _cv.unreadFrom && at(_cv.unreadFrom);
+  if (unread) { box.scrollTop += unread.getBoundingClientRect().top - box.getBoundingClientRect().top - 48; return; }
+  const el = pos && !pos.bottom && at(pos.id);
+  if (el) { box.scrollTop += el.getBoundingClientRect().top - box.getBoundingClientRect().top - (pos.off || 0); return; }
+  box.scrollTop = box.scrollHeight;
+}
+let _cvPosT = 0;
+function _cvSavePosition(box) {
+  clearTimeout(_cvPosT);
+  _cvPosT = setTimeout(() => {
+    const sel = _cv.sel; if (!sel || sel[0] === '@') return;
+    const top = box.getBoundingClientRect().top;
+    const el = [...box.querySelectorAll('.cv-post[data-id]')].find(e => e.getBoundingClientRect().bottom > top + 4);
+    const all = _cvPositions();
+    all[sel] = { id: el ? el.dataset.id : null, off: el ? Math.round(el.getBoundingClientRect().top - top) : 0,
+      bottom: box.scrollHeight - box.scrollTop - box.clientHeight < 80, at: Date.now() };
+    // Keep the 200 most recent conversations.
+    const keys = Object.keys(all).sort((a, b) => (all[b].at || 0) - (all[a].at || 0));
+    for (const k of keys.slice(200)) delete all[k];
+    try { localStorage.setItem('amux_cv_pos', JSON.stringify(all)); } catch (e) {}
+  }, 300);
 }
 async function _cvMarkRead() {
   if (!_cv.sel || _cv.sel[0] === '@' || document.hidden) return;
@@ -72068,6 +72939,37 @@ function _cmdkRun(i) {
   // rank and tier let a sweep see people opening things far down the list,
   // which is what a ranking regression looks like from outside.
   try { amuxTrack('palette_open', { kind: r.kind, rank: i, tier: r.tier || 0, match: r.match || (_cmdk.q.trim() ? '' : 'start'), measured: true, n_considered: _cmdk.rows.length }); } catch (e) {}
+  // In the Mac app, a worker or a tab already open in another tab or pane is
+  // brought forward instead (owner, 2026-10-29, MSG-100765: "if i do cmd + k
+  // and select something for which a tab is already open it goes to that
+  // tab"). The app answers within a moment; with no answer (an older app) or
+  // no such tab, it opens here as before.
+  const place = r.kind === 'worker' ? '#peek=' + r.id : r.kind === 'view' && r.id !== 'sessions' ? '#view=' + _viewHashName(r.id) : '';
+  if (place && _cmdkFocusElsewhere(place, () => _cmdkOpen(r))) return;
+  _cmdkOpen(r);
+}
+const _cmdkFocusWaits = {};
+function _cmdkFocusElsewhere(hash, otherwise) {
+  const h = typeof _nativePaneBridge === 'function' && _nativePaneBridge();
+  if (!h) return false;
+  const token = Math.random().toString(36).slice(2, 10);
+  const done = found => {
+    if (!_cmdkFocusWaits[token]) return;
+    clearTimeout(_cmdkFocusWaits[token]); delete _cmdkFocusWaits[token]; delete _cmdkFocusWaits[token + ':cb'];
+    try { amuxTrack('palette_focus', { found: found ? 1 : 0, measured: true, n_considered: 1 }); } catch (e) {}
+    if (!found) otherwise();
+  };
+  _cmdkFocusWaits[token] = setTimeout(() => done(false), 700);
+  _cmdkFocusWaits[token + ':cb'] = done;
+  try { h.postMessage({ op: 'focus', hash, token }); } catch (e) { done(false); }
+  return true;
+}
+function _cmdkFocusAck(token, found) {
+  const cb = _cmdkFocusWaits[token + ':cb'];
+  delete _cmdkFocusWaits[token + ':cb'];
+  if (cb) cb(!!found);
+}
+function _cmdkOpen(r) {
   switch (r.kind) {
     case 'worker': openPeek(r.id); break;
     case 'view': switchView(r.id); break;

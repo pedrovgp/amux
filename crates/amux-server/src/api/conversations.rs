@@ -1362,9 +1362,18 @@ pub(crate) async fn post_inner(
             targets.clear();
         }
     }
-    // What the channel said just before, so a mentioned worker answers in
-    // context the way a person scrolling up would.
-    let context = recent_context(state, &conv.key(), 8);
+    // What was said just before, so a mentioned worker answers in context the
+    // way a person scrolling up would. In a thread that is the THREAD (its
+    // opening post and replies so far), not the conversation's last few posts,
+    // which can leave out the very post the thread is about (Ethan,
+    // 2026-10-29: "in a thread if a worker is tagged it should understand the
+    // context of the thread").
+    // A new post starts a thread of its own and carries nothing: the
+    // conversation's other posts are other topics (Ethan, 2026-10-29: a new
+    // thread mentioning amux-helper arrived with the DM's last 8 messages from
+    // every thread, "it was a new thread/comment it shouldn't have given you
+    // the full context").
+    let thread_ctx: Vec<String> = state.store.read().map(|c| delivery_context(&c, &conv.key(), parent)).unwrap_or_default();
     let (key, ts) = (conv.key(), now_ms());
     let id_cell = Arc::new(Mutex::new(0i64));
     let att2 = attachments.to_string();
@@ -1404,13 +1413,12 @@ pub(crate) async fn post_inner(
         }
     }
     tracing::info!(conv = %key, author = %author_key, post = id, mentions = mentions.len(),
-        deliveries = targets.len(), "conversation post");
+        deliveries = targets.len(), thread = ?parent, context_posts = thread_ctx.len(), "conversation post");
 
     // Deliver to workers in the background; the post exists either way, and
     // each outcome is written back onto it.
     if !targets.is_empty() {
         let (st, conv2, author, text_body) = (state.clone(), conv.clone(), author_name.clone(), body.clone());
-        let channel_workers = workers_in(&conv, &lanes);
         tokio::spawn(async move {
             let mut outcomes = Vec::new();
             for w in targets {
@@ -1423,16 +1431,12 @@ pub(crate) async fn post_inner(
                     let k = conv2.key();
                     text = text.replace(&format!("amux post '{k}' <<'EOF'"), &format!("amux post '{k}' --thread {root} <<'EOF'"));
                 }
-                // A channel's recent messages go only to workers who could read
-                // the channel anyway (its group's, or anyone in #general); a
-                // worker brought in from another group sees just the post. In a
-                // DM the poster chose to bring the worker in.
-                let member = match &conv2 {
-                    Conv::Group(g) => g == GENERAL || channel_workers.contains(&w),
-                    _ => true,
-                };
-                if !isolated && member && !context.is_empty() {
-                    text = format!("Recent messages in {} before this one:\n{}\n\n{text}", conv2.key(), context.join("\n"));
+                if !thread_ctx.is_empty() {
+                    // Every worker in the thread gets it, an isolated one too:
+                    // these are the thread's own posts, people's words with no
+                    // instruction added, and without them a reply like "can you
+                    // do this?" means nothing to the worker it tags.
+                    text = format!("Earlier in this thread ({}, amux Messages):\n{}\n\n{text}", conv2.key(), thread_ctx.join("\n"));
                 }
                 if let Some(n) = &note {
                     text = format!("{n}\n\n{text}");
@@ -1478,15 +1482,36 @@ pub(crate) async fn post_inner(
 pub(crate) type AlsoWrite = Box<dyn FnOnce(&rusqlite::Connection, i64) -> rusqlite::Result<()> + Send>;
 
 /// The conversation's last `n` posts, oldest first, as `- Name: text` lines.
-fn recent_context(state: &AppState, conv: &str, n: usize) -> Vec<String> {
-    let Ok(c) = state.store.read() else { return vec![] };
-    let Ok(mut q) = c.prepare("SELECT author_name, body FROM conversation_posts WHERE conv=?1 ORDER BY id DESC LIMIT ?2") else { return vec![] };
-    let rows = q.query_map(rusqlite::params![conv, n as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
-    let mut out: Vec<String> = rows.into_iter().flatten().flatten()
-        .map(|(a, b)| format!("- {a}: {}", b.chars().take(500).collect::<String>().replace('\n', " ")))
-        .collect();
-    out.reverse();
+/// A thread as context lines: its opening post, then its latest `n` replies,
+/// oldest first. Deleted replies are left out, a deleted opening post is named
+/// as deleted; no opening post in `conv`, no lines.
+fn thread_lines(c: &rusqlite::Connection, conv: &str, root: i64, n: usize) -> Vec<String> {
+    let line = |a: String, b: String| format!("- {a}: {}", b.chars().take(800).collect::<String>().replace('\n', " "));
+    let mut out = Vec::new();
+    // A deleted opening post still anchors its replies (review F1): say it is
+    // gone rather than dropping the whole thread.
+    match c.query_row(
+        "SELECT author_name, body, deleted_at IS NOT NULL FROM conversation_posts WHERE id=?1 AND conv=?2",
+        rusqlite::params![root, conv], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?))) {
+        Ok((a, _, true)) => out.push(format!("- {a}: (this opening post was deleted)")),
+        Ok((a, b, false)) => out.push(line(a, b)),
+        Err(_) => return out,
+    }
+    let Ok(mut q) = c.prepare("SELECT author_name, body FROM conversation_posts WHERE conv=?1 AND parent_id=?2 AND deleted_at IS NULL ORDER BY id DESC LIMIT ?3") else { return out };
+    let mut replies: Vec<String> = q.query_map(rusqlite::params![conv, root, n as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .into_iter().flatten().flatten().map(|(a, b)| line(a, b)).collect();
+    replies.reverse();
+    out.extend(replies);
     out
+}
+
+/// What a worker mentioned in a post is given besides the post: for a reply,
+/// its thread (`thread_lines`); for a new post, nothing.
+fn delivery_context(c: &rusqlite::Connection, conv: &str, parent: Option<i64>) -> Vec<String> {
+    match parent {
+        Some(root) => thread_lines(c, conv, root, 20),
+        None => Vec::new(),
+    }
 }
 
 async fn mark_read(
@@ -2482,6 +2507,24 @@ mod tests {
     }
 
     #[test]
+    fn a_new_post_carries_no_context_and_a_reply_carries_its_thread() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE conversation_posts (id INTEGER PRIMARY KEY, conv TEXT, author_name TEXT, body TEXT, parent_id INTEGER, deleted_at INTEGER);").unwrap();
+        let dm = "p:a@x.com|b@x.com";
+        for (id, who, body, parent) in [(1, "ethan", "where did you run this command?", None), (2, "doron", "upload your contacts", None),
+            (3, "ethan", "the thread's question", None), (4, "doron", "a reply in it", Some(3)), (5, "ethan", "a reply elsewhere", Some(2))] {
+            c.execute("INSERT INTO conversation_posts (id, conv, author_name, body, parent_id) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![id, dm, who, body, parent]).unwrap();
+        }
+        // A new post starts a thread: nothing from the rest of the DM.
+        assert!(delivery_context(&c, dm, None).is_empty());
+        // A reply: that thread only.
+        let t = delivery_context(&c, dm, Some(3));
+        assert!(t.iter().any(|l| l.contains("the thread's question")) && t.iter().any(|l| l.contains("a reply in it")), "{t:?}");
+        assert!(!t.iter().any(|l| l.contains("upload your contacts") || l.contains("a reply elsewhere") || l.contains("where did you run")), "{t:?}");
+    }
+
+    #[test]
     fn a_worker_mentioned_in_a_dm_reads_and_answers_only_that_thread() {
         let c = rusqlite::Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE conversation_posts (id INTEGER PRIMARY KEY, conv TEXT, author_key TEXT, mentions TEXT, parent_id INTEGER);").unwrap();
@@ -2527,6 +2570,29 @@ mod tests {
         assert_eq!(latest_post_id(&c, "g:wexus"), 2);
         read_to(latest_post_id(&c, "g:wexus"));
         assert_eq!(counts(&c, me)["g:wexus"].0, 0, "reading up to the latest post clears it");
+    }
+
+    #[test]
+    fn a_thread_reply_carries_the_thread_opening_post_first() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE conversation_posts (id INTEGER PRIMARY KEY, conv TEXT, author_name TEXT, body TEXT, parent_id INTEGER, deleted_at INTEGER);").unwrap();
+        let add = |id: i64, conv: &str, a: &str, b: &str, p: Option<i64>, del: Option<i64>| {
+            c.execute("INSERT INTO conversation_posts VALUES (?1,?2,?3,?4,?5,?6)", rusqlite::params![id, conv, a, b, p, del]).unwrap();
+        };
+        add(1, "p:a|b", "doron", "can you upload your LinkedIn contacts?", None, None);
+        add(2, "p:a|b", "ethan", "an unrelated top-level post", None, None);
+        add(3, "p:a|b", "ethan", "yes, here they are", Some(1), None);
+        add(4, "p:a|b", "doron", "a reply that was deleted", Some(1), Some(9));
+        add(5, "g:other", "x", "another conversation's reply", Some(1), None);
+        assert_eq!(thread_lines(&c, "p:a|b", 1, 20),
+            vec!["- doron: can you upload your LinkedIn contacts?".to_string(), "- ethan: yes, here they are".to_string()]);
+        assert_eq!(thread_lines(&c, "p:a|b", 1, 0), vec!["- doron: can you upload your LinkedIn contacts?".to_string()],
+            "the opening post is kept even when no replies fit");
+        assert!(thread_lines(&c, "g:other", 1, 20).is_empty(), "a root in another conversation is not this thread");
+        // A deleted opening post keeps its replies (review F1).
+        c.execute("UPDATE conversation_posts SET deleted_at=9 WHERE id=1", []).unwrap();
+        assert_eq!(thread_lines(&c, "p:a|b", 1, 20),
+            vec!["- doron: (this opening post was deleted)".to_string(), "- ethan: yes, here they are".to_string()]);
     }
 
     #[test]

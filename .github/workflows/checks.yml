@@ -265,6 +265,9 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-mac-pressure-tripwire.sh
+          # A trip wakes the host-health worker first and pages the owner
+          # only when a worker cannot help (2026-10-30).
+          ./scripts/test-host-responder.sh
       # AMUX-4810. The soak's leak verdict used to be peak-minus-a-30-second
       # baseline, which measured warm-up: it failed on 100% of runs that ever
       # executed, including one whose second HALF was negative. The replacement
@@ -426,8 +429,10 @@ jobs:
       - name: the scheduled disk reclaim moves only idle, unowned build output, through the server (SCHED-783)
         run: |
           set -uo pipefail
-          ./scripts/test-disk-reclaim-tick.sh
-          ./scripts/test-pkill-guard-shim.sh
+          # No -e here, so each line carries its own exit: only the last one counted.
+          ./scripts/test-disk-reclaim-tick.sh || exit 1
+          ./scripts/test-pkill-guard-shim.sh || exit 1
+          ./scripts/test-shim-copies.sh
       - name: a red main rust run is re-run once only for a flaky e2e spec or a truncated test archive
         run: ./scripts/test-rust-flake-rerun-classify.sh
       - name: orch-pace projects the proof rate to its checkpoint
@@ -592,6 +597,10 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-post-commit-open-requests.sh
+      - name: a request landed in a repo the server does not deploy reads landed, not "not live" (AF-1058)
+        run: |
+          set -uo pipefail
+          bash scripts/test-requests-landed.sh
       - name: install.sh's hook install references the real source path
         run: |
           set -uo pipefail
@@ -903,9 +912,17 @@ jobs:
           # persistent listener loss makes the external watchdog reload only the
           # exact configured launch agent.
           ./scripts/test-build-atomic-install.sh
+          # AMUX-6530: a long deploy build logs a heartbeat, and the heartbeat
+          # can neither outlive the build nor abort it under set -e.
+          ./scripts/test-build-heartbeat.sh
+          # AF-1012: a link failure on unresolved symbols clears the stale
+          # amux_server incremental trees and retries once; a compile error does not.
+          ./scripts/test-build-link-retry.sh
           # Cloud follows main's tip without the CI wait: an activation that does
           # not come up healthy is put back and held.
           ./scripts/test-build-activation-rollback.sh
+          # The builder compiles main's tip while its CI runs (2026-10-29).
+          ./scripts/test-rust-prebuild.sh
           python3 ./scripts/test-watchdog-recovery.py
           # AEAB-36: a board write that never reached the server must say so,
           # and must never be confused with one the server refused. Its (c)/(d)

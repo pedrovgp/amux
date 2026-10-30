@@ -529,6 +529,15 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         }
         if message.name == "amuxPane" {
             let d = message.body as? [String: Any]
+            // ⌘K on a place already open in another tab or pane: that one
+            // comes forward instead of this page opening it again (owner,
+            // 2026-10-29, MSG-100765). The page waits for the answer.
+            if (d?["op"] as? String) == "focus", let hash = d?["hash"] as? String, let token = d?["token"] as? String {
+                let found = app?.focusOpenPage(hash: hash, asker: self) ?? false
+                let t = token.filter { $0.isLetter || $0.isNumber }
+                webView.evaluateJavaScript("typeof _cmdkFocusAck === 'function' && _cmdkFocusAck('\(t)', \(found))", completionHandler: nil)
+                return
+            }
             guard (d?["op"] as? String) == "split" else { return }
             // Only a page on this tab's own server; anything else splits the
             // page this tab is showing.
@@ -1742,6 +1751,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         dlog("verdict=notification_opened where=new_tab why=\(why) hash=\(hash)")
     }
 
+    /// The place a page address names: "peek=<worker>" or "view=<tab>",
+    /// without the rest (which tab of a worker, scroll and so on).
+    static func placeKey(_ fragment: String) -> String {
+        let f = fragment.hasPrefix("#") ? String(fragment.dropFirst()) : fragment
+        return String(f.split(separator: "&").first ?? "")
+    }
+    /// Brings forward the tab or pane, other than `asker`, already showing the
+    /// place `hash` names, selecting it in its pane and its window in its tab
+    /// group. False when no page shows it.
+    func focusOpenPage(hash: String, asker: DashboardWindowController) -> Bool {
+        let want = AppDelegate.placeKey(hash)
+        guard want.hasPrefix("peek=") || want.hasPrefix("view=") else { return false }
+        guard let c = controllers.first(where: { $0 !== asker && AppDelegate.placeKey($0.webView.url?.fragment ?? "") == want }) else {
+            dlog("verdict=palette_focus_none place=\(want)")
+            return false
+        }
+        let root = c.rootHost
+        if let g = c.paneHost?.grid, let id = g.id(of: c) {
+            g.select(c, in: id)
+            g.focus(id)
+        }
+        if let w = root.window {
+            if w.isMiniaturized { w.deminiaturize(nil) }
+            w.tabGroup?.selectedWindow = w
+            w.makeKeyAndOrderFront(nil)
+        }
+        dlog("verdict=palette_focus_existing place=\(want) pane=\(c.paneHost != nil ? 1 : 0)")
+        return true
+    }
+
     /// Open a dashboard hash in the key window, or a new one.
     func openHash(_ hash: String) {
         let safe = hash.allSatisfy { $0.isLetter || $0.isNumber || "#=&:-_.%|@".contains($0) }
@@ -1805,6 +1844,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     }
 
     @objc func reload(_ sender: Any?) { keyPage?.webView.reload() }
+    /// ⌘⇧R: the active pane only, past every cache (owner, 2026-10-29: "make it
+    /// so cmd shift r works to clear cache of a particular pane thats active").
+    /// The dashboard's service worker serves its assets from Cache Storage, so
+    /// a plain reload, even from origin, can show the old page: its caches go
+    /// first, then WebKit's memory and disk cache, then the pane reloads from
+    /// the server. The caches belong to the server's address, so the other
+    /// panes on it fetch fresh on their next load; only this pane reloads now.
+    @objc func reloadIgnoringCache(_ sender: Any?) {
+        guard let page = keyPage else { return }
+        let wv = page.webView
+        let js = "(async () => { let n = 0; if (window.caches) { for (const k of await caches.keys()) { if (await caches.delete(k)) n++; } } return n; })()"
+        wv.callAsyncJavaScript("return await \(js)", arguments: [:], in: nil, in: .page) { result in
+            let cleared = (try? result.get()) as? NSNumber
+            let store = wv.configuration.websiteDataStore
+            let types: Set<String> = [WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeDiskCache]
+            store.removeData(ofTypes: types, modifiedSince: .distantPast) {
+                dlog("verdict=pane_reload_ignoring_cache sw_caches_cleared=\(cleared?.intValue ?? -1) url=\(wv.url?.absoluteString.prefix(120) ?? "")")
+                wv.reloadFromOrigin()
+            }
+        }
+    }
     // Zoom goes through the dashboard's own zoom (root font size on WebKit).
     // WKWebView.pageZoom shrank the page's CSS viewport without the dashboard
     // re-measuring it, so the file viewer kept its old height and its bottom
@@ -1990,6 +2050,7 @@ func buildMenuBar(_ d: AppDelegate) {
     let viewItem = NSMenuItem()
     let view = NSMenu(title: "View")
     add(view, "Reload", #selector(AppDelegate.reload(_:)), "r", target: d)
+    add(view, "Reload Pane Ignoring Cache", #selector(AppDelegate.reloadIgnoringCache(_:)), "r", [.command, .shift], target: d)
     view.addItem(.separator())
     add(view, "Zoom In", #selector(AppDelegate.zoomIn(_:)), "+", target: d)
     add(view, "Zoom Out", #selector(AppDelegate.zoomOut(_:)), "-", target: d)

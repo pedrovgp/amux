@@ -692,7 +692,29 @@ pub(crate) async fn serve_link_file(link: &Link, uri_path: &str, tail: &str, met
         }
         return folder_listing(link, &target, tail);
     }
-    crate::api::file_viewer::serve_file(&target, headers).await
+    as_site_asset(&target, crate::api::file_viewer::serve_file(&target, headers).await)
+}
+
+/// The file viewer serves CSS and scripts as text/plain, so opening one shows
+/// its source. A shared folder is a website, and its pages load those files:
+/// with `nosniff` the browser refused a text/plain stylesheet and the page
+/// rendered unstyled (owner, 2026-10-29, the GTM demos' `../design-system/amux.css`).
+/// Here they go out as what they are.
+fn as_site_asset(path: &Path, mut r: Response) -> Response {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let real = match ext.as_str() {
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" | "cjs" => "text/javascript; charset=utf-8",
+        "wasm" => "application/wasm",
+        "webmanifest" => "application/manifest+json",
+        "map" => "application/json; charset=utf-8",
+        _ => return r,
+    };
+    let plain = r.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_none_or(|ct| ct.starts_with("text/plain") || ct.starts_with("application/octet-stream"));
+    if plain && r.status().is_success() {
+        r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(real));
+    }
+    r
 }
 
 /// Anyone with the link: no amux sign-in. Apps are relayed from loopback,
@@ -773,6 +795,9 @@ mod tests {
     #[test]
     fn workers_name_a_file_by_its_path_and_link_it_only_when_asked() {
         let dir = tempfile::tempdir().unwrap();
+        // AMUX_PUBLIC_URL from this machine's server.env would win over the
+        // fixture's learned URL (AF-1007); the guard clears it.
+        let _home = crate::api::settings::test_env::set_home(dir.path());
         std::fs::write(dir.path().join(LEARNED_URL_FILE), r#"{"url":"https://desk.example:8824"}"#).unwrap();
         let g = worker_links_guide(dir.path());
         assert!(g.contains("Name each file by its absolute path"), "{g}");

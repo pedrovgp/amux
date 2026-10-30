@@ -6065,7 +6065,8 @@ card = d.get("selection") or {}
 print("  identity: " + (card.get("identity") or "unknown") + "; role: " + (card.get("role") or "ordinary"), file=sys.stderr)
 print("  use for: " + (card.get("use_for") or "purpose not recorded"), file=sys.stderr)
 print("  avoid: " + (card.get("avoid") or "verify identity before acting"), file=sys.stderr)
-state = "login-cookie evidence (verify live access)" if d.get("signed_in") else "no login-cookie evidence"
+state = ("device-bound session: cookie evidence does not mean signed in" if d.get("session_bound")
+         else "login-cookie evidence (verify live access)" if d.get("signed_in") else "no login-cookie evidence")
 lg = d.get("login") or {}
 exp = f", login expires in {lg['days_left']} day(s)" if lg.get("days_left") is not None else ""
 print(f"  {d['site']}: {state}{exp}", file=sys.stderr)
@@ -6073,7 +6074,8 @@ print(f"  why: {d.get('why','')}", file=sys.stderr)
 if d.get("alternatives"):
     # Live-login alternatives when the pick is signed in; otherwise these are
     # only REGISTERED for the site, which is not the same claim.
-    what = "also has cookie evidence" if d.get("signed_in") else "also registered (no cookie evidence)"
+    what = ("also holds its cookies (device-bound, not proof)" if d.get("session_bound")
+            else "also has cookie evidence" if d.get("signed_in") else "also registered (no cookie evidence)")
     print(f"  {what}: " + ", ".join(d["alternatives"]), file=sys.stderr)
 import shlex
 target = os.environ["TARGET"]
@@ -8928,6 +8930,86 @@ LAND_BEHAVIOR_VERSION="2026-10-18.56"
 # MSG-<id>` trailer, or MSG-<id> anywhere in the message), LIVE when that commit
 # is in the running build, CLOSED when someone closed it with a reason. All of
 # it is computed from the message history, git and /health; no model call.
+# amux velocity [WORKER] [--card ID] [--days N] [--json] | --fleet
+# amux velocity [WORKER] --projection [--backlog]: when the open cards land.
+# Where a worker's time goes, what wastes it and who can fix it, and with
+# --card an estimate of that card's minutes and tokens from the worker's own
+# finished cards (docs/design/worker-velocity.md). WORKER defaults to you.
+cmd_velocity() {
+  local worker="" card="" days=30 raw="" fleet="" proj="" backlog=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --card)  card="${2:-}"; shift 2 ;;
+      --days)  days="${2:-30}"; shift 2 ;;
+      --json)  raw=1; shift ;;
+      --fleet) fleet=1; shift ;;
+      --projection) proj=1; shift ;;
+      --backlog) backlog=1; shift ;;
+      -h|--help) sed -n '/^# amux velocity/,/^cmd_velocity/p' "$0" | sed '$d'; return 0 ;;
+      *)       worker="$1"; shift ;;
+    esac
+  done
+  local base="${AMUX_API:-$(cmd_url)}" url
+  if [[ -n "$fleet" ]]; then
+    url="$base/api/velocity?days=$days"
+  else
+    worker="${worker:-${AMUX_SESSION:-}}"
+    [[ -n "$worker" ]] || die "usage: amux velocity [WORKER] [--card ID] [--days N] [--json] | --fleet  (no WORKER and no \$AMUX_SESSION)"
+    url="$base/api/velocity/$worker?days=$days"
+    [[ -n "$proj" ]] && url="$base/api/velocity/$worker/projection?days=$days${backlog:+&include=backlog}"
+    [[ -n "$card" ]] && url="$url&card=$card"
+  fi
+  local body
+  body=$(_curl -sk --max-time 30 -H "X-Amux-Session: ${AMUX_SESSION:-}" "$url") || die "amux velocity: the server did not answer ($url)"
+  if [[ -n "$raw" ]]; then printf '%s\n' "$body"; return 0; fi
+  python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+if "workers" in d:
+    print("Fleet velocity, last %s days (%s attempts). Most wasted hours first." % (d.get("window_days"), d.get("n_considered")))
+    for r in d["workers"]:
+        print("  %-26s finished %4s  %5s/day  %3s%% of time finished  %5.1f h wasted  top: %s" % (
+            r["worker"], r["finished_cards"], r["finished_per_day"], r["finished_share_of_time"], r["wasted_hours"], r.get("top_bottleneck") or "-"))
+    sys.exit(0)
+if "work_minutes" in d:
+    if not d.get("measured", True):
+        print(d.get("why_unmeasured")); sys.exit(0)
+    wm = d["work_minutes"]; c = d.get("calibration") or {}; pace = d.get("pace") or {}; fb = d.get("finish_by") or {}
+    print("%s: %s open cards%s." % (d["worker"], d["n_considered"], " (with backlog)" if d.get("include_backlog") else ""))
+    for x in d["cards"]:
+        b = (" blocked by " + ", ".join(x["blocked_by"])) if x["blocked_by"] else ""
+        if x.get("over_estimate"):
+            b += "  OVER ESTIMATE: %s min so far, %s expected" % (x["over_estimate"]["elapsed_minutes"], x["over_estimate"]["expected_minutes_p75"])
+        print("  %-10s %-7s %4.0f min (to %4.0f)  done after %5.0f min%s  %s" % (x["card"], x["status"], x["minutes_p50"], x["minutes_p75"], x["work_done_after_minutes"], b, x["title"][:50]))
+    print("Work time: %s min (pessimistic %s)%s." % (wm["p50"], wm["p75"], (", after scaling by %sx: your past cards took that many times their estimate" % c["actual_over_estimate"]) if c else ""))
+    if pace:
+        print("At your recent pace (%s days per finished card): done by %s, %s pessimistic." % (pace["days_per_finished_card"], (fb.get("p50") or "")[:16], (fb.get("p75") or "")[:16]))
+    if d.get("blocked_by_outside"):
+        print("Waits on work outside this queue: %s. The dates assume it lands in time." % ", ".join(d["blocked_by_outside"]))
+    sys.exit(0)
+if not d.get("measured", True):
+    print(d.get("why_unmeasured") or d.get("error") or d); sys.exit(1)
+print("%s, last %s days: finished %s of %s cards (%s a day), %s attempts, %s per card." % (
+    d["worker"], d["window_days"], d["finished_cards"], d["cards"], d["finished_per_day"], d["attempts"], d["attempts_per_card"]))
+print("Time: %s h in all, %s h (%s%%) on attempts that finished." % (d["hours"]["total"], d["hours"]["finished"], d["finished_share_of_time"]))
+m = d["per_finished_card"]["minutes"]; t = d["per_finished_card"]["tokens"]
+fmt = lambda v: "-" if v is None else ("%.0f" % v)
+print("A finished card: %s min median (%s to %s), %s tokens median, over %s cards." % (fmt(m["p50"]), fmt(m["p25"]), fmt(m["p75"]), fmt(t["p50"]), m["n"]))
+print("Waste, by who can fix it:")
+for w in sorted(d["waste"], key=lambda w: -w["hours"]):
+    print("  %-22s %-10s %4s attempts %6.1f h %3s%%  %s" % (w["kind"], w["owner"] or "-", w["attempts"], w["hours"], w["share_of_time"], w["what_it_means"]))
+if d.get("waited_on"):
+    print("Parked work waited on:")
+    for x in d["waited_on"]:
+        print("  %5.1f h  %s attempts  %s" % (x["hours"], x["attempts"], x["waiting"]))
+e = d.get("estimate")
+if e:
+    em, et = e["minutes"], e["tokens"]
+    print("Estimate for %s (%s): %s min (%s to %s), %s tokens, from %s %s." % (
+        e["card"], (e.get("title") or "")[:60], fmt(em["p50"]), fmt(em["p25"]), fmt(em["p75"]), fmt(et["p50"]), e["n"], e["basis"]))
+' "$body"
+}
+
 cmd_requests() {
   local days=7 only_open="" raw="" all="" workers=()
   if [[ "${1:-}" == "close" ]]; then
@@ -9047,6 +9129,12 @@ while True:
     offset += len(page)
     if min(h["ts"] for h in page) < cutoff or offset > 50000:
         break
+answered_cache = {}
+def answered_for(w):
+    if w not in answered_cache:
+        d = get("/api/task-history/requests?session=%s&days=%g" % (urllib.parse.quote(w), days)) or {}
+        answered_cache[w] = {r["id"]: r.get("evidence", "") for r in d.get("requests") or [] if r.get("status") == "answered"}
+    return answered_cache[w]
 by_session = {}
 for h in owner_hist:
     by_session.setdefault(h.get("session"), []).append(h)
@@ -9083,7 +9171,19 @@ for w in workers:
             st, ev = "closed", closed[mid]["reason"]
         elif sha:
             lv = live(repo, sha)
-            st, ev = ("live" if lv else "on-main") if lv is not None else "on-main", sha[:9]
+            # A repo this server never deploys cannot become "live": its landed
+            # work is finished, not held (AF-1058: amux-gtm read 10 "not live").
+            # Decided by the repo, not by live() being None: an unreachable
+            # /health also gives None, and amux work must then stay on-main.
+            if lv is not None:
+                st = "live" if lv else "on-main"
+            else:
+                st = "on-main" if os.path.isdir(os.path.join(repo, "crates", "amux-server")) else "landed"
+            ev = sha[:9]
+        elif ("MSG-" + mid) in answered_for(w):
+            # The server's rule, not a second copy of it (AF-1059): a question
+            # whose own turn ended with a reply before the next message.
+            st, ev = "answered", answered_for(w)["MSG-" + mid]
         else:
             st, ev = "open", ""
         if sha:
@@ -9099,7 +9199,7 @@ for r in rows:
     mid = r["id"][4:]
     if r["status"] == "closed" and (closed.get(mid) or {}).get("at"):
         when[r["id"]] = "%s@%s" % (r["worker"], closed[mid]["at"])
-    elif r["status"] in ("on-main", "live") and r["repo"]:
+    elif r["status"] in ("on-main", "live", "landed") and r["repo"]:
         ct = subprocess.run(["git", "-C", r["repo"], "show", "-s", "--format=%ct", lm_sha.get(r["id"], r["evidence"])],
                             capture_output=True, text=True).stdout.strip()
         if ct.isdigit():
@@ -9116,7 +9216,7 @@ for r in rows:
     t = tasks_at.get(when.get(r["id"], "")) or {}
     r["task"] = t.get("task") or ""
     r["task_ts"] = t.get("ts")
-counts = {k: sum(1 for r in rows if r["status"] == k) for k in ("open", "on-main", "live", "closed")}
+counts = {k: sum(1 for r in rows if r["status"] == k) for k in ("open", "on-main", "live", "landed", "answered", "closed")}
 summary = {"measured": not unmeasured, "n_considered": len(rows), "tasks_measured": tasks_measured, "acks_dropped": dropped, "days": days,
            "build": build[:12], "counts": counts, "fetch_timed_out": stale, "why_unmeasured": unmeasured and ("no history/session for " + ", ".join(unmeasured))}
 # WHY ON MAIN IS NOT LIVE (velocity audit 2026-10-21): the builder's CI gate
@@ -9138,13 +9238,17 @@ if only_open:
 if raw:
     print(json.dumps(dict(summary, requests=rows), indent=1))
     sys.exit(0)
-order = {"open": 0, "on-main": 1, "live": 2, "closed": 3}
+order = {"open": 0, "on-main": 1, "live": 2, "landed": 2, "answered": 3, "closed": 3}
 for r in sorted(rows, key=lambda r: (order[r["status"]], r["worker"], -r["age_h"])):
-    print("%-8s %-18s %-10s %6sh  %-10s %s" % ("held" if r.get("held_by_ci") else r["status"], r["worker"][:18], r["id"], r["age_h"], r["evidence"][:10], r["text"][:90]))
+    answered = r["status"] == "answered"
+    print("%-8s %-18s %-10s %6sh  %-10s %s" % ("held" if r.get("held_by_ci") else r["status"], r["worker"][:18], r["id"], r["age_h"],
+                                              "" if answered else r["evidence"][:10], r["text"][:90]))
+    if answered:  # the reply is the disposition, too long for the sha column
+        print("%59s %s" % ("", r["evidence"][:120]))
     if r.get("task"):
         print("%59s closed during task: %s" % ("", r["task"][:80]))
-print("%d requests from the owner over %g days (%d acks not counted): %d open, %d on main not live, %d live, %d closed%s" % (
-    summary["n_considered"], days, dropped, counts["open"], counts["on-main"], counts["live"], counts["closed"],
+print("%d requests from the owner over %g days (%d acks not counted): %d open, %d on main not live, %d live, %d landed in a repo this server does not deploy, %d answered, %d closed%s" % (
+    summary["n_considered"], days, dropped, counts["open"], counts["on-main"], counts["live"], counts["landed"], counts["answered"], counts["closed"],
     ("; UNMEASURED: " + summary["why_unmeasured"]) if unmeasured else ""))
 if summary.get("held_by_ci"):
     g = summary["held_by_ci"]
@@ -11577,6 +11681,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     contribute)       shift; cmd_contribute "$@" ;;
     github)           shift; cmd_github "$@" ;;
     requests)         shift; cmd_requests "$@" ;;
+    velocity)         shift; cmd_velocity "$@" ;;
     browser|br)      shift; cmd_browser "$@" ;;
     cdp)              shift; cmd_cdp "$@" ;;
     computer|cu)     shift; cmd_computer "$@" ;;

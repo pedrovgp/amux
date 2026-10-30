@@ -243,7 +243,11 @@
      no ellipsis to even signal truncation. flex-basis:100% forces the wrap
      deterministically instead of leaving it to whatever width happens to
      remain. */
-  .card-header-meta .meta-count { flex: 0 0 100%; margin-left: 0; }
+  /* A line longer than the card scrolls sideways instead of clipping with no
+     sign (css-mobile.md: a row that does not fit scrolls; never a second row).
+     Seen live at 375px on 2026-10-30: 7 of 36 lines ran past the card edge. */
+  .card-header-meta .meta-count { flex: 0 0 100%; margin-left: 0; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .card-header-meta .meta-count::-webkit-scrollbar { display: none; }
   .card-menu-btn {
     width: 28px; height: 28px; border-radius: var(--radius-md); border: 1px solid var(--border);
     background: transparent; color: var(--dim); cursor: pointer;
@@ -2027,6 +2031,8 @@
     display: none;
   }
   .ac-list.open { display: block; }
+  /* At the caret in a tall textarea (app.js _atPlaceAtCaret): a floating box. */
+  .ac-list.ac-at-caret { border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-md); z-index: 40; }
   .ac-list.slash-ac {
     top: auto; bottom: 100%; border-top: 1px solid var(--border); border-bottom: none;
     border-radius: var(--radius-lg) var(--radius-lg) 0 0; max-height: 220px;
@@ -3032,6 +3038,13 @@
      mc-todo/mc-backlog classes make the status semantics explicit. */
   .meta-count .mc-active { color: var(--green); font-weight: 700; }
   .meta-count .mc-total { color: var(--dim); font-weight: 600; }
+  /* The owner's requests to this worker (AF-1060): tappable, opens the list. */
+  .meta-count .mc-req { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+  /* A meta line holding only an empty request slot takes no row. */
+  .meta-count:has(> .mc-req-wrap:empty):not(:has(> span:not(.mc-req-wrap))) { display: none; }
+  .meta-count .mc-req-open { color: var(--yellow); font-weight: 700; }
+  .meta-count .mc-req-main { color: var(--accent); font-weight: 700; }
+  @media (max-width: 600px) { .meta-count .mc-req { display: inline-block; min-height: 44px; line-height: 44px; } }
   /* Session card: scrollback cached on this device (readable with no signal). */
   .card-offline-dot { color: var(--green); font-size: var(--fs-xs); opacity: 0.8; }
   /* ISOLATED (AMUX-3232). A raw agent with the harness stripped and hidden from
@@ -6395,7 +6408,9 @@
     .metrics-expand-btn { display: flex; }
     /* Disk Cleanup at phone width: the treemap needs real height to stay
        readable, and the action bar must not trap its buttons off-screen. */
-    .metrics-modebtn { flex: 1; min-width: 0; min-height: 44px; }
+    /* One row of modes on a phone: the row scrolls sideways rather than wrapping. */
+    .metrics-modebar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+    .metrics-modebtn { flex: 1 0 auto; min-height: 44px; white-space: nowrap; }
     /* No fixed svg height here: the map is laid out at its real pixel size in
        _reclaimRender, so a CSS height that disagreed with the viewBox is what
        produced the letterboxed band at 390px. */
@@ -8934,6 +8949,9 @@ body.light #fc-container { color-scheme: light; }
 #messages-view.cv-side-folded .cv-new-btn { display:none; }
 .cv-new-list { max-height:min(50vh, 360px); overflow-y:auto; margin-top:var(--space-2); }
 .cv-new-kind { margin-left:auto; color:var(--dim); font-size:var(--fs-2xs); }
+/* Where unread messages start when a conversation opens (app.js _cvRestoreScroll). */
+.cv-unread-line { display:flex; align-items:center; gap:var(--space-2); margin:var(--space-2) 0; color:var(--red); font-size:var(--fs-2xs); font-weight:700; text-transform:uppercase; }
+.cv-unread-line::before, .cv-unread-line::after { content:''; flex:1; border-top:1px solid color-mix(in srgb, var(--red) 55%, transparent); }
 /* Any avatar opens where that person is (app.js _whoOpen). */
 [data-who] { cursor:pointer; }
 .who-modal { display:flex; flex-direction:column; gap:var(--space-2); min-width:min(320px, 80vw); text-align:left; }
@@ -10427,7 +10445,7 @@ details.settings-fold[open] > summary::before { transform: rotate(90deg); }
 .pages-open { flex-direction:column; flex:1; min-height:0; gap:var(--space-2); }
 .pages-bar { display:flex; align-items:center; gap:var(--space-2); flex-wrap:wrap; }
 .pages-title { font-size:var(--fs-2xl); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:40ch; }
-.pages-status { flex:1; min-width:0; }
+.pages-status { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .pages-bar-actions { display:flex; gap:var(--space-1-5); flex-wrap:wrap; margin-left:auto; }
 .pages-frame { flex:none; min-height:320px; border:1px solid var(--border); border-radius:var(--radius-lg); overflow:hidden; background:var(--on-solid); }
 .pages-frame iframe { width:100%; height:100%; border:0; display:block; }
@@ -10781,6 +10799,15 @@ body:not(.native-panes) #peek-split-toggle { display: none !important; }
 .mdx-status { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-1) var(--space-3); border-top: 1px solid var(--border);
   font-size: var(--fs-sm); color: var(--dim); flex-wrap: nowrap; overflow-x: auto; white-space: nowrap; scrollbar-width: none; flex-shrink: 0; }
 .mdx-dirty.on { color: var(--orange); font-weight: 600; }
+/* Two people changed the same lines (app.js _fileConflictBar): one row, the
+   choices beside the sentence. */
+.file-conflict { display: flex; align-items: center; gap: var(--space-2); flex-wrap: nowrap; overflow-x: auto;
+  padding: var(--space-1-5) var(--space-2); margin-bottom: var(--space-2); border: 1px solid var(--orange);
+  border-radius: var(--radius-md); background: color-mix(in srgb, var(--orange) 12%, transparent); font-size: var(--fs-md); }
+.file-conflict[hidden] { display: none; }
+.file-conflict > span { flex: 1 1 auto; min-width: 0; }
+.file-conflict .btn { flex-shrink: 0; white-space: nowrap; }
+@media (max-width: 600px) { .file-conflict .btn { min-height: 44px; } }
 .mdx-indent select { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
 
 /* Rendered: the preview reads as a page, not the terminal-coloured raw view. */

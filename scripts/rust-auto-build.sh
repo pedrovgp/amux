@@ -40,6 +40,7 @@ cleanup() {
   [ -n "${BUILD_OUT:-}" ] && rm -f "$BUILD_OUT"
   [ -n "${INSTALL_TMP:-}" ] && rm -f "$INSTALL_TMP"
   [ -n "${LOCK_HELD:-}" ] && rm -rf "$LOCK"
+  [ -n "${HB_PID:-}" ] && { kill "$HB_PID" 2>/dev/null || true; }
   return 0   # a falsey last test must not make the trap itself fail under set -e
 }
 trap cleanup EXIT
@@ -804,6 +805,17 @@ fi
   DEPLOY_NICE="${AMUX_DEPLOY_NICE:-10}"
   DEPLOY_T0=$(date +%s)
   echo "== deploy build settings incremental=1 jobs=$DEPLOY_JOBS nice=$DEPLOY_NICE load=$(/usr/sbin/sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || cut -d' ' -f1 /proc/loadavg 2>/dev/null)"
+  # A HEARTBEAT WHILE CARGO RUNS (AMUX-6530). The build writes to $BUILD_OUT,
+  # so a long one left this log silent: on 2026-10-28 a 21-minute build under
+  # load 70 read as a dead builder (deploy.builder_is_ticking, 600 s budget),
+  # 1171 failures since 09-20. One line per AMUX_BUILD_HEARTBEAT_S while the
+  # build runs; the loop also exits on its own if this script is gone.
+  _builder_pid=$$
+  ( while sleep "${AMUX_BUILD_HEARTBEAT_S:-60}"; do
+      kill -0 "$_builder_pid" 2>/dev/null || exit 0
+      echo "== deploy build running elapsed_s=$(( $(date +%s) - DEPLOY_T0 )) verdict=deploy_build_running"
+    done ) &
+  HB_PID=$!
   BUILD_OK=0
   if [ -n "${AMUX_REMOTE_BUILD_HOST:-}" ]; then
     if "$REPO/scripts/rust-remote-build.sh" "$WORK" \
@@ -827,11 +839,32 @@ fi
       BUILD_OK=1
     fi
   fi
+  # A STALE INCREMENTAL CACHE FAILS THE LINK, NOT THE COMPILE (AF-1012). On
+  # 2026-10-29 two green commits in a row (496d9cff6, ed0421bf3) failed to
+  # deploy with "ld: symbol(s) not found" for a function that compiles fine,
+  # and backoff retried the same cache every ~13 minutes: the server stayed
+  # 11 commits behind until the amux_server incremental trees were cleared by
+  # hand. Clear them through the target guard (it defers while another build
+  # holds the target) and build once more; dependency caches stay.
+  if [ "$BUILD_OK" = 0 ] && grep -aqE 'symbol\(s\) not found|Undefined symbols for architecture|undefined reference to' "$BUILD_OUT"; then
+    echo "== WARN deploy link failed on unresolved symbols; clearing the amux_server incremental trees and retrying once verdict=deploy_incremental_link_retry"
+    for _inc in "$HOME/.amux/rust-build-target/deploy/incremental"/amux_server-*; do
+      [ -d "$_inc" ] || continue
+      python3 "$REPO/scripts/cargo-target-guard.py" clear --target "$HOME/.amux/rust-build-target" --path "$_inc" 2>&1 | sed 's/^/== /' || true
+    done
+    if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) >> "$BUILD_OUT" 2>&1; then
+      BUILD_OK=1
+    fi
+    echo "== deploy_incremental_link_retry ok=$BUILD_OK"
+  fi
   # Explicit exit-code-derived flag, NOT a file-existence check: a stale
   # binary from an earlier successful build sitting at this same path would
   # make `[ -x ... ]` true even after a genuine failure, silently
   # re-installing old code and reporting success — the exact "wrong answer,
   # not wrong-looking" shape ethos rule 4 exists to catch.
+  # Under set -e: a heartbeat that already exited makes `kill` fail, and
+  # `wait` on a killed one returns 143. Either would abort the deploy itself.
+  kill "$HB_PID" 2>/dev/null || true; wait "$HB_PID" 2>/dev/null || true; HB_PID=
   DEPLOY_ELAPSED=$(( $(date +%s) - DEPLOY_T0 ))
   echo "== deploy build elapsed_s=$DEPLOY_ELAPSED ok=$BUILD_OK jobs=$DEPLOY_JOBS"
   # A slow build is the regression this block exists to prevent, and nothing
@@ -923,7 +956,7 @@ PYIDENTITY
     # AMUX_ACTIVATION_ROLLBACK=1 (amux Cloud, which deploys main's tip without
     # waiting for CI): keep what is live, so a build that installs but does not
     # come up healthy is put back below.
-    if [ "${AMUX_ACTIVATION_ROLLBACK:-0}" = 1 ] && [ -f "$INSTALL" ]; then
+    if [ "${AMUX_ACTIVATION_ROLLBACK:-1}" = 1 ] && [ -f "$INSTALL" ]; then
       cp -p "$INSTALL" "${INSTALL}.rollback" 2>/dev/null || rm -f "${INSTALL}.rollback"
       if [ -f "${INSTALL}.identity.json" ]; then cp -p "${INSTALL}.identity.json" "${INSTALL}.identity.json.rollback"; else rm -f "${INSTALL}.identity.json.rollback"; fi
     fi
@@ -962,7 +995,7 @@ PYIDENTITY
     # failure branch below it is left alone, so it keeps naming the last good
     # build — which is exactly what that branch says is still running.
     echo "== installation action=$install_action; running server will verify identity before adoption"
-    if [ "${AMUX_ACTIVATION_ROLLBACK:-0}" = 1 ] && [ "$install_action" = replaced ] && [ -f "${INSTALL}.rollback" ]; then
+    if [ "${AMUX_ACTIVATION_ROLLBACK:-1}" = 1 ] && [ "$install_action" = replaced ] && [ -f "${INSTALL}.rollback" ]; then
       limit="${AMUX_ACTIVATION_HEALTH_S:-300}"; waited=0; healthy=0
       case "$limit" in ''|*[!0-9]*) limit=300 ;; esac
       while [ "$waited" -lt "$limit" ]; do

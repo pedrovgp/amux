@@ -16,6 +16,7 @@ pub mod bridge;
 pub mod contract;
 pub mod deep_links;
 pub mod scratchpad;
+pub(crate) mod send_profile;
 pub mod prompt_block;
 pub mod land_approvals;
 pub mod land_queue;
@@ -84,6 +85,7 @@ pub mod journal;
 pub mod launch_context;
 pub mod layout_presets;
 pub mod social;
+pub mod social_browser;
 pub mod social_devto;
 pub mod social_publish;
 pub mod log_search;
@@ -117,6 +119,7 @@ pub mod prefs;
 pub mod py_proxy;
 pub mod reclaim;
 pub(crate) mod reclaim_owner;
+pub mod tiering;
 pub mod reconciliation;
 pub mod recording_live;
 pub mod recording_sessions;
@@ -152,6 +155,7 @@ pub mod conversations;
 pub mod converse;
 pub mod static_files;
 pub mod stats;
+pub mod velocity;
 pub mod sync;
 pub mod telegram;
 pub mod tailnet_join;
@@ -241,6 +245,7 @@ pub fn router_with_connector_transport(
         .route("/api/task-history", axum::routing::get(sessions_legacy::task_list))
         .route("/api/task-history/at", axum::routing::get(sessions_legacy::task_at_batch))
         .route("/api/task-history/links", axum::routing::get(sessions_legacy::task_links))
+        .route("/api/task-history/requests", axum::routing::get(sessions_legacy::owner_requests))
         .route("/api/scratchpad/config", axum::routing::get(scratchpad::get_config).put(scratchpad::put_config))
         .nest("/api/memories", memories::routes())
         .nest("/api/traces", traces::routes())
@@ -275,7 +280,9 @@ pub fn router_with_connector_transport(
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
         .nest("/api/reclaim", reclaim::routes())
+        .nest("/api/tiering", tiering::routes())
         .nest("/api/usage", usage::routes())
+        .nest("/api/velocity", velocity::routes())
         .nest("/api/review", review::routes())
         .nest("/api/channels", channels::routes())
         .nest("/api/alert", alerts::routes())
@@ -613,6 +620,12 @@ pub fn router_with_connector_transport(
             "/api/page-links/{id}/open",
             axum::routing::post(static_files::apps_origin::open),
         )
+        // An HTML file from the Files tab, opened as its folder's website on
+        // the apps origin.
+        .route(
+            "/api/page-links/site-view",
+            axum::routing::post(static_files::apps_origin::site_view),
+        )
         // The address copied links are built on (deep_links.rs).
         .merge(deep_links::routes())
         .layer(axum::middleware::from_fn_with_state(
@@ -650,6 +663,7 @@ pub fn router_with_connector_transport(
         // until now. Public like its debug siblings (lane names and timings).
         .route("/api/debug/scan", axum::routing::get(health::debug_scan))
         .route("/api/debug/sse", axum::routing::get(debug_sse))
+        .route("/api/debug/send-profile", axum::routing::get(send_profile::debug_send_profile))
         .route(
             "/api/debug/downtime",
             axum::routing::get(health::debug_downtime),
@@ -1104,6 +1118,20 @@ static UI_STUCK: std::sync::Mutex<StuckTally> = std::sync::Mutex::new(std::colle
 pub(crate) fn ui_stuck_snapshot() -> Option<StuckTally> {
     UI_STUCK.lock().ok().map(|t| t.clone())
 }
+/// Whether a stuck-UI beacon counts toward `ui.controls_do_not_stick`.
+///
+/// A HIDDEN TAB IS NOT A STUCK CONTROL (AF-1031). The invariant's claim is
+/// that no client reports a control or view that stayed stuck; in a tab
+/// nobody is looking at there is no control to see, and WebKit throttles a
+/// hidden tab's IndexedDB and timers, so its outbox reads time out on their
+/// own (about 650 of 2,500 outbox reports on 2026-10-29 carried hidden=1).
+/// One such report from a background tab failed the fleet invariant and
+/// filed a card. The tab retries when it is shown, and a stall that a person
+/// can see arrives with hidden=0. Still logged, at INFO, with the reason.
+pub(crate) fn counts_as_stuck(body: &serde_json::Value) -> bool {
+    !matches!(body.get("hidden"), Some(v) if v.as_i64() == Some(1) || v.as_bool() == Some(true))
+}
+
 const CLIENT_DEBUG_RING_MAX: usize = 500;
 
 /// The client beacons of one `kind` still in the ring, oldest first, or None
@@ -1154,7 +1182,11 @@ async fn client_debug_post(
         .unwrap_or(0);
     // A stuck control or view: counted and said at WARN (see UI_STUCK_VERDICTS).
     let verdict = body.get("verdict").or_else(|| body.get("action")).and_then(|v| v.as_str()).unwrap_or("");
-    if UI_STUCK_VERDICTS.contains(&verdict) {
+    if UI_STUCK_VERDICTS.contains(&verdict) && !counts_as_stuck(&body) {
+        tracing::info!(kind = %kind, verdict, client = %client, measured = true, n_considered = 1,
+            payload = %body, reason = "hidden tab",
+            "client UI stall in a hidden tab: logged, not counted (ui.controls_do_not_stick)");
+    } else if UI_STUCK_VERDICTS.contains(&verdict) {
         tracing::warn!(kind = %kind, verdict, client = %client, measured = true, n_considered = 1,
             payload = %body, "client UI stuck: a control or view did not settle (ui.controls_do_not_stick)");
         if let Ok(mut t) = UI_STUCK.lock() {
@@ -1579,5 +1611,19 @@ mod slow_ok_tests {
             v.contains("helper-model"),
             "and what consumed the time: {v}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ui_stuck_hidden_tests {
+    /// AF-1031: a stall reported from a hidden tab is not counted; one from a
+    /// shown tab, or with no visibility recorded, still is.
+    #[test]
+    fn a_hidden_tab_stall_does_not_count_as_a_stuck_control() {
+        use serde_json::json;
+        assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout", "hidden": 1})));
+        assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_flight_stalled", "hidden": true})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout", "hidden": 0})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "composer_send_stuck"})), "no visibility recorded still counts");
     }
 }
