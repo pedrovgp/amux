@@ -41,6 +41,16 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
+# cargo is not on a plain `ssh host cmd` or cron PATH, and a deploy tool that
+# only works in an interactive shell is a trap: the first real invocation from
+# anywhere else fails with "cargo is not on PATH" AFTER the caller believed the
+# deploy had started (measured 2026-10-30, the first run of this script).
+if ! command -v cargo >/dev/null 2>&1; then
+  for cand in "$HOME/.cargo/bin" "/usr/local/cargo/bin"; do
+    if [ -x "$cand/cargo" ]; then PATH="$cand:$PATH"; export PATH; break; fi
+  done
+fi
+
 TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
 BUILT="$TARGET_DIR/deploy/amux-server"
 INSTALL="${AMUX_RS_INSTALL:-$HOME/.local/bin/amux-server-rs}"
