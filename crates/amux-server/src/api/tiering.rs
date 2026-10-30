@@ -105,8 +105,32 @@ const MEASURE_BUDGET: Duration = Duration::from_secs(180);
 /// measure_since was 46% of the server's CPU in a 30 s sample. A stale folder
 /// past this budget waits for the next tick, which spreads a wave over ticks.
 const MEASURE_TICK_BUDGET: Duration = Duration::from_secs(45);
-/// Pause between passes while a measuring backlog drains.
-const BACKLOG_DELAY: Duration = Duration::from_secs(30);
+/// Pause between passes while a measuring backlog drains: three times the
+/// walk the last pass did, so draining walks at most a quarter of the time,
+/// never under BACKLOG_DELAY_MIN or over BACKLOG_DELAY_MAX. Hog RCA
+/// 20261030-154014: with a fixed 30 s pause each 45-59 s pass (one ran 224 s,
+/// a single folder may walk MEASURE_BUDGET) followed the last, and tiering was
+/// 70% of the server's busy samples at steady state.
+const BACKLOG_DELAY_MIN: Duration = Duration::from_secs(120);
+const BACKLOG_DELAY_MAX: Duration = Duration::from_secs(1800);
+
+fn backlog_delay(measured_ms: u64) -> Duration {
+    Duration::from_millis(measured_ms.saturating_mul(3)).clamp(BACKLOG_DELAY_MIN, BACKLOG_DELAY_MAX)
+}
+
+/// Walking a tick may spend on stale folders. No tick walks in the first
+/// BOOT_QUIET after the server starts: it boots on every deploy (up to five
+/// an hour) and its first minute is already the busiest; the paced backlog
+/// passes measure what it leaves. Judged by uptime, not the trigger name: the
+/// periodic job's first `interval` pass runs at boot and holds TICKING, so the
+/// `startup` pass 30 s later found it busy and never ran (c84c8aacb keyed on
+/// "startup" and the 22:22Z boot still walked 64.5 s).
+const BOOT_QUIET: Duration = Duration::from_secs(120);
+static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn tick_walk_budget(since_start: Duration) -> Duration {
+    if since_start < BOOT_QUIET { Duration::ZERO } else { MEASURE_TICK_BUDGET }
+}
 /// A use must land this long after the move finished to count. Every write the
 /// move itself makes happens before that moment, so this only absorbs
 /// timestamp rounding (one second on APFS).
@@ -312,8 +336,8 @@ pub(crate) struct TickReport {
 /// Whether a stale folder is re-measured in this tick. A person asking (a click,
 /// a folder just added) and a folder with a move under way always are; the
 /// interval and startup ticks stop once they have walked MEASURE_TICK_BUDGET.
-fn measure_this_tick(forced: bool, has_op: bool, walked: Duration) -> bool {
-    forced || has_op || walked < MEASURE_TICK_BUDGET
+fn measure_this_tick(forced: bool, has_op: bool, walked: Duration, budget: Duration) -> bool {
+    forced || has_op || walked < budget
 }
 
 /// Whether a refusal is worth a WARN: a person asked, or the reason changed.
@@ -905,6 +929,7 @@ pub(crate) fn discover(c: &mut Config) -> (usize, usize) {
 // ── the tick ────────────────────────────────────────────────────────────────
 
 pub fn spawn(_state: AppState) -> crate::runtime_jobs::PeriodicTask {
+    STARTED.get_or_init(Instant::now);
     // First pass shortly after startup, so a move interrupted by the restart
     // resumes in minutes rather than at the first interval.
     tokio::spawn(async {
@@ -947,9 +972,10 @@ pub(crate) async fn tick(trigger: &'static str) -> Option<TickReport> {
     // 2026-10-30. Each pass walks for its full budget, so the chain advances
     // and ends when nothing is deferred.
     if let Some(r) = rep.as_ref().filter(|r| r.deferred > 0) {
-        tracing::info!(deferred = r.deferred, delay_s = BACKLOG_DELAY.as_secs(), verdict = "tier_backlog", "tiering: folders left to measure; next pass soon");
-        tokio::spawn(async {
-            tokio::time::sleep(BACKLOG_DELAY).await;
+        let delay = backlog_delay(r.measured_ms);
+        tracing::info!(deferred = r.deferred, measured_ms = r.measured_ms, delay_s = delay.as_secs(), verdict = "tier_backlog", "tiering: folders left to measure; next pass soon");
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
             kick("backlog");
         });
     }
@@ -985,6 +1011,7 @@ async fn tick_inner(trigger: &'static str) -> Option<TickReport> {
     let mut folders = cfg.folders.clone();
     folders.sort_by_key(|f| f.stats.as_ref().map(|s| s.last_used).unwrap_or(0));
     let mut walked = Duration::ZERO;
+    let walk_budget = tick_walk_budget(STARTED.get_or_init(Instant::now).elapsed());
     for f in folders {
         if f.each_subfolder {
             continue; // a root never moves; its subfolders are entries of their own
@@ -1005,7 +1032,7 @@ async fn tick_inner(trigger: &'static str) -> Option<TickReport> {
         // folders on a spinning disk every five minutes.
         let forced = matches!(trigger, "manual" | "added");
         let stale = forced || f.stats.as_ref().map(|s| now_secs() - s.measured_at > STATS_TTL_S).unwrap_or(true);
-        if (stale || f.op.is_some()) && !measure_this_tick(forced, f.op.is_some(), walked) {
+        if (stale || f.op.is_some()) && !measure_this_tick(forced, f.op.is_some(), walked, walk_budget) {
             // Left for the next tick, policy included: deciding on numbers
             // this old could move a folder that was used since.
             rep.deferred += 1;
@@ -1663,11 +1690,27 @@ mod tests {
     fn an_interval_tick_stops_measuring_once_its_walking_budget_is_spent() {
         let under = super::MEASURE_TICK_BUDGET - Duration::from_millis(1);
         let spent = super::MEASURE_TICK_BUDGET;
-        assert!(super::measure_this_tick(false, false, under));
-        assert!(!super::measure_this_tick(false, false, spent), "an interval tick kept walking past its budget");
+        let b = super::tick_walk_budget(super::BOOT_QUIET);
+        assert!(super::measure_this_tick(false, false, under, b));
+        assert!(!super::measure_this_tick(false, false, spent, b), "an interval tick kept walking past its budget");
         // A person asking, or a move under way, is measured whatever was spent.
-        assert!(super::measure_this_tick(true, false, spent));
-        assert!(super::measure_this_tick(false, true, spent));
+        assert!(super::measure_this_tick(true, false, spent, b));
+        assert!(super::measure_this_tick(false, true, spent, b));
+    }
+
+    #[test]
+    fn a_startup_tick_walks_nothing_and_a_backlog_drains_at_a_quarter_duty() {
+        // Any pass in the boot window, whatever its trigger (the periodic job's
+        // first pass is "interval" and runs at boot), walks nothing.
+        let b = super::tick_walk_budget(Duration::from_secs(5));
+        assert!(!super::measure_this_tick(false, false, Duration::ZERO, b), "a boot walked stale folders");
+        assert_eq!(super::tick_walk_budget(super::BOOT_QUIET), super::MEASURE_TICK_BUDGET, "after the boot window a pass walks its budget");
+        assert!(super::measure_this_tick(false, true, Duration::ZERO, b), "a move under way is still measured at boot");
+        // A full 45 s pass rests 135 s; a 224 s pass (one folder may walk 180 s) rests 672 s.
+        assert_eq!(super::backlog_delay(45_000), Duration::from_secs(135));
+        assert_eq!(super::backlog_delay(224_000), Duration::from_secs(672));
+        assert_eq!(super::backlog_delay(0), super::BACKLOG_DELAY_MIN, "a pass that walked nothing still waits");
+        assert_eq!(super::backlog_delay(u64::MAX), super::BACKLOG_DELAY_MAX);
     }
 
     use super::*;
