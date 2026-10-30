@@ -17,7 +17,7 @@ WHAT YOU CAN DO FROM YOUR PHONE
 
 BRING YOUR OWN SERVER
 
-amux is open source. Run the single-file Python server on your Mac, Linux box, or cloud VM, then connect this app over Tailscale, your LAN, or amux Cloud. Your code and agents never leave your infrastructure.
+amux is source-available under MIT + Commons Clause. Run the amux server (a single Rust binary) on your Mac, Linux box, or cloud VM, or use amux Cloud, then connect this app over Tailscale, your LAN, or your amux Cloud address. Your code and agents never leave your infrastructure.
 
 BUILT FOR PARALLEL WORK
 
@@ -33,7 +33,7 @@ Progressive Web App: Open your amux dashboard URL in Safari and install to home 
 
 REQUIREMENTS
 
-- amux server running on Mac or Linux (free, open source: github.com/mixpeek/amux)
+- amux server running on Mac or Linux (free to self-host, MIT + Commons Clause: github.com/mixpeek/amux)
 - Claude Code, OpenAI Codex CLI, or Gemini CLI installed on your server
 - Wi-Fi, Tailscale, or amux cloud for remote access
 

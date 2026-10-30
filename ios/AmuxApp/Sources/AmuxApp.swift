@@ -21,6 +21,14 @@ struct AmuxApp: App {
                 }
             }
             .preferredColorScheme(.dark)
+            // A copied file link (https://<server>/f/<path>, or amux://) opens
+            // that file here (DeepLink.swift). onOpenURL receives both the app's
+            // scheme and universal links; the activity handler is the same path
+            // for a universal link delivered as a browsing activity.
+            .onOpenURL { serverManager.open(deepLink: $0) }
+            .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
+                if let url = activity.webpageURL { serverManager.open(deepLink: url) }
+            }
         }
         // Shares queued while offline (ShareOutbox) go out when the app opens
         // or comes back to the foreground, as well as on the next share.

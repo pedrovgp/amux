@@ -241,6 +241,21 @@ pub(crate) fn tmux_fleet_shim_dir() -> PathBuf {
     home().join("shims").join("tmux-fleet")
 }
 
+/// Bring the installed fleet shims up to this build's bytes. They were written
+/// only when a worker launched, so a deploy that fixed a shim left every
+/// running worker on the old copy until some unrelated launch: 13b4d3a6b (a
+/// shim exec'ing another copy of itself) was live for minutes with the old
+/// copies still installed. Called at server start. A home with no shim dir
+/// yet is left alone; the first launch creates it.
+pub(crate) fn refresh_fleet_shims(dir: &Path) -> std::io::Result<bool> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    install_shims(dir, &["pkill", "pgrep"], PKILL_GUARD_SHIM)?;
+    install_shims(dir, &["tmux"], TMUX_FLEET_SHIM)?;
+    Ok(true)
+}
+
 /// The shell exports that put the fleet tmux shim first on a worker's PATH.
 /// Goes last in the launch line so a profile that reorders PATH cannot bury it.
 pub(crate) fn tmux_fleet_exports(name: &str) -> String {
@@ -1367,8 +1382,13 @@ pub(crate) async fn run_cmd(
     }
 }
 
+/// Every tmux command here goes through the control connection when it can
+/// (`backend::tmux_ctl`), and inside a send is added to its profile.
 async fn tmux(args: &[&str]) -> Option<std::process::Output> {
-    run_cmd("tmux", args, OP_TIMEOUT).await
+    let t = std::time::Instant::now();
+    let (out, control) = crate::backend::tmux_ctl::run_traced(args, OP_TIMEOUT).await;
+    crate::api::send_profile::note_tmux(args.first().copied().unwrap_or(""), t.elapsed().as_micros() as u64, control);
+    out
 }
 
 /// Workers with a live tmux session (`amux-<name>`), by worker name. The
@@ -1392,6 +1412,23 @@ async fn tmux_sessions_set() -> std::collections::BTreeSet<String> {
         .lines()
         .map(|l| l.trim().to_string())
         .collect()
+}
+
+/// The pane process ids of a worker's tmux session, for reading what its
+/// processes actually hold. Empty for a herdr worker or when tmux does not
+/// answer, which the caller reports as unmeasured.
+pub(crate) async fn worker_pane_pids(name: &str) -> Vec<u32> {
+    if session_backend(name) == "herdr" {
+        return Vec::new();
+    }
+    let st = st(name);
+    let Some(out) = tmux(&["list-panes", "-s", "-t", &st, "-F", "#{pane_pid}"]).await else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect()
 }
 
 /// tmux capture-pane -e; lines<=0 → visible screen only (py:4406).
@@ -1431,9 +1468,19 @@ pub(crate) async fn send_key(name: &str, key: &str) {
     let pt = pt(name);
     let _ = tmux(&["send-keys", "-t", &pt, key]).await;
 }
-async fn send_literal(name: &str, text: &str) -> bool {
+async fn send_literal(name: &str, text: &str) -> Result<(), String> {
     let pt = pt(name);
-    matches!(tmux(&["send-keys", "-t", &pt, "-l", text]).await, Some(o) if o.status.success())
+    match tmux(&["send-keys", "-t", &pt, "-l", text]).await {
+        Some(o) if o.status.success() => Ok(()),
+        Some(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let code = o.status.code().unwrap_or(-1);
+            Err(format!(
+                "send-keys exit {code}: {}", stderr.trim().chars().take(200).collect::<String>()
+            ))
+        }
+        None => Err("send-keys timed out".into()),
+    }
 }
 
 /// Pastes `text` into the lane's composer through a named tmux buffer and
@@ -1502,6 +1549,7 @@ pub(crate) fn empty_composer_verdict(now: f64, grace_until: f64, redelivered_at:
 }
 
 async fn sleep_ms(ms: u64) {
+    crate::api::send_profile::note_sleep(ms);
     tokio::time::sleep(Duration::from_millis(ms)).await;
 }
 
@@ -2860,84 +2908,6 @@ pub(crate) fn observe_claude_account_change(now: i64) -> i64 {
 /// lanes that were merely CODING the strings (2026-08-16). Line-anchored
 /// `1.`/`2.` shapes do not appear when this source file itself is on screen
 /// (quoted strings carry a leading `"`).
-// Project startup must not grant new hook authority. Codex offers a safe
-// continuation that skips untrusted hooks; only select that exact option.
-// Isolated and paused workers remain untouched. Trusted hooks are not changed.
-fn project_hook_review_key(cfg: &EnvFile, raw: &str) -> Option<&'static str> {
-    if cfg.get("CC_PROVIDER") != Some("codex")
-        || cfg.get("CC_PROJECT").is_none_or(str::is_empty)
-        || ["CC_ISOLATED", "CC_PAUSED", "CC_ARCHIVED"].iter().any(|key| env_flag_on(cfg.get(key)))
-    { return None; }
-    let clean = strip_ansi(raw);
-    if crate::backend::adapter::provider_picker_reason(&clean, "codex") != Some("hook_trust_prompt") {
-        return None;
-    }
-    let choice = "3. Continue without trusting (hooks won't run)";
-    let selected = clean.lines().map(str::trim).any(|line| {
-        line.strip_prefix('›').or_else(|| line.strip_prefix('❯')).is_some_and(|s| s.trim() == choice)
-    });
-    if selected { return Some("Enter"); }
-    clean.lines().map(str::trim).any(|line| line == choice).then_some("3")
-}
-
-// A Codex resume after project checkout consolidation can ask which of two
-// directories to use. The registered project checkout is an Amux-owned choice,
-// not a new authorization or a question for the owner. Never choose a path
-// from the pane alone: it must equal the durable project checkout record.
-fn project_checkout_directory_key(cfg: &EnvFile, raw: &str, checkout: &Path) -> Option<&'static str> {
-    if cfg.get("CC_PROVIDER") != Some("codex")
-        || cfg.get("CC_PROJECT").is_none_or(str::is_empty)
-        || ["CC_ISOLATED", "CC_PAUSED", "CC_ARCHIVED", "CC_PROJECT_PAUSED"]
-            .iter().any(|key| env_flag_on(cfg.get(key)))
-    { return None; }
-    let clean = strip_ansi(raw);
-    if crate::backend::adapter::provider_picker_reason(&clean, "codex") != Some("user_input") {
-        return None;
-    }
-    let lines: Vec<_> = clean.lines().map(str::trim).filter(|line| !line.is_empty()).rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
-    if lines.last().copied() != Some("Press enter to continue") { return None; }
-    let option = |number: usize| -> Option<(&str, bool)> {
-        let prefix = format!("{number}. ");
-        lines.iter().rev().find_map(|line| {
-            let selected = line.starts_with('›') || line.starts_with('❯');
-            let text = if selected { line[3..].trim() } else { line };
-            text.strip_prefix(&prefix).map(|value| (value, selected))
-        })
-    };
-    let (old, _) = option(1)?;
-    let (current, selected) = option(2)?;
-    if !old.starts_with("Use session directory (")
-        || !current.starts_with("Use current directory (")
-        || option(3)?.0 != "Always use session directory"
-        || option(4)?.0 != "Always use current directory"
-    { return None; }
-    let chosen = current.strip_prefix("Use current directory (")?.strip_suffix(')')?;
-    if Path::new(chosen) != checkout { return None; }
-    Some(if selected { "Enter" } else { "2" })
-}
-
-fn project_checkout_repair_claim_ready(plans: &[crate::project_execution::planner::CardPlan], worker: &str) -> bool {
-    plans.iter().any(|p| p.action == "claim" && p.execution.stage == "repair"
-        && p.execution.worker == worker && !p.execution.suspended)
-}
-
-fn project_repair_claim_ready(state: &AppState, project: &str, worker: &str) -> bool {
-    state.store.read().ok().is_some_and(|c| {
-        let Ok(Some(p)) = crate::project_execution::store::get(&c, project) else { return false; };
-        p.policy.enabled && !p.policy.paused && crate::project_execution::planner::plan(&c, &p)
-            .ok().is_some_and(|plans| project_checkout_repair_claim_ready(&plans, worker))
-    })
-}
-
-fn project_codex_conversation_retry_ready(cfg: &EnvFile, pane: &str, last_retry: i64, now: i64) -> bool {
-    cfg.get("CC_PROVIDER") == Some("codex")
-        && cfg.get("CC_PROJECT").is_some_and(|p| !p.is_empty())
-        && !["CC_ISOLATED", "CC_PAUSED", "CC_PROJECT_PAUSED", "CC_ARCHIVED", "CC_REVIEW_HELD"]
-            .iter().any(|key| env_flag_on(cfg.get(key)))
-        && codex_conversation_open_elsewhere(pane)
-        && (last_retry == 0 || now - last_retry >= 300)
-}
-
 pub(crate) fn is_resume_mode_prompt(raw: &str) -> bool {
     let clean = strip_ansi(raw).to_lowercase().replace('\u{2019}', "'");
     let opt1 = cached_re!(r"(?m)^\s*(?:[\u{276f}>]\s*)?1\.\s+resume from summary");
@@ -3764,6 +3734,10 @@ pub const SESSION_SCOPED_FIELDS: &[(&str, RenameDisposition)] = &[
     (
         "social_posts",
         RenameDisposition::KeepForAudit("a post records which worker published it at the time"),
+    ),
+    (
+        "social_queue",
+        RenameDisposition::KeepForAudit("a queued post records which worker asked for it at the time"),
     ),
     (
         "worker_resource_samples",
@@ -6264,10 +6238,13 @@ pub(crate) fn default_model_for_provider(provider: &str) -> String {
         "grok" => "grok-4.6".into(),
         // The catalog default (is_default/is_current) as of 1.0.3.
         "muse" => "muse-spark-1.3-contributor".into(),
-        // OpenCode has no single default model (`provider/model#variant`, from
-        // the worker's own config). Empty is honest; the launch arm never
-        // invents a model (ethos rule 8: the model choice is the user's).
-        "opencode" => String::new(),
+        // OpenCode is PINNED, not left empty. Its own default is not something
+        // amux can rely on: measured 2026-10-25, a worker on the agent's default
+        // answered every ACP prompt with `503 Endpoint is unavailable`, while
+        // `opencode/deepseek-v4.1-flash-free` completed a turn in 12s. One
+        // constant, overridable per worker (`--model`, which always wins) and
+        // fleet-wide (`AMUX_OPENCODE_MODEL`).
+        "opencode" => crate::opencode::default_model(),
         _ => get_default_model(),
     }
 }
@@ -6514,32 +6491,41 @@ pub(crate) fn grok_new_session_id() -> String {
 ///   2026-10-16: the env pair was on the process but the marker was absent
 ///   from the model until --standalone was added.
 /// - yolo normalizes to `--auto`; stale spellings never leak.
-/// - No model default: opencode wants `provider/model#variant` and its own
-///   config supplies the default. A `--model` in CC_FLAGS passes through.
+/// - Any `--model`/`-m` is STRIPPED, and that is load-bearing. OpenCode's TUI
+///   accepts no model flag at all — measured 2026-10-25 on 2.1.4, `opencode
+///   --help` lists only `--standalone/--server/--auto/--continue/--session/
+///   --prompt`, and a `--model` on the command line makes the lane print
+///   `ERROR Unrecognized flag: --model in command opencode` and never start
+///   (a live worker did exactly that the moment this launch began appending
+///   one). The model reaches OpenCode through the subcommands that accept it:
+///   `run --model` and ACP's `session/set_config_option`, both on the
+///   structured path. `OPENCODE_CONFIG_CONTENT` was measured NOT to reach
+///   `run` on 2.1.4 — `{"model":"opencode-go/beam-free"}` was ignored while
+///   `--model` on `run` switched — but on 2.2.0 the same env DOES change the
+///   TUI's own model (footer went MiMo-V2.6-Flash -> DeepSeek V4 Pro, measured
+///   2026-10-27), so the launch re-attaches the stripped value there instead of
+///   letting it vanish: see [`opencode_config_content_with_model`].
 pub(crate) fn opencode_launch_opts(flags: &str, extra_flags: &str) -> String {
     let mut oflags = flags.to_string();
     let oyolo = PROVIDER_YOLO_FLAGS.iter().any(|f| oflags.contains(f));
     if oyolo {
         oflags = strip_provider_yolo_flags(&oflags);
     }
-    // `--model` NEVER rides opencode's argv. The TUI has no such flag: it
-    // prints usage and exits 1 (measured 2026-10-27, opencode v2.2.0), so any
-    // worker created with a model — dashboard, CLI, API or the Telegram
-    // gateway — died on launch with the model it had been given as the cause.
-    // The value is not lost: the launch carries it through
-    // `OPENCODE_CONFIG_CONTENT` (see `opencode_model_from_flags` and
-    // `opencode_config_content_with_model`), which the TUI does honour —
-    // measured live 2026-10-27: with `{"model": "opencode-go/deepseek-v4-pro"}`
-    // in that env the footer changed from MiMo-V2.6-Flash to DeepSeek V4 Pro.
-    let oflags = strip_flag_with_value(&oflags, "--model");
-    let extra = strip_flag_with_value(extra_flags, "--model");
-    let mut opts = String::new();
+    let mut raw = String::new();
     if !oflags.is_empty() {
-        opts += &format!(" {}", shell_quote_flags(&oflags));
+        raw.push(' ');
+        raw.push_str(&oflags);
     }
-    if !extra.is_empty() {
-        opts += &format!(" {}", shell_quote_flags(&extra));
+    if !extra_flags.is_empty() {
+        raw.push(' ');
+        raw.push_str(extra_flags);
     }
+    let raw = drop_model_flags(&raw);
+    let mut opts = if raw.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" {}", shell_quote_flags(raw.trim()))
+    };
     if oyolo && !opts.contains("--auto") {
         opts += " --auto";
     }
@@ -6549,41 +6535,64 @@ pub(crate) fn opencode_launch_opts(flags: &str, extra_flags: &str) -> String {
     opts
 }
 
-/// Drop `--name value` and `--name=value` from a flag string, keeping every
-/// other token quoted the way [`strip_provider_yolo_flags`] rebuilds a list, so
-/// the two strippers agree about what a cleaned flag string looks like.
-fn strip_flag_with_value(flags: &str, name: &str) -> String {
-    if flags.is_empty() {
-        return String::new();
-    }
-    let Ok(tokens) = split_flags(flags) else {
-        return flags.to_string();
+/// Remove `--model X`, `--model=X` and `-m X` from a raw flags string.
+///
+/// Separate from [`strip_token_from_flags`] because that one returns a
+/// SHELL-QUOTED string: feeding its output back through `shell_quote_flags`
+/// quotes every token twice. Here the caller quotes once, at the end.
+fn drop_model_flags(raw: &str) -> String {
+    let Ok(tokens) = split_flags(raw) else {
+        // Unbalanced quoting: the string is not parseable as flags at all, so
+        // the launch cannot strip selectively. Say so — silently passing a
+        // `--model` through here is what breaks an opencode lane.
+        tracing::warn!(
+            flags = %raw,
+            "opencode launch: flags are not parseable; --model/-m could not be stripped"
+        );
+        return raw.to_string();
     };
-    let eq = format!("{name}=");
-    let mut out: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let mut dropped: Option<String> = None;
     let mut i = 0;
     while i < tokens.len() {
-        let token = tokens[i].as_str();
-        if token == name {
-            i += 2; // the value rides with the flag; a bare trailing flag ends it
+        let t = &tokens[i];
+        let is_model = t == "--model" || t == "-m" || t.starts_with("--model=");
+        if is_model {
+            if t.starts_with("--model=") {
+                i += 1;
+            } else if i + 1 < tokens.len() && !tokens[i + 1].starts_with('-') {
+                dropped = Some(format!("{} {}", t, tokens[i + 1]));
+                i += 2;
+            } else {
+                dropped = Some(t.clone());
+                i += 1;
+            }
             continue;
         }
-        if token.starts_with(&eq) {
-            i += 1;
-            continue;
-        }
-        out.push(tokens[i].clone());
+        kept.push(t.clone());
         i += 1;
     }
-    out.iter().map(|t| sh_quote(t)).collect::<Vec<_>>().join(" ")
+    if let Some(flag) = dropped {
+        // Said out loud, because the flag is no longer on argv — and the log
+        // must say where the value went, not just that it left. The launch
+        // re-attaches it to OPENCODE_CONFIG_CONTENT (`opencode_model_routed`)
+        // for the TUI, and the structured turns (run/ACP) take `--model`
+        // themselves.
+        tracing::warn!(
+            flag = %flag,
+            "opencode's TUI accepts no model flag; removed it from argv and re-attached it to the launch's OPENCODE_CONFIG_CONTENT (verdict=opencode_model_routed). The worker's structured (headless) turns still pass --model themselves"
+        );
+    }
+    kept.join(" ")
 }
 
 /// The model an opencode worker was CREATED with, if any — from `CC_FLAGS` or
 /// the caller's extra flags, both spellings (`--model x`, `--model=x`).
 ///
-/// This is the half of the launch contract that used to be missing: the flag
-/// reached a TUI that cannot parse it, so the model had nowhere to go and the
-/// worker did not start at all. It now travels in the launch env instead.
+/// The half of the launch contract that used to be missing: [`drop_model_flags`]
+/// takes the flag off argv (the TUI cannot parse it), and without this the
+/// value simply vanished — the lane started, but never on the model its row
+/// promised. This is where the value is picked back up.
 pub(crate) fn opencode_model_from_flags(flags: &str, extra_flags: &str) -> Option<String> {
     let model = extract_model_from_flags(flags);
     let model = if model.is_empty() {
@@ -6600,6 +6609,15 @@ pub(crate) fn opencode_model_from_flags(flags: &str, extra_flags: &str) -> Optio
 /// ONE env var, ONE writer: the launch already sets `OPENCODE_CONFIG_CONTENT`
 /// for the worker's rules/instructions, and two `-e` pairs for the same key
 /// would let the last one win — dropping either the model or the context.
+///
+/// Whether OpenCode acts on it is version- and path-dependent, and both
+/// measurements are on record: 2.1.4's `run` ignored `{"model": ...}` while
+/// `--model` on `run` switched (2026-10-25, the reason `drop_model_flags`
+/// exists), whereas on 2.2.0 the TUI footer — the interactive lane's whole
+/// model surface — changed from MiMo-V2.6-Flash to DeepSeek V4 Pro with this
+/// env set and no flag at all (measured 2026-10-27). The key costs nothing to
+/// set and is what the TUI actually reads, so the launch sets it and the WARN
+/// in [`drop_model_flags`] still says what left argv.
 pub(crate) fn opencode_config_content_with_model(existing: Option<&str>, model: &str) -> String {
     let mut value: serde_json::Value = existing
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
@@ -6912,15 +6930,21 @@ mod opencode_provider_tests {
     }
 
     #[test]
-    fn opencode_yolo_is_auto_and_has_no_invented_model() {
+    fn opencode_yolo_is_auto_and_the_structured_default_model_is_pinned() {
         assert_eq!(provider_yolo_flag("opencode"), "--auto");
-        // No provider default model: opencode wants provider/model#variant and
-        // the worker's own config supplies it (ethos rule 8).
-        assert_eq!(default_model_for_provider("opencode"), "");
+        // PINNED, not invented: the agent's own default was measured answering
+        // `503 Endpoint is unavailable` on every ACP turn (2026-10-25), so the
+        // fleet runs one known-good model unless the worker or
+        // `AMUX_OPENCODE_MODEL` says otherwise.
+        assert_eq!(
+            default_model_for_provider("opencode"),
+            crate::opencode::DEFAULT_MODEL
+        );
+        assert_eq!(crate::opencode::DEFAULT_MODEL, "opencode/deepseek-v4.1-flash-free");
     }
 
     #[test]
-    fn opencode_launch_is_standalone_and_normalizes_yolo() {
+    fn opencode_launch_is_standalone_and_drops_model_flags() {
         // `--standalone` is load-bearing: without a private server the TUI
         // reads config from the shared background service, which never saw the
         // worker's OPENCODE_CONFIG_CONTENT (measured live 2026-10-16).
@@ -6932,31 +6956,37 @@ mod opencode_provider_tests {
             "claude's yolo spelling must not leak: {opts}"
         );
 
+        // NO MODEL, EVER, on this launch path. Measured 2026-10-25 on
+        // opencode 2.1.4: the TUI has no --model flag, and one on the command
+        // line prints `ERROR Unrecognized flag: --model in command opencode`
+        // and the lane never starts (a live worker did exactly that). Model
+        // selection belongs to the structured paths (`run --model`, ACP
+        // `session/set_config_option`).
+        assert!(!opts.contains("--model"), "the TUI rejects --model: {opts}");
+
+        // A worker's flags carrying --model/-m/--model= are stripped, in every
+        // spelling, and nothing is invented in their place.
+        for flags in [
+            "--model opencode-go/deepseek-v4.1-flash",
+            "--model=opencode-go/deepseek-v4.1-flash",
+            "-m opencode-go/deepseek-v4.1-flash",
+        ] {
+            let opts = opencode_launch_opts(flags, "");
+            assert!(!opts.contains("deepseek-v4.1-flash"), "{flags} -> {opts}");
+            assert!(!opts.contains("--model"), "{flags} -> {opts}");
+            assert!(!opts.contains("-m "), "{flags} -> {opts}");
+            assert_eq!(opts.trim(), "--standalone", "{flags} -> {opts}");
+        }
+
+        // extra_flags (the resume choreography) cannot smuggle one back in.
+        let opts = opencode_launch_opts("", "--model opencode-go/beam-free --continue");
+        assert!(!opts.contains("--model"), "{opts}");
+        assert!(!opts.contains("beam-free"), "{opts}");
+        assert!(opts.contains("--continue"), "unrelated flags survive: {opts}");
+
         // A user-supplied --standalone is not duplicated.
         let opts = opencode_launch_opts("--standalone", "");
         assert_eq!(opts.matches("--standalone").count(), 1, "{opts}");
-
-        // `--model` never rides argv: the opencode TUI has no such flag, prints
-        // usage and exits 1 (measured 2026-10-27), so a worker created with a
-        // model was dead on launch. The value is extracted for the launch env
-        // instead (opencode_model_from_flags / opencode_config_content_with_model).
-        let opts = opencode_launch_opts("--model opencode-go/deepseek-v4.1-flash", "");
-        assert!(!opts.contains("--model"), "argv is what killed the worker: {opts}");
-        assert!(!opts.contains("deepseek"), "{opts}");
-        assert!(!opts.contains("sonnet"), "{opts}");
-
-        // Both spellings, and a model carried in extra flags.
-        let opts = opencode_launch_opts("--model=opencode-go/mimo-v2.6-flash", "");
-        assert!(!opts.contains("--model"), "{opts}");
-        let opts = opencode_launch_opts("--standalone", "--model opencode-go/mimo-v2.5");
-        assert!(!opts.contains("--model"), "{opts}");
-        assert_eq!(opts.matches("--standalone").count(), 1, "{opts}");
-
-        // The strip removes the flag AND its value, never a neighbouring flag.
-        let opts = opencode_launch_opts("--model opencode-go/mimo-v2.6-flash --log-level warn", "");
-        assert!(!opts.contains("mimo"), "{opts}");
-        assert!(opts.contains("--log-level"), "{opts}");
-        assert!(opts.contains("warn"), "{opts}");
 
         // Even with nothing configured, the private server rides along.
         let opts = opencode_launch_opts("", "");
@@ -8543,11 +8573,9 @@ pub(crate) async fn cmd_hist_record_with_id(
     // the prompt before it, capture declines back to exactly this outcome, so
     // the widening can only add the attachment, never a card.
     let isolated = session_is_isolated(&session);
-    let project_executor = !isolated && parse_env(&session).get("CC_PROJECT").is_some();
     // No board for this worker (every Board tab switch off): no ledger card.
     let capture_pending = !isolated
         && !crate::api::board_lifecycle::board_unused(&session)
-        && !project_executor
         && task_bearing
         && landed
         && !peer_coordination
@@ -8583,11 +8611,6 @@ pub(crate) async fn cmd_hist_record_with_id(
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
-            if project_executor {
-                if let Ok(Some((project,task)))=super::projects::executor_task(conn,&session) {
-                    conn.execute("UPDATE cmd_history SET card_id=?2,project_group=?3,capture_pending=0,type='steering' WHERE id=?1",rusqlite::params![row_id,task,project])?;
-                }
-            }
             msg_row_id_w.store(row_id, std::sync::atomic::Ordering::SeqCst);
             // cmd_history is the durable Messages ledger, but this write used
             // to publish no StateEvent. A healthy SSE client therefore had no
@@ -9071,15 +9094,6 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
         }
         return;
     }
-    if parse_env(&cap_session).get("CC_PROJECT").is_some() {
-        if crate::log_dedupe::first_this_bucket(
-            &format!("project-legacy-intake:{row_id}"),
-            crate::log_dedupe::hour_bucket(now_f64()),
-        ) {
-            tracing::warn!(message_id=row_id,session=cap_session,measured=true,n_considered=1,verdict="project.legacy_intake_held","project worker receipt cannot enter independent legacy intake; settle duplicate through project cancellation API");
-        }
-        return;
-    }
     // "Decompose onto board" off means the owner's messages stay messages
     // (Ethan, 2026-10-14: "we have all the board toggles off yet tasks
     // accumulate and its not an isolated worker"). Raw prompt capture used to
@@ -9447,12 +9461,26 @@ fn steer_row_source(conn: &rusqlite::Connection, id: &str) -> (Option<String>, O
 /// noticed later.
 const NON_COALESCING_GUARDS: &[&str] = &["board-progress"];
 
+/// The suffix the scheduler puts on a `wake` delivery's guard
+/// (`sched:<id>:wake`). A wake is the text a shell schedule PRINTED for one
+/// event, and the script closed that event before printing it, so nothing will
+/// ever send it again: it carries content, like a board note.
+///
+/// MEASURED (AF-1047, 2026-10-30). SCHED-917's 09:43:44Z run delivered "W-a69b53
+/// fired: ... cancelled"; the lane was mid-turn, so it waited under
+/// `sched:SCHED-917`. The 09:47:57Z run's "W-425051 EXPIRED" then rewrote that
+/// row in place (queued_at 09:43:46, text from 09:47), and the lane never
+/// learned its watched CI run had been cancelled. The suffix keeps the
+/// `sched:` prefix, so `is_schedule_guard` and the isolation gate still treat it
+/// as the owner's schedule.
+pub(crate) const WAKE_GUARD_SUFFIX: &str = ":wake";
+
 /// Whether `guard` names a content-bearing producer (see
 /// [`NON_COALESCING_GUARDS`]). Guards stay non-empty for these, so the isolation
 /// gate above still refuses them into a raw-agent lane — the coalescing is what
 /// is switched off, not the producer identity.
 fn non_coalescing(guard: &str) -> bool {
-    NON_COALESCING_GUARDS.contains(&guard)
+    NON_COALESCING_GUARDS.contains(&guard) || (is_schedule_guard(guard) && guard.ends_with(WAKE_GUARD_SUFFIX))
 }
 
 /// py:8595 _steer_enqueue — durable queue row + message.queued event.
@@ -9742,27 +9770,6 @@ async fn steer_enqueue_precond_with_id(
     // Owner peek/send stay working, which is the documented boundary. This
     // REFUSES rather than silently dropping: a producer that thinks it
     // delivered is how a board card gets claimed for a lane nobody is driving.
-    let project_managed = !session_is_isolated(name) && parse_env(name).get("CC_PROJECT").is_some();
-    let lead_worker = project_managed && parse_env(name).get("CC_PROJECT_LEAD") == Some("1");
-    let guard = if guard.is_empty() && project_managed && !lead_worker {
-        "project-steering"
-    } else {
-        guard
-    };
-    if project_managed
-        && !guard.is_empty()
-        && !matches!(guard, "project-execution" | "project-steering" | "project-lead")
-    {
-        tracing::info!(
-            session = name,
-            guard,
-            verdict = "project_legacy_prompt_suppressed",
-            measured = true,
-            n_considered = 1,
-            "project controller owns executor prompts"
-        );
-        return Err("project controller owns executor prompts");
-    }
     // A chat's (or an admin-group worker's) note or relay is owner input, not amux automation, so isolation,
     // pause and contract gates treat it as the owner's own send.
     let chat_input = speaks_for_owner(sender);
@@ -9770,7 +9777,7 @@ async fn steer_enqueue_precond_with_id(
         tracing::info!(session = name, sender, guard, measured = true, n_considered = 1,
             verdict = "isolated_input_from_chat", "chat or admin-group input delivered to an isolated worker as owner input");
     }
-    let automation = !chat_input && !guard.is_empty() && !(guard == "project-steering" && sender.is_empty());
+    let automation = !chat_input && !guard.is_empty();
     // SCHEDULES REACH ISOLATED WORKERS (Ethan, 2026-09-26: "isolated workers
     // can still have schedulers they should"). A schedule is standing
     // configuration of that worker, not amux steering it, so it is exempt
@@ -9870,10 +9877,6 @@ async fn steer_enqueue_precond_with_id(
     let persisted = store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
-            let precond_w=if guard_s=="project-steering" {
-                let (_,task)=super::projects::executor_task(conn,&session).map_err(crate::project_execution::store::sql_error)?.ok_or(rusqlite::Error::InvalidQuery)?;
-                Some((task,-1)) // Task binding survives revisions/retries; never expires a retained owner note.
-            } else {precond_w};
             if let Some(ref fixed) = stable_w {
                 if fixed.starts_with("board-drive-resume:") {
                     if !resume_id_is_current(conn, &session, fixed) {
@@ -9929,10 +9932,6 @@ async fn steer_enqueue_precond_with_id(
                     )
                     .unwrap_or(false);
                 if queued {
-                    if guard_s=="project-steering" {
-                        let (old_session,old_text,old_card):(String,String,Option<String>)=conn.query_row("SELECT session,text,precond_card FROM steering_queue WHERE id=?1",[fixed],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-                        if old_session!=session || old_text!=text_s || old_card.as_deref()!=precond_w.as_ref().map(|(c,_)|c.as_str()) {return Err(rusqlite::Error::InvalidQuery);}
-                    }
                     should_emit_w.store(false, std::sync::atomic::Ordering::SeqCst);
                     if let Ok(mut value) = disposition_w.lock() {
                         *value = StableEnqueueDisposition::AlreadyQueued;
@@ -9967,7 +9966,7 @@ async fn steer_enqueue_precond_with_id(
             // been waiting since it was first queued. The newest TEXT wins
             // because that is the guard's purpose (one pending answer, current
             // content); the age is not part of the content.
-            let existing: Option<String> = if stable_w.is_some() || guard_s.is_empty() || guard_s=="project-steering" || non_coalescing(&guard_s) {
+            let existing: Option<String> = if stable_w.is_some() || guard_s.is_empty() || non_coalescing(&guard_s) {
                 None
             } else {
                 conn.query_row(
@@ -9986,7 +9985,7 @@ async fn steer_enqueue_precond_with_id(
                     *g = prior;
                 }
             } else {
-                if stable_w.is_none() && guard_s!="project-steering" {
+                if stable_w.is_none() {
                     conn.execute(
                         "DELETE FROM steering_queue WHERE session=?1 AND text=?2",
                         rusqlite::params![session, text_s],
@@ -10204,6 +10203,35 @@ fn stranded_expire_secs() -> i64 {
 /// unreadable, or the part read starts after `since`, which covers both a file
 /// too large for the tail read and a conversation that began after the
 /// reservation (the prompt could be in an older transcript).
+/// Whether the lane's pane shows a turn in progress right now.
+async fn lane_generating_now(name: &str) -> bool {
+    #[cfg(test)]
+    if let Some(g) = test_generating::get(name) {
+        return g;
+    }
+    detect_claude_status(&tmux_capture(name, 0).await) == "active"
+}
+
+#[cfg(test)]
+pub(crate) mod test_generating {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static LANES: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+    pub(crate) fn set(name: &str, generating: bool) {
+        LANES.lock().unwrap().get_or_insert_with(HashMap::new).insert(name.to_string(), generating);
+    }
+    pub(crate) fn get(name: &str) -> Option<bool> {
+        LANES.lock().unwrap().as_ref().and_then(|m| m.get(name).copied())
+    }
+}
+
+/// Whether a message missing from the transcript may be released for a resend.
+/// Never while the lane is generating: a message delivered mid-turn reaches the
+/// transcript only when the turn ends, so its absence proves nothing yet.
+fn stranded_release_allowed(generating: bool) -> bool {
+    !generating
+}
+
 fn transcript_has_prompt_since(path: &std::path::Path, text: &str, since: i64, clock_skew_s: i64) -> Option<bool> {
     use std::io::{Read, Seek, SeekFrom};
     const TAIL: u64 = 16 * 1024 * 1024;
@@ -10436,7 +10464,21 @@ async fn send_receipt_resolving(
                 json!({"ok": true, "accepted": true, "reconciled": true, "id": id, "msg_id": msg_id}),
             )
         }
-        Some((Some(false), path)) if aged => {
+        Some((Some(false), path)) if aged && {
+            // ABSENCE IS NOT EVIDENCE WHILE THE LANE IS MID-TURN. Claude Code holds a
+            // message typed during a turn and writes it to the transcript only when
+            // the turn ends: on sandbox.amux.io (2026-10-26) "password protect it" was
+            // released at 15:56:18.098, the transcript recorded it at 15:56:18.577, and
+            // the owner was shown "may already be with the worker" with a resend
+            // invitation that would have delivered it twice.
+            let generating = lane_generating_now(name).await;
+            if generating {
+                tracing::info!(target: "amux::message_acceptance", session = name, measured = true, n_considered = 1,
+                    verdict = "stranded_reservation_deferred_mid_turn",
+                    "a reservation's text is not in the transcript yet, but the lane is mid-turn; not released");
+            }
+            stranded_release_allowed(generating)
+        } => {
             send_dedup_forget(state, name, msg_id).await;
             tracing::warn!(
                 target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_released",
@@ -10762,13 +10804,6 @@ pub(crate) async fn is_running(name: &str) -> bool {
         return r;
     }
     let cfg = parse_env(name);
-    // A completed project executor may deliberately retain its tmux pane so a
-    // person can inspect the exact terminal that produced the acceptance
-    // artifacts. The pane is evidence, not a live worker. Retirement writes
-    // this marker only after the provider process is confirmed stopped.
-    if cfg.get("CC_REVIEW_HELD") == Some("1") {
-        return false;
-    }
     if !iterm2_id(&cfg).is_empty() {
         return false;
     }
@@ -11231,16 +11266,6 @@ fn send_tail_squashed(text: &str) -> String {
         .collect()
 }
 
-fn project_execution_composer_owns_text(raw: &str, text: &str) -> bool {
-    let state = composer_state(raw);
-    let Some(pending) = state.typed() else {
-        return false;
-    };
-    let tail = send_tail_squashed(text);
-    let pending_sq: String = pending.split_whitespace().collect();
-    !tail.is_empty() && pending_sq.contains(&tail)
-}
-
 /// Codex's model/path line is footer chrome, not a continuation of the input.
 ///
 /// The current TUI draws no box rule between its composer and this footer, so
@@ -11302,13 +11327,6 @@ fn possible_codex_footer_chrome(raw: &str) -> bool {
             .skip(1)
             .any(|part| *part == "~" || part.starts_with("~/") || part.starts_with('/'))
         && !codex_model_footer_chrome(raw, &stripped)
-}
-
-pub(crate) fn codex_conversation_open_elsewhere(raw: &str) -> bool {
-    let clean = strip_ansi(raw);
-    clean.contains("This conversation is open in another app")
-        && clean.contains("Close it there and press R to continue here")
-        && clean.to_lowercase().contains("r retry")
 }
 
 /// A row of Muse Code's `/` command popup (`/clear   Clear terminal and start a fresh
@@ -11803,9 +11821,6 @@ fn bg_view_refusal(generating: bool) -> String {
 /// added later cannot silently land in the 500 bucket.
 pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str>) {
     let m = msg.trim();
-    if msg.contains("durable owner input remains queued") {
-        return (StatusCode::CONFLICT,Some("Owner input is held for the current authorized working claim; inspect the project hold and use explicit retry/resume when permitted."));
-    }
     // THE WRAPPER CARRIES THE REAL OUTCOME. A send to a stopped lane auto-wakes
     // it, and a wake that legitimately declines comes back as
     // "auto-wake failed: session is archived; wake it first" — a refusal with an
@@ -11910,7 +11925,6 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     //     these names the state and a way out, and every one becomes deliverable
     //     on its own without anybody fixing amux.
     let conflict: &[(&str, &str)] = &[
-        ("project pause, identity or budget holds automatic delivery", "message remains queued; inspect the current project task, pause and usage coverage, and resolve the hold before automatic delivery"),
         ("boot readiness not freshly observed", "message remains queued; wait for the new provider's idle empty composer, inspect startup if it does not become ready; do not send a duplicate"),
         ("worker is not ready; durable message remains queued", "message remains queued; start or recover the worker and wait for its idle empty composer; do not send a duplicate"),
         ("composer contains a draft", "message remains queued; inspect and submit or deliberately discard the existing draft in the pane before delivery can resume"),
@@ -12850,7 +12864,6 @@ pub(crate) fn all_lane_names() -> Vec<String> {
         let cfg = parse_env(n);
         cfg.get("CC_ARCHIVED") != Some("1")
             && cfg.get("CC_PAUSED") != Some("1")
-            && cfg.get("CC_REVIEW_HELD") != Some("1")
     });
     names
 }
@@ -13012,6 +13025,24 @@ pub(crate) fn is_board_guard(guard: &str) -> bool {
 }
 
 /// `Some(reason)` when `guard` is board automation and `name` has the board off.
+/// Does an owner's send wait for the board dispatcher instead of going to the
+/// worker? Only when the lane stages commands (`eligible`) and the sender did
+/// not ask for no board (MSG-99658).
+pub(crate) fn owner_send_staged(owner: bool, skip_board: bool, eligible: impl FnOnce() -> bool) -> bool {
+    owner && !skip_board && eligible()
+}
+
+#[cfg(test)]
+mod owner_send_staged_tests {
+    #[test]
+    fn no_board_sends_directly_even_on_a_staging_lane() {
+        assert!(super::owner_send_staged(true, false, || true), "a staging lane stages an owner command");
+        assert!(!super::owner_send_staged(true, true, || true), "no_board goes straight to the worker");
+        assert!(!super::owner_send_staged(false, false, || true), "only owner sends are staged");
+        assert!(!super::owner_send_staged(true, false, || false), "a lane that does not stage delivers");
+    }
+}
+
 pub(crate) fn board_off_refusal(name: &str, guard: &str) -> Option<&'static str> {
     // Isolation has its own, stricter rules and its own refusal text.
     if !is_board_guard(guard) || session_is_isolated(name) || !crate::api::board_lifecycle::board_unused(name) {
@@ -13452,102 +13483,6 @@ fn lane_send_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     guard.entry(name.to_string()).or_default().clone()
 }
 
-fn project_delivery_claim(
-    state: &AppState,
-    name: &str,
-    delivery: Option<&str>,
-) -> Option<(String, i64, String)> {
-    if session_is_isolated(name) {
-        return None;
-    }
-    let id = delivery?;
-    let c = state.store.read().ok()?;
-    let task:Option<String>=c.query_row("SELECT precond_card FROM steering_queue WHERE id=?1 AND session=?2 AND guard='project-steering'",rusqlite::params![id,name],|r|r.get(0)).ok()?;
-    let task = task?;
-    let e = crate::project_execution::planner::execution(&c, &task).ok()?;
-    Some((task, e.generation, e.input_hash))
-}
-
-fn project_send_hold(state: &AppState, name: &str, delivery: Option<&str>) -> Option<String> {
-    if session_is_isolated(name)
-        || (delivery.is_none() && parse_env(name).get("CC_PROJECT").is_none())
-    {
-        return None;
-    }
-    let result = state.store.read().map_err(|e| e.to_string()).and_then(|c| {
-        if let Some(id) = delivery {
-            super::projects::steering_delivery_hold(&c, name, id).map_err(|e| e.to_string())
-        } else {
-            super::projects::executor_steering_hold(&c, name).map_err(|e| e.to_string())
-        }
-    });
-    result
-        .unwrap_or_else(|_| Some("project_delivery_identity_unavailable".into()))
-        .map(|r| format!("{r}; durable owner input remains queued"))
-}
-
-fn is_project_execution_delivery(state: &AppState, name: &str, delivery: Option<&str>) -> bool {
-    let Some(id) = delivery else {
-        return false;
-    };
-    state.store.read().ok().is_some_and(|c| {
-        c.query_row(
-            "SELECT guard='project-execution' FROM steering_queue WHERE id=?1 AND session=?2",
-            rusqlite::params![id, name],
-            |r| r.get::<_, bool>(0),
-        )
-        .unwrap_or(false)
-    })
-}
-
-async fn submit_project_execution_draft_if_owned(
-    state: &AppState,
-    name: &str,
-    text: &str,
-    delivery: Option<&str>,
-    raw_hint: &str,
-) -> Option<(bool, String)> {
-    let id = delivery?;
-    if !is_project_execution_delivery(state, name, delivery)
-        || !project_execution_composer_owns_text(raw_hint, text)
-    {
-        return None;
-    }
-    let send_lock = session_send_lock(name);
-    let _guard = send_lock.lock().await;
-    let raw = tmux_capture(name, 25).await;
-    if !project_execution_composer_owns_text(&raw, text) {
-        return None;
-    }
-    if let Some(reason) = project_send_hold(state, name, delivery) {
-        return Some((false, reason));
-    }
-    tracing::warn!(
-        session = %name,
-        delivery_id = %id,
-        measured = true,
-        n_considered = 1,
-        verdict = "project_execution_draft_rescue",
-        "project execution delivery owns the unsubmitted composer text; submitting it instead of preserving a false human draft"
-    );
-    emit_event(
-        state,
-        name,
-        "project.delivery_started",
-        Some(json!({"delivery_id":id,"rescued_existing_draft":true})),
-        None,
-        "steering",
-    )
-    .await;
-    let sent_at = now_f64();
-    send_key(name, "Enter").await;
-    let generating = detect_claude_status(&raw) == "active";
-    // No retry Enter on a slash command: it would act inside its panel.
-    let (submission, retried) =
-        verify_submitted(name, text, sent_at, !generating && !is_slash_command(text)).await;
-    Some(send_outcome(submission, generating, retried))
-}
-
 /// Does the composer hold EXACTLY the message steering is delivering right now?
 ///
 /// Then the draft is amux's own earlier paste whose Enter never took (the lane
@@ -13555,8 +13490,8 @@ async fn submit_project_execution_draft_if_owned(
 /// used to protect it from its own sender: measured 2026-09-24 on amux-helper,
 /// the owner's first queued message sat pasted in the composer from 06:27 and
 /// eleven more queued behind it, refused 4x every ~9s, while the lane read
-/// idle between turns. Same provenance rule as the project-execution rescue
-/// above, for every steering delivery. Pure so the exact-match rule is tested.
+/// idle between turns. The rule applies to every steering delivery. Pure so the
+/// exact-match rule is tested.
 fn composer_holds_this_delivery(draft: &str, text: &str) -> bool {
     let want: String = text.split_whitespace().collect();
     want.chars().count() >= 8 && draft == want
@@ -13710,6 +13645,23 @@ async fn send_text_inner_bound(
     delivery: Option<&str>,
     queue_id: &mut Option<String>,
 ) -> (bool, String) {
+    // Profiled (owner, 2026-10-29): GET /api/debug/send-profile and the
+    // `send_profile` / `send_slow` log lines say where each send's time went.
+    // Boxed: `profiled` moves its future through two task-local scopes, and
+    // a debug build copies a by-value send future at each move. Unboxed, a
+    // board-drive pickup overflowed the 2 MiB maintenance stack (AF-1014).
+    crate::api::send_profile::profiled(name, text.chars().count(),
+        Box::pin(send_text_inner_bound_body(state, name, text, mode, delivery, queue_id))).await
+}
+
+async fn send_text_inner_bound_body(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    mode: SendMode,
+    delivery: Option<&str>,
+    queue_id: &mut Option<String>,
+) -> (bool, String) {
     // Serialise per lane. Taken before any pane state is read, because the
     // decisions below (is it generating? is a picker up?) are read-then-act on
     // the same composer this is about to clear.
@@ -13717,6 +13669,7 @@ async fn send_text_inner_bound(
     let waited = std::time::Instant::now();
     let _send_guard = lock.lock().await;
     let waited_ms = waited.elapsed().as_millis();
+    crate::api::send_profile::mark("lane_lock");
     if waited_ms > 250 {
         // Countable: a sweep can see how often two producers aim at one lane.
         tracing::info!(
@@ -13767,13 +13720,7 @@ async fn send_text_inner_bound(
                 .into(),
         );
     }
-    let admitted_claim = project_delivery_claim(state, name, delivery);
     let cfg = parse_env(name);
-    if from_steering || cfg.get("CC_PROJECT").is_some() {
-        if let Some(reason) = project_send_hold(state, name, delivery) {
-            return (false, reason);
-        }
-    }
     if !iterm2_id(&cfg).is_empty() {
         return (
             false,
@@ -13781,8 +13728,8 @@ async fn send_text_inner_bound(
         );
     }
     // ACW-6: every producer (owner send, peers, steering, schedules, board
-    // dispatch) has converged by here, after the isolation, pause and
-    // project gates. The worker type's adapter delivers, or the terminal
+    // dispatch) has converged by here, after the isolation and pause
+    // gates. The worker type's adapter delivers, or the terminal
     // pipeline below does.
     let adapter = crate::api::worker_exec::adapter_for(
         &crate::api::worker_exec::worker_type_of_env(cfg.get("CC_WORKER_TYPE")),
@@ -13791,14 +13738,13 @@ async fn send_text_inner_bound(
         adapter.deliver(state, name, text, origin).await
     {
         crate::api::worker_exec::note_dispatch(name, "deliver", adapter.worker_type());
-        let _ = admitted_claim;
         return r;
     }
     if backend_of_cfg(&cfg) == "herdr" {
         return herdr_send(name, text).await;
     }
     let boot_meta = load_meta(name);
-    let mut boot_pending = boot_meta
+    let boot_pending = boot_meta
         .get("boot_readiness_pending")
         .and_then(Value::as_bool)
         .unwrap_or(false);
@@ -13810,43 +13756,6 @@ async fn send_text_inner_bound(
         .and_then(Value::as_bool)
         == Some(true)
         || session_op_lock(name).try_lock().is_err();
-    let project_execution_delivery =
-        from_steering && is_project_execution_delivery(state, name, delivery);
-    if project_execution_delivery
-        && !starting
-        && !out_st.is_empty()
-        && codex_conversation_open_elsewhere(&out_st)
-    {
-        let now = now_i64();
-        let last_retry = meta_i64(&boot_meta, "codex_open_elsewhere_retry_at");
-        if last_retry > 0 && now - last_retry < 300 {
-            return (
-                false,
-                "session is open in another app; Codex retry screen is still present, durable message remains queued".into(),
-            );
-        }
-        update_meta(name, &[("codex_open_elsewhere_retry_at", json!(now))]);
-        tracing::warn!(
-            session = %name,
-            measured = true,
-            n_considered = 1,
-            verdict = "codex_conversation_open_elsewhere_retry",
-            "project execution worker is at Codex's open-elsewhere retry screen; making one bounded retry attempt before classifying the lane"
-        );
-        send_key(name, "R").await;
-        sleep_ms(1000).await;
-        out_st = tmux_capture(name, 15).await;
-        if codex_conversation_open_elsewhere(&out_st) {
-            return (
-                false,
-                "session is open in another app; Codex retry screen did not clear, durable message remains queued".into(),
-            );
-        }
-        if boot_pending {
-            update_meta(name, &[("boot_readiness_pending", json!(false))]);
-            boot_pending = false;
-        }
-    }
     let boot_in_flight = boot_delivery_held(
         &out_st,
         &meta_str(&boot_meta, "boot_previous_frame"),
@@ -13878,11 +13787,6 @@ async fn send_text_inner_bound(
         update_meta(name, &[("boot_readiness_pending", json!(false))]);
     }
     if from_steering && composer_state(&out_st).typed().is_some() {
-        if let Some(rescued) =
-            submit_project_execution_draft_if_owned(state, name, text, delivery, &out_st).await
-        {
-            return rescued;
-        }
         if let Some(submitted) = submit_own_steering_draft(state, name, text).await {
             return submitted;
         }
@@ -14431,15 +14335,6 @@ async fn send_text_inner_bound(
     let _send_guard = send_lock.lock().await;
     // `sent_at` bounds the JSONL evidence window: an OLDER identical message
     // (a second "continue" minutes later) must not count as this send.
-    if let Some(reason) = project_send_hold(state, name, delivery) {
-        return (false, reason);
-    }
-    if admitted_claim != project_delivery_claim(state, name, delivery) {
-        return (
-            false,
-            "project_claim_changed; durable owner input remains queued".into(),
-        );
-    }
     let sent_at = now_f64();
     // A Stop hook authorizes draining the queue, not pressing Escape forever.
     // Another turn/tool can start between that hook and this send lock. Preserve
@@ -14526,15 +14421,6 @@ async fn send_text_inner_bound(
     // owns — amux's job is to hand the text over in the form the harness
     // accepts, not to build a second queue in front of it. Idle lanes are
     // untouched: they still type, with no added latency.
-    if let Some(reason) = project_send_hold(state, name, delivery) {
-        return (false, reason);
-    }
-    if admitted_claim != project_delivery_claim(state, name, delivery) {
-        return (
-            false,
-            "project_claim_changed; durable owner input remains queued".into(),
-        );
-    }
     let use_paste = must_paste(generating, text.chars().count(), at_picker_text(&text));
     if generating {
         // Mid-turn delivery is the risky case, so make every instance
@@ -14572,15 +14458,10 @@ async fn send_text_inner_bound(
             );
         }
     }
+    crate::api::send_profile::mark("prechecks");
     if from_steering {
         let draft_frame = tmux_capture(name, 15).await;
         if composer_state(&draft_frame).typed().is_some() {
-            if let Some(rescued) =
-                submit_project_execution_draft_if_owned(state, name, &text, delivery, &draft_frame)
-                    .await
-            {
-                return rescued;
-            }
             return (
                 false,
                 "composer draft appeared before paste; retained without modification".into(),
@@ -14619,6 +14500,7 @@ async fn send_text_inner_bound(
     // 2026-09-24, MSG-68711 "i dont see it @/Users/.../x.png"): the cursor ends
     // on the mention, Claude Code offers the completion, and the Enter below
     // accepts it instead of submitting. The owner had to press Enter again.
+    crate::api::send_profile::mark("cleared");
     // One trailing space closes the picker; the submitted turn is trimmed.
     let staged = close_trailing_mention(&text);
     if staged.len() != text.len() {
@@ -14642,8 +14524,10 @@ async fn send_text_inner_bound(
         _ => (None, staged.to_string()),
     };
     if let Some(prefix) = typed_prefix.as_deref() {
-        if !send_literal(name, prefix).await {
-            return (false, "send-keys failed".into());
+        if let Err(detail) = send_literal(name, prefix).await {
+            tracing::warn!(session = %name, %detail, verdict = "send_keys_failed",
+                "tmux send-keys failed on slash-command prefix");
+            return (false, format!("send-keys failed ({detail})"));
         }
         sleep_ms(60).await;
     }
@@ -14652,8 +14536,10 @@ async fn send_text_inner_bound(
         if let Err(why) = paste_into_composer(name, &staged).await {
             return (false, why.into());
         }
-    } else if !send_literal(name, &staged).await {
-        return (false, "send-keys failed".into());
+    } else if let Err(detail) = send_literal(name, &staged).await {
+        tracing::warn!(session = %name, %detail, verdict = "send_keys_failed",
+            "tmux send-keys failed on message text");
+        return (false, format!("send-keys failed ({detail})"));
     }
     // HOW LONG THE COMPOSER NEEDS BEFORE Enter MEANS "SUBMIT".
     //
@@ -14682,6 +14568,7 @@ async fn send_text_inner_bound(
         tracing::debug!(session = %name, paste_settle_ms = settle_ms, verdict = "multiline_paste_settle",
             "multi-line paste: waiting before Enter so the paste is folded first");
     }
+    crate::api::send_profile::mark("typed");
     sleep_ms(settle_ms).await;
     // Only reachable if picker-shaped text was TYPED, which `use_paste` now
     // prevents. Kept as a belt-and-braces closer rather than deleted: if a
@@ -14699,33 +14586,8 @@ async fn send_text_inner_bound(
         send_key(name, "Escape").await;
         sleep_ms(60).await;
     }
-    if let Some(id) = delivery {
-        let project_packet = state.store.read().ok().is_some_and(|c| {
-            c.query_row(
-                "SELECT guard='project-execution' FROM steering_queue WHERE id=?1 AND session=?2",
-                rusqlite::params![id, name],
-                |r| r.get::<_, bool>(0),
-            )
-            .unwrap_or(false)
-        });
-        if project_packet {
-            // A fast Stop hook can precede final delivery acknowledgment. Keep
-            // actual submission start, not queued age, as its causal lower bound.
-            emit_event(
-                state,
-                name,
-                "project.delivery_started",
-                Some(json!({"delivery_id":id})),
-                None,
-                "steering",
-            )
-            .await;
-            if let Some(reason) = project_send_hold(state, name, delivery) {
-                return (false, reason);
-            }
-        }
-    }
     send_key(name, "Enter").await;
+    crate::api::send_profile::mark("entered");
     // ------------------------------------------------------------------
     // THE EVIDENCE GATE (AMUX-2629). Everything above proves only that bytes
     // reached the pty. "sent" is a claim about Claude Code's state, so it is
@@ -14754,6 +14616,7 @@ async fn send_text_inner_bound(
     // launch-videos at 21:30:36Z. So no retry and no idle watcher for them.
     let is_slash = is_slash_command(&text);
     let (first, retried) = verify_submitted(name, &text, sent_at, !generating && !is_slash).await;
+    crate::api::send_profile::mark("verified");
     if is_slash {
         // The verifier reads "stuck" whenever it never saw the composer come
         // back empty. A panel (/btw, /status) HIDES the composer, so that read
@@ -15139,16 +15002,15 @@ fn spawn_direct_draft_idle_submit(name: &str, text: &str, sent_at: f64, grace_s:
 }
 
 /// py:25815 send_keys — allowed control keys only.
-const ALLOWED_TMUX_KEYS: [&str; 47] = [
+// "C-s": the second half of the Send Now chip (Ctrl+X, release, Ctrl+S).
+const ALLOWED_TMUX_KEYS: [&str; 48] = [
     "Enter", "Escape", "Tab", "BTab", "Space", "BSpace", "Up", "Down", "Left", "Right", "Home",
     "End", "PageUp", "PageDown", "IC", "DC", "C-c", "C-d", "C-z", "C-l", "C-a", "C-e", "C-k",
-    "C-u", "C-r", "C-p", "C-n", "C-b", "C-f", "C-w", "C-o", "C-x", "M-b", "M-f", "M-d", "F1", "F2",
+    "C-u", "C-r", "C-p", "C-n", "C-b", "C-f", "C-w", "C-o", "C-x", "C-s", "M-b", "M-f", "M-d", "F1", "F2",
     "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
 ];
 // "1": the resume-mode auto-answer selects BY DIGIT (see resume_mode_action —
 // Enter would take whatever is highlighted, including "Don't ask me again").
-// "2": the exact registered project-checkout picker selects the current
-// directory without persisting a provider preference.
 const ALLOWED_TMUX_CHAR_KEYS: [&str; 8] = ["y", "n", "q", "x", "r", "1", "2", "3"];
 
 async fn send_keys_op(name: &str, keys: &str) -> (bool, String) {
@@ -15164,6 +15026,31 @@ async fn send_keys_op(name: &str, keys: &str) -> (bool, String) {
         Some(o) => (false, String::from_utf8_lossy(&o.stderr).into_owned()),
         None => (false, "timeout sending keys".into()),
     }
+}
+
+/// Projects were removed from amux (2026-10-28). A worker env written before
+/// then can still carry `CC_PROJECT` or `CC_PROJECT_LEAD`. Nothing reads them
+/// any more; say so once per worker per process so a sweep can find the stale
+/// env (verdict=project_env_ignored) instead of the variable silently meaning
+/// nothing.
+pub(crate) fn note_project_env_ignored(name: &str, cfg: &EnvFile) -> bool {
+    let project = cfg.get("CC_PROJECT").or(cfg.get("CC_PROJECT_LEAD"));
+    let Some(project) = project else {
+        return false;
+    };
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let first = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(name.to_string()))
+        .unwrap_or(true);
+    if first {
+        tracing::warn!(session = name, project, measured = true, n_considered = 1,
+            verdict = "project_env_ignored",
+            "worker env still sets CC_PROJECT; Projects were removed, so it is ignored");
+    }
+    first
 }
 
 // ---------------------------------------------------------------------------
@@ -16048,12 +15935,6 @@ pub(crate) fn start_block_reason(name: &str, cfg: &EnvFile) -> Option<String> {
     if cfg.get("CC_PAUSED") == Some("1") {
         return Some("session is paused; resume it first (amux resume)".into());
     }
-    if cfg.get("CC_REVIEW_HELD") == Some("1") {
-        return Some(
-            "worker is held for human artifact review; approve or reject the current project review first"
-                .into(),
-        );
-    }
     None
 }
 
@@ -16160,13 +16041,6 @@ pub(crate) async fn start_session(
     if cfg.get("CC_PAUSED") == Some("1") {
         return (false, "worker is paused; resume it first".into());
     }
-    if cfg.get("CC_REVIEW_HELD") == Some("1") {
-        return (
-            false,
-            "worker is held for human artifact review; approve or reject the current project review first"
-                .into(),
-        );
-    }
     // ISOLATED (AMUX-3232): computed once here from the worker's own env so the
     // spawn path can strip the harness (env injection below, --mcp-config in
     // build_claude_cmd). Read from cfg, the same map every other CC_* flag on
@@ -16184,15 +16058,7 @@ pub(crate) async fn start_session(
             "herdr-backed session start is not ported to the rust origin yet (gap named in api/session_verbs.rs)".into(),
         );
     }
-    if let Some(project) = cfg.get("CC_PROJECT").filter(|_| !isolated) {
-        let permit = state.store.read().map_err(|e|e.to_string())
-            .and_then(|c| crate::project_execution::checkout::start_permit(&c, project, name));
-        if let Err(error) = permit {
-            tracing::warn!(session=name, project, %error, measured=true, n_considered=1,
-                verdict="project.checkout_start_refused", "worker has no current exclusive project checkout claim");
-            return (false, error);
-        }
-    }
+    note_project_env_ignored(name, &cfg);
     if is_running(name).await {
         return (true, "already running".into());
     }
@@ -16241,18 +16107,12 @@ pub(crate) async fn start_session(
     };
 
     // --- Worktree isolation (opt-in via CC_WORKTREE=1) ---
-    // Project executors are ephemeral lifecycle records even when an operator explicitly chooses
-    // shared-checkout mode. In that mode the project policy already bounds execution to one worker,
-    // so starting must not manufacture a fan-out worktree behind the UI's back.
-    let project_shared_checkout =
-        cfg.get("CC_PROJECT").is_some() && cfg.get("CC_WORKTREE") == Some("0");
-    let fanout = cfg.get("CC_EPHEMERAL") == Some("1") && !project_shared_checkout;
-    // Workspace isolation implies an own worktree, except for project workers,
-    // whose project already owns one checkout for all of them.
+    let fanout = cfg.get("CC_EPHEMERAL") == Some("1");
+    // Workspace isolation implies an own worktree.
     // CC_WORKTREE=0 is an explicit opt-out that overrides group-level workspace
     // isolation, so the create modal's unchecked checkbox is respected.
     let explicit_worktree_off = cfg.get("CC_WORKTREE") == Some("0");
-    let isolation_worktree = !explicit_worktree_off && cfg.get("CC_PROJECT").is_none() && workspace_isolation_on(name);
+    let isolation_worktree = !explicit_worktree_off && workspace_isolation_on(name);
     let worktree_enabled = fanout || cfg.get_or("CC_WORKTREE", "") == "1" || isolation_worktree;
     if isolation_worktree {
         tracing::info!(session = name, measured = true, n_considered = 1,
@@ -16260,24 +16120,7 @@ pub(crate) async fn start_session(
             "workspace isolation: own worktree, TMPDIR and rebase push strategy");
     }
     if fanout {
-        let workspace = if let Some(project) = cfg.get("CC_PROJECT").filter(|_| !isolated) {
-            // The lead is also the checkout owner. start_session already holds
-            // this worker's session_op_lock, so calling checkout::ensure here
-            // would reacquire the same lock and deadlock every lead start.
-            // The project driver prepared the checkout before entering start.
-            if cfg.get("CC_PROJECT_LEAD") == Some("1") {
-                crate::project_execution::checkout::load(&home(), project)
-                    .filter(|w| {
-                        crate::project_execution::checkout::belongs_to(&home(), project, w)
-                            && std::path::Path::new(&w.path).is_dir()
-                    })
-                    .ok_or_else(|| "project lead checkout is missing; project driver must prepare it before start".to_string())
-            } else {
-                crate::project_execution::checkout::ensure(&home(), project, name, &work_dir).await
-            }
-        } else {
-            crate::fanout_workspace::ensure(&home(), name, &work_dir).await
-        };
+        let workspace = crate::fanout_workspace::ensure(&home(), name, &work_dir).await;
         match workspace {
             Ok(workspace) => work_dir = workspace.path,
             Err(error) => {
@@ -16964,9 +16807,10 @@ pub(crate) async fn start_session(
             // through to build_claude_cmd — that would launch `claude`.
             //
             // The opts are pure (opencode_launch_opts): yolo normalizes to
-            // `--auto`, no model is invented, and `--standalone` always rides
-            // so the worker runs its own server with its own env (the
-            // scoped-context channel + lane isolation; see the helper's doc).
+            // `--auto`, any `--model`/`-m` is dropped (the TUI rejects it —
+            // measured 2026-10-25), and `--standalone` always rides so the
+            // worker runs its own server with its own env (the scoped-context
+            // channel + lane isolation; see the helper's doc).
             format!("{base_bin}{}", opencode_launch_opts(&flags, extra_flags))
         }
         _ => build_claude_cmd(&cfg, &flags, &default_flags, &session_flag, extra_flags) + &rules_opts,
@@ -17928,7 +17772,7 @@ pub(crate) async fn start_session(
         );
     };
     if let Some(context) =
-        context.filter(|_| !isolated && parse_env(name).get("CC_PROJECT").is_none())
+        context.filter(|_| !isolated)
     {
         if let Err(error) = enqueue_generation_resume(state, &context, generation, &reason).await {
             tracing::warn!(session = name, %error, generation, verdict = "swap_resume_enqueue_failed",
@@ -17939,7 +17783,7 @@ pub(crate) async fn start_session(
     let instr = meta_str(&load_meta(name), "instructions")
         .trim()
         .to_string();
-    if !isolated && !instr.is_empty() && parse_env(name).get("CC_PROJECT").is_none() {
+    if !isolated && !instr.is_empty() {
         let st2 = state.clone();
         let n = name.to_string();
         queue_start_prompt(st2, n, instr, SendOrigin::Owner).await;
@@ -18089,11 +17933,9 @@ fn provider_command_in_workspace(work_dir: &str, command: &str, isolated_as: Opt
 /// restart behavior—including Codex's self-update relaunch—stays in the one
 /// provider-aware launcher rather than a board-specific copy.
 pub(crate) async fn start_for_board_dispatch(state: &AppState, name: &str) -> Result<(), String> {
-    // HOST GUARD. Every automated start (board dispatch, project executors)
-    // comes through here, and none should add a process to a host that is
-    // already critical. The prefix is the one project execution already
-    // treats as a retryable spawn refusal (planner.rs), so a deferred
-    // executor waits and is re-claimed when the host eases, never parked.
+    // HOST GUARD. Every automated start (board dispatch) comes through here,
+    // and none should add a process to a host that is already critical. A
+    // deferred start is retried when the host eases, never parked.
     if !crate::runtime_jobs::host_guard::admit_automation("automated-start") {
         return Err(format!(
             "refusing to spawn a worker: host is critical ({}); retried when it eases",
@@ -18106,97 +17948,35 @@ pub(crate) async fn start_for_board_dispatch(state: &AppState, name: &str) -> Re
     if parse_env(name).get("CC_PAUSED") == Some("1") {
         return Err("paused workers are excluded from board automation".into());
     }
-    if parse_env(name).get("CC_REVIEW_HELD") == Some("1") {
-        return Err("review-held workers are excluded from board automation".into());
+    let (started, detail) = start_session_as("board-dispatch", state, name, "", false).await;
+    if !started {
+        return Err(detail);
     }
-    let cfg = parse_env(name);
-    let codex_project = cfg.get("CC_PROJECT").is_some() && provider_of(&cfg) == "codex";
-    let failed_before_launch = codex_project
-        && cfg.get("CC_BOARD_CARD").is_some_and(|card| {
-            state.store.read().ok()
-                .and_then(|c| crate::project_execution::planner::execution(&c, card).ok())
-                .and_then(|e| e.last_failure)
-                .as_deref()
-                .is_some_and(crate::project_execution::planner::prelaunch_failure)
-        });
-    let mut fresh_retry = false;
-    loop {
-        // A failed Codex resume can exit to the shell with this exact error.
-        // Reusing its recorded conversation ID would recreate the same error
-        // forever. This is only for a claimed project executor; start_session
-        // rechecks the exclusive task permit before touching its checkout.
-        let stale_resume = codex_project
-            && codex_resume_config_failure(&tmux_capture(name, 25).await);
-        let fresh = fresh_retry || stale_resume || failed_before_launch;
-        if fresh {
-            let mut meta = load_meta(name);
-            meta.remove("codex_session_id");
-            meta.remove("pending_structured_resume_context");
-            meta.remove("pending_structured_resume_token");
-            save_meta(name, &meta);
+    // Process creation and the provider reaching the PTY are separate
+    // events. Check that it stays live long enough to avoid delivering a
+    // task packet to a shell after an immediate provider failure.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !is_running(name).await {
+        if lane_is_paused(name) || session_is_isolated(name) {
+            return Err("worker protected during provider startup".into());
         }
-        let (started, detail) = start_session_as("board-dispatch", state, name, "", fresh).await;
-        if !started {
-            return Err(detail);
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(session=name,measured=true,n_considered=1,
+                verdict="board_provider_start_timeout",
+                "provider did not become live after process startup");
+            return Err(format!(
+                "start reported '{detail}', but no live provider process remains after 30s"
+            ));
         }
-        // Process creation and the provider reaching the PTY are separate
-        // events. Check that it stays live long enough to avoid delivering a
-        // task packet to a shell after an immediate Codex resume failure.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while !is_running(name).await {
-            if lane_is_paused(name) || session_is_isolated(name) {
-                return Err("worker protected during provider startup".into());
-            }
-            if codex_project && !fresh
-                && codex_resume_config_failure(&tmux_capture(name, 25).await)
-            {
-                fresh_retry = true;
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(session=name,measured=true,n_considered=1,
-                    verdict="board_provider_start_timeout",
-                    "provider did not become live after process startup");
-                return Err(format!(
-                    "start reported '{detail}', but no live provider process remains after 30s"
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        if fresh_retry && !fresh {
-            continue;
-        }
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        if is_running(name).await {
-            return Ok(());
-        }
-        if codex_project && !fresh
-            && codex_resume_config_failure(&tmux_capture(name, 25).await)
-        {
-            fresh_retry = true;
-            continue;
-        }
-        return Err(format!(
-            "start reported '{detail}', but provider exited before task delivery"
-        ));
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
-}
-
-fn codex_resume_config_failure(pane: &str) -> bool {
-    pane.contains("Failed to rebuild configuration for resume:")
-        && pane.contains("Failed to rebuild config for cwd ")
-}
-
-#[cfg(test)]
-mod codex_project_resume_tests {
-    use super::codex_resume_config_failure;
-
-    #[test]
-    fn only_exact_failed_resume_configuration_restarts_fresh() {
-        assert!(codex_resume_config_failure("Failed to rebuild configuration for resume:\nFailed to rebuild config for cwd /repo/.worktrees/project-demo"));
-        assert!(!codex_resume_config_failure("Failed to rebuild config for cwd /repo while applying user changes"));
-        assert!(!codex_resume_config_failure("This conversation is open in another app"));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    if is_running(name).await {
+        return Ok(());
     }
+    Err(format!(
+        "start reported '{detail}', but provider exited before task delivery"
+    ))
 }
 
 #[cfg(unix)]
@@ -19006,34 +18786,8 @@ pub(crate) async fn stop_verified_worker(state: &AppState, name: &str) -> Result
     Ok(())
 }
 
-/// Persist the boundary between completed execution and human review. The
-/// marker makes worker-control paths treat the retained terminal as evidence
-/// rather than as an agent that can be started or driven again.
-pub(crate) fn set_review_hold_at(path: &Path, held: bool) -> Result<(), String> {
-    if !path.exists() {
-        return Err(format!(
-            "session env '{}' not found while setting review hold",
-            path.display()
-        ));
-    }
-    let mut cfg = EnvFile::load(path);
-    let already = cfg.get("CC_REVIEW_HELD") == Some("1");
-    if already == held {
-        return Ok(());
-    }
-    if held {
-        cfg.set("CC_REVIEW_HELD", "1");
-    } else {
-        cfg.remove("CC_REVIEW_HELD");
-    }
-    cfg.write(path).map_err(|e| env_write_error(path, &e))?;
-    crate::api::sessions_legacy::invalidate_sessions_cache();
-    Ok(())
-}
-
-/// Final disposal is deliberately separate from the review hold. Human
-/// acceptance retires the durable worker record/worktree first; only a
-/// successful finalization removes the terminal that was available for review.
+/// Final disposal of a retired worker's terminal, run only after its durable
+/// record and worktree were retired successfully.
 pub(crate) async fn dispose_verified_worker_terminal(name: &str) {
     kill_tmux_session(name).await;
 }
@@ -22247,7 +22001,7 @@ mod rate_limit_hold_tests {
         assert!(!owner_passes_rate_limit_hold(SendOrigin::Owner, true), "the steering drain waits for the reset");
         assert!(!owner_passes_rate_limit_hold(SendOrigin::Automation, false), "peers and schedules are held");
         let src = include_str!("session_verbs.rs");
-        let body = &src[src.find("async fn send_text_inner_bound(").unwrap()..];
+        let body = &src[src.find("async fn send_text_inner_bound_body(").unwrap()..];
         assert!(body.contains("if owner_passes_rate_limit_hold(origin, from_steering) {"), "the send path uses the rule");
     }
 
@@ -22257,7 +22011,7 @@ mod rate_limit_hold_tests {
     #[test]
     fn the_send_path_checks_the_hold_before_its_first_keystroke() {
         let src = include_str!("session_verbs.rs");
-        let body = &src[src.find("async fn send_text_inner_bound(").unwrap()..];
+        let body = &src[src.find("async fn send_text_inner_bound_body(").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
         let hold = body.find("rate_limit_hold_for(name,").expect("send path must call the hold");
         let esc = body.find("send_key(name, \"Escape\").await;\n            esc_at").unwrap();
@@ -23370,7 +23124,7 @@ pub(crate) fn stamp_queued_delivery(
         "UPDATE cmd_history SET delivered_at=?1 \
          WHERE id = (SELECT id FROM cmd_history \
                      WHERE session=?2 AND text=?3 \
-                       AND delivery='queued' AND delivered_at IS NULL \
+                       AND delivery IN ('queued','board') AND delivered_at IS NULL \
                      ORDER BY ts LIMIT 1)",
         // The row holds the redacted form; the queue holds the raw text.
         rusqlite::params![at_ms, session, redact_secrets(text)],
@@ -23631,45 +23385,6 @@ async fn capture_delivered_steering(
 }
 
 pub async fn steer_deliver_tick(state: &AppState) -> usize {
-    // Reconcile superseded project packets before liveness/boundary checks:
-    // an old unsent packet must not block retirement forever. All proof and
-    // settlement share one writer transaction with the delivery claim gate.
-    // Do not enqueue an empty cleanup behind unrelated writes. This loop also
-    // owns provider recovery: awaiting a no-op writer can postpone that sweep
-    // indefinitely under contention. The writer still rechecks every proof;
-    // a packet inserted after this read remains guarded until the next tick.
-    let cleanup = state
-        .store
-        .read_async(|conn| {
-            Ok(conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM steering_queue WHERE guard='project-execution' AND delivering_since IS NULL)",
-                [],
-                |r| r.get::<_, bool>(0),
-            )?)
-        })
-        .await;
-    let result = match cleanup {
-        Ok(true) => state
-            .store
-            .write_async(crate::project_execution::planner::settle_superseded_packets)
-            .await
-            .map(|_| ()),
-        Ok(false) => {
-            tracing::debug!(
-                measured = true,
-                n_considered = 0,
-                verdict = "project_packet_cleanup_not_needed",
-                "steering tick bypassed empty project cleanup writer"
-            );
-            Ok(())
-        }
-        Err(error) => Err(error),
-    };
-    if let Err(error) = result {
-        tracing::warn!(%error,measured=false,n_considered=0,verdict="project_packet_reconciliation_failed","could not reconcile superseded execution packets; unsafe queue retained; unrelated delivery continues");
-        // Optional cleanup must not veto unrelated delivery. The normal per-row
-        // project gate still refuses stale/unproven execution packets.
-    }
     // Only lanes that actually HAVE a queue: costs nothing on an empty fleet,
     // and keeps the pane captures below proportional to real work.
     // (steer id, card, why) for rows whose premise expired — filled inside the
@@ -23831,14 +23546,6 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             if let Err(error) = refusal {
                 tracing::warn!(session, queue_id = %id, %error, measured = true, n_considered = 1,
                     verdict = "peer_receive_refusal_persist_failed", "retain refused input for another audit attempt");
-            }
-            continue;
-        }
-        if guard == "project-steering" && project_send_hold(state, &session, Some(&id)).is_some() {
-            // Recheck in the writer; if the hold lifted in between, release our
-            // claim so the next pass delivers it rather than stranding it.
-            if claim_steering_row(&state.store, &id).await {
-                unclaim_steering_row(&state.store, &id).await;
             }
             continue;
         }
@@ -24166,19 +23873,6 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         let age = now_f64() - due_at;
         let decision = steer_delivery_for(state, &session, age).await;
         let mid_turn = match decision {
-            SteerDelivery::Hold if guard == "project-execution" && age >= steer_max_age_s() => {
-                tracing::warn!(
-                    session = %session,
-                    delivery_id = %id,
-                    age_s = age as i64,
-                    max_age_s = steer_max_age_s() as i64,
-                    measured = true,
-                    n_considered = 1,
-                    verdict = "project_execution_overdue_background_delivery",
-                    "overdue project execution packet is delivering through the provider queue despite background activity; project boards must keep draining"
-                );
-                true
-            }
             SteerDelivery::Hold => {
                 let reason = if age >= steer_max_age_s() {
                     "not-at-turn-boundary (background work hard hold)"
@@ -24833,19 +24527,9 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
 /// someone else is already delivering it (or already has), which is
 /// contention, not a delivery refusal.
 async fn claim_steering_row(store: &crate::db::SharedStore, id: &str) -> bool {
-    use rusqlite::OptionalExtension;
     let id = id.to_string();
     store
         .write_async(move |conn| {
-            let session: Option<String> = conn.query_row("SELECT session FROM steering_queue WHERE id=?1", [&id], |r|r.get(0)).optional()?;
-            if let Some(session) = session {
-                if let Some(reason)=super::projects::steering_delivery_hold(conn,&session,&id).map_err(crate::project_execution::store::sql_error)? {
-                    let key=format!("project-steering-held:{id}:{reason}");
-                    let n=conn.execute("INSERT OR IGNORE INTO session_events(ts,session,type,data,idem,source) VALUES(?1,?2,'message.held',?3,?4,'steering')",rusqlite::params![now_f64(),session,json!({"id":id,"reason":reason,"measured":true,"n_considered":1}).to_string(),key])?;
-                    if n>0 {skip(&session,&id,&reason);tracing::info!(session,delivery_id=id,%reason,measured=true,n_considered=1,verdict="project_steering_held","owner input retained; only an authorized active claim can consume it");}
-                    return Ok(crate::db::WriteOutcome{applied:false,events:vec![]});
-                }
-            }
             let n = conn.execute(
                 "UPDATE steering_queue SET delivering_since=?1 WHERE id=?2 AND delivering_since IS NULL",
                 rusqlite::params![now_f64(), id],
@@ -24878,11 +24562,11 @@ async fn send_claimed_steering(
     let (id_s, session_s) = (id.to_string(), session.to_string());
     let source = state.store.read_async(move |conn| {
         Ok(conn.query_row(
-            "SELECT COALESCE(guard,''), COALESCE(sender,'') FROM steering_queue WHERE id=?1 AND session=?2",
-            rusqlite::params![id_s, session_s], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            "SELECT COALESCE(guard,'') FROM steering_queue WHERE id=?1 AND session=?2",
+            rusqlite::params![id_s, session_s], |r| r.get::<_, String>(0),
         )?)
     }).await;
-    let (guard, sender) = match source {
+    let guard = match source {
         Ok(source) => source,
         Err(e) => {
             unclaim_steering_row(&state.store, id).await;
@@ -24920,7 +24604,7 @@ async fn send_claimed_steering(
     // 64 minutes, and each release was turned back into a boundary send the
     // generating lane refused.
     let mut mode = boot_delivery_mode(id, mode, lane_still_booting(&load_meta(session), now_i64()));
-    if !guard.is_empty() && !(guard == "project-steering" && sender.is_empty()) && !is_owner_configured_guard(&guard) {
+    if !guard.is_empty() && !is_owner_configured_guard(&guard) {
         mode.origin = SendOrigin::Automation;
     }
     let mut queue_id = None;
@@ -25060,19 +24744,6 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
         .unwrap_or_default();
     if rows.is_empty() {
         return false;
-    }
-    if parse_env(session).get("CC_PROJECT").is_some() {
-        let any = rows
-            .iter()
-            .any(|(id, _, _, _)| project_send_hold(state, session, Some(id)).is_none());
-        if !any {
-            for (id, _, _, _) in &rows {
-                if claim_steering_row(&state.store, id).await {
-                    unclaim_steering_row(&state.store, id).await;
-                }
-            }
-            return false;
-        }
     }
     if !env_path(session).exists() {
         return false;
@@ -25666,85 +25337,6 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             let _ = reconcile_terminal_subagents(state, name).await;
         }
         let pane = tmux_capture(name, 30).await;
-        // A Codex resume can stop at its exclusive-conversation screen after
-        // the previous project attempt has timed out. Delivery cannot retry it:
-        // the old packet is no longer an active claim, while the project driver
-        // refuses to claim a non-boundary worker. Only a *currently claimable*
-        // repair may retry this exact provider screen. Never press into an
-        // isolated, paused, archived, or unrelated worker.
-        let now = now_i64();
-        let last_retry = meta_i64(&load_meta(name), "codex_open_elsewhere_retry_at");
-        if project_codex_conversation_retry_ready(&cfg, &pane, last_retry, now) {
-            if let Some(project) = cfg.get("CC_PROJECT").filter(|p| !p.is_empty()) {
-                if project_repair_claim_ready(state, project, name) {
-                    let lock = lane_send_lock(name);
-                    let _guard = lock.lock().await;
-                    if codex_conversation_open_elsewhere(&tmux_capture(name, 15).await)
-                        && project_repair_claim_ready(state, project, name)
-                    {
-                        update_meta(name, &[("codex_open_elsewhere_retry_at", json!(now))]);
-                        let (ok, detail) = send_keys_op(name, "r").await;
-                        tracing::warn!(session=%name,project=%project,ok,detail=%detail,measured=true,n_considered=1,verdict="project_repair_codex_conversation_retry","retrying exact Codex conversation screen for a claimable project repair");
-                        emit_event(state,name,"project.conversation_retry",Some(json!({"ok":ok,"detail":detail})),None,"status").await;
-                        if ok {
-                            sleep_ms(2000).await;
-                            if codex_conversation_open_elsewhere(&tmux_capture(name, 15).await)
-                                && project_repair_claim_ready(state, project, name)
-                            {
-                                // The other app still owns the old Codex
-                                // conversation. The task packet and candidate
-                                // files are durable, so release only this
-                                // worker's locked process; the normal project
-                                // claim path will start a fresh conversation.
-                                // Never attempt to take over the other owner.
-                                send_key(name, "Escape").await;
-                                sleep_ms(500).await;
-                                let (stopped, stop_detail) = stop_session(state, name).await;
-                                if stopped && !is_running(name).await {
-                                    kill_tmux_session(name).await;
-                                    let mut meta = load_meta(name);
-                                    meta.remove("codex_session_id");
-                                    meta.remove("pending_structured_resume_context");
-                                    meta.remove("pending_structured_resume_token");
-                                    save_meta(name, &meta);
-                                    tracing::warn!(session=%name,project=%project,measured=true,n_considered=1,verdict="project_repair_codex_conversation_recycled","locked local process stopped; next project claim will launch a fresh Codex conversation in the registered checkout");
-                                    emit_event(state,name,"project.conversation_recycled",Some(json!({"reason":"codex_open_elsewhere","stopped":true})),None,"status").await;
-                                } else {
-                                    tracing::warn!(session=%name,project=%project,stopped,detail=%stop_detail,measured=true,n_considered=1,verdict="project_repair_codex_recycle_held","locked provider could not be stopped; conversation identity retained");
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(key) = project_hook_review_key(&cfg, &pane) {
-            let (ok, msg) = send_keys_op(name, key).await;
-            tracing::info!(session=%name,ok,detail=%msg,measured=true,n_considered=1,verdict="project_hook_review_safe_choice","requesting safe startup choice without granting hook trust");
-            emit_event(state,name,"session.hook_review_choice",Some(json!({"choice":"continue-without-trusting","key":key,"ok":ok,"detail":msg})),None,"status").await;
-            // Reobserve on the next sweep: never press Enter on an assumed
-            // selection or send task text while the picker is transitioning.
-            continue;
-        }
-
-        if let (Some(project), Some(repo)) = (cfg.get("CC_PROJECT"), cfg.get("CC_DIR")) {
-            let checkout = crate::project_execution::checkout::load(&home(), project);
-            if let Some(key) = checkout.as_ref().filter(|w| crate::fanout_workspace::same_repository(&w.repo, repo))
-                .and_then(|w| project_checkout_directory_key(&cfg, &pane, Path::new(&w.path))) {
-                let permitted = state.store.read().ok().is_some_and(|c|
-                    crate::project_execution::checkout::start_permit(&c, project, name).is_ok())
-                    || project_repair_claim_ready(state, project, name);
-                if permitted {
-                    let (ok, msg) = send_keys_op(name, key).await;
-                    tracing::warn!(session=%name,project=%project,ok,detail=%msg,measured=true,n_considered=1,verdict=if ok {"registered_project_checkout_selected"} else {"registered_project_checkout_choice_failed"},"attempted registered project checkout choice");
-                    emit_event(state,name,"project.checkout_selector_resolved",Some(json!({"key":key,"ok":ok,"detail":msg})),None,"status").await;
-                    if ok { continue; }
-                } else {
-                    tracing::warn!(session=%name,project=%project,measured=true,n_considered=1,verdict="project.checkout_selector_held","registered checkout selector detected but no active or claimable project task authorizes continuation");
-                }
-            }
-        }
 
         // RESUME-MODE SELECTOR: amux's to answer (D2; policy set once by Ethan
         // 2026-08-19 — "resume from summary", fleet-wide, model-agnostic). The
@@ -26760,7 +26352,22 @@ fn subagent_silent_after_s() -> i64 {
 /// such a subagent as running for hours (MSG-90283); silence is what amux can
 /// measure, and `waiting_on` says whether a tool or the model owes the next
 /// record, since a long tool call is silent without being stuck.
+///
+/// Newer Claude Code ends a subagent with a `SubagentHandback` tool call
+/// ("Report delivered to your caller"), so its transcript ends on a tool
+/// result. That is a finish too; reading it as waiting on the model listed
+/// every finished subagent of an idle worker as silent (Ethan, 2026-10-27:
+/// "there's no sub agents", mtp-demo showing 7 silent).
 fn subagent_state(tail: &[Value], silent_s: i64, silent_after_s: i64) -> (Option<&'static str>, Option<String>) {
+    let handed_back = tail
+        .iter()
+        .rev()
+        .find(|r| r["type"] == "assistant")
+        .and_then(|r| r["message"]["content"].as_array())
+        .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use" && b["name"] == "SubagentHandback"));
+    if handed_back {
+        return (Some("finished"), None);
+    }
     let Some(last) = tail
         .iter()
         .rev()
@@ -28252,7 +27859,7 @@ pub(crate) fn tracked_files_mutate(name: &str, method: &Method, body: &Value) ->
 /// INTENT (their answer to a picker) wearing a dedupe guard. The SQL
 /// predicate in the clear-all below must stay the mirror of this.
 pub(crate) fn steer_guard_is_system(guard: &str) -> bool {
-    !guard.is_empty() && guard != "selector-answer" && guard != "project-steering"
+    !guard.is_empty() && guard != "selector-answer"
 }
 
 pub(crate) async fn steer_mutate(
@@ -28316,13 +27923,13 @@ pub(crate) async fn steer_mutate(
                     // include_system:true asks for the full sweep explicitly.
                     spared = conn.query_row(
                         "SELECT COUNT(*) FROM steering_queue WHERE session=? \
-                         AND NOT (COALESCE(guard,'')='' OR guard IN ('selector-answer','project-steering'))",
+                         AND NOT (COALESCE(guard,'')='' OR guard = 'selector-answer')",
                         [&session],
                         |r| r.get::<_, i64>(0),
                     )?;
                     removed = conn.execute(
                         "DELETE FROM steering_queue WHERE session=? \
-                         AND (COALESCE(guard,'')='' OR guard IN ('selector-answer','project-steering'))",
+                         AND (COALESCE(guard,'')='' OR guard = 'selector-answer')",
                         [&session],
                     )? as i64;
                 }
@@ -29237,34 +28844,26 @@ pub(crate) fn request_target_refusal(
         .map(|why| ("peer_interaction_refused", why))
 }
 
-/// The lifecycle label for a tmux lane: archived beats paused beats review-held
-/// beats active. ONE function, called by `/api/sessions` (sessions_legacy) and
+/// The lifecycle label for a tmux lane: archived beats paused beats active. ONE function, called by `/api/sessions` (sessions_legacy) and
 /// by the peer interaction gate below, so the gate can never disagree with the
 /// dashboard about who is active (AMUX-4566).
-pub(crate) fn lifecycle_label_with_review(
-    archived: bool,
-    paused: bool,
-    review_held: bool,
-) -> &'static str {
+pub(crate) fn lifecycle_label(archived: bool, paused: bool) -> &'static str {
     if archived {
         "archived"
     } else if paused {
         "paused"
-    } else if review_held {
-        "review"
     } else {
         "active"
     }
 }
 
 /// A lane's lifecycle from its env file, parsed exactly as `/api/sessions`
-/// parses it (`CC_ARCHIVED=1`, `CC_PAUSED=1`, `CC_REVIEW_HELD=1`).
+/// parses it (`CC_ARCHIVED=1`, `CC_PAUSED=1`).
 pub(crate) fn lane_lifecycle(name: &str) -> &'static str {
     let env = parse_env(name);
-    lifecycle_label_with_review(
+    lifecycle_label(
         env.get("CC_ARCHIVED") == Some("1"),
         env.get("CC_PAUSED") == Some("1"),
-        env.get("CC_REVIEW_HELD") == Some("1"),
     )
 }
 
@@ -30374,24 +29973,6 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
     if let Some(with_notes) = attach_ask_owner_notes(state, name, &text).await {
         text = with_notes;
     }
-    // Project owner input has only next-turn delivery. Reject before reserving
-    // an identity or writing history: replaying queue text must not duplicate it.
-    if body.get("deliver_now").map(py_truthy).unwrap_or(false)
-        && !isolated
-        && parse_env(name).get("CC_PROJECT").is_some()
-    {
-        tracing::info!(
-            session = name,
-            measured = true,
-            n_considered = 1,
-            verdict = "project_send_now_refused",
-            "project owner input uses next-turn delivery; existing queue unchanged"
-        );
-        return jresp(
-            StatusCode::CONFLICT,
-            json!({"ok":false,"code":"project_next_turn_only","error":"Project owner notes use automatic next-turn delivery during an authorized working claim. Send now is unsupported; existing queued input is unchanged. Cancel the queued note to remove it.","submitted":false}),
-        );
-    }
     let msg_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
     if let Some(response) = send_dedup_gate(state, name, &msg_id).await {
         return response;
@@ -30508,6 +30089,20 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
         text = format!("{}{text}", super::repeat_ask::note(rid, rts));
     }
     let repeat_of = repeat.map(|(rid, _)| rid);
+    // THE SAME REQUEST TO ANOTHER LANE IS NAMED (AF-985, repeat_ask.rs). The
+    // sender always learns it from the result; a lane that receives the text
+    // directly gets a note, an isolated lane the owner's words untouched.
+    let elsewhere = if matches!(send_origin, SendOrigin::Owner) {
+        super::repeat_ask::lookup_elsewhere(state, name, &orig_text).await
+    } else {
+        None
+    };
+    let elsewhere_json = elsewhere.as_ref().map(|(id, lane, ts)| {
+        json!({"id": format!("MSG-{id}"), "session": lane, "age_s": (now_i64() * 1000 - ts).max(0) / 1000})
+    });
+    if let (Some((id, lane, ts)), false) = (elsewhere.as_ref(), isolated) {
+        text = format!("{}{text}", super::repeat_ask::note_elsewhere(*id, lane, *ts, now_i64() * 1000));
+    }
     // OWNER @-MENTION GRANTS (api/mention_grants.rs). Only the owner's own
     // dashboard input creates one: no worker origin, no worker header, and the
     // UI token. A worker's sends never reach this branch.
@@ -30525,75 +30120,23 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             text.push_str(&super::mention_grants::delivery_note(&made));
         }
     }
-    if !isolated && parse_env(name).get("CC_PROJECT").is_some() {
-        let task = state
-            .store
-            .read()
-            .ok()
-            .and_then(|c| super::projects::executor_task(&c, name).ok().flatten());
-        let Some((project, task)) = task else {
-            send_dedup_forget(state, name, &msg_id).await;
-            return jresp(
-                StatusCode::CONFLICT,
-                json!({"error":"project executor has no current task; submit new outcomes through Projects"}),
-            );
-        };
-        let stable = if msg_id.is_empty() {
-            format!("project-owner-{}", ulid::Ulid::new())
-        } else {
-            format!("project-owner:{name}:{msg_id}")
-        };
-        match steer_enqueue_idempotent_report(
-            state,
-            name,
-            &orig_text,
-            "project-steering",
-            &origin,
-            &stable,
-        )
-        .await
-        {
-            Ok(result) => {
-                if result.disposition == StableEnqueueDisposition::New {
-                    let row_id = cmd_hist_record_with_id(
-                        state,
-                        name,
-                        &orig_text,
-                        "user",
-                        member_actor.as_deref().unwrap_or(""),
-                        true,
-                        DeliveryMeta::queued(now_i64() * 1000),
-                    )
-                    .await;
-                    link_queued_message(state, name, row_id, &result.id).await;
-                }
-                send_dedup_accept(state, name, &msg_id, &result.id).await;
-                tracing::info!(
-                    session = name,
-                    project,
-                    task,
-                    delivery_id = result.id,
-                    measured = true,
-                    n_considered = 1,
-                    verdict = "project.within_task_steering",
-                    "project owns the task; within-task steering bypasses independent intake"
-                );
-                return jresp(
-                    StatusCode::OK,
-                    json!({"ok":true,"id":result.id,"task":task,"message":"queued within project task","submission":"queued","submitted":null}),
-                );
-            }
-            Err(e) => {
-                send_dedup_forget(state, name, &msg_id).await;
-                return jresp(StatusCode::CONFLICT, json!({"error":e}));
-            }
-        }
-    }
     // A command is a durable request before it is execution. Sending its raw
     // text first raced the planner and invited a second, worker-created board.
-    if matches!(send_origin, SendOrigin::Owner)
-        && super::board_lifecycle::stage_owner_command(name, &orig_text)
-    {
+    //
+    // NOT when the sender asked for no board (`--no-board`, {"no_board": true},
+    // a [no-board] prefix). Staging ignored it: three forced-adherence lanes
+    // answered "accepted into board lifecycle" and delivered nothing for over
+    // an hour while the dispatcher sat at its fleet cap, and no_board made no
+    // difference (2026-10-28, MSG-99658). The sender's explicit choice goes
+    // straight to the worker, logged so a sweep can count it.
+    let stage = owner_send_staged(matches!(send_origin, SendOrigin::Owner), skip_board, || {
+        super::board_lifecycle::stage_owner_command(name, &orig_text)
+    });
+    if !stage && skip_board && matches!(send_origin, SendOrigin::Owner) {
+        tracing::info!(session = name, measured = true, n_considered = 1, verdict = "command_staging_skipped_no_board",
+            "owner command delivered directly: the sender asked for no board, so it is not staged for the dispatcher");
+    }
+    if stage {
         let actor = member_actor.as_deref().unwrap_or("");
         let id = cmd_hist_record_with_id(
             state,
@@ -30631,7 +30174,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             verdict="command_retained_before_dispatch","request accepted; existing board dispatcher owns execution, no duplicate raw prompt sent");
         return jresp(
             StatusCode::OK,
-            json!({"ok":true,"id":format!("MSG-{id}"),"message":"accepted into board lifecycle","submitted":null,"submission":"queued","root":result.get("root"),"task_ids":result.get("task_ids"),"planning":result.get("state")}),
+            json!({"ok":true,"id":format!("MSG-{id}"),"message":"accepted into board lifecycle","submitted":null,"submission":"queued","root":result.get("root"),"task_ids":result.get("task_ids"),"planning":result.get("state"),"same_request_elsewhere":elsewhere_json}),
         );
     }
     let mut queue_id = None;
@@ -30935,6 +30478,9 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
     };
     let send_id = send_response_id(name, &msg_id);
     let mut resp = json!({"ok": ok, "message": msg, "id": send_id});
+    if let Some(e) = elsewhere_json {
+        resp["same_request_elsewhere"] = e;
+    }
     if let (true, Some(h)) = (ok, hold.as_ref()) {
         // AMUX-5237: the fields a sender (and `amux send`) reads to know the
         // message is parked and the work is still theirs.
@@ -31293,12 +30839,6 @@ pub(crate) async fn steer_history_verb(
             out = rows.flatten().collect();
         }
     }
-    for row in &mut out {
-        let hold =
-            super::projects::steering_delivery_hold(&conn, name, row["id"].as_str().unwrap_or(""))
-                .unwrap_or_else(|_| Some("project_delivery_identity_unavailable".into()));
-        row["blocked_reason"] = json!(hold);
-    }
     drop(conn);
     // AGE AND REACHABILITY PER ROW (AMUX-2785). A queue listing that
     // shows only text and a timestamp cannot answer the one question a
@@ -31374,10 +30914,7 @@ pub(crate) async fn steer_history_verb(
         let age = (now - due).max(0.0);
         row["age_s"] = json!(age as i64);
         row["overdue"] = json!(age >= max_age);
-        let reason = row["blocked_reason"]
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| blocked.map(str::to_owned));
+        let reason = blocked.map(str::to_owned);
         row["deliverable"] = json!(reason.is_none());
         row["blocked_reason"] = json!(reason);
     }
@@ -32315,6 +31852,17 @@ pub const SCOPED_CONTEXT_MARKER: &str = "[amux scoped context]";
 /// Empty for an isolated worker with nothing set (it receives none of it).
 /// The standing instruction a worker with every Board tab switch off starts
 /// with. The global CLAUDE.md board and task-ledger sections key on this.
+/// How a post from amux Messages reaches a worker. Without it, workers read a
+/// delivery as text the operator pasted and declined to act (2026-10-28).
+pub(crate) const MESSAGES_CONTEXT: &str = "# amux Messages\n\n\
+People and workers talk to you from amux Messages (channels, direct messages and your own thread). \
+When a post there mentions you, amux delivers it into this session as a message that begins \
+\"<name> mentioned you in ...\" or \"<name> wrote to you in ...\". That is a real request from that \
+person, sent by amux on their behalf, not text someone pasted: act on it as you would a direct \
+instruction, within your rules and boundaries. Answer where the delivery says, with the \
+`amux post` command it gives (in a channel or direct message that is the thread under their post), \
+and ask any question in that same thread. A reply there reaches you again.";
+
 pub(crate) const BOARD_OFF_CONTEXT: &str = "# Board off for this worker\n\n\
 Every board switch is off for this worker, so you have no board: do not read, create, append to, \
 move or close board cards, and skip the board and task-ledger sections of CLAUDE.md. The board API \
@@ -32346,7 +31894,9 @@ pub fn compose_worker_context(name: &str, isolated: bool) -> String {
     let block = if crate::api::board_lifecycle::board_unused(name) {
         format!("{block}\n\n{BOARD_OFF_CONTEXT}")
     } else { block };
-    let block = format!("{block}\n\n{MEMORY_VERB_CONTEXT}");
+    let block = format!("{block}\n\n{MEMORY_VERB_CONTEXT}\n\n{MESSAGES_CONTEXT}");
+    let velocity = crate::api::velocity::context_section(name);
+    let block = if velocity.is_empty() { block } else { format!("{block}\n\n{velocity}") };
     let file = worker_rules_file(name);
     format!(
         "{block}\n\n# Browser profile selection and recovery\n\n{}\n\n# Links to what you build\n\n{}\n\n# Keeping this scoped context current\n\n\
@@ -32390,6 +31940,30 @@ pub(crate) fn scoped_context_notice(name: &str, what: &str) -> String {
 /// `scoped_context_delivered_live`, `scoped_context_not_running`,
 /// `scoped_context_skipped_isolated` or `scoped_context_not_delivered_live`.
 /// Returns the workers that were sent the notice.
+/// Workers whose "board off" answer changed since `before` was taken get their
+/// rules file rewritten and the [amux scoped context] notice (AF-986).
+///
+/// The "Board off for this worker" section is composed from
+/// `board_unused` at launch, and only a rules or memory edit refreshed it, so
+/// turning a worker's Board switches back on left its rules saying the board
+/// was off: on 2026-10-28 amux-frustrations obeyed that stale text while the
+/// board drive auto-picked and auto-reclaimed AF-977 twelve times in six
+/// hours. Same predicate as the composer, so the file and the drive agree.
+pub(crate) async fn refresh_if_board_flipped(state: &AppState, before: Vec<(String, bool)>, actor: &str) -> Vec<String> {
+    let flipped: Vec<String> = before
+        .into_iter()
+        .filter(|(w, was)| super::board_lifecycle::board_unused(w) != *was)
+        .map(|(w, _)| w)
+        .collect();
+    if !flipped.is_empty() {
+        tracing::info!(workers = ?flipped, measured = true, n_considered = flipped.len(),
+            verdict = "board_switch_context_refreshed",
+            "a worker's board went on or off: its scoped rules are rewritten and it is told");
+        refresh_scoped_context(state, &flipped, "board switches", actor).await;
+    }
+    flipped
+}
+
 pub(crate) async fn refresh_scoped_context(
     state: &AppState,
     workers: &[String],
@@ -32435,6 +32009,61 @@ pub(crate) async fn refresh_scoped_context(
         }
     }
     sent
+}
+
+/// Of `workers`, how many launched with a rules file, and which of those
+/// would be told something different now. Isolated workers are never counted.
+pub(crate) fn workers_with_changed_context(workers: &[String]) -> (usize, Vec<String>) {
+    let mut compared = 0usize;
+    let mut changed = Vec::new();
+    for w in workers {
+        if session_is_isolated(w) {
+            continue;
+        }
+        let Ok(on_disk) = std::fs::read_to_string(worker_rules_file(w)) else { continue };
+        compared += 1;
+        if crate::api::velocity::without_section(&compose_worker_context(w, false)) != crate::api::velocity::without_section(&on_disk) {
+            changed.push(w.clone());
+        }
+    }
+    (compared, changed)
+}
+
+/// AN AMUX UPDATE CHANGES WHAT EVERY WORKER IS TOLD, AND NOTHING TOLD THE
+/// RUNNING ONES. A worker's instructions are composed at launch into its rules
+/// file (`--append-system-prompt-file`); `refresh_scoped_context` re-sent them
+/// only on a rules or memory edit. When a release added the "amux Messages"
+/// section (2026-10-28), a freshly started worker answered an @mention in its
+/// thread and a long-running one kept refusing it as pasted text.
+///
+/// At startup, recompose each worker's instructions and compare them with the
+/// file it launched with: a worker whose file differs gets the file rewritten
+/// and, if running, the same scoped-context notice a rules edit sends. A worker
+/// with no file (never launched with one) is left alone. Logs
+/// verdict=worker_context_reconciled with how many were compared and changed.
+pub(crate) async fn refresh_changed_worker_contexts(state: &AppState) -> usize {
+    let (compared, changed) = workers_with_changed_context(&workers_in_scope("global", ""));
+    // refresh_scoped_context rewrites each file before it tries the notice. A
+    // worker not reached gets its old file back, so the next start sees the
+    // difference again and retries instead of treating it as delivered. A
+    // worker that is not running gets it back too, harmlessly: its next launch
+    // composes and writes the file itself.
+    let before: Vec<(String, String)> = changed.iter()
+        .filter_map(|w| std::fs::read_to_string(worker_rules_file(w)).ok().map(|t| (w.clone(), t)))
+        .collect();
+    // Sent as the owner (empty sender), as a rules edit is. "amux" was read as
+    // a WORKER of that name and refused at every group boundary
+    // (why="worker_group_boundary", sandbox 2026-10-29: 7 changed, 0 notified).
+    let sent = refresh_scoped_context(state, &changed, "instructions (amux was updated)", "").await;
+    for (w, old) in &before {
+        if !sent.contains(w) {
+            write_worker_context_file(w, old);
+        }
+    }
+    tracing::info!(compared, changed = changed.len(), notified = sent.len(), measured = true, n_considered = compared,
+        verdict = "worker_context_reconciled",
+        "compared each worker's launch instructions with the current ones; changed workers were told to re-read");
+    changed.len()
 }
 
 /// Codex fixes developer instructions when a thread is CREATED: `codex resume`
@@ -32856,27 +32485,6 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
         );
     }
     let cfg = parse_env(name);
-    // A project owns one checkout shared by all of its task executors.
-    // Deleting one executor used to reclaim that *shared* checkout while
-    // another task was checking out or writing it, so project workers were
-    // refused outright. That left the owner no way to clear finished or
-    // archived executors (Ethan, 2026-09-26: "i want a way to delete
-    // workers", 25 project workers selected with no Delete offered).
-    // The hazard was the checkout, not the worker: a STOPPED project worker
-    // is deletable, and its checkout is never reclaimed here (the worktree
-    // block below is skipped for it). A running one is still refused, since
-    // it may be writing that checkout right now.
-    let project = cfg.get("CC_PROJECT").map(|p| p.to_string());
-    if let Some(project) = project.as_deref() {
-        if is_running(name).await {
-            tracing::info!(session = name, project, verdict = "project_worker_delete_refused_running",
-                "refused deleting a running project worker; its project checkout is shared");
-            return jresp(
-                StatusCode::CONFLICT,
-                json!({"error":"this project worker is running and shares its project's checkout; pause or archive it first, then delete"}),
-            );
-        }
-    }
     if cfg.get("CC_PINNED") == Some("1") && !is_session_blocked(name) {
         return jresp(
             StatusCode::FORBIDDEN,
@@ -32894,11 +32502,7 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
     // ephemeral workers, with 111 MB of directory still on disk for one of
     // them. The remedy a human would reach for, `git worktree prune`, skips
     // locked entries and so reported the repo clean the whole time.
-    if let Some(project) = project.as_deref() {
-        tracing::info!(session = name, project, verdict = "project_worker_deleted_checkout_kept",
-            "deleted a stopped project worker; the project's shared checkout was left in place");
-    }
-    if cfg.get("CC_WORKTREE") == Some("1") && project.is_none() {
+    if cfg.get("CC_WORKTREE") == Some("1") {
         // THE WORKSPACE RECORD IS THE AUTHORITY, THE ENV IS THE FALLBACK
         // (AMUX-4914). The env used to be the only source, and fan-out creation
         // never writes CC_WORKTREE_REPO: board.rs sets CC_DIR, CC_WORKTREE=1,
@@ -33906,6 +33510,62 @@ async fn record_turn_end_without_outcome(state: &AppState, session: &str) {
     }
 }
 
+/// One Claude Code tool call, from the PostToolUse report the hook already
+/// sends, into `_amux_tool_events` (until now filled only for OpenCode
+/// workers, so a Claude worker's Bash, Edit and WebFetch calls left no record
+/// at all, 2026-10-27). The input is a short summary the hook builds, passed
+/// through the secret redactor again here and capped; never the tool output.
+pub(crate) fn tool_event_detail(body: &Value, tool: &Value) -> (String, String) {
+    let name: String = tool.get("name").and_then(Value::as_str).unwrap_or("unknown").chars().take(64).collect();
+    let input = tool.get("input").and_then(Value::as_str).unwrap_or("");
+    let input: String = redact_secrets(input).chars().take(400).collect();
+    let detail = json!({
+        "input": input,
+        "ok": tool.get("ok").cloned().unwrap_or(Value::Null),
+        "exit_code": tool.get("exit_code").cloned().unwrap_or(Value::Null),
+        "tool_use_id": tool.get("use_id").cloned().unwrap_or(Value::Null),
+        "conversation": body.get("session_id").cloned().unwrap_or(Value::Null),
+        "agent_id": tool.get("agent_id").cloned().unwrap_or(Value::Null),
+        "provider": body.get("provider").cloned().unwrap_or(Value::Null),
+    });
+    (name, detail.to_string())
+}
+
+async fn record_tool_event(state: &AppState, worker: &str, body: &Value, tool: &Value) {
+    use rusqlite::OptionalExtension;
+    let (name, detail) = tool_event_detail(body, tool);
+    let (w, n) = (worker.to_string(), name.clone());
+    let use_id = tool.get("use_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let at = chrono::Utc::now().to_rfc3339();
+    let since = (chrono::Utc::now() - chrono::Duration::hours(6)).to_rfc3339();
+    let wrote = state
+        .store
+        .write_async(move |c| {
+            if !use_id.is_empty() {
+                let seen: Option<i64> = c
+                    .query_row(
+                        "SELECT 1 FROM _amux_tool_events WHERE worker_id=?1 AND created_at>=?2 AND instr(detail, ?3)>0 LIMIT 1",
+                        rusqlite::params![w, since, format!("\"tool_use_id\":{}", json!(use_id))],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if seen.is_some() {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+            }
+            c.execute(
+                "INSERT INTO _amux_tool_events(worker_id,task_id,turn_id,tool,detail,created_at) VALUES(?1,NULL,NULL,?2,?3,?4)",
+                rusqlite::params![w, n, detail, at],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+    if let Err(e) = wrote {
+        tracing::warn!(target: "amux::audit", worker, tool = %name, verdict = "tool_event_dropped", error = %e,
+            "a worker tool call happened but its audit record could not be written");
+    }
+}
+
 pub(crate) async fn report_post(
     state: &AppState,
     name: &str,
@@ -33973,6 +33633,17 @@ pub(crate) async fn report_post(
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({"error":"report provider does not match worker"}),
         );
+    }
+    // `tools_pending` holds tool calls an earlier queued report carried
+    // forward (the hook's state row is latest-wins); `tool` is this one.
+    for tool in body.get("tools_pending").and_then(Value::as_array).into_iter().flatten()
+        .chain(body.get("tool")).filter(|t| t.is_object())
+    {
+        record_tool_event(state, name, body, tool).await;
+    }
+    if let Some(n) = body.get("tools_dropped").and_then(Value::as_u64).filter(|n| *n > 0) {
+        tracing::warn!(target: "amux::audit", worker = name, dropped = n, verdict = "tool_events_dropped_in_queue",
+            "the hook queue held more tool calls than it carries; the oldest were not recorded");
     }
     // SELF-REPORTED CONVERSATION ID (AMUX-2936). Handled here, above the
     // subagent early-return, so EVERY report shape carries it — a lane that only
@@ -35433,7 +35104,9 @@ pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bo
 }
 
 pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
+    let board_before = vec![(name.to_string(), super::board_lifecycle::board_unused(name))];
     let out = config_patch_inner(state, name, body).await;
+    refresh_if_board_flipped(state, board_before, "config").await;
     // A groups-only edit does not throw the session list away. Invalidating
     // made the next caller wait for a full fleet build (11 to 16 s live), so
     // the dashboard kept showing the removed group while its refresh hung
@@ -38151,17 +37824,6 @@ mod tests {
             .expect("an archived session must block");
         assert!(r.contains("archived"), "{r}");
 
-        // A completed executor's terminal is evidence during human review. It
-        // must stay registered and inspectable without becoming startable.
-        write("reviewed", "CC_DIR=\"/tmp\"\nCC_REVIEW_HELD=\"1\"\n");
-        let r = start_block_reason("reviewed", &parse_env("reviewed"))
-            .expect("a review-held executor must block");
-        assert!(r.contains("human artifact review"), "{r}");
-        assert!(
-            !all_lane_names().iter().any(|name| name == "reviewed"),
-            "review-held evidence must not re-enter board automation"
-        );
-
         // herdr start is not ported to the rust origin — refuse now, do not 202
         // and then fail invisibly.
         write("herd", "CC_BACKEND=\"herdr\"\n");
@@ -38351,7 +38013,28 @@ mod tests {
         assert_eq!(subagent_state(&[tool.clone(), result.clone()], 60, 1800), (Some("running"), Some("model".into())));
         // A long tool call is silent too, and says which tool owes the record.
         assert_eq!(subagent_state(&[result.clone(), tool.clone()], 4_000, 1800), (Some("silent"), Some("tool:Bash".into())));
-        assert_eq!(subagent_state(&[att], 4_000, 1800), (None, None), "no conversation yet: unclassified");
+        assert_eq!(subagent_state(std::slice::from_ref(&att), 4_000, 1800), (None, None), "no conversation yet: unclassified");
+        // Handing the report back ends the subagent, before and after the tool result lands.
+        let handback = json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"SubagentHandback","input":{}}]}});
+        assert_eq!(subagent_state(&[tool.clone(), result.clone(), handback.clone(), result.clone(), att], 187_000, 1800), (Some("finished"), None));
+        assert_eq!(subagent_state(&[result.clone(), handback.clone()], 90_000, 1800), (Some("finished"), None));
+        // A handback earlier in the transcript does not finish a subagent that kept working.
+        assert_eq!(subagent_state(&[handback, result.clone(), tool.clone(), result], 4_000, 1800), (Some("silent"), Some("model".into())));
+    }
+
+    #[test]
+    fn a_tool_event_keeps_a_redacted_capped_summary_and_its_outcome() {
+        let body = json!({"session_id":"conv-1","provider":"claude"});
+        let tool = json!({"name":"Bash","input":format!("curl -H 'Authorization: Bearer {}' {}", format!("sk-ant-{}-{}", "api03", "ABCDEFGHIJKLMNOPQRSTUV"), "x".repeat(900)),
+            "ok":false,"exit_code":7,"use_id":"tu1"});
+        let (name, detail) = tool_event_detail(&body, &tool);
+        assert_eq!(name, "Bash");
+        let d: Value = serde_json::from_str(&detail).unwrap();
+        assert!(!detail.contains("ABCDEFGHIJKLMNOPQRSTUV"), "secrets redacted: {detail}");
+        assert!(d["input"].as_str().unwrap().chars().count() <= 400, "input capped");
+        assert_eq!((d["ok"].as_bool(), d["exit_code"].as_i64(), d["tool_use_id"].as_str(), d["conversation"].as_str()),
+            (Some(false), Some(7), Some("tu1"), Some("conv-1")));
+        assert!(detail.contains("\"tool_use_id\":\"tu1\""), "the dedupe probe matches this exact spelling");
     }
 
     #[test]
@@ -39699,8 +39382,7 @@ mod tests {
         assert!(body.contains("if is_owner_configured_guard(guard) && session_is_isolated(name)"));
         // Owner configuration is a schedule or the goal keeper, and nothing else.
         assert!(is_owner_configured_guard("sched:SCHED-12") && is_owner_configured_guard("goal:gs-10"));
-        assert!(!is_owner_configured_guard("board-drive") && !is_owner_configured_guard("")
-            && !is_owner_configured_guard("project-steering"));
+        assert!(!is_owner_configured_guard("board-drive") && !is_owner_configured_guard(""));
         assert!(!body.contains("send_text(state, name, text, false, SendOrigin::Automation)"),
             "the direct send must use the computed origin");
     }
@@ -39716,7 +39398,7 @@ mod tests {
         let store = std::sync::Arc::new(crate::db::Store::open(&home.path().join("fixture.db")).unwrap());
         let state = AppState { store: store.clone(), started: std::time::Instant::now(), build_hash: "test".into(),
             auth_token: None, reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
-        for guard in ["owner-policy:auto-proceed", "owner-ask", "needs-input:auto-approve", "", "sched:SCHED-12", "goal:fixture", "project-steering"] {
+        for guard in ["owner-policy:auto-proceed", "owner-ask", "needs-input:auto-approve", "", "sched:SCHED-12", "goal:fixture"] {
             let id = format!("legacy-{guard}");
             let (id_s, guard_s) = (id.clone(), guard.to_string());
             store.write(move |conn| {
@@ -39731,9 +39413,6 @@ mod tests {
                 let conn = store.read().unwrap();
                 assert_eq!(conn.query_row("SELECT COUNT(*) FROM steering_queue WHERE id=?1", [&id], |r| r.get::<_,i64>(0)).unwrap(), 0);
                 assert_eq!(conn.query_row("SELECT outcome FROM steering_history WHERE id=?1", [&id], |r| r.get::<_,String>(0)).unwrap(), "void:retired-owner-policy");
-            } else if guard == "project-steering" {
-                assert!(result.is_none(), "an unbound project note stays held before delivery");
-                assert_eq!(store.read().unwrap().query_row("SELECT COUNT(*) FROM steering_queue WHERE id=?1 AND delivering_since IS NULL", [&id], |r| r.get::<_,i64>(0)).unwrap(), 1);
             } else {
                 let (sent, reason) = result.unwrap_or_else(|| panic!("{guard}: refusal leaves the queued row available"));
                 assert!(!sent);
@@ -42857,7 +42536,7 @@ mod tests {
         }
         {
             let c = st.store.read().unwrap();
-            let linked: i64 = c.query_row("SELECT COUNT(*) FROM cmd_history WHERE session='raw' AND (card_id IS NOT NULL OR project_group IS NOT NULL OR capture_pending!=0 OR intake_attempts!=0 OR type!='user')", [], |r|r.get(0)).unwrap();
+            let linked: i64 = c.query_row("SELECT COUNT(*) FROM cmd_history WHERE session='raw' AND (card_id IS NOT NULL OR capture_pending!=0 OR intake_attempts!=0 OR type!='user')", [], |r|r.get(0)).unwrap();
             assert_eq!(
                 linked, 0,
                 "isolated receipts remain human messages without harness processing"
@@ -42916,7 +42595,6 @@ mod tests {
             0
         );
         drop(c);
-        assert!(project_send_hold(&st, "raw", None).is_none());
         let queued = steer_enqueue(&st, "raw", "literal owner message", "", "")
             .await
             .unwrap();
@@ -42930,7 +42608,7 @@ mod tests {
             .unwrap();
         assert!(
             guard.is_none(),
-            "stale project metadata cannot convert raw input into project steering"
+            "a stale CC_PROJECT env cannot convert raw input into harness steering"
         );
         drop(c);
         let literal = "[no-board] Implement literal queue proof\n  Keep indentation →";
@@ -45947,6 +45625,15 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             (json!(true), json!(true)),
             "{v}"
         );
+        // Mid-turn, a missing message is not yet evidence: Claude Code writes a
+        // message typed during a turn to the transcript when the turn ends.
+        test_generating::set(name, true);
+        let (_, v) =
+            read(send_receipt_resolving(&state, name, "lost-id", "[03:17 PM] never typed").await)
+                .await;
+        assert!(v.get("released").is_none(), "released while the lane was mid-turn: {v}");
+        assert!(send_dedup_gate(&state, name, "lost-id").await.is_some(), "still reserved: no resend while mid-turn");
+        test_generating::set(name, false);
         let (_, v) =
             read(send_receipt_resolving(&state, name, "lost-id", "[03:17 PM] never typed").await)
                 .await;
@@ -47677,6 +47364,32 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         );
     }
 
+    /// AF-986: turning a worker's board off or on rewrites its scoped rules
+    /// file, so the "Board off for this worker" section follows the switch.
+    /// On 2026-10-28 the file still said off after the switches went on, and
+    /// the board drive reclaimed a finished card twelve times in six hours.
+    #[tokio::test]
+    async fn flipping_the_board_switch_rewrites_the_workers_rules_file() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/probe.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+        let app: Router = routes().with_state(state);
+        let rules = || std::fs::read_to_string(home.path().join("rules/probe.md")).unwrap_or_default();
+        // On first, so the off below is a flip whatever the process env says
+        // (a worker shell can carry board keys set to 0 from its own launch).
+        let (st, v) = call(&app, "PATCH", "/api/sessions/probe/config", Some(json!({"board_enabled": true}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = call(&app, "PATCH", "/api/sessions/probe/config", Some(json!({"board_enabled": false}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(rules().contains("# Board off for this worker"), "board off: the rules say so: {}", rules());
+        let (st, v) = call(&app, "PATCH", "/api/sessions/probe/config", Some(json!({"board_enabled": true}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(!rules().is_empty(), "the rules file was rewritten");
+        assert!(!rules().contains("# Board off for this worker"), "board back on: the section is gone: {}", rules());
+    }
+
     /// Ethan, 2026-10-17: one switch for "all the board stuff". `board_enabled`
     /// writes every board key, off and on, and `null` hands them all back to
     /// inheritance.
@@ -48372,10 +48085,8 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             Some(json!({"toggle_pin": true})),
         )
         .await;
-        // A STOPPED project worker is deletable (8c2f32c4, Ethan 2026-09-26:
-        // "i want a way to delete workers"); only a RUNNING one is refused,
-        // because it may be writing the project's shared checkout. This test
-        // has no tmux, so the worker reads as stopped and the delete lands.
+        // Projects were removed: a worker env that still carries CC_PROJECT
+        // is an ordinary worker and deletes like one.
         let mut project_env = EnvFile::load(&env_path("probe"));
         project_env.set("CC_PROJECT", "sample");
         project_env.write(&env_path("probe")).unwrap();
@@ -49408,22 +49119,12 @@ mod steer_boundary_tests {
             );
         }
         assert_eq!(
-            lifecycle_label_with_review(true, true, false),
+            lifecycle_label(true, true),
             "archived",
             "archived outranks paused, as /api/sessions reports"
         );
-        assert_eq!(lifecycle_label_with_review(false, true, false), "paused");
-        assert_eq!(lifecycle_label_with_review(false, false, false), "active");
-        assert_eq!(
-            lifecycle_label_with_review(false, false, true),
-            "review",
-            "review-held lanes are retained for evidence, not active work"
-        );
-        assert_eq!(
-            lifecycle_label_with_review(false, true, true),
-            "paused",
-            "manual pause outranks review hold for resume/archive UI"
-        );
+        assert_eq!(lifecycle_label(false, true), "paused");
+        assert_eq!(lifecycle_label(false, false), "active");
     }
 
     /// AMUX-4566 through the shared resolver, with real env files: the paused
@@ -50646,23 +50347,6 @@ mod submission_gate_tests {
     }
 
     #[test]
-    fn project_execution_draft_match_requires_visible_project_packet_tail() {
-        let packet = "For an unavailable concrete same-project output, POST /api/projects/single-image-gs7/tasks/PIG-4/required-outputs with the exact artifact path and verification note.";
-        assert!(project_execution_composer_owns_text(
-            &frame_stuck_idle(packet),
-            packet
-        ));
-        assert!(!project_execution_composer_owns_text(
-            &frame_stuck_idle("human typed unrelated draft"),
-            packet
-        ));
-        assert!(!project_execution_composer_owns_text(
-            &frame_stuck_idle("[Pasted text #1 +12 lines]"),
-            packet
-        ));
-    }
-
-    #[test]
     fn read_frame_detects_text_with_spaces_still_in_composer() {
         let msg = "this is a test message with spaces";
         let t = tail_sq(msg);
@@ -50673,19 +50357,6 @@ mod submission_gate_tests {
             read_frame(&frame_cleared(), &t),
             FrameRead::Cleared
         );
-    }
-
-    #[test]
-    fn composer_owns_text_with_spaces() {
-        let msg = "deploy the new version to staging now";
-        assert!(project_execution_composer_owns_text(
-            &frame_stuck_idle(msg),
-            msg
-        ));
-        assert!(!project_execution_composer_owns_text(
-            &frame_cleared(),
-            msg
-        ));
     }
 
     /// A successful submit: composer drawn and empty.
@@ -52179,9 +51850,6 @@ mod composer_state_tests {
 
     #[test]
     fn a_codex_open_elsewhere_retry_screen_is_not_boot_readiness() {
-        assert!(codex_conversation_open_elsewhere(
-            LIVE_CODEX_OPEN_ELSEWHERE_RETRY
-        ));
         assert_eq!(
             composer_state(LIVE_CODEX_OPEN_ELSEWHERE_RETRY),
             ComposerState::NotVisible
@@ -54173,6 +53841,27 @@ mod steer_coalescing_tests {
         );
     }
 
+    /// AF-1047: two wake events from one schedule, both pending for a lane
+    /// mid-turn, are two messages. The plain `sched:` guard (a recurring prompt
+    /// fire) still coalesces: that is the control.
+    #[tokio::test]
+    async fn two_wakes_from_one_schedule_both_survive_until_delivery() {
+        let (st, _d) = store().await;
+        let wake = format!("sched:SCHED-917{WAKE_GUARD_SUFFIX}");
+        assert!(is_schedule_guard(&wake), "a wake is still the owner's schedule");
+        steer_enqueue_store(&st, "lane", "W-a69b53 fired: cancelled", &wake, "").await.unwrap();
+        steer_enqueue_store(&st, "lane", "W-425051 EXPIRED unfired", &wake, "").await.unwrap();
+        let got = pending(&st, "lane");
+        assert_eq!(got.len(), 2, "both wakes must be pending, got {got:?}");
+        assert!(got.contains(&"W-a69b53 fired: cancelled".to_string()), "the FIRST wake survived");
+        steer_enqueue_store(&st, "lane", "daily audit, fire 1", "sched:SCHED-773", "").await.unwrap();
+        steer_enqueue_store(&st, "lane", "daily audit, fire 2", "sched:SCHED-773", "").await.unwrap();
+        let got = pending(&st, "lane");
+        assert_eq!(got.len(), 3, "two wakes plus ONE coalesced prompt fire, got {got:?}");
+        assert!(got.contains(&"daily audit, fire 2".to_string()) && !got.contains(&"daily audit, fire 1".to_string()),
+            "a recurring prompt fire still coalesces to its newest text: {got:?}");
+    }
+
     /// CONTROL 1, and the reason this is an allowlist rather than a deletion:
     /// coalescing is CORRECT for a nudge. auto-compact re-evaluates one
     /// condition hundreds of times and the reader wants one pending answer with
@@ -54353,7 +54042,6 @@ mod refusal_status_tests {
     fn state_refusals_are_conflicts() {
         for msg in [
             "not running",
-            "project pause, identity or budget holds automatic delivery",
             "boot readiness not freshly observed; durable message remains queued",
             "composer contains a draft; durable message remains queued",
             "worker is not ready; durable message remains queued",
@@ -54436,6 +54124,8 @@ mod refusal_status_tests {
     fn real_failures_are_still_500() {
         for msg in [
             "send-keys failed",
+            "send-keys failed (send-keys exit 1: no server running on /tmp/tmux-501/default)",
+            "send-keys failed (send-keys timed out)",
             "paste-buffer failed",
             "could not stage paste buffer",
             "tmux not found or timed out",
@@ -55523,6 +55213,19 @@ mod commit_shape_tests {
         let launch = super::compose_worker_context("memapp", false);
         assert!(launch.contains(super::MEMORY_VERB_CONTEXT), "{launch}");
         assert!(launch.contains("amux memory add --stdin"));
+        // A Messages delivery is a person's request, not pasted text (2026-10-28).
+        assert!(launch.contains(super::MESSAGES_CONTEXT), "{launch}");
+        assert!(!super::compose_worker_context("memapp", true).contains("# amux Messages"), "isolated workers get no injected guide");
+
+        // A worker that launched before an amux update changed its
+        // instructions is found; one launched with the current ones is not;
+        // one that never launched with a file is left alone (2026-10-28).
+        let names = vec!["memapp".to_string()];
+        assert_eq!(super::workers_with_changed_context(&names), (0, vec![]), "no rules file yet");
+        assert!(super::write_worker_context_file("memapp", "instructions from an older amux"));
+        assert_eq!(super::workers_with_changed_context(&names), (1, names.clone()));
+        assert!(super::write_worker_context_file("memapp", &launch));
+        assert_eq!(super::workers_with_changed_context(&names), (1, vec![]));
         // The worker block points at the verb, not at a file a guard may refuse.
         let block = super::compose_worker_block("memapp", "x");
         assert!(block.contains("amux memory add --stdin") && !block.contains("~/.amux/memory/"), "{block}");
@@ -57097,848 +56800,6 @@ mod spawn_argv_secret_tests {
 }
 
 #[cfg(test)]
-mod project_steering_tests {
-    use super::*;
-    #[test]
-    fn project_owner_note_waits_for_explicit_retry_and_current_working_claim() {
-        use crate::project_execution::{planner, store, task_retry};
-        let home = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(home.path());
-        let (_dir, db, _) = crate::project_execution::outputs::tests::fixture();
-        let e = planner::execution(&db.read().unwrap(), "A").unwrap();
-        let worker = e.worker.clone();
-        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-        std::fs::write(env_path(&worker), "CC_PROJECT=sample\nCC_BOARD_CARD=A\n").unwrap();
-        let state = AppState {
-            store: std::sync::Arc::new(db),
-            started: std::time::Instant::now(),
-            build_hash: "test".into(),
-            auth_token: None,
-            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let response = send_post(
-                &state,
-                &worker,
-                &HeaderMap::new(),
-                &json!({"text":"Retained owner note","msg_id":"held-owner","force":true}),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let id: String = state
-                .store
-                .read()
-                .unwrap()
-                .query_row(
-                    "SELECT id FROM steering_queue WHERE guard='project-steering'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            for _ in 0..2 {
-                // Fail a policy-only negative control here, before any native send/wake.
-                assert!(
-                    !claim_steering_row(&state.store, &id).await,
-                    "exhausted owner note cannot claim delivery"
-                );
-                assert!(send_claimed_steering(
-                    &state,
-                    &id,
-                    &worker,
-                    "Retained owner note",
-                    SendMode::drained(true, true)
-                )
-                .await
-                .is_none());
-            }
-            {
-                let c = state.store.read().unwrap();
-                assert_eq!(planner::execution(&c, "A").unwrap().attempt, e.attempt);
-                assert_eq!(
-                    c.query_row("SELECT COUNT(*) FROM steering_history", [], |r| r
-                        .get::<_, i64>(0))
-                        .unwrap(),
-                    0
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM session_events WHERE type='message.held'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )
-                    .unwrap(),
-                    1,
-                    "hold signal is durable and idempotent"
-                );
-                assert_eq!(
-                    c.query_row("SELECT text FROM steering_queue WHERE id=?1", [&id], |r| {
-                        r.get::<_, String>(0)
-                    })
-                    .unwrap(),
-                    "Retained owner note"
-                );
-                assert_eq!(
-                    c.query_row("SELECT COUNT(*) FROM issues", [], |r| r.get::<_, i64>(0))
-                        .unwrap(),
-                    3
-                );
-                assert!(
-                    crate::api::projects::steering_delivery_hold(&c, &worker, &id)
-                        .unwrap()
-                        .unwrap()
-                        .contains("active_claim")
-                );
-            }
-            state
-                .store
-                .write(|c| {
-                    let row = crate::db::board_store::get_issue(c, "A")?.unwrap();
-                    let e = planner::execution(c, "A").unwrap();
-                    let request = task_retry::Request {
-                        idempotency_key: "one-explicit-retry".into(),
-                        expect_generation: e.generation,
-                        expect_revision: row.rev,
-                        input_hash: e.input_hash.clone(),
-                    };
-                    assert!(
-                        task_retry::grant(c, "sample", "A", &request)
-                            .unwrap()
-                            .applied
-                    );
-                    assert!(
-                        !task_retry::grant(c, "sample", "A", &request)
-                            .unwrap()
-                            .applied
-                    );
-                    assert!(planner::claim(c, "sample", "A").unwrap().applied);
-                    Ok(crate::db::WriteOutcome {
-                        applied: true,
-                        events: vec![],
-                    })
-                })
-                .unwrap();
-            assert!(
-                !claim_steering_row(&state.store, &id).await,
-                "reserved is not a working claim"
-            );
-            state
-                .store
-                .write(|c| {
-                    let row = crate::db::board_store::get_issue(c, "A")?.unwrap();
-                    let mut e = planner::execution(c, "A").unwrap();
-                    e.stage = "working".into();
-                    planner::save_execution(c, &row, &e, "project.execution")
-                        .map_err(store::sql_error)
-                })
-                .unwrap();
-            assert!(claim_steering_row(&state.store, &id).await);
-            assert!(
-                !claim_steering_row(&state.store, &id).await,
-                "only one sender can claim"
-            );
-            assert!(project_send_hold(&state, &worker, Some(&id)).is_none());
-            let before_race = project_delivery_claim(&state, &worker, Some(&id));
-            state
-                .store
-                .write(|c| {
-                    let row = crate::db::board_store::get_issue(c, "A")?.unwrap();
-                    let mut e = planner::execution(c, "A").unwrap();
-                    e.stage = "reported".into();
-                    planner::save_execution(c, &row, &e, "project.execution")
-                        .map_err(store::sql_error)
-                })
-                .unwrap();
-            assert!(
-                project_send_hold(&state, &worker, Some(&id)).is_some(),
-                "report arriving after queue claim must hold before typing"
-            );
-            assert_eq!(
-                project_delivery_claim(&state, &worker, Some(&id)),
-                before_race,
-                "stage transition alone need not change generation to revoke delivery"
-            );
-            unclaim_steering_row(&state.store, &id).await;
-            // The real writer authority and final typing gate must both reject each hold,
-            // even when a caller says Send now and the provider reports idle.
-            for (stage, category) in [
-                ("waiting", None),
-                ("repair", None),
-                ("reported", None),
-                ("verified", None),
-                ("working", Some("spend")),
-                ("working", Some("customer_outbound")),
-                ("working", Some("required_outputs")),
-            ] {
-                let stage = stage.to_string();
-                let category = category.map(str::to_string);
-                state
-                    .store
-                    .write(move |c| {
-                        let row = crate::db::board_store::get_issue(c, "A")?.unwrap();
-                        let mut e = planner::execution(c, "A").unwrap();
-                        e.stage = stage;
-                        e.wait_category = category;
-                        e.waiting = if e.stage == "working" {
-                            None
-                        } else {
-                            Some("held".into())
-                        };
-                        planner::save_execution(c, &row, &e, "project.execution")
-                            .map_err(store::sql_error)
-                    })
-                    .unwrap();
-                assert!(!claim_steering_row(&state.store, &id).await);
-                assert!(project_send_hold(&state, &worker, Some(&id)).is_some());
-            }
-            state
-                .store
-                .write(|c| {
-                    let row = crate::db::board_store::get_issue(c, "A")?.unwrap();
-                    let mut e = planner::execution(c, "A").unwrap();
-                    e.stage = "working".into();
-                    e.wait_category = None;
-                    e.waiting = None;
-                    e.input_hash = "stale".into();
-                    planner::save_execution(c, &row, &e, "project.execution")
-                        .map_err(store::sql_error)
-                })
-                .unwrap();
-            assert!(
-                !claim_steering_row(&state.store, &id).await,
-                "stale requirements hold"
-            );
-            std::fs::write(env_path(&worker), "CC_PROJECT=sample\nCC_BOARD_CARD=B\n").unwrap();
-            assert!(
-                !claim_steering_row(&state.store, &id).await,
-                "retargeted worker cannot consume A's input"
-            );
-            assert!(steer_enqueue_idempotent_report(
-                &state,
-                &worker,
-                "Retained owner note",
-                "project-steering",
-                "",
-                &id
-            )
-            .await
-            .is_err());
-            let c = state.store.read().unwrap();
-            let after = planner::execution(&c, "A").unwrap();
-            assert_eq!(after.attempt, e.attempt + 1);
-            assert_eq!(after.retry_grants.len(), 1);
-            assert_eq!(
-                c.query_row("SELECT COUNT(*) FROM steering_history", [], |r| r
-                    .get::<_, i64>(0))
-                    .unwrap(),
-                0
-            );
-            assert_eq!(
-                c.query_row(
-                    "SELECT COUNT(*) FROM steering_queue WHERE id=?1",
-                    [&id],
-                    |r| r.get::<_, i64>(0)
-                )
-                .unwrap(),
-                1
-            );
-            assert!(crate::project_execution::intake::receipts(&c, "sample")
-                .unwrap()
-                .is_empty());
-        });
-    }
-
-    #[test]
-    fn empty_project_cleanup_does_not_wait_for_a_held_store_writer() {
-        let home = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(home.path());
-        for inflight in [false, true] {
-            let (_dir, db, _) = crate::project_execution::outputs::tests::fixture();
-            db.write(move |c| {
-                c.execute("DELETE FROM steering_queue", [])?;
-                if inflight {
-                    c.execute("INSERT INTO steering_queue(id,session,text,queued_at,guard,delivering_since) VALUES('already-claimed','private-worker','retained',1,'project-execution',1)", [])?;
-                }
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-            }).unwrap();
-            let state = AppState {
-                store: std::sync::Arc::new(db),
-                started: std::time::Instant::now(),
-                build_hash: "test".into(),
-                auth_token: None,
-                reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            };
-            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let store = state.store.clone();
-            let writer = std::thread::spawn(move || {
-                store.write(move |c| {
-                    c.execute("INSERT INTO steering_history(id,session,text,delivered_at,outcome) VALUES('writer-witness','private-worker','fixture',1,'fixture')", [])?;
-                    entered_tx.send(()).unwrap();
-                    release_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-                }).unwrap();
-            });
-            entered_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            let tick = runtime.block_on(async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(1),
-                    steer_deliver_tick(&state),
-                )
-                .await
-            });
-            // Always release the real writer before asserting, including on the
-            // predecessor whose unconditional write makes this deadline fail.
-            release_tx.send(()).unwrap();
-            writer.join().unwrap();
-            assert_eq!(
-                tick.unwrap(),
-                0,
-                "empty/claimed-only queues must not delay the following recovery sweep"
-            );
-            let c = state.store.read().unwrap();
-            assert_eq!(
-                c.query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r
-                    .get::<_, i64>(0))
-                    .unwrap(),
-                i64::from(inflight)
-            );
-            assert_eq!(
-                c.query_row(
-                    "SELECT COUNT(*) FROM steering_history WHERE id='writer-witness'",
-                    [],
-                    |r| r.get::<_, i64>(0)
-                )
-                .unwrap(),
-                1
-            );
-        }
-    }
-
-    #[test]
-    fn project_packet_cleanup_failure_does_not_veto_legacy_queue_progress() {
-        use crate::project_execution::planner;
-        let home = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(home.path());
-        let (_dir, db, _) = crate::project_execution::outputs::tests::fixture();
-        let e = planner::execution(&db.read().unwrap(), "A").unwrap();
-        let worker = e.worker.clone();
-        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-        std::fs::write(
-            env_path(&worker),
-            "CC_PROJECT=sample\nCC_BOARD_CARD=A\nCC_PAUSED=1\n",
-        )
-        .unwrap();
-        db.write(move|c| {
-            let old:String=c.query_row("SELECT json_extract(data,'$.execution.delivery_id') FROM session_events WHERE type='project.claimed' AND json_extract(data,'$.task')='A' ORDER BY id LIMIT 1",[],|r|r.get(0))?;
-            assert_ne!(old,e.delivery_id);
-            c.execute("INSERT INTO steering_queue(id,session,text,queued_at,guard) VALUES(?1,?2,'retained project packet',1,'project-execution')",rusqlite::params![old,e.worker])?;
-            c.execute("INSERT INTO issues(id,title,status,session,created,updated) VALUES('LEGACY-1','finished','done','legacy-cleanup-fixture',1,1)",[])?;
-            c.execute("INSERT INTO steering_queue(id,session,text,queued_at,guard) VALUES('legacy-stale','legacy-cleanup-fixture',?1,1,?2)",rusqlite::params![format!("{}LEGACY-1 — work it now.",crate::runtime_jobs::board_drive::PICKUP_ANCHOR),BOARD_DRIVE_GUARD])?;
-            // Real writer failure confined to optional project cleanup. Legacy
-            // queue/history remains writable; no fake delivery/provider needed.
-            c.execute_batch("CREATE TRIGGER reject_project_packet_void BEFORE INSERT ON steering_history WHEN NEW.outcome='void:project-execution-superseded' BEGIN SELECT RAISE(ABORT,'fixture project cleanup failure'); END;")?;
-            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
-        }).unwrap();
-        let state = AppState {
-            store: std::sync::Arc::new(db),
-            started: std::time::Instant::now(),
-            build_hash: "test".into(),
-            auth_token: None,
-            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            assert!(
-                state
-                    .store
-                    .write_async(planner::settle_superseded_packets)
-                    .await
-                    .is_err(),
-                "fixture must exercise a real transactional failure"
-            );
-            steer_deliver_tick(&state).await;
-        });
-        let c = state.store.read().unwrap();
-        assert_eq!(
-            c.query_row(
-                "SELECT outcome FROM steering_history WHERE id='legacy-stale'",
-                [],
-                |r| r.get::<_, String>(0)
-            )
-            .unwrap(),
-            "void:pickup-stale",
-            "unrelated queue authority still progresses after cleanup failure"
-        );
-        assert_eq!(
-            c.query_row(
-                "SELECT COUNT(*) FROM steering_queue WHERE id='legacy-stale'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
-        );
-        let (old, text, inflight): (String, String, Option<f64>) = c
-            .query_row(
-                "SELECT id,text,delivering_since FROM steering_queue WHERE session=?1",
-                [&worker],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(text, "retained project packet");
-        assert!(inflight.is_none());
-        assert!(
-            super::super::projects::steering_delivery_hold(&c, &worker, &old)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(
-            c.query_row(
-                "SELECT COUNT(*) FROM steering_history WHERE session=?1",
-                [&worker],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0,
-            "failed transaction must not create project receipt"
-        );
-    }
-
-    #[test]
-    fn project_send_now_refuses_without_changing_held_or_working_note_identity() {
-        use crate::project_execution::{planner, store};
-        let home = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(home.path());
-        let (_dir, db, _) = crate::project_execution::outputs::tests::fixture();
-        let worker = planner::execution(&db.read().unwrap(), "A").unwrap().worker;
-        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-        std::fs::write(env_path(&worker), "CC_PROJECT=sample\nCC_BOARD_CARD=A\n").unwrap();
-        let state = AppState {
-            store: std::sync::Arc::new(db),
-            started: std::time::Instant::now(),
-            build_hash: "test".into(),
-            auth_token: None,
-            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
-        let snapshot = || {
-            let c = state.store.read().unwrap();
-            [
-                "issues",
-                "task_attempts",
-                "steering_queue",
-                "steering_history",
-                "cmd_history",
-                "session_events",
-            ]
-            .map(|table| {
-                let mut stmt = c
-                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
-                    .unwrap();
-                let columns = stmt.column_count();
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((0..columns)
-                            .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
-                            .collect::<Vec<_>>())
-                    })
-                    .unwrap();
-                rows.collect::<Result<Vec<_>, _>>().unwrap()
-            })
-        };
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let response=send_post(&state,&worker,&HeaderMap::new(),&json!({"text":"Original owner note","msg_id":"original-note"})).await;
-            assert_eq!(response.status(),StatusCode::OK);
-            let receipt:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap();
-            let id=receipt["id"].as_str().unwrap();
-            for working in [false,true] {
-                if working {
-                    state.store.write(|c| {let row=crate::db::board_store::get_issue(c,"A")?.unwrap();let mut e=planner::execution(c,"A").unwrap();e.stage="working".into();e.waiting=None;planner::save_execution(c,&row,&e,"project.execution").map_err(store::sql_error)}).unwrap();
-                }
-                assert_eq!(project_send_hold(&state,&worker,Some(id)).is_none(),working);
-                let before=snapshot();
-                for msg_id in ["","force-now","force-now","original-note"] {
-                    let response=send_post(&state,&worker,&HeaderMap::new(),&json!({"text":"Original owner note","deliver_now":true,"msg_id":msg_id})).await;
-                    assert_eq!(response.status(),StatusCode::CONFLICT);
-                    let body:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap();
-                    assert_eq!(body["code"],"project_next_turn_only");assert_eq!(body["submitted"],false);assert!(body.get("id").is_none());
-                    assert_eq!(snapshot(),before,"refusal must not create receipts/tasks/deliveries or alter the existing note/attempt");
-                }
-                let c=state.store.read().unwrap();
-                let note:(String,String,Option<f64>)=c.query_row("SELECT text,guard,delivering_since FROM steering_queue WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-                assert_eq!(note,("Original owner note".into(),"project-steering".into(),None));
-                assert_eq!(c.query_row("SELECT COUNT(*) FROM steering_history",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-            }
-        });
-    }
-
-    #[test]
-    fn project_send_route_has_one_execution_authority_and_durable_idempotent_steering() {
-        let home = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(home.path());
-        let (_dir, db, _) = crate::project_execution::outputs::tests::fixture();
-        let worker = crate::project_execution::planner::execution(&db.read().unwrap(), "A")
-            .unwrap()
-            .worker;
-        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-        std::fs::write(
-            env_path(&worker),
-            "CC_PROJECT=sample\nCC_BOARD_CARD=A\nCC_COMMAND_LIFECYCLE=1\n",
-        )
-        .unwrap();
-        assert!(!super::super::board_lifecycle::enabled(&worker));
-        let state = AppState {
-            store: std::sync::Arc::new(db),
-            started: std::time::Instant::now(),
-            build_hash: "test".into(),
-            auth_token: None,
-            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            for id in ["owner1", "owner1", "owner2"] {
-                let response = send_post(
-                    &state,
-                    &worker,
-                    &HeaderMap::new(),
-                    &json!({"text":"Repair current task","msg_id":id,"force":true}),
-                )
-                .await;
-                assert_eq!(response.status(), StatusCode::OK);
-            }
-        });
-        let c = state.store.read().unwrap();
-        let queued: i64 = c
-            .query_row(
-                "SELECT COUNT(*) FROM steering_queue WHERE session=?1 AND guard='project-steering'",
-                [&worker],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(queued, 2);
-        let rows:i64=c.query_row("SELECT COUNT(*) FROM cmd_history WHERE session=?1 AND type='steering' AND card_id='A' AND project_group='sample' AND capture_pending=0 AND intake_attempts=0",[&worker],|r|r.get(0)).unwrap();
-        assert_eq!(rows, 2);
-        assert_eq!(
-            crate::project_execution::intake::receipts(&c, "sample")
-                .unwrap()
-                .len(),
-            0
-        );
-        assert_eq!(
-            c.query_row("SELECT COUNT(*) FROM issues", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            3
-        );
-        std::fs::write(env_path("normal-fixture"), "CC_COMMAND_LIFECYCLE=1\nCC_AUTO_PICKUP=1\n").unwrap();
-        assert!(super::super::board_lifecycle::enabled("normal-fixture"));
-        let id: String = c
-            .query_row(
-                "SELECT id FROM steering_queue WHERE session=?1 LIMIT 1",
-                [&worker],
-                |r| r.get(0),
-            )
-            .unwrap();
-        drop(c);
-        state
-            .store
-            .write(|c| {
-                let row = crate::db::board_store::get_issue(c, "A")?.unwrap();
-                let mut e = crate::project_execution::planner::execution(c, "A").unwrap();
-                e.stage = "working".into();
-                e.waiting = None;
-                crate::project_execution::planner::save_execution(c, &row, &e, "project.execution")
-                    .map_err(crate::project_execution::store::sql_error)
-            })
-            .unwrap();
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            for (budget, paused, expected) in [
-                (Some(1.0), false, false),
-                (None, false, true),
-                (None, true, false),
-            ] {
-                state
-                    .store
-                    .write(move |c| {
-                        let mut p = crate::project_execution::store::get(c, "sample")
-                            .unwrap()
-                            .unwrap();
-                        p.policy.cost_budget_usd = budget;
-                        p.policy.paused = paused;
-                        crate::project_execution::store::save(
-                            c, "sample", p.revision, &p.policy, "test",
-                        )
-                        .map_err(crate::project_execution::store::sql_error)
-                    })
-                    .unwrap();
-                assert_eq!(
-                    claim_steering_row(&state.store, &id).await,
-                    expected,
-                    "budget={budget:?}, paused={paused}"
-                );
-                if expected {
-                    assert!(
-                        !claim_steering_row(&state.store, &id).await,
-                        "one delivery claimant"
-                    );
-                    // Release the fixture claim so the final pause assertion tests
-                    // policy admission, not an already claimed delivery row.
-                    unclaim_steering_row(&state.store, &id).await;
-                }
-            }
-        });
-    }
-}
-
-#[cfg(test)]
-mod boot_delivery_tests {
-
-    /// AMUX-5013. A message parked past the invariant's own threshold must
-    /// arrive SAYING SO, and a fresh one must arrive untouched.
-    ///
-    /// Measured 2026-09-23: 61 messages sit in `steering_queue` behind 13
-    /// paused lanes, in two bulk clusters (53 queued 09-14, 8 queued 09-20).
-    /// ts-gke alone holds 21 from 09-14. Nothing drops them on resume, so the
-    /// lane that comes back reads a 9.3-day-old request as current.
-    ///
-    /// The codebase already makes this argument ninety lines above the delivery
-    /// call, for a keypress: "once [the picker] is gone the same characters
-    /// become an instruction the model will try to obey" (AMUX-2823, which
-    /// VOIDS it). Prose cannot be voided safely — it is a peer's real request —
-    /// so it is stamped instead.
-    #[test]
-    fn a_long_parked_message_arrives_carrying_its_age() {
-        let parked_max = 72.0 * 3600.0;
-        assert_eq!(
-            super::stale_delivery_stamp("ship it", 223.1 * 3600.0, parked_max, true),
-            None,
-            "isolated queued messages must remain exact owner input"
-        );
-
-        // Fresh: untouched. A stamp on every delivery would be noise on the
-        // 99% of messages that are seconds old.
-        assert_eq!(
-            super::stale_delivery_stamp("ship it", 5.0, parked_max, false),
-            None
-        );
-        // Exactly at the threshold is not PAST it.
-        assert_eq!(
-            super::stale_delivery_stamp("ship it", parked_max, parked_max, false),
-            None,
-            "the boundary must match the invariant's `age > max`, not `>=`"
-        );
-
-        // ts-gke's real worst case: 9.3 days.
-        let aged = super::stale_delivery_stamp("ship it", 223.1 * 3600.0, parked_max, false)
-            .expect("a message parked 223h must be stamped");
-        assert!(aged.contains("223.1h"), "the age must be IN it: {aged}");
-        // THE MESSAGE ITSELF SURVIVES. This is the whole reason it is a stamp
-        // and not a void: dropping a peer's request is not amux's call.
-        assert!(
-            aged.ends_with("ship it"),
-            "the original text was altered: {aged}"
-        );
-        assert!(
-            aged.lines().count() == 2,
-            "the stamp is one line above the message, not woven into it: {aged:?}"
-        );
-
-        // A DIFFERENT AGE PRODUCES A DIFFERENT STAMP, so the field cannot be a
-        // constant wearing a measurement's clothes.
-        let other =
-            super::stale_delivery_stamp("ship it", 100.0 * 3600.0, parked_max, false).unwrap();
-        assert_ne!(aged, other);
-        assert!(other.contains("100.0h"));
-    }
-
-    use super::*;
-    #[test]
-    fn boot_delivery_requires_fresh_empty_idle_frame() {
-        let old="old transcript\n\n\u{1b}[1m›\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  gpt-6-astra medium · ~/private/repo · resumed\n";
-        let fingerprint = boot_frame_fingerprint(old);
-        assert!(
-            !fresh_boot_frame(old, &fingerprint, false),
-            "pre-restart frame is not readiness"
-        );
-        assert!(
-            fresh_boot_frame(old, &fingerprint, true),
-            "same text in positively observed new launch is ready"
-        );
-        assert!(
-            boot_delivery_held(old, &fingerprint, false, true, true, false),
-            "scheduled start holds old pane even before start acquires operation lock"
-        );
-        assert!(
-            !boot_delivery_held(old, &fingerprint, true, true, false, false),
-            "new process idle frame admits drain after launch finishes"
-        );
-        let idle = old.replace("old transcript", "new startup frame");
-        assert!(fresh_boot_frame(&idle, &fingerprint, false));
-        for draft in ["[Pasted Content 1024 chars]", "unfinished user draft"] {
-            let raw = idle.replace("\u{1b}[2mAsk Codex to do anything\u{1b}[0m", draft);
-            assert!(!fresh_boot_frame(&raw, &fingerprint, true), "draft {draft}");
-        }
-        for busy in [
-            "• Working (1s • esc to interrupt)",
-            "• Waiting for background terminal (1s • esc to interrupt)",
-        ] {
-            assert!(!fresh_boot_frame(
-                &idle.replace("new startup frame", busy),
-                &fingerprint,
-                true
-            ));
-        }
-        assert!(!fresh_boot_frame("", &fingerprint, true));
-        for deferred in [
-            "sent (waiting for in-flight boot)",
-            "sent (auto-woke)",
-            "queued (steering) — waiting for fresh boot readiness",
-        ] {
-            assert_eq!(submit_verdict_of(deferred), None);
-            assert_eq!(submission_verdict(true, deferred), (None, "deferred"));
-        }
-    }
-    #[test]
-    fn boot_delivery_preserves_exact_bytes_and_single_claim_across_retry() {
-        let home = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(home.path());
-        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-        std::fs::write(env_path("boot-fixture"), "CC_ISOLATED=1\n").unwrap();
-        let db = crate::db::Store::open(&home.path().join("db")).unwrap();
-        let state = AppState {
-            store: std::sync::Arc::new(db),
-            started: std::time::Instant::now(),
-            build_hash: "test".into(),
-            auth_token: None,
-            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
-        let text = format!(
-            "  precise unicode α\n{}\n  ",
-            "do not duplicate or truncate ".repeat(100)
-        );
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let first = queue_boot_prompt(&state, "boot-fixture", &text, SendOrigin::Owner).await;
-            assert!(first.0);
-            assert_eq!(submit_verdict_of(&first.1), None);
-            assert!(
-                queue_boot_prompt(&state, "boot-fixture", &text, SendOrigin::Owner)
-                    .await
-                    .0
-            );
-            assert!(
-                !queue_boot_prompt(&state, "boot-fixture", &text, SendOrigin::Automation)
-                    .await
-                    .0,
-                "isolated automation protection retained"
-            );
-            let (id, stored, count): (String, String, i64) = {
-                let c = state.store.read().unwrap();
-                c.query_row("SELECT id,text,COUNT(*) FROM steering_queue", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })
-                .unwrap()
-            };
-            assert_eq!(stored, text);
-            assert_eq!(count, 1);
-            assert!(claim_steering_row(&state.store, &id).await);
-            assert!(!claim_steering_row(&state.store, &id).await);
-            unclaim_steering_row(&state.store, &id).await;
-            assert!(
-                claim_steering_row(&state.store, &id).await,
-                "failure releases the same durable row, not a new paste timer"
-            );
-            assert_eq!(
-                state
-                    .store
-                    .read()
-                    .unwrap()
-                    .query_row("SELECT text FROM steering_queue WHERE id=?1", [id], |r| {
-                        r.get::<_, String>(0)
-                    })
-                    .unwrap(),
-                text
-            );
-        });
-    }
-}
-
-#[cfg(test)]
-mod project_hook_review_tests {
-    use super::*;
-    #[test]
-    fn declines_only_exact_untrusted_hook_choice_for_active_projects() {
-        let dir = tempfile::tempdir().unwrap();
-        let path=dir.path().join("worker.env");
-        std::fs::write(&path,"CC_PROVIDER=codex\nCC_PROJECT=demo\n").unwrap();
-        let mut cfg=EnvFile::load(&path);
-        let pane="Hooks need review\n10 hooks are new or changed.\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\nPress enter to confirm or esc to go back";
-        assert_eq!(project_hook_review_key(&cfg,pane),Some("3"));
-        assert!(ALLOWED_TMUX_CHAR_KEYS.contains(&project_hook_review_key(&cfg,pane).unwrap()), "the safe choice must be accepted by the actual key sender");
-        let selected=pane.replace("› 1.","  1.").replace("  3.","› 3.");
-        assert_eq!(project_hook_review_key(&cfg,&selected),Some("Enter"));
-        assert_eq!(project_hook_review_key(&cfg,&pane.replace("3. Continue without trusting (hooks won't run)","3. Trust all")),None);
-        assert_eq!(project_hook_review_key(&cfg,&format!("{pane}\n› Implement a feature")),None);
-        for key in ["CC_ISOLATED","CC_PAUSED","CC_ARCHIVED"] {
-            cfg.set(key,"1"); assert_eq!(project_hook_review_key(&cfg,pane),None); cfg.remove(key);
-        }
-        cfg.set("CC_PROVIDER","claude"); assert_eq!(project_hook_review_key(&cfg,pane),None);
-        cfg.set("CC_PROVIDER","codex"); cfg.remove("CC_PROJECT"); assert_eq!(project_hook_review_key(&cfg,pane),None);
-    }
-    #[test]
-    fn project_checkout_picker_uses_only_the_registered_checkout_without_persisting_preference() {
-        let dir=tempfile::tempdir().unwrap();
-        let path=dir.path().join("worker.env");
-        std::fs::write(&path,"CC_PROVIDER=codex\nCC_PROJECT=demo\n").unwrap();
-        let mut cfg=EnvFile::load(&path);
-        let pane="› 1. Use session directory (/repo/.worktrees/old)\n  2. Use current directory (/repo/.worktrees/project-demo)\n  3. Always use session directory\n  4. Always use current directory\n  Press enter to continue";
-        let checkout=Path::new("/repo/.worktrees/project-demo");
-        assert_eq!(project_checkout_directory_key(&cfg,pane,checkout),Some("2"));
-        assert!(ALLOWED_TMUX_CHAR_KEYS.contains(&project_checkout_directory_key(&cfg,pane,checkout).unwrap()), "the exact checkout choice must be sendable");
-        assert_eq!(project_checkout_directory_key(&cfg,&pane.replace("› 1.","  1.").replace("  2.","› 2."),checkout),Some("Enter"));
-        assert_eq!(project_checkout_directory_key(&cfg,pane,Path::new("/repo/.worktrees/other")),None);
-        assert_eq!(project_checkout_directory_key(&cfg,&pane.replace("2. Use current directory", "2. Trust this directory"),checkout),None);
-        assert_eq!(project_checkout_directory_key(&cfg,&format!("{pane}\n› Work on something else"),checkout),None);
-        for key in ["CC_ISOLATED","CC_PAUSED","CC_ARCHIVED","CC_PROJECT_PAUSED"] {
-            cfg.set(key,"1"); assert_eq!(project_checkout_directory_key(&cfg,pane,checkout),None); cfg.remove(key);
-        }
-        cfg.set("CC_PROVIDER","claude"); assert_eq!(project_checkout_directory_key(&cfg,pane,checkout),None);
-    }
-    #[test]
-    fn queued_repair_can_clear_its_checkout_picker_without_creating_a_new_claim() {
-        use crate::project_execution::planner::{CardPlan, Execution};
-        use amux_core::project::Phase;
-        let mut plan=CardPlan{id:"A".into(),phase:Phase::Ready,action:"claim".into(),waiting_reason:None,waiting_label:None,
-            execution:Execution{stage:"repair".into(),worker:"owner".into(),..Default::default()}};
-        assert!(project_checkout_repair_claim_ready(&[plan.clone()],"owner"));
-        assert!(!project_checkout_repair_claim_ready(&[plan.clone()],"other"));
-        plan.execution.suspended=true;assert!(!project_checkout_repair_claim_ready(&[plan.clone()],"owner"));
-        plan.execution.suspended=false;plan.action="observe".into();assert!(!project_checkout_repair_claim_ready(&[plan.clone()],"owner"));
-        plan.action="claim".into();plan.execution.stage="waiting".into();assert!(!project_checkout_repair_claim_ready(&[plan],"owner"));
-    }
-    #[test]
-    fn only_a_live_project_codex_retry_screen_is_eligible_for_bounded_repair() {
-        let dir=tempfile::tempdir().unwrap();
-        let path=dir.path().join("worker.env");
-        std::fs::write(&path,"CC_PROVIDER=codex\nCC_PROJECT=demo\n").unwrap();
-        let mut cfg=EnvFile::load(&path);
-        let pane="This conversation is open in another app   R to Retry\nClose it there and press R to continue here.\nr retry";
-        assert!(project_codex_conversation_retry_ready(&cfg,pane,0,1000));
-        assert!(ALLOWED_TMUX_CHAR_KEYS.contains(&"r"),"the retry key must be accepted by the sender");
-        assert!(!project_codex_conversation_retry_ready(&cfg,pane,900,1000));
-        assert!(project_codex_conversation_retry_ready(&cfg,pane,700,1000));
-        assert!(!project_codex_conversation_retry_ready(&cfg,"› Ask Codex to do anything",0,1000));
-        for key in ["CC_ISOLATED","CC_PAUSED","CC_PROJECT_PAUSED","CC_ARCHIVED","CC_REVIEW_HELD"] {
-            cfg.set(key,"1");
-            assert!(!project_codex_conversation_retry_ready(&cfg,pane,0,1000),"{key}");
-            cfg.remove(key);
-        }
-        cfg.set("CC_PROVIDER","claude");
-        assert!(!project_codex_conversation_retry_ready(&cfg,pane,0,1000));
-        cfg.set("CC_PROVIDER","codex");cfg.remove("CC_PROJECT");
-        assert!(!project_codex_conversation_retry_ready(&cfg,pane,0,1000));
-    }
-}
-
-#[cfg(test)]
 mod startup_profile_recovery_tests {
     use super::*;
     #[test]
@@ -58586,4 +57447,22 @@ pub(crate) async fn relaunch_key_workers_onto_subscription(state: &AppState) -> 
         }
     }
     (considered, relaunched)
+}
+
+#[cfg(test)]
+mod refresh_fleet_shims_tests {
+    use super::*;
+
+    #[test]
+    fn server_start_replaces_a_stale_installed_shim_and_creates_no_dir() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("shims").join("tmux-fleet");
+        assert!(!refresh_fleet_shims(&dir).unwrap(), "no shim dir: nothing to refresh");
+        assert!(!dir.exists(), "server start created a shim dir nobody launched");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pgrep"), "#!/bin/bash\n# an older amux pkill/pgrep guard\n").unwrap();
+        assert!(refresh_fleet_shims(&dir).unwrap());
+        assert_eq!(std::fs::read_to_string(dir.join("pgrep")).unwrap(), PKILL_GUARD_SHIM, "the stale pgrep shim was kept");
+        assert_eq!(std::fs::read_to_string(dir.join("tmux")).unwrap(), TMUX_FLEET_SHIM);
+    }
 }

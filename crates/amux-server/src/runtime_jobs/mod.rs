@@ -50,6 +50,7 @@ pub mod board_hygiene;
 pub mod browser_login_sync;
 pub mod connector_maintenance;
 pub mod social_metrics;
+pub mod social_publish;
 pub mod browser_reaper;
 pub mod search_ingest;
 pub mod computer_reaper;
@@ -87,6 +88,7 @@ mod poll_watch;
 /// derived from the spawn sites rather than declared alongside them.
 pub mod receipts;
 pub mod recordings_transcribe;
+pub mod recordings_live;
 pub mod registry;
 pub mod scheduler;
 pub mod schedule_failure;
@@ -94,6 +96,7 @@ pub mod schedule_wake;
 /// Owner card for queued messages held behind a composer draft (called from
 /// the steering loop, not a periodic job of its own).
 pub mod draft_hold;
+pub mod schedule_check;
 pub mod schedule_lifecycle;
 pub mod episodes;
 pub mod status_history;

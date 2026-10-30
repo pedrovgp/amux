@@ -30,7 +30,9 @@ class DoorJoin(unittest.TestCase):
         cls.amux_port, cls.door_port = free_port(), free_port()
         home = os.path.join(cls.tmp, "home"); os.makedirs(home)
         cls.amux = subprocess.Popen([BIN], env={"HOME": home, "PATH": os.environ["PATH"], "AMUX_HOME": os.path.join(cls.tmp, "amux"),
-                                    "AMUX_RS_PORT": str(cls.amux_port), "AMUX_NO_SELF_ADOPT": "1"},
+                                    "AMUX_RS_PORT": str(cls.amux_port), "AMUX_NO_SELF_ADOPT": "1",
+                                    # The apps origin binds AMUX_RS_PORT+1, often the door port picked next.
+                                    "AMUX_APPS_PORT": "0"},
                                     stdout=open(os.path.join(cls.tmp, "amux.log"), "w"), stderr=subprocess.STDOUT)
         for _ in range(120):
             try:

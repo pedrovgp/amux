@@ -366,6 +366,10 @@ pub struct ExprParseError(pub String);
 /// - `monthly on N at HH:MM` (N in 1..=28, like Python — day 29-31 is
 ///   rejected rather than silently drifting on short months)
 /// - 5-field cron `MIN HOUR DOM MON DOW` (standard DOW: 0 or 7 = Sunday)
+/// - `daily at sunset`, `every saturday at sunset+50m`, `weekly on friday at
+///   sunset-18m`, `every day at sunrise`, and `after shabbos` (Saturday,
+///   sunset + AMUX_SHABBAT_END_MIN, 50 by default), at AMUX_LATITUDE /
+///   AMUX_LONGITUDE -> [`ScheduleExpr::Sun`]
 ///
 /// `Cron` boxes the crate schedule: it is ~250 bytes against everyone
 /// else's 16, and this enum is cloned into write closures.
@@ -398,6 +402,56 @@ pub enum ScheduleExpr {
     /// 5-field cron, held as the `cron` crate's schedule (seconds pinned to
     /// 0, DOW translated — see [`translate_dow`]).
     Cron(Box<cron::Schedule>),
+    /// At sunset or sunrise, plus an offset, every day or on one weekday
+    /// (`daily at sunset`, `every saturday at sunset+50m`, `after shabbos`).
+    /// Where: AMUX_LATITUDE / AMUX_LONGITUDE, captured when parsed.
+    Sun {
+        weekday: Option<Weekday>,
+        sunset: bool,
+        offset_min: i64,
+        lat: f64,
+        lon: f64,
+    },
+}
+
+/// The server's place on Earth, for sun-based schedules.
+pub fn sun_location() -> Option<(f64, f64)> {
+    let get = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<f64>().ok());
+    match (get("AMUX_LATITUDE"), get("AMUX_LONGITUDE")) {
+        (Some(la), Some(lo)) if (-90.0..=90.0).contains(&la) && (-180.0..=180.0).contains(&lo) => Some((la, lo)),
+        _ => None,
+    }
+}
+
+/// Minutes after sunset that "after Shabbos" means (nightfall). 50 by
+/// default; communities use 42 to 72, so AMUX_SHABBAT_END_MIN sets it.
+pub fn shabbat_end_offset_min() -> i64 {
+    std::env::var("AMUX_SHABBAT_END_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(50)
+}
+
+/// Sunset (or sunrise) on `date` at `lat`, `lon` (east positive), in UTC, by
+/// the sunrise equation (accurate to a minute or two away from the poles).
+/// None when the sun does not set or rise that day.
+pub fn sun_event_utc(date: NaiveDate, lat: f64, lon: f64, sunset: bool) -> Option<DateTime<chrono::Utc>> {
+    let rad = std::f64::consts::PI / 180.0;
+    let noon = date.and_hms_opt(12, 0, 0)?.and_utc().timestamp() as f64;
+    let jdate = noon / 86400.0 + 2440587.5;
+    // jdate is already at noon, so the day number rounds (ceil gives tomorrow).
+    let n = (jdate - 2451545.0 + 0.0008).round();
+    let jstar = n - lon / 360.0;
+    let m = (357.5291 + 0.98560028 * jstar).rem_euclid(360.0);
+    let c = 1.9148 * (m * rad).sin() + 0.02 * (2.0 * m * rad).sin() + 0.0003 * (3.0 * m * rad).sin();
+    let l = (m + c + 180.0 + 102.9372).rem_euclid(360.0);
+    let jtransit = 2451545.0 + jstar + 0.0053 * (m * rad).sin() - 0.0069 * (2.0 * l * rad).sin();
+    let decl = ((l * rad).sin() * (23.4397 * rad).sin()).asin();
+    let cos_w = ((-0.833 * rad).sin() - (lat * rad).sin() * decl.sin()) / ((lat * rad).cos() * decl.cos());
+    if !(-1.0..=1.0).contains(&cos_w) {
+        return None;
+    }
+    let w = cos_w.acos() / rad;
+    let j = if sunset { jtransit + w / 360.0 } else { jtransit - w / 360.0 };
+    let unix = (j - 2440587.5) * 86400.0;
+    DateTime::from_timestamp(unix.round() as i64, 0)
 }
 
 /// How many times a day this expression fires (AMUX-3546).
@@ -431,6 +485,7 @@ pub fn fires_per_day(expr: &ScheduleExpr) -> Option<f64> {
         // monthly schedule as firing 1.4% more often than it does, which is
         // invisible and wrong rather than approximate and honest.
         ScheduleExpr::Monthly { .. } => Some(12.0 / 365.2425),
+        ScheduleExpr::Sun { weekday, .. } => Some(if weekday.is_some() { 1.0 / 7.0 } else { 1.0 }),
         // COUNTED, not derived from the field pattern. A cron expression's
         // firing rate is not readable from its shape without reimplementing
         // cron, and the `cron` crate already owns that: walk the next 24 hours
@@ -465,6 +520,11 @@ static RE_WEEKDAY_AT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^every\s+weekday\s+at\s+(.+)$").unwrap());
 static RE_EVERY_DAY_AT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^every\s+(\w+)\s+at\s+(.+)$").unwrap());
+static RE_SUN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:(?:daily|every\s+day)|(?:every|weekly\s+on)\s+(\w+))\s+at\s+(sunset|sundown|sunrise)\s*(?:([+-])\s*(\d+)\s*(m|min|mins|minutes?|h|hrs?|hours?)?)?$").unwrap()
+});
+static RE_SHABBOS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:(?:every\s+week|weekly)\s+)?after\s+(?:shabbos|shabbat|shabbes|sabbath|havdalah)$").unwrap());
 static RE_DAILY_AT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^daily\s+at\s+(.+)$").unwrap());
 static RE_WEEKLY_ON: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^weekly\s+on\s+(\w+)\s+at\s+(.+)$").unwrap());
@@ -606,6 +666,38 @@ impl ScheduleExpr {
             return Ok(ScheduleExpr::Interval { every });
         }
 
+        // Sun-based: "after shabbos", "daily at sunset", "every saturday at
+        // sunset+50m" (NetSuite worker, 2026-10-26: the scheduler could not say
+        // "after Shabbos", which moves with the season). Needs a location.
+        let shabbos = RE_SHABBOS.is_match(&s);
+        if shabbos || RE_SUN.is_match(&s) {
+            let Some((lat, lon)) = sun_location() else {
+                return Err(ExprParseError(format!(
+                    "{orig} (sunset depends on where you are: set AMUX_LATITUDE and AMUX_LONGITUDE in ~/.amux/server.env)"
+                )));
+            };
+            if shabbos {
+                return Ok(ScheduleExpr::Sun { weekday: Some(Weekday::Sat), sunset: true, offset_min: shabbat_end_offset_min(), lat, lon });
+            }
+            let c = RE_SUN.captures(&s).ok_or_else(fail)?;
+            let weekday = match c.get(1) {
+                Some(d) => Some(day_from_name(d.as_str()).ok_or_else(fail)?),
+                None => None,
+            };
+            let sunset = &c[2] != "sunrise";
+            let mut offset_min: i64 = c.get(4).map(|n| n.as_str().parse().unwrap_or(0)).unwrap_or(0);
+            if c.get(5).is_some_and(|u| u.as_str().starts_with('h')) {
+                offset_min *= 60;
+            }
+            if c.get(3).is_some_and(|sign| sign.as_str() == "-") {
+                offset_min = -offset_min;
+            }
+            if offset_min.abs() > 12 * 60 {
+                return Err(fail());
+            }
+            return Ok(ScheduleExpr::Sun { weekday, sunset, offset_min, lat, lon });
+        }
+
         // every morning / evening / night (Python aliases: 9am / 18:00)
         if let Some(c) = RE_EVERY_WORD.captures(&s) {
             let hour = if &c[1] == "morning" { 9 } else { 18 };
@@ -718,6 +810,24 @@ impl ScheduleExpr {
                 None
             }
             ScheduleExpr::Cron(sched) => sched.after(&after).next(),
+            ScheduleExpr::Sun { weekday, sunset, offset_min, lat, lon } => {
+                // From the day before: a negative offset can put a fire on
+                // the previous evening's wall-clock date.
+                let mut d = after.date_naive().pred_opt()?;
+                for _ in 0..=372 {
+                    if weekday.is_none_or(|w| d.weekday() == w) {
+                        if let Some(t) = sun_event_utc(d, *lat, *lon, *sunset) {
+                            let t = t.with_timezone(&Local) + ChronoDuration::minutes(*offset_min);
+                            let t = t.with_second(0).unwrap_or(t);
+                            if t > after {
+                                return Some(t);
+                            }
+                        }
+                    }
+                    d = d.succ_opt()?;
+                }
+                None
+            }
         }
     }
 }
@@ -906,8 +1016,10 @@ impl RetryPolicy {
 /// The seven fields whose changes are audited into `schedule_audit`
 /// (mirrors Python's `_AUDIT_FIELDS` exactly, so both servers' trails agree
 /// on what counts as an auditable mutation).
-pub const AUDIT_FIELDS: [&str; 7] = [
+pub const AUDIT_FIELDS: [&str; 9] = [
     "enabled",
+    "pass_check",
+    "when_check",
     "session",
     "command",
     "schedule_expr",
@@ -1114,7 +1226,7 @@ fn due_schedules(conn: &Connection, now_str: &str) -> rusqlite::Result<Vec<Durab
 /// is still written, and the only behavioural difference is that an unset
 /// defaulted column now gets its default instead of failing the insert.
 pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<()> {
-    const COLS: [&str; 34] = [
+    const COLS: [&str; 39] = [
         "id",
         "title",
         "session",
@@ -1150,6 +1262,13 @@ pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Resu
         "lock_reason",
         "locked_at",
         "disabled_reason",
+        // 0135 pass/fail (schedule_check.rs).
+        "pass_check",
+        "pass_state",
+        "pass_next_at",
+        // 0141 wake condition (schedule_wake.rs).
+        "when_check",
+        "when_once",
     ];
     let present: Vec<&str> = COLS
         .iter()
@@ -1169,7 +1288,7 @@ pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Resu
 
 /// Full-row UPDATE with Python's PATCH column list.
 pub fn update_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<usize> {
-    const COLS: [&str; 29] = [
+    const COLS: [&str; 32] = [
         "title",
         "session",
         "command",
@@ -1201,11 +1320,17 @@ pub fn update_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Resu
         "lock_reason",
         "locked_at",
         "disabled_reason",
+        // 0135. The sweep's state columns are written by schedule_check.rs.
+        "pass_check",
+        // 0141 wake condition. `when_once` is NOT NULL: a row built without
+        // it keeps its stored value (COALESCE below).
+        "when_check",
+        "when_once",
     ];
     let sets: Vec<String> = COLS
         .iter()
         .enumerate()
-        .map(|(i, c)| format!("{c}=?{}", i + 1))
+        .map(|(i, c)| if *c == "when_once" { format!("{c}=COALESCE(?{}, {c})", i + 1) } else { format!("{c}=?{}", i + 1) })
         .collect();
     let sql = format!(
         "UPDATE schedules SET {} WHERE id=?{}",
@@ -1533,7 +1658,7 @@ pub const SHELL_TIMEOUT_S: u64 = 600;
 /// bash: SCHED-783's `bash "$R" | tail -60` kept running after its 600s
 /// timeout (2026-10-22 04:00), finished at 04:15 and quarantined a file under
 /// a run already reported failed.
-fn shell_schedule_command(cmd: &str) -> tokio::process::Command {
+pub(crate) fn shell_schedule_command(cmd: &str) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("/bin/bash");
     // A check piped into tail must report the check's failure.
     command.args(["-o", "pipefail", "-c"]).arg(cmd).env_remove("TMUX").env_remove("TMUX_PANE");
@@ -2163,6 +2288,14 @@ impl LiveDeliverer {
             verdict = if code == 0 { "shell_run_output_recorded" } else { "shell_run_failed_output_recorded" },
             "shell schedule finished; exit code and filtered output tail stored on the run row (AMUX-5241)"
         );
+        // `wake`: the run's stdout is a message for the schedule's own lane
+        // (scripts/wake-watch.py prints one and exits 10 when a watched file or
+        // CI run fires). Delivered like a tmux schedule's command, so it reaches
+        // an isolated lane as that lane's own schedule and is refused for a
+        // paused, archived or unregistered one.
+        if act == "wake" {
+            return self.shell_wake(sched, code, &stdout, &vault_vals, output).await;
+        }
         if act == "alert" || (act.is_empty() && code != 0 && !actions.is_empty()) {
             let why = reason(400);
             // `why` already leads with "exit N"; keep the action tag beside it.
@@ -2207,6 +2340,133 @@ impl LiveDeliverer {
                 .filter(|s| !s.trim().is_empty()),
             output,
         }
+    }
+}
+
+impl LiveDeliverer {
+    /// Deliver a `wake` run's stdout to the schedule's own lane, retrying a
+    /// failed (not refused) delivery up to [`shell_wake_attempts`] times. This
+    /// is the only retry layer on the path: the script that printed the text
+    /// has already closed the watch, so it never re-sends.
+    async fn shell_wake(&self, sched: &DurableSchedule, code: i32, stdout: &str, vault: &[(String, String)], output: Option<ShellOutput>) -> RunOutcome {
+        let session = sched.str_field("session").trim().to_string();
+        let text = match shell_wake_text(&session, stdout, vault) {
+            Ok(t) => t,
+            Err(why) => {
+                tracing::warn!(schedule = %sched.id(), session = %session, exit_code = code, measured = true, n_considered = 1,
+                    verdict = "shell_wake_unsendable", why = %why, "wake exit action had nothing it could deliver");
+                return RunOutcome::ShellError { note: format!("exit {code} [wake] {why}"), output };
+            }
+        };
+        // `:wake`: each wake is a distinct message, never folded into the last (AF-1047).
+        let guard = format!("sched:{}{}", sched.id(), crate::api::session_verbs::WAKE_GUARD_SUFFIX);
+        let started = std::time::Instant::now();
+        let (d, attempts) = shell_wake_with_retry(shell_wake_attempts(), std::time::Duration::from_secs(shell_wake_backoff_s()), || {
+            crate::api::session_verbs::deliver_automated(&self.state, &session, &text, &guard)
+        })
+        .await;
+        let outcome = shell_wake_outcome(d);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let verdict = match &outcome {
+            RunOutcome::Delivered { .. } => "shell_wake_delivered",
+            RunOutcome::Queued { .. } => "shell_wake_queued",
+            RunOutcome::Refused { .. } => "shell_wake_refused",
+            _ => "shell_wake_failed",
+        };
+        if matches!(outcome, RunOutcome::Delivered { .. } | RunOutcome::Queued { .. }) {
+            tracing::info!(schedule = %sched.id(), session = %session, exit_code = code, attempts, elapsed_ms, chars = text.chars().count(),
+                status = outcome.status(), measured = true, n_considered = 1, verdict, "wake exit action delivered the run's output to its lane");
+        } else {
+            tracing::warn!(schedule = %sched.id(), session = %session, exit_code = code, attempts, elapsed_ms, status = outcome.status(),
+                measured = true, n_considered = 1, verdict, outcome = ?outcome, "wake exit action could not deliver the run's output to its lane");
+        }
+        if let RunOutcome::Delivered { .. } = &outcome {
+            let origin = schedule_message_origin(sched.str_field("title"), sched.id(), "wake");
+            crate::api::session_verbs::cmd_hist_record_schedule(&self.state, &session, &text, &origin).await;
+        }
+        outcome
+    }
+}
+
+/// Characters of a wake run's stdout delivered; the rest is cut with a marker.
+pub const SHELL_WAKE_MAX_CHARS: usize = 4000;
+
+/// Delivery attempts for one wake run (`AMUX_SHELL_WAKE_ATTEMPTS`, 1..=5, default 3).
+pub fn shell_wake_attempts() -> u32 {
+    std::env::var("AMUX_SHELL_WAKE_ATTEMPTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3u32).clamp(1, 5)
+}
+
+/// Seconds between wake delivery attempts (`AMUX_SHELL_WAKE_BACKOFF_S`, 0..=30, default 5).
+pub fn shell_wake_backoff_s() -> u64 {
+    std::env::var("AMUX_SHELL_WAKE_BACKOFF_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5u64).min(30)
+}
+
+/// The message a wake run delivers, or why there is none.
+///
+/// The text goes into a lane's prompt, so it is masked with the run's vault
+/// values (`[vault:KEY]`) HERE, at the delivery boundary, with the redactor the
+/// run log uses. `run_shell` already masks the stdout it returns; this does not
+/// rely on that, so a later change to how stdout is captured cannot put a vault
+/// value into a prompt.
+pub fn shell_wake_text(session: &str, stdout: &str, vault: &[(String, String)]) -> Result<String, String> {
+    if session.trim().is_empty() {
+        return Err("the schedule has no session to wake".into());
+    }
+    let masked = crate::api::vault_secrets::redact(stdout, vault);
+    let t = masked.trim();
+    if t.is_empty() {
+        return Err("the run printed nothing to deliver".into());
+    }
+    if t.chars().count() <= SHELL_WAKE_MAX_CHARS {
+        return Ok(t.to_string());
+    }
+    let cut: String = t.chars().take(SHELL_WAKE_MAX_CHARS).collect();
+    Ok(format!("{cut}\n[cut at {SHELL_WAKE_MAX_CHARS} chars; the full output is in this schedule's Shell tab]"))
+}
+
+/// Is this delivery a failure worth another attempt? A refusal is a policy
+/// answer (paused, archived, unregistered) and a queued one is pending, so
+/// neither is retried.
+pub(crate) fn shell_wake_retryable(d: &crate::api::session_verbs::AutoDelivery) -> bool {
+    !d.refused && d.queue_id.is_none() && d.submitted == Some(false)
+}
+
+/// Run `attempt` until it is not retryable or `max` attempts are spent.
+/// Returns the last delivery and how many attempts were made.
+pub(crate) async fn shell_wake_with_retry<F, Fut>(
+    max: u32,
+    backoff: std::time::Duration,
+    mut attempt: F,
+) -> (crate::api::session_verbs::AutoDelivery, u32)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = crate::api::session_verbs::AutoDelivery>,
+{
+    let max = max.max(1);
+    let mut n = 0;
+    loop {
+        n += 1;
+        let d = attempt().await;
+        if !shell_wake_retryable(&d) || n >= max {
+            return (d, n);
+        }
+        tracing::warn!(attempt = n, max, measured = true, n_considered = 1, verdict = "shell_wake_retry",
+            message = %d.message, "wake delivery failed; retrying");
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+/// The run outcome for a wake delivery, mapped exactly as a tmux fire maps it.
+pub(crate) fn shell_wake_outcome(d: crate::api::session_verbs::AutoDelivery) -> RunOutcome {
+    if d.refused {
+        return RunOutcome::Refused { reason: format!("[wake] {}", d.message) };
+    }
+    if let Some(queue_id) = d.queue_id {
+        return RunOutcome::Queued { queue_id, detail: format!("[wake] {}", d.message) };
+    }
+    match d.submitted {
+        Some(false) => RunOutcome::Failed { reason: format!("[wake] {}", d.message) },
+        _ => RunOutcome::Delivered { submission: d.submission.to_string(), detail: format!("[wake] {}", d.message) },
     }
 }
 
@@ -2905,10 +3165,31 @@ async fn fire_one(
     };
 
     // ---- DELIVER (outside the write lock) ----
+    // WAKE CONDITION (`when`, schedule_wake.rs): a tmux schedule's shell check
+    // runs once per scheduled fire, before any delivery or gate. A failing
+    // check skips the fire; it is not a delivery attempt, so it spends no
+    // max_runs and wakes nobody. Run now never reaches here, so it skips it.
+    let when_check = super::schedule_wake::when_check_of(&claim.sched);
+    let when_skip: Option<String> = match &when_check {
+        Some(c) => super::schedule_wake::when_gate(&claim.sched, c).await.err(),
+        None => None,
+    };
     let mut outcomes: Vec<RunOutcome> = Vec::with_capacity(claim.notes.len());
     for _ in 0..claim.notes.len() {
-        outcomes.push(deliverer.deliver(&claim.sched, "cron-rs").await);
+        outcomes.push(match &when_skip {
+            Some(reason) => RunOutcome::Refused { reason: reason.clone() },
+            None => deliverer.deliver(&claim.sched, "cron-rs").await,
+        });
     }
+    let when_skipped_all = when_skip.is_some();
+    // The check passed and the prompt is delivered or pending: a `when_once`
+    // schedule has done its job.
+    let when_met_once = when_check.is_some()
+        && !when_skipped_all
+        && claim.sched.i64_field("when_once", 1) != 0
+        && outcomes.iter().any(|o| matches!(o, RunOutcome::Delivered { .. } | RunOutcome::Queued { .. }));
+    let bounds_before = super::schedule_lifecycle::Bounds::of(&claim.sched);
+    let is_once_row = claim.sched.str_field("sched_type") == "once";
 
     // ---- RECORD what actually happened ----
     let sid = claim.sched.id().to_string();
@@ -2981,6 +3262,47 @@ async fn fire_one(
                     rusqlite::params![occurrences_n, sid],
                 )?;
             }
+            // A fire skipped by its wake condition is not a fire: its run rows
+            // read `skipped` (not counted as failures), it gives its max_runs
+            // count back, and a recurring row the claim ended only because
+            // that count reached max_runs is re-armed. Only cron_runs and the
+            // bound end are touched: the reserve retry logic does not apply.
+            if when_skipped_all {
+                for id in &run_ids {
+                    conn.execute(
+                        "UPDATE schedule_runs SET status='skipped', delivery='skipped' WHERE id=?1",
+                        [id],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE schedules SET cron_runs = MAX(0, COALESCE(cron_runs,0) - ?1) WHERE id=?2",
+                    rusqlite::params![occurrences_n, sid],
+                )?;
+                if ended_by_claim && !is_once_row {
+                    let next: String = conn
+                        .query_row("SELECT COALESCE(next_run,'') FROM schedules WHERE id=?1", [&sid], |r| r.get(0))
+                        .unwrap_or_default();
+                    if bounds_before.end_reason(Some(&next)).is_none() {
+                        let changed = conn.execute(
+                            "UPDATE schedules SET enabled=1, disabled_reason=NULL WHERE id=?1 AND enabled=0 AND deleted IS NULL AND version=?2 AND command=?3 AND session=?4",
+                            rusqlite::params![sid, expected_version, expected_command, expected_session])?;
+                        if changed > 0 {
+                            insert_audit(conn, &sid, "enabled", "0", "1", "wake-condition-rs", "")?;
+                        }
+                    }
+                }
+            }
+            if when_met_once {
+                let changed = conn.execute(
+                    "UPDATE schedules SET enabled=0, updated=?1, disabled_reason=?2 WHERE id=?3 AND enabled=1",
+                    rusqlite::params![now_ts, format!("wake condition met: delivered at {}", fmt_minute(Local::now())), sid],
+                )?;
+                if changed > 0 {
+                    insert_audit(conn, &sid, "enabled", "1", "0", "wake-condition-rs", "")?;
+                }
+                tracing::info!(schedule = %sid, verdict = "schedule_when_disabled", measured = true, n_considered = 1,
+                    "wake condition met and the prompt delivered; when_once schedule disabled");
+            }
             let retry_at = fmt_minute(retry_target);
             let mut retried = false;
             if retry_once {
@@ -3026,9 +3348,10 @@ async fn fire_one(
             // schedule object itself — not the run history — can see a
             // refusal/failure without last_run masquerading as health.
             if let Some(last_outcome) = outcomes.last() {
+                let status = if when_skipped_all { "skipped" } else { last_outcome.status() };
                 conn.execute(
                     "UPDATE schedules SET last_delivery=?1, last_refusal_reason=?2 WHERE id=?3",
-                    rusqlite::params![last_outcome.status(), last_outcome.refusal_reason(), sid],
+                    rusqlite::params![status, last_outcome.refusal_reason(), sid],
                 )?;
             }
             Ok(WriteOutcome {
@@ -3039,6 +3362,12 @@ async fn fire_one(
         .await?;
     // An empty outcome set still warns — nothing was delivered because nothing
     // was attempted, which is the same silence from a reader's side.
+    // A wake-condition skip is a deliberate no-op: no "nothing was delivered"
+    // warning (it would fire every check interval), no failure notice and no
+    // pass-check scheduling. `schedule_when_skipped` already logged it.
+    if when_skipped_all {
+        return Ok(true);
+    }
     if all_lost {
         // Loud, because it is the AMUX-2647 shape: the schedule fired and the
         // command did not reach anyone. It is on the run row too, but a fleet
@@ -3166,6 +3495,11 @@ pub async fn run_scheduler(
                     tokio::time::sleep(retry.delay(attempt)).await;
                 }
             }
+        }
+        // Pass/fail schedules: check the due ones, re-fire the failing ones
+        // (schedule_check.rs). Firing mode only: a re-fire is a fire.
+        if enabled {
+            super::schedule_check::spawn_sweep(store.clone(), deliverer.clone());
         }
     }
 }
@@ -3415,6 +3749,102 @@ mod tests {
         assert_eq!(ok.calls(), 2, "a spent max_runs ends the row at claim instead of firing");
     }
 
+    fn run_statuses(store: &SharedStore, id: &str) -> Vec<String> {
+        let conn = store.read().unwrap();
+        let mut st = conn.prepare("SELECT status FROM schedule_runs WHERE schedule_id=?1 ORDER BY id").unwrap();
+        st.query_map([id], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect()
+    }
+
+    /// `when` (0141): a failing wake condition skips the fire. Nothing is
+    /// delivered, the run reads `skipped` (not a failure), and the fire gives
+    /// its max_runs count back, so a max_runs 1 row the claim ended is re-armed.
+    #[tokio::test]
+    async fn a_failing_wake_condition_skips_the_fire_and_spends_no_run() {
+        let (store, _dir) = store();
+        let now = Local::now();
+        let due = fmt_minute(now - ChronoDuration::minutes(1));
+        let mut row = make_row("WHEN", "lane", Some("every 2m"), &due);
+        row.set("max_runs", Value::from(1));
+        row.set("when_check", Value::from("echo not yet; exit 3"));
+        put_row(&store, row);
+        let ok = StubDeliverer::confirmed();
+        for _ in 0..2 {
+            exec(&store, format!("UPDATE schedules SET next_run='{due}' WHERE id='WHEN'"));
+            assert!(fire_one(&store, &ok, "WHEN", now, MissedRunPolicy::Skip).await.unwrap());
+        }
+        assert_eq!(ok.calls(), 0, "a failing check delivers nothing");
+        let (en, runs, why, _) = lifecycle_cols(&store, "WHEN");
+        assert!(en, "max_runs 1 is not spent by a skipped fire: {why}");
+        assert_eq!(runs, 0);
+        assert_eq!(run_statuses(&store, "WHEN"), vec!["skipped", "skipped"]);
+        let s = get_schedule(&store.read().unwrap(), "WHEN").unwrap().unwrap();
+        assert_eq!(s.str_field("last_delivery"), "skipped");
+        let reason = s.str_field("last_refusal_reason").to_string();
+        assert!(reason.starts_with(super::super::schedule_wake::WHEN_PREFIX) && reason.contains("exited 3"), "{reason}");
+        let streak = s.i64_field("failure_streak", 0);
+        assert_eq!(streak, 0, "a skip is not a failure");
+
+        // The condition comes true: one delivery, then the row ends.
+        exec(&store, format!("UPDATE schedules SET next_run='{due}', when_check='true' WHERE id='WHEN'"));
+        assert!(fire_one(&store, &ok, "WHEN", now, MissedRunPolicy::Skip).await.unwrap());
+        assert_eq!(ok.calls(), 1);
+        let (en, runs, why, _) = lifecycle_cols(&store, "WHEN");
+        assert!(!en && runs == 1, "delivered once: enabled={en} cron_runs={runs}");
+        assert!(why.starts_with("wake condition met: delivered at") || why.contains("max_runs"), "{why}");
+        assert_eq!(run_statuses(&store, "WHEN").last().map(String::as_str), Some("delivered"));
+    }
+
+    #[tokio::test]
+    async fn a_passing_wake_condition_delivers_once_and_disables_the_row() {
+        let (store, _dir) = store();
+        let now = Local::now();
+        let due = fmt_minute(now - ChronoDuration::minutes(1));
+        let mut row = make_row("MET", "lane", Some("every 2m"), &due);
+        row.set("when_check", Value::from("test \"$AMUX_SESSION\" = lane"));
+        put_row(&store, row);
+        let ok = StubDeliverer::confirmed();
+        assert!(fire_one(&store, &ok, "MET", now, MissedRunPolicy::Skip).await.unwrap());
+        assert_eq!(ok.calls(), 1, "the check ran as the owner and passed");
+        let (en, _, why, _) = lifecycle_cols(&store, "MET");
+        assert!(!en, "when_once (the default) disables after the delivery");
+        assert!(why.starts_with("wake condition met: delivered at"), "{why}");
+        let audit: i64 = store.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM schedule_audit WHERE schedule_id='MET' AND source='wake-condition-rs' AND field='enabled'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(audit, 1);
+        // Re-armed by hand, it does not fire again: it is disabled.
+        assert!(!fire_one(&store, &ok, "MET", now, MissedRunPolicy::Skip).await.unwrap());
+
+        // when_once off: it keeps firing while the check passes.
+        let mut keep = make_row("KEEP", "lane", Some("every 2m"), &due);
+        keep.set("when_check", Value::from("true"));
+        keep.set("when_once", Value::from(0));
+        put_row(&store, keep);
+        assert!(fire_one(&store, &ok, "KEEP", now, MissedRunPolicy::Skip).await.unwrap());
+        assert!(lifecycle_cols(&store, "KEEP").0, "when_once=0 stays enabled");
+
+        // A check that passes but whose delivery is refused does not end it.
+        let mut held = make_row("HELD", "lane", Some("every 2m"), &due);
+        held.set("when_check", Value::from("true"));
+        put_row(&store, held);
+        let refused = StubDeliverer::new(reserve_refusal());
+        fire_one(&store, &refused, "HELD", now, MissedRunPolicy::Skip).await.unwrap();
+        assert_eq!(refused.calls(), 1);
+        assert!(lifecycle_cols(&store, "HELD").0, "nothing was delivered, so the wake is still pending");
+    }
+
+    #[test]
+    fn a_shell_schedule_has_no_wake_condition() {
+        let mut row = make_row("SH", "lane", Some("every 2m"), "2026-01-01T00:00");
+        row.set("when_check", Value::from("true"));
+        assert_eq!(super::super::schedule_wake::when_check_of(&row).as_deref(), Some("true"));
+        row.set("kind", Value::from("shell"));
+        assert_eq!(super::super::schedule_wake::when_check_of(&row), None);
+        row.set("kind", Value::from("tmux"));
+        row.set("when_check", Value::from("  "));
+        assert_eq!(super::super::schedule_wake::when_check_of(&row), None);
+    }
+
     #[tokio::test]
     async fn until_ends_the_schedule_after_its_last_allowed_fire() {
         let (store, _dir) = store();
@@ -3654,6 +4084,103 @@ mod tests {
             assert_eq!(matches!(out, RunOutcome::ShellOk { .. }), success, "{out:?}");
             if !success { assert!(matches!(out, RunOutcome::ShellError { .. }), "{out:?}"); }
         }
+    }
+    fn wake_delivery(refused: bool, submitted: Option<bool>, queue_id: Option<&str>) -> crate::api::session_verbs::AutoDelivery {
+        crate::api::session_verbs::AutoDelivery {
+            message: format!("refused={refused} submitted={submitted:?}"),
+            submitted,
+            submission: "test",
+            queue_id: queue_id.map(String::from),
+            refused,
+        }
+    }
+
+    /// wake-watch: a failed delivery is retried, a success stops the loop, and
+    /// the attempts are bounded. A refusal is final on the first attempt.
+    #[tokio::test]
+    async fn shell_wake_retries_a_failed_delivery_and_stops_at_the_bound() {
+        let zero = std::time::Duration::ZERO;
+        // Fails twice, then lands: three attempts, delivered.
+        let mut calls = 0;
+        let (d, n) = shell_wake_with_retry(3, zero, || {
+            calls += 1;
+            let ok = calls >= 3;
+            async move { wake_delivery(false, Some(ok), None) }
+        })
+        .await;
+        assert_eq!((n, calls), (3, 3));
+        assert!(matches!(shell_wake_outcome(d), RunOutcome::Delivered { .. }));
+        // Never lands: stops at the bound and is recorded as a failure.
+        let mut calls = 0;
+        let (d, n) = shell_wake_with_retry(3, zero, || {
+            calls += 1;
+            async { wake_delivery(false, Some(false), None) }
+        })
+        .await;
+        assert_eq!((n, calls), (3, 3), "bounded at max attempts");
+        assert_eq!(shell_wake_outcome(d).status(), "error");
+        // A refusal is a policy answer: one attempt, recorded refused.
+        let mut calls = 0;
+        let (d, n) = shell_wake_with_retry(3, zero, || {
+            calls += 1;
+            async { wake_delivery(true, Some(false), None) }
+        })
+        .await;
+        assert_eq!((n, calls), (1, 1));
+        assert_eq!(shell_wake_outcome(d).status(), "refused");
+        // Queued is pending, not failed: no retry.
+        let (d, n) = shell_wake_with_retry(3, zero, || async { wake_delivery(false, None, Some("Q-1")) }).await;
+        assert_eq!(n, 1);
+        assert_eq!(shell_wake_outcome(d).queue_id(), Some("Q-1"));
+    }
+
+    #[test]
+    fn shell_wake_text_refuses_empty_output_and_caps_long_output() {
+        assert!(shell_wake_text("", "hello", &[]).is_err());
+        assert!(shell_wake_text("lane", "  \n ", &[]).is_err());
+        assert_eq!(shell_wake_text("lane", " hi\n", &[]).unwrap(), "hi");
+        let long = "x".repeat(SHELL_WAKE_MAX_CHARS + 10);
+        let t = shell_wake_text("lane", &long, &[]).unwrap();
+        assert!(t.starts_with(&"x".repeat(SHELL_WAKE_MAX_CHARS)) && t.contains("[cut at"), "{t}");
+    }
+
+    /// A wake delivers into a lane's prompt, so a vault value the run printed
+    /// arrives masked as `[vault:KEY]`, never as the value.
+    #[test]
+    fn shell_wake_text_masks_vault_values_before_delivery() {
+        let vault = vec![("GH_PAT".to_string(), "ghp_s3cretVALUE123".to_string())];
+        let t = shell_wake_text("lane", "wake-watch: fired, token=ghp_s3cretVALUE123 done\n", &vault).unwrap();
+        assert!(!t.contains("ghp_s3cretVALUE123"), "vault value reached the delivered text: {t}");
+        assert_eq!(t, "wake-watch: fired, token=[vault:GH_PAT] done");
+    }
+
+    /// The exit action is honoured on the shipped path: exit 10 mapped to
+    /// `wake` goes to delivery (refused here: the lane is not registered, and
+    /// a paused lane is refused too), never to a plain shell ok/error.
+    #[tokio::test]
+    async fn a_wake_exit_action_delivers_instead_of_recording_shell_output() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let (store, _dir) = store();
+        let state = crate::api::AppState { store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let live = LiveDeliverer::new(state);
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/paused-lane.env"), "CC_PAUSED=1\n").unwrap();
+        for lane in ["ghost-lane", "paused-lane"] {
+            let mut row = make_row("WAKE", lane, None, "2020-01-01T00:00");
+            row.raw.insert("kind".into(), Value::from("shell"));
+            row.raw.insert("command".into(), Value::from("echo 'wake-watch: W-1 fired'; exit 10"));
+            row.raw.insert("exit_actions".into(), Value::from(r#"{"10":"wake"}"#));
+            let out = live.run_shell(&row).await;
+            assert!(matches!(out, RunOutcome::Refused { .. }), "{lane}: {out:?}");
+        }
+        // Empty output has nothing to deliver: an error, not a silent ok.
+        let mut row = make_row("WAKE", "ghost-lane", None, "2020-01-01T00:00");
+        row.raw.insert("kind".into(), Value::from("shell"));
+        row.raw.insert("command".into(), Value::from("exit 10"));
+        row.raw.insert("exit_actions".into(), Value::from(r#"{"10":"wake"}"#));
+        assert!(matches!(live.run_shell(&row).await, RunOutcome::ShellError { .. }));
     }
     /// AMUX-3546: a cadence has a number, and it is the number nobody saw.
     ///
@@ -5900,5 +6427,62 @@ mod shell_in_flight_tests {
             "a run older than the cap no longer holds adoption");
         drop(g);
         assert!(!shell_runs_in_flight(hour).contains(&"SCHED-test-inflight".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod sun_schedule_tests {
+    use super::*;
+
+    fn near(t: DateTime<chrono::Utc>, want: &str, tol_min: i64) -> bool {
+        let w = DateTime::parse_from_rfc3339(want).unwrap().with_timezone(&chrono::Utc);
+        (t - w).num_minutes().abs() <= tol_min
+    }
+
+    /// New York's published sunsets: 20:31 EDT on the June solstice, 16:32
+    /// EST on the December one; sunrise 05:25 EDT in June.
+    #[test]
+    fn sunset_and_sunrise_match_published_times() {
+        let (lat, lon) = (40.7128, -74.0060);
+        let jun = NaiveDate::from_ymd_opt(2026, 6, 21).unwrap();
+        let dec = NaiveDate::from_ymd_opt(2026, 12, 21).unwrap();
+        assert!(near(sun_event_utc(jun, lat, lon, true).unwrap(), "2026-06-22T00:31:00Z", 3));
+        assert!(near(sun_event_utc(dec, lat, lon, true).unwrap(), "2026-12-21T21:32:00Z", 3));
+        assert!(near(sun_event_utc(jun, lat, lon, false).unwrap(), "2026-06-21T09:25:00Z", 3));
+        // No sunset at the pole in June.
+        assert!(sun_event_utc(jun, 89.0, 0.0, true).is_none());
+    }
+
+    #[test]
+    fn after_shabbos_is_saturday_night_and_the_forms_parse() {
+        // SAFETY: only this test reads these variables.
+        unsafe {
+            std::env::set_var("AMUX_LATITUDE", "40.7128");
+            std::env::set_var("AMUX_LONGITUDE", "-74.0060");
+        }
+        let e = ScheduleExpr::parse("after Shabbos").unwrap();
+        let ScheduleExpr::Sun { weekday, sunset, offset_min, .. } = e.clone() else { panic!("{e:?}") };
+        assert_eq!((weekday, sunset, offset_min), (Some(Weekday::Sat), true, shabbat_end_offset_min()));
+        let from = Local.from_local_datetime(&NaiveDate::from_ymd_opt(2026, 10, 26).unwrap().and_hms_opt(9, 0, 0).unwrap()).unwrap();
+        let next = e.next_run_after(from).unwrap();
+        assert_eq!(next.weekday(), Weekday::Sat);
+        assert!(next.with_timezone(&chrono_tz_ny()).hour() >= 18, "Saturday night: {next}");
+        for ok in ["daily at sunset", "every saturday at sunset+50m", "weekly on friday at sunset-18m", "every day at sunrise", "every sunday at sundown + 1h"] {
+            assert!(matches!(ScheduleExpr::parse(ok), Ok(ScheduleExpr::Sun { .. })), "{ok}");
+        }
+        let ScheduleExpr::Sun { offset_min, .. } = ScheduleExpr::parse("weekly on friday at sunset-18m").unwrap() else { unreachable!() };
+        assert_eq!(offset_min, -18);
+        assert!(ScheduleExpr::parse("daily at sunset+13h").is_err());
+        assert_eq!(fires_per_day(&ScheduleExpr::parse("after shabbat").unwrap()), Some(1.0 / 7.0));
+        unsafe {
+            std::env::remove_var("AMUX_LATITUDE");
+            std::env::remove_var("AMUX_LONGITUDE");
+        }
+        let e = ScheduleExpr::parse("after shabbos").unwrap_err();
+        assert!(e.0.contains("AMUX_LATITUDE"), "the refusal says what to set: {e}");
+    }
+
+    fn chrono_tz_ny() -> chrono::FixedOffset {
+        chrono::FixedOffset::west_opt(4 * 3600).unwrap()
     }
 }

@@ -632,6 +632,17 @@ test('settings_theme_toggle', async ({ page }, testInfo) => {
     type: 'storage',
     description: 'localStorage amux_theme (device-scoped by design)',
   });
+  // This tests THIS device's toggle. A fresh page also adopts the server's
+  // ui_theme, which themes.spec sets server-wide (Atom One Light) while one of
+  // its tests runs in a parallel worker on this same e2e server, so this page
+  // booted light (CI 40433057712, mobile). Keep the other spec's theme out.
+  await page.route(/\/api\/prefs$/, async (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
+    const res = await route.fetch();
+    const prefs = await res.json();
+    delete prefs.ui_theme;
+    await route.fulfill({ response: res, json: prefs });
+  });
   await settle(page);
   await openSettings(page);
 

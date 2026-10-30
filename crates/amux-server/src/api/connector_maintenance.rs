@@ -97,6 +97,23 @@ pub(super) async fn pass(ctx: &ConnectorsCtx) -> Value {
     for provider in REGISTRY {
         if let Auth::ApiKey { key_env } = provider.auth {
             if let Some(key) = env_val(&file_env, key_env) {
+                // No test endpoint (dev.to reads its key from an api-key header the
+                // bearer canary cannot send): a GET of the empty URL failed as a
+                // transport error and was recorded as "provider unreachable", so the
+                // list showed a working key as an error after every pass. The Test
+                // button answers "untested" for these; upkeep says the same and
+                // records that it tried nothing. The record replaces a failure an
+                // older pass stored, which nothing else would clear until someone
+                // pressed Test; the list and the dashboard read untested as no
+                // failure (status_after_test, _connTestFailed).
+                if provider.test_url.is_empty() && provider.id != "telegram" {
+                    tracing::info!(connector = %provider.id, measured = false, n_considered = 1,
+                        verdict = "connector_maintenance_untested", "connector has no test endpoint; upkeep did not probe it");
+                    let check = json!({"connector":provider.id,"ok":false,"status":"untested","measured":false});
+                    record_test(&ctx.home, provider.id, &check);
+                    keys.push(check);
+                    continue;
+                }
                 let url = if provider.id == "telegram" {
                     format!("https://api.telegram.org/bot{key}/getMe")
                 } else {
@@ -149,7 +166,7 @@ pub(super) async fn pass(ctx: &ConnectorsCtx) -> Value {
             )
         })
         .count()
-        + keys.iter().filter(|k| k["ok"] == false).count()
+        + keys.iter().filter(|k| k["ok"] == false && k["status"] != "untested").count()
         + accounts
             .iter()
             .flat_map(|a| a["canary"].as_object().into_iter().flat_map(|c| c.values()))

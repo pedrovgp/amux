@@ -140,8 +140,11 @@ done
 # alone can't distinguish "guard refused" from "transport failed downstream" --
 # the warning text is the assertion: it must say "could not confirm ...
 # reachable" (unknown, fail-open), never claim the session IS isolated.
+# AMUX_CURL_RESTART_WAIT=0: the CLI otherwise waits up to 30s for a server
+# that refuses connections (ffa508743, riding out a restart), which outlasts
+# the 5s timeout here. This case is about an unknown lookup, not a restart.
 DEAD_PORT=1
-OUT=$(timeout 5 env -u AMUX_WORKER CC_HOME="$CLI_HOME" AMUX_API="http://127.0.0.1:$DEAD_PORT" AMUX_SESSION=guard-test \
+OUT=$(timeout 5 env -u AMUX_WORKER CC_HOME="$CLI_HOME" AMUX_API="http://127.0.0.1:$DEAD_PORT" AMUX_SESSION=guard-test AMUX_CURL_RESTART_WAIT=0 \
     bash "$AMUX_BIN" board reviewer TEST-1 some-unreachable-session 2>&1) && RC=0 || RC=$?
 if [[ "$OUT" == *"could not confirm"*"reachable"*"proceeding anyway"* ]] && [[ "$OUT" != *"is isolated"* ]]; then
   ok "reviewer: a lookup failure warns as unknown and still attempts the write, never fabricates 'isolated'"

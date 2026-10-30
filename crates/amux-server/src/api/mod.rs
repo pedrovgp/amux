@@ -8,11 +8,17 @@ pub mod agent_limit_resume;
 pub mod alerts;
 pub mod aliases;
 pub mod auth;
+pub mod avatars;
+pub mod whereabouts;
 pub mod board;
 pub mod boundaries;
+pub mod bridge;
 pub mod contract;
+pub mod deep_links;
 pub mod scratchpad;
+pub(crate) mod send_profile;
 pub mod prompt_block;
+pub mod land_approvals;
 pub mod land_queue;
 pub mod worker_identity;
 pub mod contract_fresh;
@@ -26,7 +32,9 @@ pub mod branding;
 pub mod brex;
 pub mod browser;
 pub mod browser_import;
+pub mod audit;
 pub mod browser_routing;
+pub mod cdp_proxy;
 pub mod browser_scope;
 pub mod calendar;
 pub mod channels;
@@ -77,6 +85,9 @@ pub mod journal;
 pub mod launch_context;
 pub mod layout_presets;
 pub mod social;
+pub mod social_browser;
+pub mod social_devto;
+pub mod social_publish;
 pub mod log_search;
 pub mod lookup;
 pub mod location;
@@ -105,11 +116,13 @@ pub mod pinned;
 pub mod planning;
 pub mod policy;
 pub mod prefs;
-pub mod projects;
 pub mod py_proxy;
 pub mod reclaim;
 pub(crate) mod reclaim_owner;
+pub mod tiering;
 pub mod reconciliation;
+pub mod recording_live;
+pub mod recording_sessions;
 pub mod recordings;
 pub(crate) mod transcription;
 pub mod reports;
@@ -142,6 +155,7 @@ pub mod conversations;
 pub mod converse;
 pub mod static_files;
 pub mod stats;
+pub mod velocity;
 pub mod sync;
 pub mod telegram;
 pub mod tailnet_join;
@@ -231,6 +245,7 @@ pub fn router_with_connector_transport(
         .route("/api/task-history", axum::routing::get(sessions_legacy::task_list))
         .route("/api/task-history/at", axum::routing::get(sessions_legacy::task_at_batch))
         .route("/api/task-history/links", axum::routing::get(sessions_legacy::task_links))
+        .route("/api/task-history/requests", axum::routing::get(sessions_legacy::owner_requests))
         .route("/api/scratchpad/config", axum::routing::get(scratchpad::get_config).put(scratchpad::put_config))
         .nest("/api/memories", memories::routes())
         .nest("/api/traces", traces::routes())
@@ -250,6 +265,8 @@ pub fn router_with_connector_transport(
         // turn ledger). The CLI verb is a printer over this; the correlation
         // lives here so there is one place to be wrong.
         .nest("/api/why", why::routes())
+        // One worker's browser, tool and API actions, newest first (audit.rs).
+        .nest("/api/audit", audit::routes())
         .nest("/api/verify", verify::routes())
         .nest(
             "/api/harness",
@@ -263,7 +280,9 @@ pub fn router_with_connector_transport(
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
         .nest("/api/reclaim", reclaim::routes())
+        .nest("/api/tiering", tiering::routes())
         .nest("/api/usage", usage::routes())
+        .nest("/api/velocity", velocity::routes())
         .nest("/api/review", review::routes())
         .nest("/api/channels", channels::routes())
         .nest("/api/alert", alerts::routes())
@@ -365,7 +384,6 @@ pub fn router_with_connector_transport(
         // CC_TAGS env files, config from the shared group_config table
         // (api/groups.rs). Both spellings, matching python's alias.
         .nest("/api/groups", groups::routes())
-        .nest("/api/projects", projects::routes())
         .nest("/api/tags", groups::tags_routes())
         .nest("/api/journal", journal::routes())
         // CRM: a PORT of the python contract, not a new feature — the schema and
@@ -392,9 +410,15 @@ pub fn router_with_connector_transport(
         .merge(needs_input::routes())
         .merge(needs_input_auto::routes())
         .merge(contract::routes())
+        .merge(land_approvals::routes())
+        .merge(bridge::routes())
         .merge(land_queue::routes())
         .merge(vault::routes())
         .merge(vault_secrets::routes())
+        // People's pictures beside their names (avatars.rs).
+        .merge(avatars::routes())
+        // What each person has open right now, behind every avatar (whereabouts.rs).
+        .merge(whereabouts::routes())
         .merge(chatgpt_app::routes())
         .merge(chat_delegate::routes())
         .merge(self_update::routes())
@@ -596,6 +620,14 @@ pub fn router_with_connector_transport(
             "/api/page-links/{id}/open",
             axum::routing::post(static_files::apps_origin::open),
         )
+        // An HTML file from the Files tab, opened as its folder's website on
+        // the apps origin.
+        .route(
+            "/api/page-links/site-view",
+            axum::routing::post(static_files::apps_origin::site_view),
+        )
+        // The address copied links are built on (deep_links.rs).
+        .merge(deep_links::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             policy::enforce,
@@ -631,6 +663,7 @@ pub fn router_with_connector_transport(
         // until now. Public like its debug siblings (lane names and timings).
         .route("/api/debug/scan", axum::routing::get(health::debug_scan))
         .route("/api/debug/sse", axum::routing::get(debug_sse))
+        .route("/api/debug/send-profile", axum::routing::get(send_profile::debug_send_profile))
         .route(
             "/api/debug/downtime",
             axum::routing::get(health::debug_downtime),
@@ -698,6 +731,9 @@ pub fn router_with_connector_transport(
         // a revocable member cookie; the outer identity layer below resolves
         // it before auth and request logging.
         .merge(org::public_routes())
+        // Copied file links (/f/<path>) and the file that lets the iOS app
+        // claim them; neither reveals anything (deep_links.rs).
+        .merge(deep_links::public_routes())
         // The ChatGPT app (AMUX-5396): /mcp and its OAuth server. Outside
         // require_bearer on purpose; each route authenticates for itself and
         // the loopback bypass earns nothing here (chatgpt_app.rs, trust rule).
@@ -1059,6 +1095,43 @@ async fn debug_sse(
 
 static CLIENT_DEBUG_RING: std::sync::Mutex<Vec<serde_json::Value>> =
     std::sync::Mutex::new(Vec::new());
+
+/// UI-STUCK SIGNALS (owner, 2026-10-29: "make sure we have verbose logging,
+/// profiling, monitoring etc. in amux so we can automatically identify these
+/// bugs and fix them via a sweep"). The verdicts a client sends when a control
+/// or a view stayed stuck: a button held disabled, a request whose receipt
+/// never settled, a microphone nobody answered. Counted per verdict for the
+/// life of this process, outside the 500-entry ring that routine beacons
+/// churn through in minutes, logged at WARN so /api/logs/analyze groups them,
+/// and read by the invariant `ui.controls_do_not_stick`.
+pub(crate) const UI_STUCK_VERDICTS: &[&str] = &[
+    "composer_send_stuck", "press_busy_released_unsettled", "interaction_ack_timeout",
+    "interaction_ack_failed", "interaction_ack_slow", "mic_permission_slow",
+    "outbox_replay_lock_stalled", "attachment-save-stalled", "history_failed", "task_toggle_unmatched",
+    "outbox_flight_stalled", "message_queue_stalled_sent_direct", "outbox_upload_list_timeout",
+];
+type StuckTally = crate::invariants::checks::StuckRows;
+static UI_STUCK: std::sync::Mutex<StuckTally> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Every stuck-UI verdict seen since this process started, or None when the
+/// tally could not be read (so the invariant says unmeasured, not clear).
+pub(crate) fn ui_stuck_snapshot() -> Option<StuckTally> {
+    UI_STUCK.lock().ok().map(|t| t.clone())
+}
+/// Whether a stuck-UI beacon counts toward `ui.controls_do_not_stick`.
+///
+/// A HIDDEN TAB IS NOT A STUCK CONTROL (AF-1031). The invariant's claim is
+/// that no client reports a control or view that stayed stuck; in a tab
+/// nobody is looking at there is no control to see, and WebKit throttles a
+/// hidden tab's IndexedDB and timers, so its outbox reads time out on their
+/// own (about 650 of 2,500 outbox reports on 2026-10-29 carried hidden=1).
+/// One such report from a background tab failed the fleet invariant and
+/// filed a card. The tab retries when it is shown, and a stall that a person
+/// can see arrives with hidden=0. Still logged, at INFO, with the reason.
+pub(crate) fn counts_as_stuck(body: &serde_json::Value) -> bool {
+    !matches!(body.get("hidden"), Some(v) if v.as_i64() == Some(1) || v.as_bool() == Some(true))
+}
+
 const CLIENT_DEBUG_RING_MAX: usize = 500;
 
 /// The client beacons of one `kind` still in the ring, oldest first, or None
@@ -1107,6 +1180,23 @@ async fn client_debug_post(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // A stuck control or view: counted and said at WARN (see UI_STUCK_VERDICTS).
+    let verdict = body.get("verdict").or_else(|| body.get("action")).and_then(|v| v.as_str()).unwrap_or("");
+    if UI_STUCK_VERDICTS.contains(&verdict) && !counts_as_stuck(&body) {
+        tracing::info!(kind = %kind, verdict, client = %client, measured = true, n_considered = 1,
+            payload = %body, reason = "hidden tab",
+            "client UI stall in a hidden tab: logged, not counted (ui.controls_do_not_stick)");
+    } else if UI_STUCK_VERDICTS.contains(&verdict) {
+        tracing::warn!(kind = %kind, verdict, client = %client, measured = true, n_considered = 1,
+            payload = %body, "client UI stuck: a control or view did not settle (ui.controls_do_not_stick)");
+        if let Ok(mut t) = UI_STUCK.lock() {
+            let e = t.entry(verdict.to_string()).or_insert((0, 0, String::new(), String::new()));
+            e.0 += 1;
+            e.1 = ts;
+            e.2 = kind.clone();
+            e.3 = client.chars().take(120).collect();
+        }
+    }
     if let Ok(mut ring) = CLIENT_DEBUG_RING.lock() {
         ring.push(serde_json::json!({ "ts": ts, "kind": kind, "ua": ua, "client": client, "body": body }));
         let n = ring.len();
@@ -1521,5 +1611,19 @@ mod slow_ok_tests {
             v.contains("helper-model"),
             "and what consumed the time: {v}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ui_stuck_hidden_tests {
+    /// AF-1031: a stall reported from a hidden tab is not counted; one from a
+    /// shown tab, or with no visibility recorded, still is.
+    #[test]
+    fn a_hidden_tab_stall_does_not_count_as_a_stuck_control() {
+        use serde_json::json;
+        assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout", "hidden": 1})));
+        assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_flight_stalled", "hidden": true})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout", "hidden": 0})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "composer_send_stuck"})), "no visibility recorded still counts");
     }
 }

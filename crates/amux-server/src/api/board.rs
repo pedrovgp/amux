@@ -976,12 +976,19 @@ async fn board_changes(
         .unwrap_or(500)
         .clamp(1, 5000);
 
+    // A read that cannot get a pooled connection is the pool saturated, not
+    // this handler failing (AMUX-6515: "db read failed" after 5143 ms, the
+    // pool's acquire timeout, during a fleet-wide stall). 503 with
+    // Retry-After says what it is; the dashboard only reads `ok` and retries
+    // on its next poll, and autofix keeps 501/503 out of its 5xx cards because
+    // the overload already reports itself (read_pool_exhausted).
     let conn = match state.store.read() {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "db read failed"})),
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "2")],
+                Json(json!({"error": "board read pool busy; retry", "detail": e.to_string(), "retryable": true})),
             )
                 .into_response();
         }
@@ -1324,7 +1331,7 @@ pub(crate) fn lane_frontier(conn: &rusqlite::Connection, lane: &str, limit: usiz
     let holding_result = crate::runtime_jobs::board_drive::wip_holding_ids(conn, lane, None);
     let wip_measured = holding_result.is_ok();
     let holding = holding_result.unwrap_or_default();
-    let cap = crate::runtime_jobs::board_drive::wip_cap().max(0) as usize;
+    let cap = crate::runtime_jobs::board_drive::wip_cap_for(lane).max(0) as usize;
     let available = if wip_measured {
         cap.saturating_sub(holding.len())
     } else {
@@ -5068,7 +5075,7 @@ fn body_str_list(v: &Value) -> Result<Vec<String>, String> {
 fn foreign_dependency_refusal(deps: &[(String, String)]) -> Value {
     tracing::warn!(marker="cross_board_dependency_refused", dependencies=?deps,
         measured=true, n_considered=deps.len(), "foreign task cannot gate a self-contained board");
-    json!({"code":"cross_board_dependency_forbidden", "error":"dependencies must share the same project or legacy worker board",
+    json!({"code":"cross_board_dependency_forbidden", "error":"dependencies must share the same worker board",
         "dependencies":deps.iter().map(|(id,session)|json!({"id":id,"session":session})).collect::<Vec<_>>(),
         "how_to_fix":"keep the required outcome on your own board and own its missing components; reference existing peer artifacts in the description or evidence instead of depends_on. Do not relocate a peer wait into source_ref, blocked_on, next_action or gate text: keep the actual prerequisite on this board and implement it here. Preserve real access, spend and customer-outbound restrictions."})
 }
@@ -6388,7 +6395,7 @@ pub async fn create_item(
         .write_async(move |conn| {
             let foreign = bs::foreign_dependencies(
                 conn,
-                &bs::BoardOwner::new(None, new.session.as_deref()),
+                &bs::BoardOwner::new(new.session.as_deref()),
                 &new.depends_on,
             )?;
             if !foreign.is_empty() {
@@ -8636,7 +8643,7 @@ mod overlap_reconciliation_tests {
         let store = Arc::new(crate::db::Store::open(&dir.path().join("overlap.db")).unwrap());
         // The writer and read pool outlive this helper.  The OS cleans the test
         // directory, but the Store must retain a valid path for this test.
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         store
     }
 
@@ -9066,6 +9073,23 @@ mod overlap_reconciliation_tests {
         call(app, "POST", "/api/board/overlap", session, Some(body)).await
     }
 
+    /// AMUX-6515: with every pooled read connection held, /api/board/changes
+    /// answers 503 + Retry-After (overload, retryable) instead of a 500.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saturated_read_pool_answers_503_not_500() {
+        let db = store();
+        let app = Router::new()
+            .nest("/api/board", routes())
+            .with_state(state(db.clone()));
+        let held: Vec<_> = (0..crate::db::read_pool_size()).map(|_| db.read().unwrap()).collect();
+        let (status, v) = call(&app, "GET", "/api/board/changes?since_seq=0&limit=1", "probe", None).await;
+        drop(held);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["retryable"], true, "{v}");
+        let (status, _) = call(&app, "GET", "/api/board/changes?since_seq=0&limit=1", "probe", None).await;
+        assert_eq!(status, StatusCode::OK, "answers again once a connection is free");
+    }
+
     #[tokio::test]
     async fn vanished_peer_and_model_switch_keep_the_handoff_callback_recoverable() {
         let home = tempfile::tempdir().unwrap();
@@ -9354,10 +9378,6 @@ fn ensure_owner_doing_claim(
     source: &str,
     from: &str,
 ) -> rusqlite::Result<bool> {
-    if row.project_group.is_some() {
-        return Ok(false);
-    }
-
     if row.status != "doing" || row.session.as_deref() != Some(actor) {
         return Ok(false);
     }
@@ -11105,9 +11125,6 @@ pub async fn patch_item(
             let Some(row) = bs::get_issue(conn, &id_w)? else {
                 return finish(&slot_w, PatchOut::NotFound, no_write());
             };
-            if let Some(project)=row.project_group.as_deref() {
-                return finish(&slot_w,PatchOut::Refused(StatusCode::CONFLICT,json!({"error":"project-owned tasks use the project lifecycle","project":project,"how_to_fix":"submit a project command to refine requirements; executors use the claim-bound report endpoint"})),no_write());
-            }
 
 
             // Optimistic concurrency: expect_rev checks the PYTHON counter.
@@ -12226,14 +12243,6 @@ pub async fn patch_item(
                 if !foreign.is_empty() {
                     return finish(&slot_w, PatchOut::Refused(StatusCode::CONFLICT,
                         foreign_dependency_refusal(&foreign)), no_write());
-                }
-            }
-            if map.contains_key("depends_on") {
-                if let Some(project) = next.project_group.as_deref() {
-                    if let Err(e) = crate::project_execution::graph::validate(conn, project, &row.id, &next.depends_on, "board_edit") {
-                        return finish(&slot_w, PatchOut::Refused(StatusCode::BAD_REQUEST,
-                            json!({"error": e.to_string(), "code": format!("dependency_{}", e.code())})), no_write());
-                    }
                 }
             }
             if bs::BoardOwner::of(&next) != bs::BoardOwner::of(&row) {
@@ -15424,7 +15433,7 @@ pub async fn patch_item(
                 crate::db::interactions::spawn(async move {
                     if note.contains("MSG-") {
                         crate::runtime_jobs::capture_reconcile::on_text(
-                            &st, &author, &note, "board note",
+                            &st, &author, &note, "board note", Some(&card),
                         )
                         .await;
                     }
@@ -15461,7 +15470,7 @@ mod capture_requeue_tests {
             crate::db::Store::open(&dir.path().join("capture-requeue.db")).expect("open store"),
         );
         // Store owns live SQLite handles after this helper returns.
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         let state = AppState {
             store: store.clone(),
             started: std::time::Instant::now(),
@@ -15633,7 +15642,7 @@ mod af701_archive_guard_tests {
         let store = Arc::new(
             crate::db::Store::open(&dir.path().join("af701-archive-guard.db")).expect("open store"),
         );
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         let state = AppState {
             store: store.clone(),
             started: std::time::Instant::now(),
@@ -17132,7 +17141,7 @@ mod af711_acceptance_criteria_tests {
             crate::db::Store::open(&dir.path().join("af711-acceptance-criteria.db"))
                 .expect("open store"),
         );
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         let state = AppState {
             store: store.clone(),
             started: std::time::Instant::now(),
@@ -17373,7 +17382,7 @@ mod af930_waiting_on_tests {
         let store = Arc::new(
             crate::db::Store::open(&dir.path().join("af930-waiting-on.db")).expect("open store"),
         );
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         let state = AppState {
             store: store.clone(),
             started: std::time::Instant::now(),
@@ -17620,7 +17629,7 @@ mod af703_citing_cards_tests {
         let store = Arc::new(
             crate::db::Store::open(&dir.path().join("af703-citing-cards.db")).expect("open store"),
         );
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         let state = AppState {
             store: store.clone(),
             started: std::time::Instant::now(),

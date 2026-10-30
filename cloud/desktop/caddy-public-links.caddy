@@ -26,3 +26,18 @@ handle @pub_link {
     flush_interval -1
   }
 }
+
+# Apple fetches this without a sign-in to learn that the amux iOS app opens
+# this server's copied file links (/f/<path>, crates/amux-server/src/api/
+# deep_links.rs). It names only the app; nothing else passes the door here.
+handle /.well-known/apple-app-site-association {
+  request_header -Cookie
+  request_header -Authorization
+  header -Set-Cookie
+  reverse_proxy https://127.0.0.1:8824 {
+    transport http {
+      tls_insecure_skip_verify
+    }
+    header_up Host {host}
+  }
+}

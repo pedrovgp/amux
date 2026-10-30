@@ -4,9 +4,11 @@
 # after boot.
 #
 #   1. Fast-forward the amux checkout (the bash CLI, this script, the unit templates).
-#   2. Compare ghcr.io/mixpeek/amux:latest with the digest installed last time. The image is
-#      rebuilt only after CI passes on main (.github/workflows/deploy-cloud.yml), so "latest" is a
-#      green build.
+#   2. Compare ghcr.io/mixpeek/amux:main with the digest installed last time. :main is built from
+#      every push to main (.github/workflows/cloud-image-main.yml), so a server is on main's newest
+#      build minutes after it lands (Ethan, 2026-10-27: "all amux cloud instances always immediately
+#      get the latest as they come out from main"). :latest, built only once all of CI passes
+#      (deploy-cloud.yml), is the fallback, and AMUX_IMAGE_TAG=latest keeps a server on it.
 #   3. New digest: copy its binaries in by rename, restart the server, and require /health to answer
 #      within 120 s. Otherwise put the previous binaries back and restart again.
 #   4. Make sure the server and Caddy are running even when nothing changed (crash recovery).
@@ -71,6 +73,14 @@ PY
 # 1. Checkout (fast-forward only; a diverged checkout is reported, never forced).
 SELF="$SRC/cloud/desktop/update.sh"
 before=$(sha256sum "$SELF" 2>/dev/null | cut -c1-64)
+# The builder's launcher self-heals by writing a version of itself from main into this checkout
+# (scripts/rust-auto-build-authority.sh). That left the checkout dirty, the pull below refused,
+# and this run went on with the old update.sh, whose image step then put an older server over a
+# source-mode build (sandbox, 2026-10-27). The file is main's either way, so take it back first.
+AUTH=scripts/rust-auto-build-authority.sh
+if ! as_user git -C "$SRC" diff --quiet -- "$AUTH" 2>/dev/null; then
+  as_user git -C "$SRC" checkout -- "$AUTH" && say "verdict=authority_selfheal_reset $AUTH taken back to the checkout's own before the pull"
+fi
 if ! as_user git -C "$SRC" pull -q --ff-only 2>/dev/null; then
   say "WARN checkout $SRC did not fast-forward; keeping its current scripts"
 fi
@@ -102,6 +112,15 @@ if [[ -f "$HOOKS" ]]; then
   else
     say "verdict=status_hooks_install_failed provider=claude workers will not report state"
   fi
+fi
+
+# Follow main within minutes: servers set up before 2026-10-27 checked hourly. Rewrite the timer
+# once (bootstrap.sh writes the same unit); the new cadence applies from its next run.
+TIMER=/etc/systemd/system/amux-update.timer
+if [[ -f "$TIMER" ]] && grep -q '^OnUnitActiveSec=1h' "$TIMER"; then
+  sed -i -e 's/^OnUnitActiveSec=1h/OnUnitActiveSec=2min/' -e 's/^RandomizedDelaySec=10min/RandomizedDelaySec=20s/' \
+         -e 's/^Description=amux: hourly self-update and health check/Description=amux: follow main every two minutes, and health check/' "$TIMER"
+  systemctl daemon-reload && say "verdict=update_timer_every_2min"
 fi
 
 # Pull from remote sends local amux changes upstream as a pull request before replacing them
@@ -198,6 +217,15 @@ if [[ -f $CF && -f $ENVF ]] && ! grep -q '^AMUX_PUBLIC_URL=' "$ENVF"; then
     say "verdict=public_url_set url=https://$site"
   fi
 fi
+# Where connector sign-ins (Google, Slack) return, for servers bootstrapped before bootstrap.sh
+# wrote it. Taken from AMUX_PUBLIC_URL, which the block above guarantees on a Caddy server.
+if [[ -f $CF && -f $ENVF ]] && ! grep -q '^AMUX_OAUTH_ORIGIN=' "$ENVF"; then
+  pub=$(grep -m1 '^AMUX_PUBLIC_URL=' "$ENVF" | cut -d= -f2-)
+  if [[ $pub == https://* ]]; then
+    printf 'AMUX_OAUTH_ORIGIN=%s\n' "$pub" >> "$ENVF"
+    say "verdict=oauth_origin_set url=$pub"
+  fi
+fi
 
 # The agent CLIs, once a day. bootstrap.sh installs them globally as root, so they cannot update
 # themselves (Claude Code showed "Auto-update failed: no write permission to npm prefix" to the
@@ -221,17 +249,33 @@ if [[ -s $CS ]] && ! jq -e '.env.DISABLE_AUTOUPDATER == "1"' "$CS" >/dev/null 2>
     && say "verdict=claude_self_update_off the agent CLIs are updated by this script"
 fi
 
-# 2. Newest green image.
+# 2. Newest image of main. A source-mode server (bootstrap.sh AMUX_UPDATES=source, which sets
+# AMUX_REPO_DIR) builds main itself with rust-auto-build.sh and has no image to follow; this script
+# still keeps its checkout, door, Caddy snippets and agent CLIs current (sandbox, 2026-10-27: the
+# public-links Caddy change never reached it because nothing ran this script there).
+if grep -q '^AMUX_REPO_DIR=' "$HOME_DIR/.amux/server.env" 2>/dev/null; then
+  VERDICT="source_mode"; DETAIL="the builder follows main here (scripts/rust-auto-build.sh); no image to install"
+else
 TOKEN=$(curl -fsS --max-time 20 "https://ghcr.io/token?scope=repository:$IMAGE_REPO:pull" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])' 2>/dev/null)
-LATEST=$(curl -fsSI --max-time 20 -H "Authorization: Bearer $TOKEN" \
-  -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
-  "https://ghcr.io/v2/$IMAGE_REPO/manifests/latest" 2>/dev/null | awk 'tolower($1)=="docker-content-digest:"{print $2}' | tr -d '\r')
+digest_of() {
+  curl -fsSI --max-time 20 -H "Authorization: Bearer $TOKEN" \
+    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "https://ghcr.io/v2/$IMAGE_REPO/manifests/$1" 2>/dev/null | awk 'tolower($1)=="docker-content-digest:"{print $2}' | tr -d '\r'
+}
+TAG="${AMUX_IMAGE_TAG:-main}"
+LATEST=$(digest_of "$TAG")
+if [[ -z "$LATEST" && "$TAG" != latest ]]; then TAG=latest; LATEST=$(digest_of latest); fi
 CURRENT=$(cat "$STATE/digest" 2>/dev/null || true)
+# An image that failed /health is not tried again (every two minutes it would restart the server
+# each time); the next image of main is.
+FAILED=$(cat "$STATE/failed_digest" 2>/dev/null || true)
 
 if [[ -z "$LATEST" ]]; then
-  VERDICT="failed_registry"; DETAIL="could not read the latest image digest from ghcr.io"
+  VERDICT="failed_registry"; DETAIL="could not read the $TAG image digest from ghcr.io"
 elif [[ "$LATEST" == "$CURRENT" ]]; then
-  VERDICT="current"; DETAIL="already on the newest image"
+  VERDICT="current"; DETAIL="already on the newest $TAG image"
+elif [[ "$LATEST" == "$FAILED" ]]; then
+  VERDICT="held_failed_image"; DETAIL="${LATEST:7:12} failed /health before; waiting for a newer $TAG image"
 else
   # 3. Install by rename, keep the previous binaries for rollback.
   CID=""
@@ -254,7 +298,8 @@ else
       else
         for b in amux-server-rs amux-rs; do [[ -x "$BIN_DIR/$b.prev" ]] && mv "$BIN_DIR/$b.prev" "$BIN_DIR/$b"; done
         ucl restart amux-server.service; wait_healthy
-        VERDICT="failed_rolled_back"; DETAIL="${LATEST:7:12} did not pass /health in 120 s; previous binaries restored"
+        echo "$LATEST" > "$STATE/failed_digest"
+        VERDICT="failed_rolled_back"; DETAIL="${LATEST:7:12} did not pass /health in 120 s; previous binaries restored and that image held"
       fi
     else
       rm -f "$BIN_DIR"/amux-*.new
@@ -264,6 +309,8 @@ else
     VERDICT="failed_pull"; DETAIL="docker could not pull ${LATEST:7:12}"
   fi
   docker image prune -af >/dev/null 2>&1 || true
+fi
+
 fi
 
 # 4. Recovery, whatever happened above.

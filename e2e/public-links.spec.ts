@@ -1,4 +1,4 @@
-// The Pages tab's three kinds (static_files/public_links.rs): an app inside
+// The Apps tab's three kinds (static_files/public_links.rs): an app inside
 // amux for the owner, the app shared publicly, and a public folder. The real
 // server and a real loopback app; everything is made and removed in the UI,
 // and the public links are opened with no amux credentials.
@@ -10,9 +10,10 @@ import * as os from 'os';
 import * as path from 'path';
 import type { AddressInfo } from 'net';
 
-test('Pages provisions an app inside amux, a public app and a public folder', async ({ page, playwright }, testInfo) => {
+test('Apps provisions an app and a file inside amux, a public app and a public folder', async ({ page, playwright }, testInfo) => {
   const app = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
+    // Like mtp-demo's sign-in page: an app that forbids framing still shows in Apps.
+    res.writeHead(200, { 'Content-Type': 'text/html', 'X-Frame-Options': 'SAMEORIGIN' });
     res.end(`<h1>shared app</h1><p id="cookie">${(req.headers.cookie || '').replace(/</g, '')}</p>`);
   });
   await new Promise<void>(r => app.listen(0, '127.0.0.1', () => r()));
@@ -21,6 +22,11 @@ test('Pages provisions an app inside amux, a public app and a public folder', as
   const dir = fs.mkdtempSync(path.join(os.homedir(), 'pagesfiles-'));
   fs.writeFileSync(path.join(dir, 'report.txt'), 'quarterly report');
   fs.writeFileSync(path.join(dir, '.secret'), 'never public');
+  // A deck in its own folder, beside its build script (sandbox rothco, 2026-10-26).
+  const deckDir = fs.mkdtempSync(path.join(os.homedir(), 'pagesdeck-'));
+  fs.writeFileSync(path.join(deckDir, 'deck.html'), '<h1>the deck</h1>');
+  fs.writeFileSync(path.join(deckDir, 'build_deck.py'), 'print(1)');
+  fs.writeFileSync(path.join(deckDir, 'notes.txt'), 'plain notes\n');
   const tag = testInfo.project.name;
   const modalBtn = (name: string) => page.locator('#modal-btns').getByRole('button', { name });
   const base = () => new URL(page.url()).origin;
@@ -34,7 +40,7 @@ test('Pages provisions an app inside amux, a public app and a public folder', as
     const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
     await page.goto('/?_token=' + encodeURIComponent(token));
     await page.waitForURL(/_fresh=1/, { timeout: 20000 });
-    await page.goto('/#view=pages');
+    await page.goto('/#view=apps');
     for (const h of ['Inside amux', 'Public apps', 'Public files']) await expect(page.getByRole('heading', { name: h })).toBeVisible();
 
     // 1. Inside amux: listed, and opens in the amux UI.
@@ -56,13 +62,49 @@ test('Pages provisions an app inside amux, a public app and a public folder', as
     const spent = await anon.get(frameSrc!, { maxRedirects: 0 });
     expect(spent.status()).toBe(403);
     await expect(page.locator('#pages-page-actions')).toBeHidden();
-    await page.getByRole('button', { name: 'Back to all pages' }).click();
-    // A worker's localhost link lands on that Pages entry; /proxy/ is gone.
+    await page.getByRole('button', { name: 'Back to all apps' }).click();
+    // A worker's localhost link lands on that Apps entry; /proxy/ is gone. The
+    // older #view=pages address (in links workers already sent) still works.
     await page.goto(`/#view=pages&add-internal=${port}`);
     await expect(page.frameLocator('.pub-app-frame').locator('h1')).toHaveText('shared app');
     const gone = await anon.get(`${base()}/proxy/${port}/`);
     expect(await gone.text()).not.toContain('shared app');
-    await page.getByRole('button', { name: 'Back to all pages' }).click();
+    await page.getByRole('button', { name: 'Back to all apps' }).click();
+
+    // 1b. A file inside amux, added by path: shown in the amux UI with no
+    // server started, and only that file.
+    await page.getByRole('button', { name: 'Add app' }).click();
+    await page.locator('#pub-new-target').fill(path.join(deckDir, 'deck.html'));
+    await page.locator('#pub-new-title').fill(`deck ${tag}`);
+    await modalBtn('Add').click();
+    const deck = page.locator('#pub-internal .pub-card', { hasText: `deck ${tag}` });
+    await expect(deck).toContainText('deck.html');
+    // Previews load as their card scrolls into view (a phone shows one at a time).
+    await deck.scrollIntoViewIfNeeded();
+    await expect(deck.frameLocator('.pub-preview iframe').locator('h1')).toHaveText('the deck');
+    await deck.click();
+    await expect(page.frameLocator('.pub-app-frame').locator('h1')).toHaveText('the deck');
+    await page.getByRole('button', { name: 'Back to all apps' }).click();
+
+    // A plain-text file shows on the frame's white backing under a dark system
+    // theme: Chrome drew it in light text on white, a blank page (sandbox,
+    // 2026-10-27), until the frames were made light. Playwright's dark emulation
+    // overrides every frame's scheme, so this pins the frame's own scheme, which
+    // is what real Chrome follows (checked live on the sandbox). The dashboard
+    // must be dark for it to mean anything: a light one is inherited as light.
+    await page.evaluate(() => (window as any).themeActivate('amux-dark'));
+    await page.getByRole('button', { name: 'Add app' }).click();
+    await page.locator('#pub-new-target').fill(path.join(deckDir, 'notes.txt'));
+    await page.locator('#pub-new-title').fill(`notes ${tag}`);
+    await modalBtn('Add').click();
+    const notesCard = page.locator('#pub-internal .pub-card', { hasText: `notes ${tag}` });
+    await notesCard.scrollIntoViewIfNeeded();
+    await expect(notesCard.locator('.pub-preview iframe')).toHaveCSS('color-scheme', 'light');
+    await notesCard.click();
+    await expect(page.frameLocator('.pub-app-frame').locator('body')).toContainText('plain notes');
+    await expect(page.locator('.pub-app-frame')).toHaveCSS('color-scheme', 'light');
+    await page.getByRole('button', { name: 'Back to all apps' }).click();
+    await page.evaluate(() => (window as any).themeActivate('amux-light'));
 
     // 2. A public app: anyone, no amux credential reaches it, and its card
     // shows a live preview.
@@ -122,14 +164,14 @@ test('Pages provisions an app inside amux, a public app and a public folder', as
     expect(await (await anon.get(upUrl + `${upName}.txt`)).text()).toBe('uploaded and shared');
 
     // 5. A link a worker asks for (the bearer alone, no person) waits for
-    // approval in Pages and serves nobody until approved here.
+    // approval in Apps and serves nobody until approved here.
     const asked = await anon.post(`${base()}/api/page-links`, { headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
       data: { kind: 'file', path: dir, title: `asked ${tag}` } });
     expect(asked.status()).toBe(201);
     const askedLink = await asked.json();
     expect(askedLink.pending).toBe(true);
     expect((await anon.get(new URL(askedLink.path, base()).toString())).status()).toBe(404);
-    await page.goto('/#view=pages');
+    await page.goto('/#view=apps');
     const pending = page.locator('#pub-files .pub-file', { hasText: `asked ${tag}` });
     await expect(pending).toContainText('Waiting for your approval');
     await pending.getByRole('button', { name: 'Approve' }).click();
@@ -145,10 +187,15 @@ test('Pages provisions an app inside amux, a public app and a public folder', as
     await expect(pub).toBeVisible();
 
     // One row of controls per entry on a phone; cards fit the screen.
-    // (The list redraws itself while uploads land, so the box is re-read until present.)
+    // The list redraws itself while uploads land (2, 6 and 15 s refreshes), so
+    // each poll reads the box once: a second read can fall between two renders
+    // and find none (ios-safari CI, 2026-10-26).
+    const vw = page.viewportSize()!.width;
     for (const row of [pub, files]) {
-      await expect.poll(async () => (await row.boundingBox())?.width ?? -1).toBeGreaterThan(0);
-      expect((await row.boundingBox())!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+      await expect.poll(async () => {
+        const w = (await row.boundingBox())?.width ?? -1;
+        return w > 0 && w <= vw ? 'fits' : `width ${w} in a ${vw}px viewport`;
+      }).toBe('fits');
     }
 
     // Turned off from the card's menu (where it lives on a phone), gone for everyone.
@@ -167,7 +214,7 @@ test('Pages provisions an app inside amux, a public app and a public folder', as
       expect((await anon.get(url)).status()).toBe(404);
     }
     for (const row of [inside, stopped]) {
-      await viaMenu(row, 'Remove from Pages');
+      await viaMenu(row, 'Remove from Apps');
       await modalBtn('Remove').click();
       await expect(row).toHaveCount(0);
     }
@@ -175,6 +222,43 @@ test('Pages provisions an app inside amux, a public app and a public folder', as
     await cleanup('dispose the anonymous request context', () => anon.dispose());
     app.close();
     fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(deckDir, { recursive: true, force: true });
     if (sharedDir && sharedDir.includes('/Shared/upload-')) fs.rmSync(sharedDir, { recursive: true, force: true });
+  }
+});
+
+// Ethan, 2026-10-28: "Not approved: only the owner, signed in to the dashboard,
+// can approve an Apps link" on his own click. A browser on this Mac gets the
+// owner bearer in the page and never the owner-session cookie approval takes,
+// unless it went through ?_token= first (the test above does; the owner does
+// not). Approve now signs in once with the page's token and retries.
+test('the owner approves a pending link from a plain page load, with no sign-in step', async ({ page, playwright }, testInfo) => {
+  const dir = fs.mkdtempSync(path.join(os.homedir(), 'pagesapprove-'));
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'approve me\n');
+  const anon = await playwright.request.newContext({ ignoreHTTPSErrors: true });
+  try {
+    await page.goto('/');
+    await page.waitForFunction(() => !!(window as any)._AMUX_AUTH_TOKEN, { timeout: 20000 });
+    const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
+    const base = new URL(page.url()).origin;
+    const title = `plain approve ${testInfo.project.name}`;
+    const asked = await anon.post(`${base}/api/page-links`, { headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      data: { kind: 'file', path: dir, title } });
+    expect(asked.status()).toBe(201);
+    const link = await asked.json();
+    expect(link.pending).toBe(true);
+    // The bearer alone (a worker's kind of caller) is still refused.
+    const self = await anon.post(`${base}/api/page-links/${link.id}/approve`, { headers: { Authorization: 'Bearer ' + token } });
+    expect(self.status()).toBe(403);
+    await page.goto('/#view=apps');
+    const pending = page.locator('#pub-files .pub-file', { hasText: title });
+    await expect(pending).toContainText('Waiting for your approval');
+    await pending.getByRole('button', { name: 'Approve' }).click();
+    await page.locator('#modal-btns').getByRole('button', { name: 'Approve' }).click();
+    await expect(pending).not.toContainText('Waiting for your approval', { timeout: 15000 });
+    expect((await anon.get(new URL(link.path, base).toString())).status()).toBe(200);
+  } finally {
+    await cleanup('dispose the anonymous request context', () => anon.dispose(), testInfo);
+    await cleanup('remove the approved folder', () => fs.rmSync(dir, { recursive: true, force: true }), testInfo);
   }
 });

@@ -32,7 +32,6 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -45,6 +44,12 @@ const MEMBER_SCOPE_NAME_HEADER: &str = "x-amux-local-member-scope-name";
 const MEMBER_ACTOR_HEADER: &str = "x-amux-local-member-actor";
 const MEMBER_TEAM_ID_HEADER: &str = "x-amux-local-member-team-id";
 const MEMBER_TEAM_NAME_B64_HEADER: &str = "x-amux-local-member-team-name-b64";
+/// A verified member whose stored role is `admin` (and whose scope is global):
+/// set only by [`local_member_identity`] from the database, stripped from every
+/// inbound request with the other markers. Ethan, 2026-10-26: the people he
+/// invites to run a server with him must manage its vault without signing in
+/// as the anonymous host owner.
+const MEMBER_ADMIN_HEADER: &str = "x-amux-local-member-admin";
 /// Names an automated owner-configured policy (the needs-input auto-approver)
 /// as the actor of an INTERNAL call. Stripped from inbound requests below with
 /// the member markers, so only server code can produce it. Before it existed
@@ -348,11 +353,6 @@ pub(crate) fn authorize_local_member_request(
             .is_some_and(|worker| scope.allows_worker(&worker));
         return (!allowed).then(|| forbidden(&scope, target));
     }
-    // Project handlers enforce both membership and worker group scope. Policy
-    // and migration mutations remain operator-only inside that boundary.
-    if path == "/api/projects" || path.starts_with("/api/projects/") {
-        return None;
-    }
     if path == "/api/board" || path == "/api/board/" {
         // GET is filtered below; POST validates the requested session in the
         // handler before it writes.
@@ -450,7 +450,7 @@ fn member_file_target(path: &str, uri: &Uri) -> Option<std::path::PathBuf> {
             .into_iter().next().map(|(_, v)| v).unwrap_or_default();
         return Some(std::path::PathBuf::from(format!("/{}", decoded.trim_start_matches('/'))));
     }
-    let reads = ["/api/file", "/api/file/", "/api/file/raw", "/api/file/hls", "/api/file/xlsx", "/api/file/vtt",
+    let reads = ["/api/file", "/api/file/", "/api/file/raw", "/api/file/hls", "/api/file/xlsx", "/api/file/vtt", "/api/file/history",
                  "/api/fs/read", "/api/fs/list"];
     if !reads.contains(&path) {
         return None;
@@ -494,6 +494,25 @@ struct MemberIdentity {
     scope: MemberScope,
     team_id: String,
     team_name: String,
+    admin: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn test_member_headers(email: &str, admin: bool) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert(VERIFIED_MEMBER_HEADER, HeaderValue::from_static("1"));
+    h.insert(MEMBER_ACTOR_HEADER, HeaderValue::from_str(&format!("member:{email}")).unwrap());
+    if admin {
+        h.insert(MEMBER_ADMIN_HEADER, HeaderValue::from_static("1"));
+    }
+    h
+}
+
+/// A verified member the host owner made an admin. An admin can do what only the
+/// owner could (managing vault secrets), and keeps their own name in every log.
+pub(crate) fn local_member_is_admin(headers: &HeaderMap) -> bool {
+    is_verified_local_member(headers)
+        && headers.get(MEMBER_ADMIN_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
 }
 
 fn member_cookie(headers: &HeaderMap) -> Option<&str> {
@@ -534,6 +553,7 @@ pub async fn local_member_identity(
     req.headers_mut().remove(MEMBER_ACTOR_HEADER);
     req.headers_mut().remove(MEMBER_TEAM_ID_HEADER);
     req.headers_mut().remove(MEMBER_TEAM_NAME_B64_HEADER);
+    req.headers_mut().remove(MEMBER_ADMIN_HEADER);
     req.headers_mut().remove(POLICY_ACTOR_HEADER);
     req.headers_mut().remove("x-amux-user-id");
     req.headers_mut().remove("x-amux-user-email");
@@ -553,7 +573,7 @@ pub async fn local_member_identity(
                          WHEN COALESCE(m.team_id,'')='' THEN m.scope_level ELSE 'worker' END, \
                     CASE WHEN t.id IS NOT NULL THEN t.scope_name \
                          WHEN COALESCE(m.team_id,'')='' THEN m.scope_name ELSE '__invalid_team_scope__' END, \
-                    COALESCE(t.id,''), COALESCE(t.name,'') \
+                    COALESCE(t.id,''), COALESCE(t.name,''), COALESCE(m.role,'member') \
              FROM org_invites i JOIN org_members m ON m.id=i.used_by \
              LEFT JOIN org_teams t ON t.id=m.team_id \
              WHERE i.token=?1 AND i.used_at IS NOT NULL",
@@ -561,7 +581,12 @@ pub async fn local_member_identity(
             |row| {
                 let level: String = row.get(2)?;
                 let name: String = row.get(3)?;
+                let role: String = row.get(6)?;
+                // An admin with a narrowed scope is a contradiction: a group's
+                // member must not reach the whole server's secrets.
+                let admin = role == "admin" && level == "global";
                 Ok(MemberIdentity {
+                    admin,
                     id: row.get(0)?,
                     email: row.get(1)?,
                     // Corrupt rows fail closed. Defaulting here to Global
@@ -597,6 +622,9 @@ pub async fn local_member_identity(
     };
     req.headers_mut()
         .insert(VERIFIED_MEMBER_HEADER, HeaderValue::from_static("1"));
+    if member.admin {
+        req.headers_mut().insert(MEMBER_ADMIN_HEADER, HeaderValue::from_static("1"));
+    }
     req.headers_mut().insert(
         MEMBER_SCOPE_LEVEL_HEADER,
         HeaderValue::from_static(member.scope.level()),
@@ -776,7 +804,7 @@ fn ev(entity: &str, id: &str, mutation: MutationKind) -> PendingEvent {
 /// `secrets.token_urlsafe(n)`: n CSPRNG bytes, base64url, no padding.
 fn token_urlsafe(nbytes: usize) -> String {
     let mut bytes = vec![0u8; nbytes];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("OS random source");
     base64url_nopad(&bytes)
 }
 
@@ -1474,6 +1502,34 @@ pub async fn patch_member(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
+    // {"role": "admin" | "member"}: the host owner makes a member an admin or
+    // takes it back. Org routes refuse members (authorize_local_member_request),
+    // so only the owner reaches this.
+    if let Some(role) = body.get("role") {
+        let Some(role) = role.as_str().filter(|r| *r == "admin" || *r == "member").map(str::to_string) else {
+            return err(StatusCode::BAD_REQUEST, json!({"error": "role is \"admin\" or \"member\""}));
+        };
+        let (id_w, role_w) = (id.clone(), role.clone());
+        let write = state
+            .store
+            .write_async(move |conn| {
+                let n = conn.execute("UPDATE org_members SET role=?1 WHERE id=?2", rusqlite::params![role_w, id_w])?;
+                Ok(WriteOutcome {
+                    applied: n > 0,
+                    events: (n > 0).then(|| ev("org_member", &id_w, MutationKind::Updated)).into_iter().collect(),
+                })
+            })
+            .await;
+        return match write {
+            Ok(outcome) if outcome.applied => {
+                tracing::warn!(member = %id, role = %role, measured = true, n_considered = 1,
+                    verdict = "org_member_role_set", "a member's role changed (admin manages the vault)");
+                Json(json!({"ok": true, "id": id, "role": role})).into_response()
+            }
+            Ok(_) => err(StatusCode::NOT_FOUND, json!({"error": "member not found"})),
+            Err(e) => internal(e),
+        };
+    }
     let conn = match state.store.read() {
         Ok(conn) => conn,
         Err(e) => return internal(e),
@@ -2631,6 +2687,92 @@ mod tests {
         assert_eq!(denied, StatusCode::FORBIDDEN, "no owner token must not mean no member scope: {denied_body}");
         let (admin, _, _) = raw_send(&app, "GET", "/api/org/members", "", &[("cookie", &cookie)]).await;
         assert_eq!(admin, StatusCode::FORBIDDEN);
+    }
+
+    /// An admin member manages the vault as themselves (Ethan, 2026-10-26: "make
+    /// sure ethan and doron are admins i need to be able to create VAULT keys").
+    /// Only the owner sets the role; a forged marker, a plain member and a
+    /// group-scoped "admin" stay refused.
+    #[tokio::test]
+    async fn an_admin_member_manages_the_vault_and_nobody_else_becomes_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("org-admin.db");
+        let state = AppState {
+            store: Arc::new(Store::open(&db).unwrap()),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let app = crate::api::router(state);
+        rusqlite::Connection::open(&db).unwrap().execute(
+            "INSERT INTO _amux_workers \
+             (id,display_name,name_aliases,cwd,provider,backend,environment,permissions,state,version,created_at,updated_at) \
+             VALUES ('wrk_one','one-worker','[]','/tmp','claude','tmux','{}','[]','{\"state\":\"stopped\"}',0,'now','now')",
+            [],
+        ).unwrap();
+        let join = |email: &'static str, scope: &'static str| {
+            let app = app.clone();
+            async move {
+                let body = if scope == "global" {
+                    format!(r#"{{"email":"{email}","scope_level":"global","grant_host_access":true}}"#)
+                } else {
+                    format!(r#"{{"email":"{email}","scope_level":"worker","scope_name":"{scope}"}}"#)
+                };
+                let (st, _, b) = raw_send(&app, "POST", "/api/org/invites", &body, &[("content-type", "application/json")]).await;
+                assert_eq!(st, StatusCode::CREATED, "{b}");
+                let token = serde_json::from_str::<Value>(&b).unwrap()["token"].as_str().unwrap().to_string();
+                let form = format!("email={}&name=x", email.replace('@', "%40"));
+                let (st, h, _) = raw_send(&app, "POST", &format!("/invite/{token}"), &form,
+                    &[("content-type", "application/x-www-form-urlencoded")]).await;
+                assert_eq!(st, StatusCode::SEE_OTHER);
+                h[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string()
+            }
+        };
+        let ethan = join("admin-e@example.com", "global").await;
+        let grouped = join("admin-g@example.com", "one-worker").await;
+        let vault = |cookie: String, extra: Option<(&'static str, &'static str)>| {
+            let app = app.clone();
+            async move {
+                let mut h = vec![("content-type", "application/json"), ("cookie", cookie.as_str())];
+                if let Some(x) = extra { h.push(x); }
+                raw_send(&app, "POST", "/api/vault/secrets", r#"{"key":"ADMIN_TEST_KEY","value":"v"}"#, &h).await
+            }
+        };
+        let refused = |st: StatusCode, b: &str| st == StatusCode::FORBIDDEN && b.contains("only the owner");
+        let (st, _, b) = vault(ethan.clone(), None).await;
+        assert!(refused(st, &b), "a plain member managed the vault: {st} {b}");
+        let (st, _, b) = vault(ethan.clone(), Some(("x-amux-local-member-admin", "1"))).await;
+        assert!(refused(st, &b), "a forged admin marker was trusted: {st} {b}");
+
+        // A member cannot make themselves an admin; the owner can.
+        let id_of = |email: &'static str| {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.query_row("SELECT id FROM org_members WHERE email=?1", [email], |r| r.get::<_, String>(0)).unwrap()
+        };
+        let (eid, gid) = (id_of("admin-e@example.com"), id_of("admin-g@example.com"));
+        let (st, _, _) = raw_send(&app, "PATCH", &format!("/api/org/members/{eid}"), r#"{"role":"admin"}"#,
+            &[("content-type", "application/json"), ("cookie", ethan.as_str())]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "a member set their own role");
+        let (st, _, b) = raw_send(&app, "PATCH", &format!("/api/org/members/{eid}"), r#"{"role":"root"}"#,
+            &[("content-type", "application/json")]).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        for id in [&eid, &gid] {
+            let (st, _, b) = raw_send(&app, "PATCH", &format!("/api/org/members/{id}"), r#"{"role":"admin"}"#,
+                &[("content-type", "application/json")]).await;
+            assert_eq!(st, StatusCode::OK, "{b}");
+        }
+        let (st, _, b) = vault(ethan.clone(), None).await;
+        assert!(!refused(st, &b), "an admin member was refused the vault: {st} {b}");
+        let (st, _, b) = vault(grouped, None).await;
+        // Refused before the vault even looks (the scope guard), which is the point.
+        assert_eq!(st, StatusCode::FORBIDDEN, "a scoped admin reached the whole server's vault: {b}");
+
+        // Taken back by the owner, refused again.
+        raw_send(&app, "PATCH", &format!("/api/org/members/{eid}"), r#"{"role":"member"}"#,
+            &[("content-type", "application/json")]).await;
+        let (st, _, b) = vault(ethan, None).await;
+        assert!(refused(st, &b), "a former admin kept the vault: {st} {b}");
     }
 
     #[tokio::test]

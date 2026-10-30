@@ -101,6 +101,7 @@ pub fn routes() -> Router<AppState> {
         .route("/screenshot/file", get(screenshot_file))
         .route("/state", get(state_verb))
         .route("/keepalive", post(keepalive))
+        .route("/hold", post(hold))
         .route("/action", post(action))
         // Verb routes agents guess before reading the catalog (/eval, /click and
         // /resize each 404'd in the last 7 days). Each is /action with that verb.
@@ -239,7 +240,7 @@ fn now_epoch() -> i64 {
 /// research parameters while redacting credential-shaped values, userinfo and
 /// every fragment (implicit-flow tokens live there). The action trail must be
 /// safer than the browser history it replaces, not a second credential store.
-fn audit_url(raw: &str) -> String {
+pub(crate) fn audit_url(raw: &str) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
         return String::new();
@@ -316,7 +317,7 @@ fn action_text_chars(body: &Value, key: &str) -> usize {
 /// Describe a browser action without retaining what the user typed, the code
 /// they evaluated, or local file paths. Those are precisely the values most
 /// likely to contain passwords, tokens, private prompts or customer data.
-fn action_audit_fields(body: &Value, page_url: &str) -> Value {
+pub(crate) fn action_audit_fields(body: &Value, page_url: &str) -> Value {
     let action = body.get("action").and_then(Value::as_str).unwrap_or("");
     let mut out = json!({
         "action": action,
@@ -418,7 +419,7 @@ fn action_audit_fields(body: &Value, page_url: &str) -> Value {
 /// history, not a ninth storage primitive. A failed audit write cannot undo a
 /// browser action, but it is WARNed with a machine-readable verdict so the log
 /// sweep catches the missing record instead of silently claiming completeness.
-async fn record_browser_event(
+pub(crate) async fn record_browser_event(
     state: &AppState,
     actor: Option<&str>,
     binding_session: &str,
@@ -467,6 +468,18 @@ async fn record_browser_event(
             error = %error,
             "browser action completed but its durable audit event could not be written"
         ),
+    }
+}
+
+/// What a triage needs beside the action: the page it ended on (`url` is the
+/// page it started on) and how long it took. Bounded to two seconds so a
+/// wedged page cannot hold the response.
+async fn finish_action_audit(cdp: &mut chrome::CdpClient, audit: &mut Value, started: std::time::Instant) {
+    let after = cdp.eval("location.href", 2).await.ok().and_then(|v| v.as_str().map(audit_url));
+    if let Some(o) = audit.as_object_mut() {
+        o.insert("url_before".into(), o.get("url").cloned().unwrap_or(Value::Null));
+        o.insert("url_after".into(), after.map(Value::from).unwrap_or(Value::Null));
+        o.insert("latency_ms".into(), json!(started.elapsed().as_millis() as u64));
     }
 }
 
@@ -693,7 +706,7 @@ mod af419_start_origin_tests {
     use super::*;
 
     fn store_with(rows: &[(f64, &str, &str, &str)]) -> crate::db::SharedStore {
-        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let dir = crate::test_tempdirs::keep(tempfile::tempdir().unwrap());
         let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
         let owned: Vec<(f64, String, String, String)> = rows
             .iter()
@@ -1075,15 +1088,30 @@ fn takeover_refusal(
 /// + the fix), CDP trouble is the browser misbehaving (502).
 fn driver_err(e: chrome::DriverError) -> Response {
     match e {
-        chrome::DriverError::NotRunning => err(
-            StatusCode::CONFLICT,
-            json!({
-                "error": "no amux-launched browser is running — POST /api/browser/start {\"profile\":\"...\",\"url\":\"...\"} first",
-                "hint": "native driver verbs operate the Chrome started by /api/browser/start; \
-                         GET /api/browser/status shows what is running. They never attach to a \
-                         browser this server did not launch.",
-            }),
-        ),
+        chrome::DriverError::NotRunning => {
+            // WHY it is gone and how to get it back, beside the refusal: a bare
+            // "not running" after a reap or a restart sent a worker to debug
+            // its connection (NetSuite, 2026-10-26).
+            let last = chrome::LAST_EXIT.lock().ok().and_then(|g| g.clone())
+                .or_else(|| chrome::persisted_last_exit(&chrome::amux_home()));
+            let why = last.as_ref().and_then(|v| v.get("reason")).and_then(Value::as_str).map(str::to_owned);
+            let profile = last.as_ref().and_then(|v| v.get("profile")).and_then(Value::as_str).unwrap_or("<profile>").to_owned();
+            err(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": match &why {
+                        Some(w) => format!("the browser is closed ({w}); start it again: POST /api/browser/start {{\"profile\":\"{profile}\"}} (amux browser start {profile})"),
+                        None => "no amux-launched browser is running — POST /api/browser/start {\"profile\":\"...\",\"url\":\"...\"} first".to_string(),
+                    },
+                    "closed_because": why,
+                    "last_exit": last,
+                    "restart": format!("POST /api/browser/start {{\"profile\":\"{profile}\"}}  (logins on the profile survive)"),
+                    "hint": "native driver verbs operate the Chrome started by /api/browser/start; \
+                             GET /api/browser/status shows what is running. They never attach to a \
+                             browser this server did not launch. `amux browser hold <profile> --for 2h` keeps one open for a long task.",
+                }),
+            )
+        }
         chrome::DriverError::Cdp(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
     }
 }
@@ -1245,6 +1273,10 @@ pub(crate) async fn connect_session(
 struct StartBody {
     #[serde(default)]
     profile: String,
+    /// Why a route cannot do the job, if the caller wants the CDP port
+    /// (cdp_proxy.rs). Without it `cdp_port` is withheld.
+    #[serde(default)]
+    cdp_reason: Option<String>,
     #[serde(default)]
     url: String,
     /// Same resolution as every driver verb. `start` needs it for the reason
@@ -1294,6 +1326,24 @@ struct StartBody {
 
 // `HeaderMap` before `Json` — axum requires the body extractor last.
 async fn start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<StartBody>>,
+) -> Response {
+    let reason = body.as_ref().and_then(|Json(b)| b.cdp_reason.clone());
+    let session = explicit_session(body.as_ref().and_then(|Json(b)| b.session.as_deref()), &headers)
+        .unwrap_or_else(|| "owner".to_string());
+    let resp = start_inner(State(state.clone()), headers, body).await;
+    let (parts, b) = resp.into_parts();
+    let bytes = axum::body::to_bytes(b, 16 << 20).await.unwrap_or_default();
+    let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    super::cdp_proxy::gate(&state, &session, reason.as_deref(), &mut v, &[("/cdp_port", "/profile")]).await;
+    (parts.status, Json(v)).into_response()
+}
+
+async fn start_inner(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Option<Json<StartBody>>,
@@ -1651,7 +1701,32 @@ fn start_failure(e: &anyhow::Error) -> (StatusCode, Value) {
     (status, body)
 }
 
-async fn status() -> Response {
+/// `cdp_port` here is gated (cdp_proxy.rs): withheld unless the caller says
+/// why a route cannot do the job, and then a logged proxy port. The rest of
+/// the status is unchanged.
+async fn status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let resp = status_inner().await;
+    let (parts, b) = resp.into_parts();
+    let bytes = axum::body::to_bytes(b, 16 << 20).await.unwrap_or_default();
+    let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    let reason = q.get("cdp_reason").cloned();
+    let session = explicit_session(None, &headers).unwrap_or_else(|| "owner".to_string());
+    let n = v.get("browsers").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    let ptrs: Vec<(String, String)> = std::iter::once(("/cdp_port".to_string(), "/profile".to_string()))
+        .chain((0..n).map(|i| (format!("/browsers/{i}/cdp_port"), format!("/browsers/{i}/profile"))))
+        .collect();
+    let refs: Vec<(&str, &str)> = ptrs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    super::cdp_proxy::gate(&state, &session, reason.as_deref(), &mut v, &refs).await;
+    (parts.status, Json(v)).into_response()
+}
+
+async fn status_inner() -> Response {
     // Adopt BEFORE reading (AMUX-3414): status is the first place anyone looks
     // after a death, and it was the one verb that never ran the adopt — so a
     // browser surviving a restart read as "running": false here while every
@@ -1734,6 +1809,7 @@ async fn status() -> Response {
     let mut browsers: Vec<Value> = Vec::new();
     for (p, o, st, pid, port, last_verb) in &all {
         let t = chrome::cdp_list(*port).await.ok();
+        let closes = crate::runtime_jobs::browser_reaper::closes_at(&chrome::amux_home(), p, *st, *last_verb);
         let age_s = now_f - *st as f64;
         let since_verb_s = now_f - *last_verb as f64;
         let ttl_remaining_s = if ttl > 0 {
@@ -1773,6 +1849,12 @@ async fn status() -> Response {
             // How long since any verb (navigate/screenshot/action) was called.
             "since_verb_s": since_verb_s.round(),
             "activity_reap_s": activity_reap_val,
+            // WHEN amux will close it, and why: the soonest arm, or a hold
+            // (`amux browser hold`). Null when no arm can close it.
+            "closes_at": closes.0,
+            "closes_in_s": closes.0.map(|t| (t - now_f as i64).max(0)),
+            "closes_because": if closes.0.is_some() { json!(closes.1) } else { Value::Null },
+            "held_until": crate::runtime_jobs::browser_reaper::hold_until(&chrome::amux_home(), p).filter(|u| *u as f64 > now_f),
         }));
     }
     Json(json!({
@@ -3534,6 +3616,56 @@ async fn state_payload(cdp: &mut chrome::CdpClient, session: &str) -> Result<Val
 /// `cdp.mjs` sends this on EVERY command, best-effort. A keepalive a caller must
 /// remember is opt-in, and the population that needs it is every CDP driver
 /// (ethos rule 1). Nobody should have to know this route exists.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldBody {
+    /// A browser profile, or `route:<dir>` for a route's Chrome. Empty: the
+    /// browser this session started.
+    #[serde(default)]
+    profile: String,
+    /// How long to keep it open, in seconds. 0 releases the hold.
+    for_s: i64,
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// Keep a browser open for a long task (`amux browser hold <profile> --for 2h`).
+/// No reaper arm closes it until the hold ends; a hold is capped at
+/// AMUX_BROWSER_HOLD_MAX_S (24h). A worker may hold only a profile it may use.
+async fn hold(headers: HeaderMap, Json(b): Json<HoldBody>) -> Response {
+    let session = resolve_session(b.session.as_deref(), &headers);
+    let profile = if b.profile.trim().is_empty() {
+        match chrome::running_all().into_iter().find(|r| r.1 == session) {
+            Some(r) => r.0,
+            None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "no profile named and this session has no browser running",
+                "hint": "amux browser hold <profile> --for 2h"}))).into_response(),
+        }
+    } else {
+        b.profile.trim().to_string()
+    };
+    if !profile.starts_with("route:") && !session.is_empty() {
+        if let Err(denied) = super::browser_scope::profile_allowed(&session, &profile) {
+            return denied.response();
+        }
+    }
+    if b.for_s < 0 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "for_s must be 0 (release) or more"}))).into_response();
+    }
+    let now = chrome::now_secs_i64();
+    let until = crate::runtime_jobs::browser_reaper::set_hold(&chrome::amux_home(), &profile, b.for_s, now);
+    tracing::info!(profile = %profile, session = %session, for_s = b.for_s, until = ?until, verdict = if until.is_some() { "browser_held" } else { "browser_hold_released" },
+        "browser: hold {}", if until.is_some() { "set" } else { "released" });
+    Json(json!({
+        "ok": true,
+        "profile": profile,
+        "held_until": until,
+        "held_for_s": until.map(|u| u - now),
+        "capped": until.is_some_and(|u| u - now < b.for_s),
+        "running": chrome::running_snapshot_for(&profile).is_some(),
+    }))
+    .into_response()
+}
+
 async fn keepalive(headers: HeaderMap, Query(q): Query<SessionQuery>) -> Response {
     let session = resolve_session(q.session.as_deref(), &headers);
     crate::integrations::browser::touch_verb_for_session(&session);
@@ -3714,12 +3846,128 @@ async fn action_as(
     action(state, headers, Some(Json(v))).await
 }
 
+/// Every action `/api/browser/action` (and `amux browser route action`) runs.
+/// `help`, an empty action and an unknown one answer with this list
+/// (NetSuite, 2026-10-26: "unknown action: help" listed nothing).
+pub(crate) const BROWSER_ACTIONS: &[(&str, &str)] = &[
+    ("click", "ref + observation_id from state, or selector, index, or x,y"),
+    ("input", "ref or index (or selector on a route) + text: REPLACES the field's contents; alias fill"),
+    ("type", "text, at the caret; with a selector it replaces the field unless append:true; replace:true clears the focused field first"),
+    ("key", "key: Enter, Tab, Escape, Backspace, arrows"),
+    ("scroll", "dy (or amount), dx"),
+    ("eval", "script: a JavaScript EXPRESSION, its value is returned; aliases evaluate, js; script may also be named expression or code"),
+    ("wait", "selector or text"),
+    ("extract", "page text and elements"),
+    ("back", ""),
+    ("viewport", "width+height, or device=iphone|iphone-se|ipad|desktop"),
+    ("files", "selector + files[]: absolute paths for an <input type=file>"),
+    ("download", "url (absolute or relative), optional filename: fetched with the page's cookies, saved under ~/.amux/downloads/<session>/, path returned"),
+];
+
+/// Names and parameter spellings a caller reasonably tries, mapped onto the
+/// ones the handlers take, so `evaluate` is not an "unknown action" (NetSuite,
+/// 2026-10-26: with no way to run JavaScript the worker wrote its own CDP
+/// client, which the reaper could not see). Returns the canonical action.
+pub(crate) fn normalize_action_body(body: &mut Value) -> String {
+    let Some(o) = body.as_object_mut() else { return String::new() };
+    let raw = o.get("action").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+    let canon = match raw.as_str() {
+        "evaluate" | "js" | "javascript" | "run" => "eval",
+        "fill" => "input",
+        "press" => "key",
+        other => other,
+    }
+    .to_string();
+    if canon == "eval" && o.get("script").and_then(Value::as_str).is_none_or(|s| s.trim().is_empty()) {
+        for k in ["expression", "code", "js"] {
+            if let Some(v) = o.get(k).and_then(Value::as_str).map(str::to_owned) {
+                o.insert("script".into(), json!(v));
+                break;
+            }
+        }
+    }
+    o.insert("action".into(), json!(canon));
+    canon
+}
+
+/// A safe file name for a download: the caller's, else Content-Disposition's,
+/// else the URL's last segment. No directories, no dot-files.
+pub(crate) fn download_file_name(asked: Option<&str>, disposition: &str, url: &str) -> String {
+    let from_cd = disposition.split(';').find_map(|p| {
+        let p = p.trim();
+        p.strip_prefix("filename*=UTF-8''").or_else(|| p.strip_prefix("filename=")).map(|v| v.trim_matches('"').to_string())
+    });
+    let from_url = url.split(['?', '#']).next().and_then(|u| u.rsplit('/').next()).map(str::to_string);
+    let raw = asked.map(str::to_string).filter(|s| !s.trim().is_empty()).or(from_cd).or(from_url).unwrap_or_default();
+    let raw = raw.replace("%20", " ");
+    let clean: String = raw.rsplit(['/', '\\']).next().unwrap_or("").chars()
+        .map(|c| if c.is_alphanumeric() || " ._-()".contains(c) { c } else { '_' }).collect();
+    let clean = clean.trim().trim_start_matches('.').to_string();
+    if clean.is_empty() { format!("download-{}", now_epoch()) } else { clean.chars().take(150).collect() }
+}
+
+/// Select element `e`'s contents (JS, `e` in scope), so typed text replaces them.
+const SELECT_E_CONTENTS: &str = "if(typeof e.select==='function'&&('value' in e)){e.select();}\
+else{var r=document.createRange();r.selectNodeContents(e);var s=getSelection();s.removeAllRanges();s.addRange(r);}";
+/// The same for whatever is focused (`type` with replace:true).
+const SELECT_FOCUSED_CONTENTS: &str = "(function(){var e=document.activeElement;if(!e||e===document.body)return false;\
+if(typeof e.select==='function'&&('value' in e)){e.select();return true}\
+if(e.isContentEditable){var r=document.createRange();r.selectNodeContents(e);var s=getSelection();s.removeAllRanges();s.addRange(r);return true}return false})()";
+
+pub(crate) fn actions_help(asked: &str) -> Value {
+    json!({
+        "error": if asked.is_empty() || asked == "help" { Value::Null } else { json!(format!("unknown action: {asked}")) },
+        "actions": BROWSER_ACTIONS.iter().map(|(n, d)| json!({"action": n, "takes": d})).collect::<Vec<_>>(),
+        "eval_contract": "script must be a bare EXPRESSION; a `return` statement yields null",
+    })
+}
+
+/// Drive the browser from server code, as `session`: `start` (StartBody),
+/// `navigate` (NavigateBody) or any action (the body of POST /action). The
+/// same handlers the HTTP routes run, so ownership, scope and audit apply
+/// unchanged. Returns the reply body, or its error text for a non-2xx reply.
+pub(crate) async fn drive(state: &AppState, session: &str, verb: &str, body: Value) -> Result<Value, String> {
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = axum::http::HeaderValue::from_str(session) {
+        headers.insert("x-amux-session", v);
+    }
+    let resp = match verb {
+        "start" => {
+            let b: StartBody = serde_json::from_value(body).map_err(|e| format!("start body: {e}"))?;
+            start(State(state.clone()), headers, Some(Json(b))).await
+        }
+        "navigate" => {
+            let b: NavigateBody = serde_json::from_value(body).map_err(|e| format!("navigate body: {e}"))?;
+            navigate(State(state.clone()), headers, Some(Json(b))).await
+        }
+        "stop" => stop(State(state.clone()), headers, Some(Json(body))).await,
+        _ => {
+            let mut b = body;
+            b["action"] = json!(verb);
+            action_inner(State(state.clone()), headers, Some(Json(b))).await
+        }
+    };
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 << 20).await.map_err(|e| with_cause(&e))?;
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({"text": String::from_utf8_lossy(&bytes)}));
+    if status.is_success() {
+        Ok(v)
+    } else {
+        Err(format!("browser {verb}: HTTP {status}: {}", v["error"].as_str().map(String::from).unwrap_or_else(|| v.to_string())))
+    }
+}
+
 async fn action_inner(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Option<Json<Value>>,
 ) -> Response {
-    let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let mut body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let canon = normalize_action_body(&mut body);
+    if canon.is_empty() || canon == "help" {
+        return Json(actions_help(&canon)).into_response();
+    }
+    let body = body;
     let action = body
         .get("action")
         .and_then(Value::as_str)
@@ -3839,13 +4087,13 @@ async fn action_inner(
                 return err(StatusCode::BAD_REQUEST, json!({ "error": error }));
             }
         }
-        "type" | "scroll" | "back" | "extract" => {}
-        other => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                json!({ "error": format!("unknown action: {other}") }),
-            )
+        "download" => {
+            if get_str("url").map(|u| u.trim().is_empty()).unwrap_or(true) {
+                return err(StatusCode::BAD_REQUEST, json!({ "error": "download needs url (absolute, or relative to the page)" }));
+            }
         }
+        "type" | "scroll" | "back" | "extract" => {}
+        other => return err(StatusCode::BAD_REQUEST, actions_help(other)),
     }
 
     let (page, mut cdp) = match connect_session(&session, None).await {
@@ -3854,12 +4102,14 @@ async fn action_inner(
     };
     crate::integrations::browser::touch_verb_for_session(&session);
     let ten = Duration::from_secs(10);
-    let audit = action_audit_fields(&body, &page.url);
+    let mut audit = action_audit_fields(&body, &page.url);
+    let action_started = std::time::Instant::now();
 
     macro_rules! audited_return {
         ($response:expr) => {{
             let response = $response;
             let status = response.status();
+            finish_action_audit(&mut cdp, &mut audit, action_started).await;
             record_action_response(&state, actor.as_deref(), &session, audit.clone(), status).await;
             return response;
         }};
@@ -3943,12 +4193,29 @@ async fn action_inner(
         }
         "type" => {
             let text = get_str("text").unwrap_or_default();
+            // replace:true clears the focused field first (select its contents,
+            // so the text replaces them through the browser's own input path).
+            if body.get("replace").and_then(Value::as_bool) == Some(true) {
+                let _ = cdp.eval(SELECT_FOCUSED_CONTENTS, 10).await;
+            }
             match cdp
                 .call("Input.insertText", json!({ "text": text }), ten)
                 .await
             {
                 Ok(_) => {
-                    Json(json!({ "ok": true, "typed": text.chars().count(), "backend": "native" }))
+                    // What the focused field holds now, so typing into a
+                    // pre-filled field shows the doubled value in this very
+                    // reply (2026-10-26) instead of six steps later. A
+                    // password field reports its length only.
+                    let back = cdp
+                        .eval("(function(){var e=document.activeElement;if(!e||!('value' in e))return null;\
+                               return e.type==='password'?{length:String(e.value).length}:{value:String(e.value).slice(0,500)};})()", 10)
+                        .await
+                        .ok()
+                        .filter(|v| !v.is_null());
+                    Json(json!({ "ok": true, "typed": text.chars().count(), "backend": "native",
+                        "field_after": back,
+                        "note": "type inserts at the caret; to replace a field's contents use input (or type with replace:true)" }))
                         .into_response()
                 }
                 Err(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
@@ -3978,12 +4245,18 @@ async fn action_inner(
                     Err(e) => audited_return!(err(cdp_status(&e), json!({ "error": with_cause(&e) }))),
                 }
             }
-            // Focus + clear element[idx] of the /state list, then type.
+            // Focus element[idx] of the /state list and SELECT what it holds,
+            // so the typed text replaces it. `e.value=''` was not enough: a
+            // framework-controlled field (React) puts its own value back and
+            // the text was appended to it ("Kayla@…comKayla@…com", NetSuite,
+            // 2026-10-26). Typing over a selection goes through the browser's
+            // own input path, which every framework hears.
             let js = format!(
                 "(function(){{var els=window.__amux_els||[];var e=els[{idx}];\
                  if(!e)return 'NOELEMENT';if(!e.isConnected)return 'STALE';\
                  e.scrollIntoView({{block:'center'}});e.focus();\
-                 if('value' in e)e.value='';return 'FOCUSED';}})()"
+                 {sel}return 'FOCUSED';}})()",
+                sel = SELECT_E_CONTENTS,
             );
             let raw = match cdp.eval(&js, 20).await {
                 Ok(r) => r,
@@ -4098,6 +4371,52 @@ async fn action_inner(
         // Consequence for the reader: this is the one action whose paths are
         // resolved on the machine running CHROME, not by the page. Both
         // validations above (absolute, exists) are about that seam.
+        "download" => {
+            // The page's own fetch, so the file comes with the profile's
+            // cookies and the page's origin, as a click on the link would
+            // (NetSuite, 2026-10-26: no way to download a file through a
+            // profile, so the worker wrote export scripts). The bytes go to
+            // disk; the reply carries the path, never the content.
+            let url = get_str("url").unwrap_or_default();
+            let max: usize = 50 * 1024 * 1024;
+            let js = format!(
+                "(async()=>{{const r=await fetch({u},{{credentials:'include'}});const b=new Uint8Array(await r.arrayBuffer());\
+                 if(b.length>{max})return {{error:'larger than 50 MB',size:b.length,status:r.status}};let s='';\
+                 for(let i=0;i<b.length;i+=32768)s+=String.fromCharCode.apply(null,b.subarray(i,i+32768));\
+                 return {{status:r.status,url:r.url,type:r.headers.get('content-type')||'',disposition:r.headers.get('content-disposition')||'',size:b.length,b64:btoa(s)}};}})()",
+                u = json!(url)
+            );
+            let r = match cdp.eval(&js, 120).await {
+                Ok(v) => v,
+                Err(e) => audited_return!(err(cdp_status(&e), json!({ "error": with_cause(&e) }))),
+            };
+            if let Some(e) = r.get("error") {
+                audited_return!(err(StatusCode::PAYLOAD_TOO_LARGE, json!({ "error": e, "size": r.get("size") })));
+            }
+            use base64::Engine as _;
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(r["b64"].as_str().unwrap_or("")) {
+                Ok(b) => b,
+                Err(e) => audited_return!(err(StatusCode::BAD_GATEWAY, json!({ "error": format!("the page returned unreadable bytes: {e}") }))),
+            };
+            let name = download_file_name(get_str("filename").as_deref(), r["disposition"].as_str().unwrap_or(""), r["url"].as_str().unwrap_or(&url));
+            let dir = chrome::amux_home().join("downloads").join(if session.is_empty() { "anonymous" } else { session.as_str() });
+            let path = dir.join(&name);
+            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes)) {
+                audited_return!(err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": format!("could not save {}: {e}", path.display()) })));
+            }
+            let status = r["status"].as_u64().unwrap_or(0);
+            tracing::info!(session = %session, bytes = bytes.len(), status, verdict = "browser_download_saved", "browser: saved a download from the page's session (content not logged)");
+            Json(json!({
+                "ok": (200..300).contains(&status),
+                "path": path,
+                "size": bytes.len(),
+                "http_status": status,
+                "content_type": r["type"],
+                "url": r["url"],
+                "note": if (200..300).contains(&status) { Value::Null } else { json!("the server answered with an error status; the saved file is that answer (often a sign-in page)") },
+            }))
+            .into_response()
+        }
         "files" => {
             let selector = get_str("selector").unwrap_or_default();
             let files: Vec<String> = body
@@ -4220,6 +4539,7 @@ async fn action_inner(
         _ => unreachable!("validated above"),
     };
     let status = response.status();
+    finish_action_audit(&mut cdp, &mut audit, action_started).await;
     record_action_response(&state, actor.as_deref(), &session, audit, status).await;
     response
 }
@@ -4856,7 +5176,7 @@ mod tests {
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         AppState {
             store,
             started: std::time::Instant::now(),
@@ -6565,5 +6885,58 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(!proxied);
         assert_eq!(v["running"], json!(false));
+    }
+}
+
+#[cfg(test)]
+mod action_names_tests {
+    use super::*;
+
+    /// NetSuite, 2026-10-26: `evaluate` was an unknown action, so the worker
+    /// wrote its own CDP client. Every reasonable spelling now runs.
+    #[test]
+    fn evaluate_fill_and_friends_map_onto_the_handlers() {
+        let mut b = json!({"action": "evaluate", "expression": "1+1"});
+        assert_eq!(normalize_action_body(&mut b), "eval");
+        assert_eq!(b["script"], "1+1");
+        let mut b = json!({"action": "JS", "code": "document.title"});
+        assert_eq!(normalize_action_body(&mut b), "eval");
+        assert_eq!(b["script"], "document.title");
+        let mut b = json!({"action": "eval", "script": "x", "code": "y"});
+        normalize_action_body(&mut b);
+        assert_eq!(b["script"], "x", "an explicit script wins");
+        let mut b = json!({"action": "fill", "index": 3, "text": "a@b.c"});
+        assert_eq!(normalize_action_body(&mut b), "input");
+    }
+
+    #[test]
+    fn help_and_unknown_actions_list_what_exists() {
+        let h = actions_help("help");
+        assert!(h["error"].is_null());
+        let names: Vec<_> = h["actions"].as_array().unwrap().iter().map(|a| a["action"].as_str().unwrap()).collect();
+        for want in ["click", "input", "type", "eval", "key", "scroll", "wait"] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+        let u = actions_help("dance");
+        assert_eq!(u["error"], "unknown action: dance");
+        assert!(!u["actions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_download_gets_a_safe_name() {
+        assert_eq!(download_file_name(None, "attachment; filename=\"AR Aging.csv\"", "https://x/y?z"), "AR Aging.csv");
+        assert_eq!(download_file_name(None, "", "https://x/reports/aging.csv?token=1"), "aging.csv");
+        assert_eq!(download_file_name(Some("../../etc/passwd"), "", ""), "passwd");
+        assert_eq!(download_file_name(Some(".bashrc"), "", ""), "bashrc");
+        assert!(download_file_name(None, "", "https://x/").starts_with("download-"));
+    }
+
+    #[test]
+    fn input_selects_the_field_so_the_text_replaces_it() {
+        // The clear has to go through a selection, not `e.value=''`, which a
+        // framework-controlled field undoes (the doubled email).
+        assert!(SELECT_E_CONTENTS.contains("e.select()"));
+        assert!(SELECT_E_CONTENTS.contains("selectNodeContents(e)"));
+        assert!(!SELECT_E_CONTENTS.contains("e.value=''"));
     }
 }

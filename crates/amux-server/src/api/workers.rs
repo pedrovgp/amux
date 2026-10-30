@@ -1183,6 +1183,11 @@ pub async fn start_worker(
                 },
             )?;
             queries::update_worker_state(conn, &row.id, &WorkerState::Starting, &now_s)?;
+            // The other half of the record: a start CLEARS an owner stop, or a
+            // lane the owner deliberately resumed would read as "owner stopped"
+            // forever and never be driven again. Same shape as the fleet start
+            // path (`session_verbs`), so one predicate answers for both.
+            record_owner_lifecycle(conn, &row.display_name, "session.started", "api-start")?;
             // Post-mutation snapshot for the journal (RR-0111a): the row as
             // update_worker_state just left it.
             let mut after = row.clone();
@@ -1250,6 +1255,30 @@ pub async fn start_worker(
     step_response(write, slot, &key, StatusCode::ACCEPTED)
 }
 
+/// Record a stop or a start in `session_events`, keyed by the lane name.
+///
+/// WHY: `WorkerState::Stopped` carries no reason, so this row IS the reason.
+/// Both stop paths (`amux stop` for a fleet lane, `POST /api/workers/{id}/stop`
+/// for a durable worker) write `session.stopped` with source `api-stop`, and
+/// `board_drive::owner_stopped` — the predicate the board drive and the
+/// bootstrap `todo_owner_autostart` sweep both consult — reads exactly that.
+/// A start writes `session.started`, which clears the hold; without it a lane
+/// the owner resumed would stay "owner stopped" forever.
+///
+/// `ts` is epoch seconds (REAL), the unit `owner_stopped` compares.
+fn record_owner_lifecycle(
+    conn: &rusqlite::Connection,
+    lane: &str,
+    etype: &str,
+    source: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO session_events (ts, session, type, data, source) \
+         VALUES (?1, ?2, ?3, NULL, ?4)",
+        rusqlite::params![crate::config::now_f64(), lane, etype, source],
+    )
+}
+
 /// POST /api/workers/{id}/stop — worker -> Stopped; the live session row (if
 /// any) is ended as Killed. Stopping a stopped worker is an honest no-op.
 pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
@@ -1291,6 +1320,13 @@ pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>)
                     },
                 ));
             }
+            // THE REASON, in the one place every reader of it already looks. A
+            // stop recorded here used to leave no trace, so the bootstrap
+            // `todo_owner_autostart` sweep could not tell it from a crash and
+            // restarted the worker on its next tick (review on #391). Written in
+            // the same transaction as the state change: a stop that cannot be
+            // explained is worse than no stop at all.
+            record_owner_lifecycle(conn, &row.display_name, "session.stopped", "api-stop")?;
             finish(
                 &slot_w,
                 StepOutcome::Applied {
@@ -1435,7 +1471,6 @@ fn restore_retired_legacy_for_resume(name: &str) -> anyhow::Result<bool> {
     std::fs::rename(&retired, &active)?;
     let mut cfg = fleet::EnvFile::load(&active);
     cfg.remove("CC_ARCHIVED");
-    cfg.remove("CC_REVIEW_HELD");
     cfg.set("CC_PAUSED", "1");
     cfg.write(&active)?;
     crate::api::sessions_legacy::invalidate_sessions_cache();
@@ -1512,11 +1547,10 @@ async fn change_pause(
         return not_found(&key);
     }
     let cfg = fleet::parse_env(&name);
-    let review_held = cfg.get("CC_REVIEW_HELD") == Some("1");
     let current = row.as_ref().map(|r| r.lifecycle).unwrap_or_else(|| {
         if cfg.get("CC_ARCHIVED") == Some("1") {
             WorkerLifecycle::Archived
-        } else if cfg.get("CC_PAUSED") == Some("1") || review_held {
+        } else if cfg.get("CC_PAUSED") == Some("1") {
             WorkerLifecycle::Paused
         } else {
             WorkerLifecycle::Active
@@ -1536,7 +1570,7 @@ async fn change_pause(
         WorkerLifecycle::Active
     };
     // A repeated Resume is a no-op, not a request to restart a manually stopped worker.
-    if !paused && current == target && cfg.get("CC_PAUSED") != Some("1") && !review_held {
+    if !paused && current == target && cfg.get("CC_PAUSED") != Some("1") {
         return (
             StatusCode::OK,
             Json(json!({"applied":false,"lifecycle":"active","name":name})),
@@ -1557,10 +1591,6 @@ async fn change_pause(
         }
     }
     let outcome: anyhow::Result<Value> = async {
-        if !paused && review_held {
-            fleet::set_review_hold_at(&fleet::env_path(&name), false)
-                .map_err(anyhow::Error::msg)?;
-        }
         fleet::set_legacy_paused(&name, paused)?;
         if let (Some(row), Some(protocol)) = (&row, crate::opencode::process_protocol()) {
             let worker = WorkerId::parse(&row.id)?;
@@ -3072,40 +3102,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_held_legacy_resume_clears_hold_before_starting() {
-        let home = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(home.path());
-        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-        let env = home.path().join("sessions/review-probe.env");
-        std::fs::write(
-            &env,
-            "CC_REVIEW_HELD=1
-CC_BACKEND=herdr
-CC_DIR=/tmp
-",
-        )
-        .unwrap();
-        let (app, _dir) = app();
-
-        let (st, _, body) = send(&app, "POST", "/api/workers/review-probe/resume", None).await;
-        assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap()
-                .contains("herdr-backed session start"),
-            "resume must reach start_session after clearing the review hold: {body}"
-        );
-        let env = crate::api::session_verbs::parse_env("review-probe");
-        assert_ne!(env.get("CC_REVIEW_HELD"), Some("1"));
-        assert_eq!(
-            env.get("CC_PAUSED"),
-            Some("1"),
-            "failed review resume stays visible and retryable as paused"
-        );
-    }
-
-    #[tokio::test]
     async fn pause_legacy_failure_and_resume_failure_are_honest() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(home.path());
@@ -3176,6 +3172,53 @@ CC_DIR=/tmp
         assert_eq!(st, StatusCode::NOT_FOUND);
         let (_, _, list) = send(&app, "GET", "/api/workers", None).await;
         assert_eq!(list["total"], json!(0));
+    }
+
+    /// Review on #391: `WorkerState::Stopped` carries no reason, so an owner
+    /// stop made through this route must leave one where every reader already
+    /// looks. The bootstrap `todo_owner_autostart` sweep consults
+    /// `board_drive::owner_stopped`; before this the dashboard stop was
+    /// indistinguishable from a crash and sweep 0 restarted the worker on its
+    /// next tick. A start must clear the hold, or a lane the owner resumed
+    /// reads "owner stopped" forever.
+    #[tokio::test]
+    async fn an_api_stop_is_recorded_and_the_sweep_predicate_reads_it() {
+        let (app, dir) = app();
+        let id = create(&app, "ownerstop").await;
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/start"), None).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{body}");
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/stop"), None).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+
+        let conn = rusqlite::Connection::open(dir.path().join("amux-test.db")).unwrap();
+        let events = |kind: &str, source: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session='ownerstop' \
+                 AND type=?1 AND source=?2",
+                rusqlite::params![kind, source],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(events("session.started", "api-start"), 1, "the start is recorded");
+        assert_eq!(
+            events("session.stopped", "api-stop"),
+            1,
+            "the stop carries its reason"
+        );
+        assert!(
+            crate::runtime_jobs::board_drive::owner_stopped(&conn, "ownerstop"),
+            "the predicate the sweep reads must see this stop as the owner's"
+        );
+
+        drop(conn);
+        let (st, _, body) = send(&app, "POST", &format!("/api/workers/{id}/start"), None).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{body}");
+        let conn = rusqlite::Connection::open(dir.path().join("amux-test.db")).unwrap();
+        assert!(
+            !crate::runtime_jobs::board_drive::owner_stopped(&conn, "ownerstop"),
+            "a later start clears the hold"
+        );
     }
 
     #[tokio::test]

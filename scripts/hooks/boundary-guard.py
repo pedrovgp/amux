@@ -8,7 +8,11 @@ boundaries.toml (repo root; installed beside this file as
 registry, refuses the tool calls a `deny` rule describes, refuses heavy
 commands while the machine is critical (the `resources` boundary), and refuses
 a new Agent/Task call past the running-subagent cap or under the account's
-usage headroom floor (the `subagents` boundary).
+usage headroom floor (the `subagents` boundary), and refuses modal prompt tools
+(AskUserQuestion, plan mode) for orchestrator lanes (the `modal` boundary),
+and refuses hook-less pushes to a protected branch (the `push-gates` boundary),
+and refuses a cluster or cloud delete that this worker has not previewed (the
+`delete-gate` boundary).
 
 Who it applies to: amux workers (AMUX_SESSION set), and isolated ones
 (AMUX_ISOLATED_WORKER set) while the registry's top-level `apply_to_isolated`
@@ -22,7 +26,17 @@ Every decision other than a plain allow is appended to
 Fail-open: a guard must never wedge a tool call. An unreadable payload or
 registry lets the call through, and a registry that does not load is logged
 as verdict=boundary_registry_unloadable so the sweep sees every boundary
-went dark.
+went dark. The one exception is a deny rule with `requires_receipt`
+(tenant-workload-gate): once its patterns match a command segment, a missing,
+stale or foreign receipt refuses the call, and so does a failed check. The
+other is the push-gates boundary (kind push_gates): a `git push` segment that
+writes main or master is refused when it skips the hooks or runs in a repo
+that ships a pre-push hook it has not installed, when the hook state
+cannot be read, and in a repo whose `repos` entry sets `land = true` (it lands
+main through `amux land`, whose own push runs in its subprocess, unseen here).
+The delete gate (kind delete_gate) also fails closed: a delete with no fresh,
+unused preview receipt, or a receipt that cannot be read, consumed or written,
+is refused.
 """
 from __future__ import annotations
 
@@ -146,6 +160,12 @@ def rule_applies(rule: dict, tool: str, command: str, path: str, content: str) -
         return False
     if tool == "Bash":
         alls = rule.get("match_all") or []
+        if rule.get("requires_receipt"):
+            # A cheap prefilter only: quotes read as spaces so a command inside
+            # bash -c '...' still passes it. match_none and the receipt are
+            # decided per segment in check_receipts.
+            loose = re.sub(r"[\"'`()]", " ", command)
+            return bool(alls) and all(search(p, loose) for p in alls)
         if not alls or not all(search(p, command) for p in alls):
             return False
         return not any(search(p, command) for p in rule.get("match_none") or [])
@@ -156,6 +176,792 @@ def rule_applies(rule: dict, tool: str, command: str, path: str, content: str) -
         anys = rule.get("content_any") or []
         return not anys or any(search(p, content) for p in anys)
     return False
+
+
+# ---- receipts (tenant-workload-gate, 2026-10-27) --------------------------------
+#
+# A deny rule with `requires_receipt` refuses only the command segments whose
+# target has no fresh receipt. On 2026-10-27 a worker scaled
+# ephemeral-r40255478404's deploy/api to zero without reading the namespace's
+# ScaledObjects, and a second ScaledObject that watches app=api pods
+# deactivated the mvs-primary shard mid index rebuild. The receipt is what the
+# read-only gate (scripts/tenant-gate.sh) writes after it reads what scales
+# what. Everything that decides scope (which segments, which namespaces, how
+# the namespace and context are found) is in the registry; this code only
+# splits the command, applies those patterns, and checks the file. Fail
+# CLOSED: a matching segment with no valid receipt is refused.
+
+SHELL_WRAPPERS = {"bash", "sh", "zsh", "eval", "ssh", "su", "watch"}
+OPERATORS = {";", "&&", "||", "|", "&", "\n", ";;", "|&"}
+
+
+def receipt_key(value: str) -> str:
+    """The receipt file name part for a context or namespace. tenant-gate.sh
+    applies the same substitution, so the two always agree."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", value) or "_"
+
+
+def command_token_segments(command: str, depth: int = 0, via: str = "") -> list[tuple[list[str], str]]:
+    """Simple commands as token lists, split on shell operators and newlines,
+    with the string given to bash -c / sh -c / eval / ssh split again (those
+    follow their parent, tagged with the wrapper's name in `via`)."""
+    import shlex
+
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
+        lex.whitespace = " \t\r"
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:  # unbalanced quotes (a heredoc body, say): split crudely
+        tokens = []
+        for part in re.split(r"(;|&&|\|\||\||\n)", command):
+            tokens.extend(["\n"] if part in (";", "&&", "||", "|", "\n") else part.split())
+    segs: list[list[str]] = [[]]
+    for t in tokens:
+        if t in OPERATORS:
+            segs.append([])
+        else:
+            segs[-1].append(t)
+    out: list[tuple[list[str], str]] = []
+    for seg in segs:
+        if not seg:
+            continue
+        out.append((seg, via))
+        if depth < 2:
+            words = [w for w in seg if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
+            if words and os.path.basename(words[0]) in SHELL_WRAPPERS:
+                wrapper = os.path.basename(words[0])
+                for w in words[1:]:
+                    if re.search(r"\s", w):
+                        out.extend(command_token_segments(w, depth + 1, via if via == "ssh" else wrapper))
+    return out
+
+
+def command_segments(command: str, depth: int = 0) -> list[str]:
+    """Simple commands, split on shell operators and newlines, with the string
+    given to bash -c / sh -c / eval / ssh split again. A quoted argument with
+    spaces in it (a commit message, a grep pattern) is not read as a command."""
+    # A quoted argument with spaces in it (a commit message, a JSON patch)
+    # is data to this command, so it reads as one placeholder word.
+    return [" ".join("_" if re.search(r"\s", t) else t for t in seg) for seg, _ in command_token_segments(command, depth)]
+
+
+def first_group(patterns: list[str], text: str) -> str | None:
+    for p in patterns or []:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return m.group(1) if m.groups() else m.group(0)
+    return None
+
+
+def segment_matches(rule: dict, seg: str) -> bool:
+    alls = rule.get("match_all") or []
+    return bool(alls) and all(search(p, seg) for p in alls) and not any(search(p, seg) for p in rule.get("match_none") or [])
+
+
+def read_receipt(path: str, worker: str, context: str, namespace: str, max_age_s: float) -> tuple[dict | None, str]:
+    """(receipt, "") when valid, else (None, cause)."""
+    try:
+        with open(path) as fh:
+            r = json.load(fh)
+    except FileNotFoundError:
+        return None, "no_receipt"
+    except (OSError, ValueError):
+        return None, "receipt_unreadable"
+    if not isinstance(r, dict):
+        return None, "receipt_unreadable"
+    if r.get("session") != worker:
+        return None, "receipt_other_session"
+    if r.get("context") != context or r.get("namespace") != namespace:
+        return None, "receipt_other_target"
+    try:
+        age = time.time() - float(r.get("ts"))
+    except (TypeError, ValueError):
+        return None, "receipt_unreadable"
+    if age > max_age_s or age < -60:
+        return None, "receipt_expired"
+    return dict(r, age_s=round(age)), ""
+
+
+def check_receipts(b: dict, i: int, rule: dict, command: str) -> tuple[int, str]:
+    rr = rule.get("requires_receipt") or {}
+    in_scope = rr.get("namespaces") or []
+    targets: list[dict] = []
+    for seg in command_segments(command):
+        if not segment_matches(rule, seg):
+            continue
+        if first_group(rr.get("all_namespaces_patterns") or [], seg) is not None:
+            targets.append({"segment": seg, "namespace": "*", "context": first_group(rr.get("context_patterns"), seg) or rr.get("default_context", "default")})
+            continue
+        ns = first_group(rr.get("namespace_patterns"), seg)
+        if not ns or not any(re.search(p, ns, re.IGNORECASE) for p in in_scope):
+            continue  # no namespace named, or not a tenant namespace: out of scope
+        targets.append({"segment": seg, "namespace": ns,
+                        "context": first_group(rr.get("context_patterns"), seg) or rr.get("default_context", "default")})
+    if not targets:
+        return 0, ""
+    env_key = rr.get("max_age_env") or ""
+    raw = (scoped_env_value(env_key) if env_key else None) or (os.environ.get(env_key) if env_key else None)
+    try:
+        max_age = float(raw) if raw not in (None, "") else float(rr.get("max_age_s", 1800))
+    except ValueError:
+        max_age = float(rr.get("max_age_s", 1800))
+    rdir = os.path.join(amux_home(), rr.get("dir") or "receipts", receipt_key(WORKER))
+    refused: list[dict] = []
+    allowed: list[dict] = []
+    for t in targets:
+        if t["namespace"] == "*":
+            refused.append({**t, "cause": "all_namespaces"})
+            continue
+        path = os.path.join(rdir, f"{receipt_key(t['context'])}__{receipt_key(t['namespace'])}.json")
+        rec, cause = read_receipt(path, WORKER, t["context"], t["namespace"], max_age)
+        if rec is None:
+            refused.append({**t, "cause": cause, "receipt": path})
+        else:
+            allowed.append({**t, "receipt": path, "receipt_age_s": rec.get("age_s"), "receipt_sha256": rec.get("sha256")})
+    base = {"boundary": b.get("id"), "rule": i, "tool": "Bash", "subject": redact(command), "max_age_s": max_age,
+            "measured": True, "n_considered": len(targets)}
+    strip = lambda ts: [{k: (redact(v) if k == "segment" else v) for k, v in t.items()} for t in ts]  # noqa: E731
+    if not refused:
+        log({**base, "level": "INFO", "verdict": rr.get("verdict_allowed") or "receipt_allowed", "targets": strip(allowed)})
+        return 0, ""
+    log({**base, "level": "WARN", "verdict": rr.get("verdict_refused") or "receipt_refused", "targets": strip(refused),
+         "with_receipt": strip(allowed)})
+    gate = rr.get("gate_command") or ""
+    lines = []
+    for t in refused:
+        what = {"no_receipt": "this session has no gate receipt for it",
+                "receipt_expired": f"this session's gate receipt is older than {max_age / 60:.0f} min",
+                "receipt_other_session": "the receipt there was written for another worker",
+                "receipt_other_target": "the receipt there names another context or namespace",
+                "receipt_unreadable": "the receipt there does not parse",
+                "all_namespaces": "it spans every namespace, so no one receipt can cover it; name one namespace with -n"}.get(t["cause"], t["cause"])
+        lines.append(f"- `{t['segment'][:140]}`: namespace {t['namespace']}, context {t['context']}: {what}.")
+        if t["namespace"] != "*" and gate:
+            lines.append("  Run, as its own command:\n    " + gate.format(context=t["context"], namespace=t["namespace"]))
+            try:
+                others = sorted(n for n in os.listdir(rdir) if n.endswith(f"__{receipt_key(t['namespace'])}.json")
+                                and n != f"{receipt_key(t['context'])}__{receipt_key(t['namespace'])}.json")
+            except OSError:
+                others = []
+            if others:
+                lines.append(f"  (you hold receipts for this namespace under other contexts: {', '.join(others)}; "
+                             "name that --context in your command if it is the cluster you mean)")
+    return 2, (
+        f"BLOCKED by amux boundary '{b.get('id')}' ({b.get('title', '')}).\n"
+        f"{rule.get('reason', '').strip()}\n" + "\n".join(lines) + "\n"
+        "Read what the gate prints (what scales what, and which ScaledObjects watch this workload's pods), "
+        "then retry.\n\n" + b.get("rule", "").strip() + "\n"
+        "(boundary-guard; the registry is boundaries.toml, GET $AMUX_URL/api/boundaries)\n"
+    )
+
+
+# ---- push gates (push-gates, 2026-10-27) ----------------------------------------
+#
+# A worker's subagent pushed to the mixpeek repo's main from a fresh clone that
+# had no pre-push hook installed (1212229610, since reverted). Its precheck had
+# refused, but the push was chained after it, and the clone ran no hook, so
+# mixpeek's .githooks/pre-push gates never ran. This check refuses a `git push`
+# segment that targets a protected branch when it skips the hooks
+# (--no-verify, or core.hooksPath emptied inline) or when the repository it
+# runs in SHIPS a pre-push hook that is not installed. Each command segment is
+# judged on its own, in the directory it will run in (the payload's cwd,
+# moved by `cd <dir>` segments and `git -C <dir>`). It runs git only for a
+# segment that is a push, and fails CLOSED when it cannot tell the hook state.
+
+PUSH_LAUNCHERS = {"env", "command", "exec", "nohup", "time", "nice", "builtin"}
+# git global options that take the next word as their value.
+GIT_GLOBAL_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env",
+                  "--super-prefix", "--list-cmds", "--attr-source"}
+# push options that take the next word as their value.
+PUSH_OPT_ARG = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
+
+
+class PushParse:
+    def __init__(self) -> None:
+        self.dirs: list[str] = []         # -C values, in order
+        self.globals: list[str] = []      # global options to replay on the probe
+        self.env: dict[str, str] = {}     # GIT_* assignments before the command
+        self.inline_hooks: list[str] = []  # core.hooksPath values set inline
+        self.no_verify = False
+        self.dry_run = False
+        self.all_refs = ""                # --all / --mirror / --branches
+        self.positional: list[str] = []
+
+
+def parse_git_push(tokens: list[str]) -> PushParse | None:
+    """A PushParse when this simple command is `git ... push ...`, else None."""
+    toks = list(tokens)
+    if toks:
+        toks[0] = toks[0].lstrip("({")
+    while toks and toks[-1] in (")", "}"):
+        toks.pop()
+    toks = [t for t in toks if t]
+    pp = PushParse()
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", t, re.S)
+        if m:
+            pp.env[m.group(1)] = m.group(2)
+            i += 1
+            continue
+        if os.path.basename(t) in PUSH_LAUNCHERS or (t.startswith("-") and i and os.path.basename(toks[i - 1]) == "env"):
+            i += 1
+            continue
+        break
+    if i >= len(toks) or os.path.basename(toks[i]) != "git":
+        return None
+    i += 1
+    while i < len(toks) and toks[i].startswith("-"):
+        t = toks[i]
+        key = t.split("=", 1)[0]
+        if key in GIT_GLOBAL_ARG and "=" not in t and not (key == "-c" and len(t) > 2):
+            val = toks[i + 1] if i + 1 < len(toks) else ""
+            i += 2
+        elif t.startswith("-c") and len(t) > 2 and not t.startswith("--"):
+            key, val = "-c", t[2:]
+            i += 1
+        else:
+            val = t.split("=", 1)[1] if "=" in t else ""
+            i += 1
+        if key == "-C":
+            pp.dirs.append(val)
+            continue
+        if key == "-c" and re.match(r"^core\.hookspath(=|$)", val, re.I):
+            pp.inline_hooks.append(val.split("=", 1)[1] if "=" in val else "")
+        if key in GIT_GLOBAL_ARG:
+            pp.globals += [key, val] if key not in ("--git-dir", "--work-tree", "--namespace") else [f"{key}={val}"]
+        else:
+            pp.globals.append(t)
+    if i >= len(toks) or toks[i] != "push":
+        return None
+    i += 1
+    for k, v in pp.env.items():  # GIT_CONFIG_KEY_<n>=core.hooksPath GIT_CONFIG_VALUE_<n>=...
+        m = re.match(r"^GIT_CONFIG_KEY_(\d+)$", k)
+        if m and v.lower() == "core.hookspath":
+            pp.inline_hooks.append(pp.env.get(f"GIT_CONFIG_VALUE_{m.group(1)}", ""))
+    while i < len(toks):
+        t = toks[i]
+        i += 1
+        if t == "--":
+            pp.positional += toks[i:]
+            break
+        if t.startswith("--"):
+            key = t.split("=", 1)[0]
+            if key == "--no-verify":
+                pp.no_verify = True
+            elif key == "--verify":
+                pp.no_verify = False
+            elif key == "--dry-run":
+                pp.dry_run = True
+            elif key in ("--all", "--mirror", "--branches"):
+                pp.all_refs = key
+            elif key in PUSH_OPT_ARG and "=" not in t:
+                i += 1
+            continue
+        if t.startswith("-") and len(t) > 1:
+            if t in PUSH_OPT_ARG:
+                i += 1
+            elif "n" in t[1:] and t[1] != "o":
+                pp.dry_run = True  # push's -n is --dry-run (it has no short --no-verify)
+            continue
+        pp.positional.append(t)
+    return pp
+
+
+def _resolve_dir(base: str | None, d: str) -> str | None:
+    if base is None:
+        return None
+    d = os.path.expanduser(d)
+    d = re.sub(r"^\$(HOME\b|\{HOME\})", os.path.expanduser("~"), d)
+    if "$" in d or "`" in d:
+        return None
+    return os.path.normpath(os.path.join(base, d))
+
+
+def refspec_dst(spec: str, current: str | None) -> str | None:
+    """The remote branch a refspec writes, as a short name, or None."""
+    spec = spec.lstrip("+")
+    if spec.startswith("tag "):
+        return None
+    src, colon, dst = spec.partition(":")
+    name = dst if colon else src
+    if not colon and name in ("HEAD", "@"):
+        name = current or ""
+    name = re.sub(r"^refs/heads/", "", name)
+    return name or None
+
+
+def _git(args: list[str], cwd: str, env: dict, timeout: float) -> tuple[int, str]:
+    import subprocess
+
+    full_env = {**os.environ, **env, "GIT_TERMINAL_PROMPT": "0"}
+    p = subprocess.run(["git", *args], cwd=cwd, env=full_env, capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout
+
+
+def check_push_gates(b: dict, command: str, cwd: str) -> tuple[int, str]:
+    cfg = b.get("push_gates") or {}
+    if not re.search(r"\bgit\b", command) or not re.search(r"\bpush\b", command):
+        return 0, ""  # the cheap prefilter: no git, no subprocess
+    protected = {x.lower() for x in (cfg.get("protected_branches") or ["main", "master"])}
+    timeout = float(cfg.get("timeout_s") or 3)
+    cur_dir: str | None = cwd or os.getcwd()
+    results: list[dict] = []
+    for toks, via in command_token_segments(command):
+        words = [t for t in toks if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
+        if words and words[0].lstrip("({") in ("cd", "pushd"):
+            target = words[1] if len(words) > 1 else "~"
+            cur_dir = None if target == "-" else _resolve_dir(cur_dir, target)
+            continue
+        pp = parse_git_push(toks)
+        if pp is None or pp.dry_run:
+            continue  # a dry run writes nothing to the remote
+        seg = " ".join(toks)
+        rec: dict = {"segment": redact(seg)}
+        results.append(rec)
+        repo_dir = cur_dir if via != "ssh" else None
+        for d in pp.dirs:
+            repo_dir = _resolve_dir(repo_dir, d)
+        explicit = pp.positional[1:]
+        # Decided from the text alone: explicit refspecs that write no protected branch.
+        if not pp.all_refs and explicit:
+            dsts = [refspec_dst(s, None) for s in explicit]
+            if all(x is not None and "*" not in x and x.lower() not in protected and x not in ("HEAD", "@") for x in dsts):
+                rec["skip"] = "not_protected"
+                continue
+        if repo_dir is None:
+            rec.update(cause="repo_unknown", why="cannot tell which repository this push runs in"
+                       + (" (it runs on another host over ssh)" if via == "ssh" else ""))
+            continue
+        env = {k: v for k, v in pp.env.items() if k.startswith("GIT_")}
+        try:
+            code, out = _git([*pp.globals, "rev-parse", "--git-path", "hooks", "--git-common-dir"], repo_dir, env, timeout)
+            if code != 0:
+                raise RuntimeError(f"git rev-parse exited {code} in {repo_dir}")
+            hooks_rel, _common = (out.splitlines() + ["", ""])[:2]
+            hooks_dir = os.path.normpath(os.path.join(repo_dir, hooks_rel))
+            code, top = _git([*pp.globals, "rev-parse", "--show-toplevel"], repo_dir, env, timeout)
+            toplevel = top.strip() if code == 0 else ""
+            _code, conf = _git([*pp.globals, "config", "--get-regexp",
+                                r"^(remote\..*\.(url|push)|branch\..*\.merge|push\.default)$"], repo_dir, env, timeout)
+            config: dict[str, list[str]] = {}
+            for line in conf.splitlines():
+                k, _, v = line.partition(" ")
+                config.setdefault(k.lower(), []).append(v)
+            current = None
+            if not explicit or any(s.lstrip("+") in ("HEAD", "@") for s in explicit):
+                code, out = _git([*pp.globals, "symbolic-ref", "-q", "--short", "HEAD"], repo_dir, env, timeout)
+                current = out.strip() if code == 0 else None
+        except Exception as e:  # noqa: BLE001 - fails closed
+            rec.update(cause="probe_failed", why=f"could not read the repository's hook state ({str(e)[:160]})", repo=repo_dir)
+            continue
+        rec["repo"] = toplevel or repo_dir
+        # Which branches the push writes.
+        remote = pp.positional[0] if pp.positional else ""
+        if pp.all_refs:
+            targets = [pp.all_refs]
+        elif explicit:
+            targets = [refspec_dst(s, current) or "" for s in explicit]
+        else:
+            specs = config.get(f"remote.{(remote or 'origin').lower()}.push") or []
+            if specs:
+                targets = [refspec_dst(s, current) or "" for s in specs]
+            else:
+                mode = ((config.get("push.default") or ["simple"])[-1]).lower()
+                targets = [current or ""]
+                if current and mode in ("upstream", "tracking", "simple"):
+                    up = (config.get(f"branch.{current.lower()}.merge") or [""])[-1]
+                    targets.append(re.sub(r"^refs/heads/", "", up))
+                if mode == "matching":
+                    targets.append("*")
+        hit = [t for t in targets if t and (t.startswith("--") or "*" in t or t.lower() in protected)]
+        if not hit:
+            rec["skip"] = "not_protected"
+            continue
+        rec["targets"] = hit
+        # Does the repository ship a pre-push hook, and how is it installed?
+        install = ""
+        ships = ""
+        for sh in cfg.get("shipped_hooks") or []:
+            if toplevel and os.path.isfile(os.path.join(toplevel, sh.get("path", ""))):
+                ships, install = sh.get("path", ""), sh.get("install", "")
+                break
+        urls = [u for k, vs in config.items() if k.startswith("remote.") and k.endswith(".url") for u in vs]
+        if remote and ("/" in remote or ":" in remote):
+            urls.append(remote)
+        for r in cfg.get("repos") or []:
+            if any(re.search(r.get("remote", "$^"), u, re.I) for u in urls):
+                ships = ships or f"registry: {r.get('remote')}"
+                install = install or r.get("install", "")
+                break
+        install = install or cfg.get("default_install") or "git config core.hooksPath .githooks"
+        # Does this repository land through the queue (`amux land`)? Judged on
+        # the remote actually pushed to; a remote name with no URL in config
+        # falls back to every remote URL (fails closed).
+        push_urls = [remote] if remote and ("/" in remote or ":" in remote) else \
+            (config.get(f"remote.{(remote or 'origin').lower()}.url") or urls)
+        land = next((r.get("remote") for r in cfg.get("repos") or [] if r.get("land")
+                     and any(re.search(r.get("remote", "$^"), u, re.I) for u in push_urls)), "")
+        rec.update(ships_hook=ships or False, install=install, hooks_dir=hooks_dir, land_required=bool(land))
+        if pp.no_verify:
+            rec.update(cause="no_verify", why="it passes --no-verify, which skips the pre-push gates")
+            continue
+        bad = [v for v in pp.inline_hooks if v.strip() in ("", "/dev/null")]
+        if bad:
+            rec.update(cause="hooks_disabled_inline", why=f"it sets core.hooksPath to {bad[0]!r} inline, which turns the hooks off")
+            continue
+        hook = os.path.join(hooks_dir, "pre-push")
+        installed = os.path.isfile(hook) and os.access(hook, os.X_OK)
+        rec["hook_installed"] = installed
+        if ships and not installed:
+            rec.update(cause="hook_not_installed",
+                       why=f"this repository ships a pre-push hook ({ships}) and none is installed at {hook}")
+            continue
+        if land:
+            rec.update(cause="land_required", land_cmd=cfg.get("land_command") or "amux land --detach",
+                       why=f"this repository lands main through the queue ({land}), and a direct push races it")
+            continue
+        rec["allowed"] = True
+    checked = [r for r in results if "skip" not in r]
+    if not checked:
+        return 0, ""
+    refused = [r for r in checked if r.get("cause")]
+    base = {"boundary": b.get("id"), "tool": "Bash", "subject": redact(command), "cwd": cwd,
+            "measured": True, "n_considered": len(checked)}
+    if not refused:
+        log({**base, "level": "INFO", "verdict": cfg.get("verdict_allowed") or "push_gate_allowed", "targets": checked})
+        return 0, ""
+    land_cmd = cfg.get("land_command") or "amux land --detach"
+    for verdict, group in ((cfg.get("verdict_land_required") or "push_gate_land_required",
+                            [r for r in refused if r["cause"] == "land_required"]),
+                           (cfg.get("verdict_refused") or "push_gate_refused",
+                            [r for r in refused if r["cause"] != "land_required"])):
+        if group:
+            log({**base, "level": "WARN", "verdict": verdict, "targets": group,
+                 "measured": not any(r["cause"] in ("probe_failed", "repo_unknown") for r in group)})
+    lines = []
+    for r in refused:
+        lines.append(f"- `{r['segment'][:140]}`" + (f" in {r['repo']}" if r.get("repo") else "") + f": {r['why']}.")
+        # How this repository's main is written once the cause is fixed.
+        again = f"run `{land_cmd}` from {r['repo']} instead of git push" if r.get("land_required") else "push again"
+        if r["cause"] == "land_required":
+            lines.append(f"  Fix: from {r['repo']}, run `{land_cmd}` instead of git push. It queues behind other "
+                         "lanes, rebases, runs the pre-push gates and pushes for you (`amux land --help`).")
+        elif r["cause"] == "hook_not_installed":
+            lines.append(f"  Fix: in {r['repo']}, run `{r['install']}`, then {again}.")
+        elif r["cause"] == "no_verify":
+            lines.append(f"  Fix: drop --no-verify and {again}. If a gate refuses, fix what it reports.")
+        elif r["cause"] == "hooks_disabled_inline":
+            lines.append(f"  Fix: drop the core.hooksPath override and {again}.")
+        else:
+            lines.append("  This check fails closed. Run the push as its own command from inside the repository "
+                         "(cd <repo> && git push ...), with the repo's pre-push hook installed.")
+    return 2, (
+        f"BLOCKED by amux boundary '{b.get('id')}' ({b.get('title', '')}).\n" + "\n".join(lines) + "\n\n"
+        + b.get("rule", "").strip() + "\n(boundary-guard; the registry is boundaries.toml, GET $AMUX_URL/api/boundaries)\n"
+    )
+
+
+# ---- delete gate (delete-gate, 2026-10-27, V7-delete) ---------------------------
+#
+# On 2026-10-24 a production delete-all was replayed and data was lost, and the
+# fleet has deleted cloud resources by hand before. Owner rules: deleting
+# customer or production data needs the owner, and every delete is previewed
+# first so its blast radius is seen before it happens. Two phases:
+#
+#   1. A preview segment records a receipt for this worker, keyed by the
+#      normalised delete it previews, at $AMUX_HOME/<dir>/<worker>/<sha>.json.
+#   2. A delete segment is refused unless a receipt for its key from this
+#      worker exists and is younger than max_age_s. A receipt is used once.
+#
+# One preview form per tool, the smallest set that shows the blast radius:
+#   kubectl|oc delete ARGS           <- the same command with --dry-run=client|server
+#   gcloud GROUP... delete T...      <- gcloud GROUP... describe T (one per target)
+#   gsutil rm|rb URL..., gcloud storage rm URL...
+#                                    <- gsutil ls URL... or gcloud storage ls URL...
+#                                       (-r on both or on neither)
+# Every segment is judged on its own (command_token_segments). Deletes are
+# checked against receipts that existed BEFORE this command, and previews are
+# recorded only once the whole command is allowed, so a preview chained with
+# its delete never satisfies it. Fails CLOSED: a receipt that cannot be read,
+# consumed or written refuses the command.
+
+LAUNCHER_ARG_OPTS = {
+    "env": {"-u", "-C", "-S", "--unset", "--chdir"}, "command": set(), "exec": {"-a"}, "nohup": set(),
+    "time": set(), "nice": {"-n"}, "builtin": set(), "sudo": {"-u", "-g", "-h", "-p", "-C", "-U"},
+    "xargs": {"-n", "-I", "-L", "-P", "-d", "-s", "-E", "-a"}, "timeout": {"-s", "-k", "--signal", "--kill-after"},
+    "watch": {"-n", "--interval"},
+}
+KUBECTL_ALIASES = {"-n": "--namespace", "-l": "--selector", "-f": "--filename", "-o": "--output", "-k": "--kustomize",
+                   "-s": "--server", "-A": "--all-namespaces", "-R": "--recursive", "-v": "--v"}
+KUBECTL_VALUE_FLAGS = {
+    "--namespace", "--context", "--cluster", "--kubeconfig", "--user", "--server", "--token", "--as", "--as-group",
+    "--as-uid", "--request-timeout", "--cache-dir", "--certificate-authority", "--client-certificate", "--client-key",
+    "--tls-server-name", "--username", "--password", "--v", "--vmodule", "--log-file", "--log-dir", "--profile",
+    "--profile-output", "--selector", "--filename", "--field-selector", "--output", "--grace-period", "--timeout",
+    "--kustomize", "--raw", "--template", "--chunk-size"}
+# How a delete is shown or paced, not what it removes: left out of the key.
+KUBECTL_DROP = {"--dry-run", "--output", "--template", "--wait", "--timeout", "--grace-period", "--now", "--force",
+                "--ignore-not-found", "--v", "--vmodule", "--request-timeout", "--chunk-size", "--show-managed-fields"}
+GCLOUD_BOOL = {"--quiet", "-q", "--async", "--recursive", "-r", "-R", "--all", "--all-versions", "-a", "--force",
+               "--log-http", "--user-output-enabled", "--continue-on-error", "--dry-run", "--read-paths-from-stdin", "-I"}
+GCLOUD_DROP = {"--quiet", "--async", "--format", "--verbosity", "--log-http", "--user-output-enabled",
+               "--no-user-output-enabled", "--continue-on-error", "--delete-disks", "--keep-disks", "--force"}
+GSUTIL_GLOBAL_ARG = {"-o", "-h", "-u", "-i"}
+URL_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
+
+
+def strip_launchers(tokens: list[str]) -> list[str]:
+    """The simple command's own argv: env assignments, launchers (env, sudo,
+    xargs, timeout, ...) and their options removed."""
+    toks = list(tokens)
+    if toks:
+        toks[0] = toks[0].lstrip("({")
+    while toks and toks[-1] in (")", "}"):
+        toks.pop()
+    toks = [t for t in toks if t]
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
+            i += 1
+            continue
+        base = os.path.basename(t)
+        if base not in LAUNCHER_ARG_OPTS:
+            break
+        i += 1
+        while i < len(toks) and toks[i].startswith("-") and toks[i] != "--":
+            i += 2 if (toks[i] in LAUNCHER_ARG_OPTS[base] and "=" not in toks[i]) else 1
+        if i < len(toks) and toks[i] == "--":
+            i += 1
+        if base == "timeout" and i < len(toks):
+            i += 1  # the duration
+    return toks[i:]
+
+
+def parse_flags(args: list[str], aliases: dict, value_flags: set | None, bool_flags: set) -> tuple[list[str], list[tuple[str, str | None]]]:
+    """(positionals, [(flag, value or None)]). With value_flags (kubectl), only
+    those take a separate value; without (gcloud), every --flag does unless it
+    is a known boolean or a --no- flag."""
+    pos: list[str] = []
+    flags: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(args):
+        t = args[i]
+        i += 1
+        if t == "--":
+            pos += args[i:]
+            break
+        if not (t.startswith("-") and len(t) > 1) or re.match(r"^-\d", t):
+            pos.append(t)
+            continue
+        name, eq, val = t.partition("=")
+        if not eq and not t.startswith("--") and len(t) > 2 and value_flags is not None \
+                and aliases.get(t[:2], t[:2]) in value_flags:
+            name, val, eq = t[:2], t[2:], "="  # -nfoo
+        name = aliases.get(name, name)
+        if eq:
+            flags.append((name, val))
+            continue
+        if value_flags is not None:
+            takes = name in value_flags
+        else:
+            takes = name.startswith("--") and name not in bool_flags and not name.startswith("--no-")
+        if takes and i < len(args) and (args[i] == "-" or not args[i].startswith("-")):
+            flags.append((name, args[i]))
+            i += 1
+        else:
+            flags.append((name, None))
+    return pos, flags
+
+
+def _flag_text(flags: list[tuple[str, str | None]], drop: set) -> list[str]:
+    return sorted(n if v is None else f"{n}={v}" for n, v in flags if n not in drop)
+
+
+def _storage_op(argv: list[str], verb_at: int, tool: str) -> dict:
+    """gsutil rm|rb|ls, gcloud storage rm|ls: keyed on the URLs and -r."""
+    rest = argv[verb_at + 1:]
+    urls = sorted({u.rstrip("/") or u for u in rest if URL_RE.match(u)})
+    rec = any(t == "--recursive" or re.match(r"^-[A-Za-z]*[rR]", t) for t in rest if not URL_RE.match(t))
+    stdin = any(t in ("-I", "--read-paths-from-stdin") for t in rest)
+    preview = argv[verb_at] == "ls"
+    key = "gcs " + ("-r " if rec else "") + " ".join(urls)
+    lister = ["gsutil", "ls"] if tool == "gsutil" else ["gcloud", "storage", "ls"]
+    op = {"phase": "preview" if preview else "delete", "keys": [key],
+          "suggest": [" ".join(lister + (["-r"] if rec else []) + urls)]}
+    if not preview and (stdin or not urls):
+        op.update(cause="no_target", keys=[],
+                  why="its targets are not on the command line (stdin or none), so no preview can show them")
+    return op
+
+
+def parse_delete_segment(tokens: list[str]) -> dict | None:
+    """{"phase": "delete"|"preview", "keys": [...], "suggest": [...]} for a
+    segment the delete gate judges, else None."""
+    import shlex
+
+    argv = strip_launchers(tokens)
+    if not argv:
+        return None
+    tool = os.path.basename(argv[0])
+    args = argv[1:]
+    if tool in ("kubectl", "oc"):
+        pos, flags = parse_flags(args, KUBECTL_ALIASES, KUBECTL_VALUE_FLAGS, set())
+        if not pos or pos[0] != "delete":
+            return None
+        dry = [v for n, v in flags if n == "--dry-run"]
+        preview = any(v is None or v.lower() in ("client", "server", "true") for v in dry)
+        key = " ".join(["kubectl delete", *pos[1:], *_flag_text(flags, KUBECTL_DROP)])
+        op = {"phase": "preview" if preview else "delete", "keys": [key],
+              "suggest": [shlex.join(["kubectl", *args]) + " --dry-run=server -o name"]}
+        if not preview and any(n == "--filename" and v == "-" for n, v in flags):
+            op.update(cause="no_target", keys=[], why="it reads its manifest from stdin, so no preview can show the same objects")
+        return op
+    if tool == "gsutil":
+        i = 0
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if args[i] in GSUTIL_GLOBAL_ARG else 1
+        if i < len(args) and args[i] in ("rm", "rb", "ls"):
+            return _storage_op(args, i, "gsutil")
+        return None
+    if tool == "gcloud":
+        pos, flags = parse_flags(args, {"-q": "--quiet"}, None, GCLOUD_BOOL)
+        verb = next((j for j, p in enumerate(pos) if p in ("delete", "describe")
+                     or (p in ("rm", "ls") and j and pos[j - 1] == "storage")), None)
+        if verb is None:
+            return None
+        if pos[verb] in ("rm", "ls"):
+            st = args.index("storage")
+            return _storage_op(args, args.index(pos[verb], st + 1), "gcloud")
+        path, targets = pos[:verb], pos[verb + 1:] or [""]
+        ftext = _flag_text(flags, GCLOUD_DROP)
+        keys = [" ".join(["gcloud", *path, "::", t, *ftext]) for t in targets]
+        suggest = [" ".join(["gcloud", *path, "describe", *([shlex.quote(t)] if t else []), *map(shlex.quote, ftext)])
+                   for t in targets]
+        return {"phase": "preview" if pos[verb] == "describe" else "delete", "keys": keys, "suggest": suggest}
+    return None
+
+
+def _preview_path(rdir: str, key: str) -> str:
+    import hashlib
+
+    return os.path.join(rdir, hashlib.sha256(key.encode()).hexdigest()[:32] + ".json")
+
+
+def read_preview(path: str, key: str, max_age_s: float) -> tuple[dict | None, str]:
+    try:
+        with open(path) as fh:
+            r = json.load(fh)
+    except FileNotFoundError:
+        return None, "no_preview"
+    except (OSError, ValueError):
+        return None, "preview_unreadable"
+    if not isinstance(r, dict):
+        return None, "preview_unreadable"
+    if r.get("session") != WORKER:
+        return None, "preview_other_session"
+    if r.get("key") != key:
+        return None, "preview_other_target"
+    try:
+        age = time.time() - float(r.get("ts"))
+    except (TypeError, ValueError):
+        return None, "preview_unreadable"
+    if age > max_age_s or age < -60:
+        return None, "preview_expired"
+    return dict(r, age_s=round(age)), ""
+
+
+def check_delete_gate(b: dict, command: str) -> tuple[int, str]:
+    cfg = b.get("delete_gate") or {}
+    if not re.search(r"\b(kubectl|oc|gcloud|gsutil)\b", command):
+        return 0, ""  # the cheap prefilter
+    ops: list[dict] = []
+    for toks, _via in command_token_segments(command):
+        op = parse_delete_segment(toks)
+        if op is not None:
+            op["segment"] = " ".join(toks)
+            ops.append(op)
+    if not ops:
+        return 0, ""
+    max_age = float(cfg.get("max_age_s", 900))
+    rdir = os.path.join(amux_home(), cfg.get("dir") or "state/delete-previews", receipt_key(WORKER))
+    deletes = [o for o in ops if o["phase"] == "delete"]
+    previews = [o for o in ops if o["phase"] == "preview"]
+    chained = {k for o in previews for k in o["keys"]}
+    base = {"boundary": b.get("id"), "tool": "Bash", "subject": redact(command), "max_age_s": max_age,
+            "measured": True, "n_considered": len(ops)}
+    v_refused = cfg.get("verdict_refused") or "delete_gate_refused"
+    refused: list[dict] = []
+    allowed: list[dict] = []
+    used: set[str] = set()
+    for d in deletes:
+        if d.get("cause"):
+            refused.append({"segment": redact(d["segment"]), "operand": "", "cause": d["cause"], "why": d["why"]})
+            continue
+        for key, suggest in zip(d["keys"], d["suggest"]):
+            path = _preview_path(rdir, key)
+            rec, cause = (None, "no_preview") if path in used else read_preview(path, key, max_age)
+            t = {"segment": redact(d["segment"]), "operand": redact(key), "receipt": path}
+            if rec is None:
+                refused.append({**t, "cause": cause, "suggest": suggest, "chained": key in chained})
+            else:
+                used.add(path)
+                allowed.append({**t, "preview_age_s": rec.get("age_s"), "preview": rec.get("preview")})
+    if not refused:
+        for path in sorted(used):  # a receipt is good for one delete
+            try:
+                os.remove(path)
+            except OSError as e:
+                refused.append({"segment": redact(command), "operand": "", "receipt": path, "cause": "state_unwritable",
+                                "why": f"its preview receipt could not be consumed ({e})"})
+    if not refused and previews:
+        try:
+            os.makedirs(rdir, exist_ok=True)
+            for o in previews:
+                for key in o["keys"]:
+                    path = _preview_path(rdir, key)
+                    tmp = f"{path}.{os.getpid()}.tmp"
+                    with open(tmp, "w") as fh:
+                        json.dump({"session": WORKER, "key": key, "ts": time.time(), "preview": redact(o["segment"])}, fh)
+                    os.replace(tmp, path)
+        except OSError as e:
+            refused.append({"segment": redact(command), "operand": " | ".join(k for o in previews for k in o["keys"]),
+                            "cause": "state_unwritable", "why": f"the preview receipt could not be written ({e})"})
+    if refused:
+        log({**base, "level": "WARN", "verdict": v_refused, "targets": refused,
+             "measured": not any(r["cause"] == "state_unwritable" for r in refused)})
+    else:
+        if allowed:
+            log({**base, "level": "INFO", "verdict": cfg.get("verdict_allowed") or "delete_gate_allowed", "targets": allowed})
+        if previews:
+            log({**base, "level": "INFO", "verdict": cfg.get("verdict_preview") or "delete_gate_preview_recorded",
+                 "targets": [{"segment": redact(o["segment"]), "operand": redact(k)} for o in previews for k in o["keys"]]})
+        return 0, ""
+    mins = f"{max_age / 60:g} min"
+    lines = []
+    for r in refused:
+        what = {"no_preview": f"this worker has no unused preview of this delete from the last {mins}",
+                "preview_expired": f"this worker's preview of it is older than {mins}",
+                "preview_other_session": "the preview receipt there was written for another worker",
+                "preview_other_target": "the preview receipt there names another target",
+                "preview_unreadable": "the preview receipt there does not parse"}.get(r["cause"], r.get("why", r["cause"]))
+        lines.append(f"- `{r['segment'][:160]}`: {what}.")
+        if r.get("chained"):
+            lines.append("  A preview chained in the same command does not count: run it on its own first and read it.")
+        if r.get("suggest"):
+            lines.append("  Preview it first, as its own command, and read what it lists:\n    " + r["suggest"])
+        elif r["cause"] == "no_target":
+            lines.append("  Name the targets on the command line, preview them, then delete.")
+        elif r["cause"] == "state_unwritable":
+            lines.append(f"  This check fails closed. Check that {rdir} is writable.")
+    return 2, (
+        f"BLOCKED by amux boundary '{b.get('id')}' ({b.get('title', '')}).\n" + "\n".join(lines) + "\n"
+        f"Then run the delete again: a preview is good for one delete within {mins}.\n\n"
+        + b.get("rule", "").strip() + "\n(boundary-guard; the registry is boundaries.toml, GET $AMUX_URL/api/boundaries)\n"
+    )
 
 
 # ---- resources -----------------------------------------------------------------
@@ -611,6 +1417,7 @@ def count_running_subagents(transcript_path: str, cfg: dict, now: float | None =
     except OSError as e:
         return {"measured": False, "why_unmeasured": f"cannot list {subs}: {e}", "n_considered": 0}
     running: list[str] = []
+    details: list[dict] = []
     ended_by_restart = 0
     ended_by_stop_n = 0
     for n in names:
@@ -637,9 +1444,38 @@ def count_running_subagents(transcript_path: str, cfg: dict, now: float | None =
             continue
         if live:
             running.append(stem)
+            started = agent_started_at(os.path.join(subs, n))
+            details.append({"id": stem[len("agent-"):] if stem.startswith("agent-") else stem,
+                            "description": str((meta or {}).get("description") or "")[:80],
+                            "age_s": round(now - started) if started is not None else None,
+                            "idle_s": round(age)})
+    details.sort(key=lambda d: -(d["age_s"] if d["age_s"] is not None else -1))
+    ages = [d["age_s"] for d in details if d["age_s"] is not None]
     return {"measured": True, "running": len(running), "n_considered": len(names), "running_ids": sorted(running)[:12],
+            "running_agents": details[:12], "oldest_age_s": max(ages) if ages else None,
             "ended_by_restart": ended_by_restart, "ended_by_stop": ended_by_stop_n,
             "host_start_measured": host_start is not None}
+
+
+TS_RE = re.compile(r'"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z"')
+
+
+def agent_started_at(path: str) -> float | None:
+    """When a subagent started: the first transcript entry's timestamp (the
+    prompt the parent sent), else the file's birth time, else None. Only the
+    first 256 KB are read; a key inside the prompt text is escaped, so the
+    first raw match is the entry's own field."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(262144).decode("utf-8", "replace")
+        m = TS_RE.search(head)
+        if m:
+            import calendar
+            return float(calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")))
+        st = os.stat(path)
+        return float(getattr(st, "st_birthtime", 0) or 0) or None
+    except (OSError, ValueError):
+        return None
 
 
 def usage_headroom() -> dict:
@@ -672,8 +1508,32 @@ def usage_headroom() -> dict:
             "window": top.get("kind") or top.get("group") or "", "resets_at": top.get("resets_at") or ""}
 
 
+def scoped_env_value(key: str) -> str | None:
+    """The worker's live scoped value for key, from $AMUX_HOME/sessions/<worker>.env.
+
+    The process env is fixed at launch, so a cap the owner raises in the Scope
+    tab used to apply only after a restart (2026-10-26: a doubled cap for three
+    lanes mid-incident read the old value). The env file is what the server
+    writes on every scope change, so it wins when it names the key.
+    """
+    if not WORKER:
+        return None
+    try:
+        with open(os.path.join(amux_home(), "sessions", WORKER + ".env")) as f:
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep and k == key:
+                    return v.strip().strip('"').strip("'")
+    except OSError:
+        return None
+    return None
+
+
 def subagent_max(cfg: dict) -> int | None:
-    raw = os.environ.get(cfg.get("env_max") or "AMUX_MAX_SUBAGENTS")
+    key = cfg.get("env_max") or "AMUX_MAX_SUBAGENTS"
+    raw = scoped_env_value(key)
+    if raw is None:
+        raw = os.environ.get(key)
     try:
         n = int(raw) if raw not in (None, "") else int(cfg.get("max_running_default", 4))
     except ValueError:
@@ -681,10 +1541,37 @@ def subagent_max(cfg: dict) -> int | None:
     return n if n > 0 else None
 
 
-def check_subagents(b: dict, tool: str, transcript_path: str) -> tuple[int, str]:
+def fmt_age(s: float | None) -> str:
+    if s is None:
+        return "age unknown"
+    s = int(s)
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
+
+
+def priority_marker(cfg: dict, ti: dict) -> str | None:
+    """The registry's priority marker this Agent call carries, if any. Matched
+    against the description and the start of the prompt."""
+    text = [str(ti.get("description") or ""), str(ti.get("prompt") or "")[:400]]
+    for p in cfg.get("priority_markers") or []:
+        for t in text:
+            m = re.search(p, t, re.IGNORECASE | re.MULTILINE)
+            if m:
+                return m.group(0).strip()
+    return None
+
+
+def running_list(count: dict) -> str:
+    rows = count.get("running_agents") or []
+    return "\n".join(
+        f"  - {r['id']}  {r.get('description') or '(no description)'}  running {fmt_age(r.get('age_s'))}, "
+        f"last wrote {fmt_age(r.get('idle_s'))} ago" for r in rows)
+
+
+def check_subagents(b: dict, tool: str, transcript_path: str, ti: dict | None = None) -> tuple[int, str]:
     cfg = b.get("subagents") or {}
     if tool not in (cfg.get("tools") or ["Agent", "Task"]):
         return 0, ""
+    ti = ti or {}
     limit = subagent_max(cfg)
     floor = float(cfg.get("min_headroom_pct", 0) or 0)
     if limit is None and floor <= 0:
@@ -692,19 +1579,53 @@ def check_subagents(b: dict, tool: str, transcript_path: str) -> tuple[int, str]
     count = (count_running_subagents(transcript_path, cfg, host_start=host_process_start()) if limit is not None
              else {"measured": False, "why_unmeasured": "cap off"})
     head = usage_headroom() if floor > 0 else {"measured": False, "why_unmeasured": "headroom floor off"}
+    marker = priority_marker(cfg, ti)
+    over_cap = max(0, int(cfg.get("over_cap_max", 0) or 0))
     base = {"boundary": b.get("id"), "tool": tool, "limit": limit, "min_headroom_pct": floor,
             "running": count.get("running"), "running_ids": count.get("running_ids"),
+            "running_agents": count.get("running_agents"), "oldest_age_s": count.get("oldest_age_s"),
+            "priority_marker": marker, "over_cap_max": over_cap,
             "ended_by_restart": count.get("ended_by_restart"), "ended_by_stop": count.get("ended_by_stop"),
             "host_start_measured": count.get("host_start_measured"),
             "measured": bool(count.get("measured")), "n_considered": count.get("n_considered", 0),
             "headroom_pct": head.get("headroom_pct"), "headroom_measured": bool(head.get("measured")),
             "window": head.get("window"), "resets_at": head.get("resets_at")}
-    if limit is not None and count.get("measured") and count["running"] >= limit:
-        log({**base, "level": "WARN", "verdict": "subagent_cap_refused", "cause": "running_cap"})
+    markers = " or ".join(f"`{m}`" for m in cfg.get("priority_example") or []) or "a priority marker"
+    long_s = float(cfg.get("long_running_s", 0) or 0)
+    if long_s > 0 and (count.get("oldest_age_s") or 0) >= long_s:
+        # Logged whatever this call's outcome: a line a sweep can find when a subagent has run for hours.
+        log({**base, "level": "WARN", "verdict": "subagent_long_running", "long_running_s": long_s})
+    at_cap = limit is not None and bool(count.get("measured")) and count["running"] >= limit
+    listing = running_list(count)
+    preempt = ""
+    if at_cap and marker and over_cap > 0 and count["running"] < limit + over_cap:
+        # Priority-aware allowance (2026-10-27, MSG-98201): the lane's most
+        # important task starts even with the cap full, bounded at
+        # limit + over_cap_max. True preemption (stopping another agent) is
+        # impossible from a PreToolUse hook: it can only allow or refuse this
+        # call, and subagents run inside the Claude process with no handle the
+        # hook could stop. The lane stops one itself (TaskStop). The usage
+        # headroom floor below still applies to a marked call.
+        preempt = (f"amux boundary '{b.get('id')}': started over the cap on priority marker {marker!r} "
+                   f"({count['running']} running, limit {limit}, at most {limit + over_cap} with a marker). Stop your "
+                   f"lowest-priority or stale subagent (TaskStop) so the next marked task has room:\n{listing}\n")
+    if at_cap and not preempt:
+        n = count["running"]
+        cause = "over_cap_bound" if marker else "running_cap"
+        log({**base, "level": "WARN", "verdict": "subagent_cap_refused", "cause": cause})
+        why = (f"it carries priority marker {marker!r}, but you already use the {over_cap} over-cap slot(s) a marked "
+               f"task may take (at most {limit + over_cap})" if marker else
+               f"a task marked {markers} at the start of its description may start {over_cap} over the cap"
+               if over_cap > 0 else "")
         return 2, (
-            f"BLOCKED by amux boundary '{b.get('id')}': you already have {count['running']} subagents running "
-            f"and the limit is {limit} (AMUX_MAX_SUBAGENTS), so this new agent was not started.\n"
-            "Retry when one of them finishes (a background agent notifies you when it stops), or do this step "
+            f"BLOCKED by amux boundary '{b.get('id')}': you already have {n} subagents running "
+            f"and the limit is {limit} (AMUX_MAX_SUBAGENTS), so this new agent was not started"
+            + (f"; {why}" if why else "") + ".\n"
+            f"Running now (oldest first):\n{listing or '  (no details)'}\n"
+            "If this task matters more than one of those, stop the lowest-priority or stale one yourself with "
+            "TaskStop (its id is listed) and retry"
+            + (f", or mark this one {markers}" if not marker and over_cap > 0 else "")
+            + ". Retry when one of them finishes (a background agent notifies you when it stops), or do this step "
             "yourself. Fanning out past the account's capacity is how a usage limit stops every agent at once.\n"
             "(boundary-guard; the registry is boundaries.toml)\n"
         )
@@ -718,12 +1639,81 @@ def check_subagents(b: dict, tool: str, transcript_path: str) -> tuple[int, str]
             f"Retry after the window resets ({head.get('resets_at') or 'see `amux usage`'}), finish the work with the "
             "agents you have, or do this step yourself.\n(boundary-guard; the registry is boundaries.toml)\n"
         )
+    if preempt:
+        log({**base, "level": "WARN", "verdict": "subagent_cap_preempt_allowed", "cause": "priority_marker"})
+        sys.stderr.write(preempt)
     unmeasured = [k for k, r, on in (("count", count, limit is not None), ("headroom", head, floor > 0))
                   if on and not r.get("measured")]
     if unmeasured:
         log({**base, "level": "INFO", "verdict": "subagent_cap_allowed_unmeasured", "unmeasured": unmeasured,
              "why_unmeasured": "; ".join(str(r.get("why_unmeasured")) for k, r in (("count", count), ("headroom", head)) if k in unmeasured)})
     return 0, ""
+
+
+# ---- modal prompts for orchestrator lanes (2026-10-27, MSG-98201) ----------------
+#
+# On 2026-10-24/25 the orchestrator amux-helper called AskUserQuestion while the
+# owner slept. The tool blocks the whole turn until a human answers, so for
+# about 8 h peer messages queued unread and its wakeup chain could not fire.
+# For a worker the registry marks as an orchestrator (the `orchestrators` list,
+# or the scoped env named by `env`), the modal tools are refused and the reason
+# carries the question back as plain text, so the worker can decide and go on.
+
+ON_VALUES = ("1", "true", "yes", "on")
+OFF_VALUES = ("0", "false", "no", "off")
+
+
+def is_orchestrator(cfg: dict) -> tuple[bool, str]:
+    """(orchestrator?, why). The scoped env wins over the registry list."""
+    key = cfg.get("env") or ""
+    raw = scoped_env_value(key) if key else None
+    src = "scope"
+    if raw is None and key:
+        raw, src = os.environ.get(key), "env"
+    val = (raw or "").strip().lower()
+    if val in ON_VALUES:
+        return True, f"{key}={raw} ({src})"
+    if val in OFF_VALUES:
+        return False, f"{key}={raw} ({src})"
+    if WORKER and WORKER in (cfg.get("orchestrators") or []):
+        return True, "listed in orchestrators"
+    return False, "not listed"
+
+
+def question_text(ti: dict) -> str:
+    """AskUserQuestion's questions as numbered plain-text options."""
+    out = []
+    for q in (ti.get("questions") or [])[:4]:
+        if not isinstance(q, dict):
+            continue
+        out.append(f"  Q: {str(q.get('question') or '').strip()[:300]}")
+        for n, o in enumerate(q.get("options") or [], 1):
+            o = o if isinstance(o, dict) else {"label": str(o)}
+            desc = str(o.get("description") or "").strip()
+            out.append(f"    {n}. {str(o.get('label') or '').strip()[:120]}" + (f": {desc[:200]}" if desc else ""))
+    return "\n".join(out)
+
+
+def check_modal(b: dict, tool: str, ti: dict) -> tuple[int, str]:
+    cfg = b.get("modal") or {}
+    if tool not in (cfg.get("tools") or []):
+        return 0, ""
+    orch, why = is_orchestrator(cfg)
+    if not orch:
+        return 0, ""
+    qs = question_text(ti) if tool == "AskUserQuestion" else ""
+    log({"level": "WARN", "verdict": cfg.get("verdict") or "modal_prompt_refused", "boundary": b.get("id"),
+         "tool": tool, "orchestrator_by": why, "subject": redact(qs.replace("\n", " ")) if qs else "",
+         "measured": True, "n_considered": 1})
+    return 2, (
+        f"BLOCKED by amux boundary '{b.get('id')}' ({b.get('title', '')}): this worker is an orchestrator ({why}), "
+        f"and {tool} would block the whole turn until a human answers.\n"
+        + (f"Your question:\n{qs}\n" if qs else "")
+        + "Write the question in your turn output as plain text with numbered options, pick the option you "
+        "recommend inside your standing authority, say which one you took and why, and keep working. "
+        "If it touches money, an outside send, production data or a foreign push, leave that one step for the "
+        "owner and carry on with the rest.\n(boundary-guard; the registry is boundaries.toml)\n"
+    )
 
 
 def main() -> None:
@@ -782,6 +1772,23 @@ def main() -> None:
             except re.error as e:
                 log({"verdict": "boundary_rule_invalid", "boundary": b.get("id"), "rule": i, "error": str(e)})
                 continue
+            if hit and rule.get("requires_receipt"):
+                # The whole-command match is only the cheap prefilter; the
+                # rule is decided per segment against the receipts.
+                try:
+                    code, msg = check_receipts(b, i, rule, command)
+                except re.error as e:
+                    log({"verdict": "boundary_rule_invalid", "boundary": b.get("id"), "rule": i, "error": str(e)})
+                    continue
+                except Exception as e:  # noqa: BLE001 - this rule fails closed
+                    log({"level": "WARN", "verdict": "receipt_check_failed", "boundary": b.get("id"), "rule": i,
+                         "subject": redact(command), "error": str(e)[:300], "measured": False, "n_considered": 1})
+                    code, msg = 2, (f"BLOCKED by amux boundary '{b.get('id')}': the receipt check failed ({e}), and "
+                                    "this rule fails closed.\n" + b.get("rule", "").strip() + "\n(boundary-guard)\n")
+                if code:
+                    sys.stderr.write(msg)
+                    sys.exit(code)
+                continue
             if hit:
                 log({"verdict": "boundary_refused", "boundary": b.get("id"), "rule": i, "tool": tool,
                      "subject": redact(command or path), "measured": True, "n_considered": 1})
@@ -796,8 +1803,36 @@ def main() -> None:
             if code:
                 sys.stderr.write(msg)
                 sys.exit(code)
+        if b.get("kind") == "push_gates" and tool == "Bash" and command:
+            try:
+                code, msg = check_push_gates(b, command, str(payload.get("cwd") or ""))
+            except Exception as e:  # noqa: BLE001 - this check fails closed
+                log({"level": "WARN", "verdict": "push_gate_check_failed", "boundary": b.get("id"),
+                     "subject": redact(command), "error": str(e)[:300], "measured": False, "n_considered": 1})
+                code, msg = 2, (f"BLOCKED by amux boundary '{b.get('id')}': the push gate check failed ({e}), and "
+                                "this check fails closed.\n" + b.get("rule", "").strip() + "\n(boundary-guard)\n")
+            if code:
+                sys.stderr.write(msg)
+                sys.exit(code)
+        if b.get("kind") == "delete_gate" and tool == "Bash" and command:
+            try:
+                code, msg = check_delete_gate(b, command)
+            except Exception as e:  # noqa: BLE001 - this check fails closed
+                log({"level": "WARN", "verdict": (b.get("delete_gate") or {}).get("verdict_refused") or "delete_gate_refused",
+                     "boundary": b.get("id"), "subject": redact(command), "targets": [{"cause": "check_failed"}],
+                     "error": str(e)[:300], "measured": False, "n_considered": 1})
+                code, msg = 2, (f"BLOCKED by amux boundary '{b.get('id')}': the delete gate check failed ({e}), and "
+                                "this check fails closed.\n" + b.get("rule", "").strip() + "\n(boundary-guard)\n")
+            if code:
+                sys.stderr.write(msg)
+                sys.exit(code)
+        if b.get("kind") == "modal":
+            code, msg = check_modal(b, tool, ti)
+            if code:
+                sys.stderr.write(msg)
+                sys.exit(code)
         if b.get("kind") == "subagents":
-            code, msg = check_subagents(b, tool, str(payload.get("transcript_path") or ""))
+            code, msg = check_subagents(b, tool, str(payload.get("transcript_path") or ""), ti)
             if code:
                 sys.stderr.write(msg)
                 sys.exit(code)

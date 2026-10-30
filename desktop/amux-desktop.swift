@@ -2,6 +2,7 @@ import Cocoa
 import WebKit
 import Carbon.HIToolbox
 import UserNotifications
+import AVFoundation
 
 // The native macOS app: dashboard windows and tabs on the system WebKit (no
 // bundled browser), pinned notes as floating panels, the menu bar readout, a
@@ -113,11 +114,22 @@ struct Config: Codable {
     // "last" (default), "new", or "layout:<name>"
     var launch: String?
     var snapToGrid: Bool?
+    // Added 2026-10-29: where Split puts the new pane: "right" (unset), "below",
+    // or "longer" (along the pane's longer side).
+    var splitDirection: String?
     var openAtLogin: Bool?
     // The workspace open now; switching away saves where you left it.
     var activeWorkspace: String?
+    // Added 2026-10-28: workspace changes made here that the server has not
+    // confirmed yet, in order. Each sync replays them on the server's list.
+    var workspacesPending: [WorkspaceOp]?
+    // Set once a sync has reached the server; until then this Mac's own
+    // workspaces are merged into the server's list rather than replaced by it.
+    var workspacesSyncedOnce: Bool?
     // false while the app runs; still false at launch means it did not quit cleanly.
     var cleanExit: Bool?
+    // View > Zoom All Windows (2026-10-28). Unset means on.
+    var zoomAllWindows: Bool?
 }
 
 /// One line in the app's log: NSLog, which reaches the file below too.
@@ -318,11 +330,27 @@ let currentViewJS = "(() => {\n" + viewHashBody + "\n})()"
 let windowLabelJS = """
 (() => {
   let last = null;
+  // A file shown is named by its file (owner, 2026-10-29: "files should have
+  // a name based on the file thats open"), a folder in Files by its folder.
+  const base = p => String(p || '').replace(/[/]+$/, '').split('/').pop() || '';
   const label = () => {
     try {
+      const fo = document.getElementById('file-overlay');
+      if (fo && fo.classList.contains('active')) {
+        let p = '';
+        try { if (typeof _fileData !== 'undefined' && _fileData && _fileData.path) p = _fileData.path; } catch (e) {}
+        const n = base(p || fo.dataset.path);
+        if (n) return n;
+      }
+      const mo = document.getElementById('mdai-overlay');
+      if (mo && mo.classList.contains('active')) {
+        try { if (typeof _mdaiCur !== 'undefined' && _mdaiCur && _mdaiCur.abs) return base(_mdaiCur.abs); } catch (e) {}
+      }
       const peek = document.getElementById('peek-overlay');
       if (peek && peek.classList.contains('active') && typeof peekSession !== 'undefined' && peekSession) return peekSession;
       if (typeof activeView !== 'undefined' && activeView) {
+        try { if (activeView === 'files' && _filesPath && _filesPath !== '/') return base(_filesPath); } catch (e) {}
+        try { if (activeView === 'draw') { const d = _drawS(), dp = (d && (d.path || d.pendingOpen)) || ''; if (dp.startsWith('/')) return base(dp); } } catch (e) {}
         const tab = document.getElementById('tab-' + activeView);
         const t = tab ? tab.textContent.replace(/[^\\p{L}\\p{N} &'-]/gu, ' ').replace(/\\s+/g, ' ').trim() : '';
         return t || activeView;
@@ -368,6 +396,15 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     var lastMemoryReload = Date.distantPast
     // The last amux page this window showed, kept while it shows the connect page.
     var lastServerURL: URL?
+
+    /// The amux server this tab is on (scheme, host and port): the page it shows,
+    /// or the last one it showed while it sits on the connect page.
+    var serverOrigin: URL? {
+        let page = webView.url.flatMap { ($0.scheme == "https" || $0.scheme == "http") ? $0 : nil } ?? lastServerURL
+        guard let u = page, let scheme = u.scheme, let host = u.host else { return nil }
+        let h = host.contains(":") ? "[\(host)]" : host
+        return URL(string: "\(scheme)://\(h)" + (u.port.map { ":\($0)" } ?? ""))
+    }
     /// A restored tab that is not showing waits to load (launch speed, 2026-10-25):
     /// the shown tabs load first, then these one at a time, or at once when picked.
     var deferredURL: URL?
@@ -411,8 +448,12 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         if !cfg.userContentController.userScripts.contains(where: { $0.source == windowLabelJS }) {
             cfg.userContentController.addUserScript(WKUserScript(source: windowLabelJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         }
+        // WebKit's own user agent with the app's name after it. A custom agent of
+        // only "Amux-Desktop/2.0" hid that this is WebKit, so the dashboard took
+        // its CSS-zoom path, and at 110% the spreadsheet editor selected the
+        // wrong cell (2026-10-26; the page's zoom-mode beacon read apple_webkit:false).
+        cfg.applicationNameForUserAgent = "Amux-Desktop/2.0"
         webView = WKWebView(frame: .zero, configuration: cfg)
-        webView.customUserAgent = "Amux-Desktop/2.0"
         webView.allowsMagnification = true
         webView.allowsBackForwardNavigationGestures = true
 
@@ -442,6 +483,20 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         window.delegate = self
         cfg.userContentController.removeScriptMessageHandler(forName: "amuxWindowLabel")
         cfg.userContentController.add(WeakScriptHandler(self), name: "amuxWindowLabel")
+        // The page's Split button (app.js _nativeSplit): this page again in a
+        // new pane on the right half.
+        cfg.userContentController.removeScriptMessageHandler(forName: "amuxPane")
+        cfg.userContentController.add(WeakScriptHandler(self), name: "amuxPane")
+        // The Record tab drives the native recorder (amux-recorder.swift).
+        cfg.userContentController.removeScriptMessageHandler(forName: "amuxRecorder")
+        cfg.userContentController.add(WeakScriptHandler(self), name: "amuxRecorder")
+        // Messages notifications (app.js _cvMaybeNotify): native, so they show
+        // when the window is hidden and click through to the conversation.
+        cfg.userContentController.removeScriptMessageHandler(forName: "amuxNotify")
+        cfg.userContentController.add(WeakScriptHandler(self), name: "amuxNotify")
+        // A zoom from the page (app.js _zoomShare): every other page follows it.
+        cfg.userContentController.removeScriptMessageHandler(forName: "amuxZoom")
+        cfg.userContentController.add(WeakScriptHandler(self), name: "amuxZoom")
         webView.navigationDelegate = self
         webView.uiDelegate = self
         themeObservation = webView.observe(\.themeColor, options: [.initial, .new]) { [weak self] wv, _ in
@@ -455,6 +510,44 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     required init?(coder: NSCoder) { fatalError("not used") }
 
     func userContentController(_ c: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "amuxZoom" {
+            if let n = message.body as? NSNumber { app?.zoomOthers(from: self, level: n.intValue) }
+            return
+        }
+        if message.name == "amuxNotify" {
+            if webView.url.map({ app?.isServerURL($0) ?? false }) ?? false, let d = message.body as? [String: Any] {
+                app?.notifyMessage(d)
+            }
+            return
+        }
+        if message.name == "amuxRecorder" {
+            // Only a page on this tab's own server drives the recorder.
+            if webView.url.map({ app?.isServerURL($0) ?? false }) ?? false {
+                app?.recorderMessage(message.body as? [String: Any] ?? [:], from: self)
+            }
+            return
+        }
+        if message.name == "amuxPane" {
+            let d = message.body as? [String: Any]
+            // ⌘K on a place already open in another tab or pane: that one
+            // comes forward instead of this page opening it again (owner,
+            // 2026-10-29, MSG-100765). The page waits for the answer.
+            if (d?["op"] as? String) == "focus", let hash = d?["hash"] as? String, let token = d?["token"] as? String {
+                let found = app?.focusOpenPage(hash: hash, asker: self) ?? false
+                let t = token.filter { $0.isLetter || $0.isNumber }
+                webView.evaluateJavaScript("typeof _cmdkFocusAck === 'function' && _cmdkFocusAck('\(t)', \(found))", completionHandler: nil)
+                return
+            }
+            guard (d?["op"] as? String) == "split" else { return }
+            // Only a page on this tab's own server; anything else splits the
+            // page this tab is showing.
+            let asked = (d?["url"] as? String).flatMap(URL.init(string:))
+            let same = asked.map { u in
+                u.scheme == webView.url?.scheme && u.host == webView.url?.host && u.port == webView.url?.port
+            } ?? false
+            app?.splitPane(self, url: same ? asked : webView.url)
+            return
+        }
         guard message.name == "amuxWindowLabel" else { return }
         if let d = message.body as? [String: Any] {
             pageLabel = (d["label"] as? String) ?? ""
@@ -470,6 +563,10 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     /// and name it"). It wins over the page's own name until cleared, and is
     /// saved with the window and its workspace.
     var customName: String?
+    /// A name for the whole tab of a window split into panes (owner,
+    /// 2026-10-29: "when i rename a tab it should rename the entire tab").
+    /// Shown instead of the panes' names joined; each page keeps its own.
+    var windowName: String?
 
     var pageTitle: String {
         if let n = customName, !n.isEmpty { return n }
@@ -482,8 +579,36 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         customName = (n?.isEmpty ?? true) ? nil : n
         dlog("verdict=tab_renamed named=\(customName == nil ? 0 : 1) view=\(viewHash)")
         updateTitle()
-        (paneHost ?? self).updateTitle()
         app?.saveWindowsSoon()
+    }
+
+    /// Renames the tab in the window's tab bar: the whole tab when the
+    /// window is split into panes, else its page.
+    func renameTab(_ name: String?) {
+        guard grid != nil else { rename(name); return }
+        let n = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        windowName = (n?.isEmpty ?? true) ? nil : n
+        dlog("verdict=tab_renamed whole=1 named=\(windowName == nil ? 0 : 1) view=\(viewHash)")
+        updateTitle()
+        app?.saveWindowsSoon()
+    }
+    var tabName: String? { grid != nil ? windowName : customName }
+
+    // ── Nested splits (owner, 2026-10-29: "i have top level 2nd level i want
+    // 3rd and 4th so i can create panes within panes") ──
+    // A pane's tab can itself be split: that page hosts a grid of its own,
+    // shown in its pane. Its own paneHost is the grid it is a tab of, so the
+    // hosts form a tree up to the window.
+    /// The page whose window everything here is drawn in.
+    var rootHost: DashboardWindowController { var h = self; while let p = h.paneHost { h = p }; return h }
+    /// Hosts above this page: 0 for a window, 1 for a pane tab of a window's
+    /// split, 2 for a tab of a split inside that, ...
+    var depth: Int { var n = 0, h = self; while let p = h.paneHost { n += 1; h = p }; return n }
+    /// A tab that is a split of its own is named by its panes (or its name).
+    var tabLabel: String {
+        guard let g = grid, paneHost != nil else { return pageTitle }
+        if let n = windowName, !n.isEmpty { return n }
+        return g.tree.leaves.compactMap { g.members[$0].map { $0 === self ? $0.pageTitle : $0.tabLabel } }.joined(separator: " | ")
     }
 
     func updateTitle() {
@@ -494,11 +619,19 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
             w.tab.accessoryView = badge.dot()
             w.tab.toolTip = pageTitle + " · " + badge.name
         }
-        // A grid's window is named by its panes, each pane by its page.
-        if let host = paneHost ?? (grid != nil ? self : nil), let g = host.grid {
+        // A grid's window is named by its panes, each pane by its page (a
+        // split tab inside one by its panes), up through every host.
+        if let g = grid {
             g.refreshStrips()
-            host.window?.title = g.tree.leaves.compactMap { g.members[$0]?.pageTitle }.joined(separator: " | ")
+            if paneHost == nil {
+                let panes = g.tree.leaves.compactMap { g.members[$0].map { $0 === self ? $0.pageTitle : $0.tabLabel } }.joined(separator: " | ")
+                window?.title = windowName ?? panes
+                // Hovering a split tab lists its panes, named or not, so clearing
+                // the name leaves no stale tooltip behind.
+                window?.tab.toolTip = panes
+            }
         }
+        paneHost?.updateTitle()
     }
 
     func applyTheme(_ color: NSColor?) {
@@ -530,10 +663,13 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     /// ⌘W in a window split into panes closes the focused pane's tab
     /// (amux-panes.swift); the window's close button still closes the window.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if let g = grid, g.all.count > 1, NSApp.currentEvent?.type == .keyDown,
-           let id = g.focused ?? g.tree.leaves.first, let c = g.members[id] {
-            app?.undockPane(c, to: .close)
-            return false
+        if let top = grid, let app = app, top.all.count > 1, NSApp.currentEvent?.type == .keyDown {
+            // The innermost focused pane's tab, inside a split tab included.
+            let g = app.deepestFocused(top)
+            if let id = g.focused ?? g.tree.leaves.first, let c = g.members[id] {
+                app.undockPane(c, to: .close, from: g)
+                return false
+            }
         }
         return true
     }
@@ -568,8 +704,20 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     func windowDidExitFullScreen(_ notification: Notification) { normalFrame = nil; app?.windowPlaced(self) }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        if let u = webView.url, app?.isServerURL(u) == true { lastServerURL = u }
+        // Any amux server this tab shows, not only the default connection: a tab on
+        // sandbox.amux.io must remember sandbox, or its new tabs and its saved place
+        // fall back to the default server (Ethan, 2026-10-26).
+        if let u = webView.url, u.scheme == "https" || u.scheme == "http" { lastServerURL = u }
         app?.loadNextDeferred(after: self)
+        // The first dashboard page carries the token the server's copy of the
+        // workspaces needs; until one sync reaches it, each page load tries again.
+        if let a = app, a.workspacesSync == .never, a.workspacesKey != nil, webView.url.map(a.isServerURL) ?? false {
+            a.workspacesSync = .running
+            a.syncWorkspaces { [weak a] reached in
+                a?.workspacesSync = reached ? .reached : .never
+                if reached { a?.adoptServerWindows() }
+            }
+        }
     }
 
     // The tab bar's "+" button and File > New Tab.
@@ -623,14 +771,22 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
             decisionHandler(.cancel)
             return
         }
-        // Links off the amux server open in the default browser.
-        if navigationAction.navigationType == .linkActivated, !(app?.isServerURL(url) ?? true) {
-            NSWorkspace.shared.open(url)
-            decisionHandler(.cancel)
+        // A download first: a page saving a file (an <a download> on a blob: or
+        // data: URL, as the file viewer's Download does) is not a link to
+        // another site. Checked after the link rule, a blob: URL is not a server
+        // URL, so it went to macOS, which offered to find an app for
+        // "blob:https://..." (Ethan, 2026-10-26 screenshot).
+        if navigationAction.shouldPerformDownload {
+            dlog("verdict=download_started url_scheme=\(url.scheme ?? "-")")
+            decisionHandler(.download)
             return
         }
-        if navigationAction.shouldPerformDownload {
-            decisionHandler(.download)
+        // Links off the amux server open in the default browser. blob: and
+        // data: belong to this page, never to another app.
+        if navigationAction.navigationType == .linkActivated, !(app?.isServerURL(url) ?? true),
+           url.scheme != "blob", url.scheme != "data" {
+            NSWorkspace.shared.open(url)
+            decisionHandler(.cancel)
             return
         }
         decisionHandler(.allow)
@@ -669,7 +825,9 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     // ── WKDownloadDelegate: into ~/Downloads, never overwriting ──
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
                   suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
-        let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+        // AMUX_DESKTOP_DOWNLOADS_DIR: where a test copy saves (download-e2e.py).
+        let dir = ProcessInfo.processInfo.environment["AMUX_DESKTOP_DOWNLOADS_DIR"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
         var dest = dir.appendingPathComponent(suggestedFilename)
         let base = dest.deletingPathExtension().lastPathComponent
         let ext = dest.pathExtension
@@ -682,7 +840,16 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     }
 
     func downloadDidFinish(_ download: WKDownload) {
+        dlog("verdict=download_finished")
         NSSound(named: "Glass")?.play()
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        dlog("verdict=download_failed error=\(error.localizedDescription)")
+        let a = NSAlert()
+        a.messageText = "The download did not finish"
+        a.informativeText = error.localizedDescription
+        a.runModal()
     }
 
     // ── WKUIDelegate ──
@@ -695,6 +862,13 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
                 dlog("verdict=page_opened_window url=\(url.absoluteString) from=\(webView.url?.absoluteString ?? "-")")
                 let c = app.openWindow(url: nil, frame: nil, configuration: configuration)
                 return c.webView
+            }
+            // A blob: or data: URL opened in a new window (target=_blank) is a
+            // file this page made: save it, rather than asking macOS for an app.
+            if url.scheme == "blob" || url.scheme == "data" {
+                dlog("verdict=download_started url_scheme=\(url.scheme ?? "-") via=new_window")
+                webView.startDownload(using: navigationAction.request) { $0.delegate = self }
+                return nil
             }
             NSWorkspace.shared.open(url)
         }
@@ -747,7 +921,28 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,
                  initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
                  decisionHandler: @escaping (WKPermissionDecision) -> Void) {
-        decisionHandler(origin.host == app?.serverURL?.host ? .grant : .prompt)
+        guard origin.host == app?.serverURL?.host else { decisionHandler(.prompt); return }
+        guard type == .microphone || type == .cameraAndMicrophone else { decisionHandler(.grant); return }
+        // Dictation sat on "Starting mic…" (owner, 2026-10-29): WebKit was told
+        // yes while macOS had not decided, and its own prompt never came to the
+        // front. The app asks macOS itself, in front, and answers the page with
+        // what macOS said, so the page hears yes or no instead of waiting.
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            decisionHandler(.grant)
+        case .notDetermined:
+            dlog("verdict=mic_permission_asked view=\(viewHash)")
+            NSApp.activate(ignoringOtherApps: true)
+            AVCaptureDevice.requestAccess(for: .audio) { ok in
+                DispatchQueue.main.async {
+                    dlog("verdict=mic_permission_\(ok ? "granted" : "refused") view=\(self.viewHash)")
+                    decisionHandler(ok ? .grant : .deny)
+                }
+            }
+        default:
+            dlog("verdict=mic_permission_denied_in_settings view=\(viewHash)")
+            decisionHandler(.deny)
+        }
     }
 }
 
@@ -758,9 +953,16 @@ func registerHotKey() {
     let id = EventHotKeyID(signature: OSType(0x616D7578), id: 1)   // 'amux'
     // Control-Option-Space toggles amux from any app.
     RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &ref)
+    // Control-Option-R starts or stops a recording from any app (amux-recorder.swift).
+    var recRef: EventHotKeyRef?
+    RegisterEventHotKey(UInt32(kVK_ANSI_R), UInt32(controlKey | optionKey), EventHotKeyID(signature: OSType(0x616D7578), id: 2),
+                        GetApplicationEventTarget(), 0, &recRef)
     var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-    InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-        DispatchQueue.main.async { hotKeyHandler?() }
+    InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+        var hk = EventHotKeyID()
+        GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
+                          MemoryLayout<EventHotKeyID>.size, nil, &hk)
+        DispatchQueue.main.async { if hk.id == 2 { recordHotKeyHandler?() } else { hotKeyHandler?() } }
         return noErr
     }, 1, &spec, nil, nil)
 }
@@ -786,9 +988,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     var placementTimer: Timer?
     var lastSignature = ""
     var sigtermSource: DispatchSourceSignal?
+    var sigtermQuitting = false
     var dragTimer: Timer?
     var tabDragTimer: Timer?
     var tabDragMonitor: Any?
+    var globeMonitor: Any?
+    var globeDown = false, globeUsed = false
     var tearWatchTimer: Timer?
     var tabGroupSeen: [ObjectIdentifier: (tabs: Int, frame: NSRect)] = [:]
     var lastTabPlaced = Date.distantPast
@@ -811,6 +1016,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
 
     var serverURL: URL? {
         config.connections.isEmpty ? nil : URL(string: normalized(config.lastUrl))
+    }
+
+    /// The saved connection `url` names (same scheme, host and port), if any.
+    func knownConnection(_ url: URL) -> URL? {
+        func key(_ u: URL) -> String? {
+            guard let scheme = u.scheme?.lowercased(), scheme == "https" || scheme == "http", let host = u.host?.lowercased() else { return nil }
+            return "\(scheme)://\(host):\(u.port ?? (scheme == "https" ? 443 : 80))"
+        }
+        guard let want = key(url) else { return nil }
+        return config.connections.compactMap { URL(string: normalized($0.url)) }.first { key($0) == want }
     }
 
     func isServerURL(_ url: URL) -> Bool {
@@ -842,9 +1057,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         saveConfig(config)
         startWorkspaceTracking()
         startTabDragTracking()
+        startGlobeKey()
         applyOpenAtLogin()
         hotKeyHandler = { [weak self] in self?.toggleVisible() }
         registerHotKey()
+        setUpRecorder()
         startMenuBarItem()
         setUpNotifications()
         refreshPins()
@@ -892,10 +1109,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     /// A new tab opens on the worker list (Ethan, 2026-10-22). The bare server
     /// address restores the page's last view, which is usually the worker the
     /// tab beside it already shows.
-    func newTab(nextTo c: DashboardWindowController) {
+    /// A new tab opens on the server of the tab it was opened from (Ethan,
+    /// 2026-10-26: "if i open a new tab from an active one that has a certain
+    /// connection (like sandbox) it should open the tab in that"); only a tab on
+    /// no server falls back to the default connection.
+    func newTab(nextTo c: DashboardWindowController, hash: String = "#view=sessions") {
         let n = DashboardWindowController(app: self, frame: c.window?.frame, configuration: nil)
         controllers.append(n)
-        if let u = url(withHash: "#view=sessions") { n.load(u) } else { n.showConnectPage() }
+        let u = url(withHash: hash, on: c.serverOrigin)
+        dlog("verdict=new_tab_server server=\(u.flatMap { $0.host } ?? "-") from_tab=\(c.serverOrigin != nil)")
+        if let u = u { n.load(u) } else { n.showConnectPage() }
         if let w = c.window, let nw = n.window {
             w.addTabbedWindow(nw, ordered: .above)
             nw.makeKeyAndOrderFront(nil)
@@ -916,13 +1139,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     /// the pane you last clicked. Reload, zoom and the like act on it.
     var keyPage: DashboardWindowController? {
         guard let c = keyController else { return nil }
-        if let g = c.grid, let fr = c.window?.firstResponder as? NSView,
-           let m = g.members.values.first(where: { fr === $0.webView || fr.isDescendant(of: $0.webView) }) { return m }
+        if c.grid != nil, let fr = c.window?.firstResponder as? NSView,
+           let m = pages(under: c).first(where: { fr === $0.webView || fr.isDescendant(of: $0.webView) }) { return m }
         return c
     }
 
-    func url(withHash hash: String) -> URL? {
-        guard let s = serverURL else { return nil }
+    /// `hash` on server `base`, or on the default connection when `base` is nil.
+    func url(withHash hash: String, on base: URL? = nil) -> URL? {
+        guard let s = base ?? serverURL else { return nil }
         return URL(string: normalized(s.absoluteString) + "/" + hash)
     }
 
@@ -938,14 +1162,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
                 guard let self = self, !self.terminating, !self.restoring else { return }
                 var c = loadConfig().merging(windows: windows)
                 c.cleanExit = false
-                // The open workspace keeps where you left it.
-                if let name = c.activeWorkspace, var ls = c.layouts, let i = ls.firstIndex(where: { $0.name == name }) {
-                    ls[i].windows = windows
-                    ls[i].pins = self.snapshotPins()
-                    c.layouts = ls
-                }
+                // A saved workspace changes only on Save or Update. Copying the
+                // live windows into the open one made Open return to whatever
+                // was on screen, never to what was saved (owner, 2026-10-28).
                 self.config = c
                 saveConfig(c)
+                self.sendWindowsSoon(windows)
             }
         }
         saveWork = w
@@ -953,16 +1175,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if !recorderAllowsQuit(fromSignal: sigtermQuitting) { return .terminateCancel }
         snapshotWindows { [weak self] windows in
             guard let self = self else { return }
             self.terminating = true
             var c = loadConfig().merging(windows: windows)
             c.cleanExit = true
-            if let name = c.activeWorkspace, var ls = c.layouts, let i = ls.firstIndex(where: { $0.name == name }) {
-                ls[i].windows = windows
-                ls[i].pins = self.snapshotPins()
-                c.layouts = ls
-            }
             self.config = c
             saveConfig(c)
             NSLog("amux-desktop: verdict=windows_saved_on_quit n=%d", windows.count)
@@ -1044,7 +1262,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         case "worker":
             // Already open somewhere (any Desktop): go to it instead of opening a duplicate.
             if let c = controllers.first(where: { $0.viewHash.hasPrefix("#peek=" + enc) && ($0.viewHash.count == 6 + enc.count || $0.viewHash.dropFirst(6 + enc.count).hasPrefix("&")) }),
-               let w = c.paneHost?.window ?? c.window {
+               let w = c.rootHost.window {
                 // A pane is shown in its grid's window; its own window is hidden.
                 if w.isMiniaturized { w.deminiaturize(nil) }
                 w.tabGroup?.selectedWindow = w
@@ -1055,7 +1273,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
                 openWindow(url: self.url(withHash: "#peek=" + enc), frame: nil)
             }
         case "view": openWindow(url: self.url(withHash: "#view=" + enc), frame: nil)
-        case "open": openWindow(url: self.url(withHash: url.fragment.map { "#" + $0 } ?? ""), frame: nil)
+        case "open":
+            // amux://open?server=<origin>#path=<file> comes from a copied file link
+            // opened in a browser (deep_links.rs, app.js _offerOpenInMacApp). Any web
+            // page can fire an amux:// link, so only a server already among your
+            // connections is honoured; anything else opens on the default server.
+            let asked = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "server" })?.value.flatMap(URL.init(string:))
+            let server = asked.flatMap { knownConnection($0) }
+            if asked != nil { dlog("verdict=\(server != nil ? "open_link_known_server" : "open_link_unknown_server_refused") server=\(asked?.host ?? "-")") }
+            openWindow(url: self.url(withHash: url.fragment.map { "#" + $0 } ?? "", on: server), frame: nil)
         case "pin": if let id = Int(arg) { openPin(id: id) }
         case "layout", "workspace": openLayout(named: arg)
         case "save-layout", "save-workspace": saveLayout(named: arg)
@@ -1095,7 +1322,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
 
     /// On screen: the selected tab of a visible window, or a pane of one.
     func isShown(_ c: DashboardWindowController) -> Bool {
-        let host = c.paneHost?.window ?? c.window
+        let host = c.rootHost.window
         return (host?.isVisible ?? false) && (host?.tabGroup?.selectedWindow ?? host) === host
             && (c.paneHost == nil || c.webView.window != nil)
     }
@@ -1208,6 +1435,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     // a minute from one laptop, so pins and the badge never loaded).
     var apiToken: String?
     var unauthorized = UnauthorizedBackoff()
+    enum WorkspacesSync { case never, running, reached }
+    var workspacesSync = WorkspacesSync.never
+    // One sync at a time: a second waits, so two never read the same server
+    // list and overwrite each other's change.
+    var workspacesSyncBusy = false
+    // The open windows' copy on the server: what was last sent, the pending
+    // send, and whether this launch began with no windows of its own.
+    var windowsSent: Data?
+    var windowsSendWork: DispatchWorkItem?
+    var launchedWithoutWindows = false
+    var workspacesSyncWaiting: [(Bool) -> Void] = []
 
     func withAPIToken(_ go: @escaping (String?) -> Void) {
         if let t = apiToken { go(t); return }
@@ -1219,7 +1457,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         }
     }
 
-    func api(_ path: String, method: String = "GET", _ done: @escaping (Any?) -> Void) {
+    func api(_ path: String, method: String = "GET", body: Any? = nil, _ done: @escaping (Any?) -> Void) {
         guard let s = serverURL, let url = URL(string: normalized(s.absoluteString) + path) else { done(nil); return }
         withAPIToken { [weak self] token in
             // A poll that would repeat a refused call waits out the backoff;
@@ -1229,6 +1467,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
             req.httpMethod = method
             req.timeoutInterval = 8
             if let token = token { req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+            if let b = body, let data = try? JSONSerialization.data(withJSONObject: b) {
+                req.httpBody = data
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            }
             let session = URLSession(configuration: .ephemeral, delegate: InsecureDelegate(), delegateQueue: nil)
             session.dataTask(with: req) { data, resp, _ in
                 let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -1427,6 +1669,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         }
     }
 
+    /// A Messages post addressed to the owner (the page decided; it only asks
+    /// for one when the owner is not already looking at that conversation).
+    func notifyMessage(_ d: [String: Any]) {
+        guard canNotify else { return }
+        let content = UNMutableNotificationContent()
+        content.title = (d["title"] as? String) ?? "amux"
+        content.body = (d["body"] as? String) ?? ""
+        content.sound = .default
+        let hash = (d["url"] as? String) ?? "#view=messages"
+        content.userInfo = ["hash": hash.hasPrefix("#") ? hash : "#view=messages"]
+        content.threadIdentifier = (d["tag"] as? String) ?? "messages"
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
+        NSLog("amux-desktop: verdict=message_notified tag=%@", content.threadIdentifier)
+    }
+
     func notify(_ item: [String: Any]) {
         guard canNotify else { return }
         let content = UNMutableNotificationContent()
@@ -1434,7 +1692,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         content.title = "amux needs you" + (card.isEmpty ? "" : " · " + card)
         content.body = (item["question"] as? String) ?? (item["context"] as? String) ?? ""
         content.sound = .default
-        content.userInfo = ["card": card]
+        // The worker too: a click opens it, in a tab of the window you have.
+        content.userInfo = ["card": card, "worker": (item["worker"] as? String) ?? ""]
         let req = UNNotificationRequest(identifier: (item["key"] as? String) ?? UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
     }
@@ -1447,8 +1706,94 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         NSApp.activate(ignoringOtherApps: true)
-        openCard((response.notification.request.content.userInfo["card"] as? String) ?? "")
+        if let hash = response.notification.request.content.userInfo["hash"] as? String, hash.hasPrefix("#messages=") || hash == "#view=messages" {
+            openNotificationTab(hash, why: "message")
+            completionHandler()
+            return
+        }
+        if response.notification.request.content.userInfo["recorder_meeting"] != nil {
+            meetingNotificationClicked()   // amux-recorder.swift
+            completionHandler()
+            return
+        }
+        let info = response.notification.request.content.userInfo
+        let worker = (info["worker"] as? String) ?? ""
+        let card = (info["card"] as? String) ?? ""
+        if !worker.isEmpty, worker.allSatisfy({ $0.isLetter || $0.isNumber || "-_.".contains($0) }) {
+            openNotificationTab("#peek=" + worker, why: "worker")
+        } else {
+            openCard(card)
+        }
         completionHandler()
+    }
+
+    /// A notification click opens what it is about in a NEW TAB of the window
+    /// you already have, on that window's server. It used to reuse only a
+    /// visible key window and otherwise open a whole new window, which is what
+    /// a click from another app (amux hidden, minimized, on another Space)
+    /// always got (owner, 2026-10-28). A new window only when none exists.
+    func openNotificationTab(_ hash: String, why: String) {
+        let safe = hash.allSatisfy { $0.isLetter || $0.isNumber || "#=&:-_.%|@".contains($0) }
+        guard safe else { return }
+        NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        let withWindow = controllers.filter { $0.window != nil }
+        let host = withWindow.first { $0.window == NSApp.keyWindow }
+            ?? withWindow.last { $0.window?.isVisible == true }
+            ?? withWindow.last
+        guard let c = host, let w = c.window else {
+            dlog("verdict=notification_opened where=new_window why=\(why) reason=no_window")
+            openWindow(url: url(withHash: hash), frame: nil)
+            return
+        }
+        if w.isMiniaturized { w.deminiaturize(nil) }
+        newTab(nextTo: c, hash: hash)
+        dlog("verdict=notification_opened where=new_tab why=\(why) hash=\(hash)")
+    }
+
+    /// The place a page address names: "peek=<worker>" or "view=<tab>",
+    /// without the rest (which tab of a worker, scroll and so on).
+    static func placeKey(_ fragment: String) -> String {
+        let f = fragment.hasPrefix("#") ? String(fragment.dropFirst()) : fragment
+        return String(f.split(separator: "&").first ?? "")
+    }
+    /// Brings forward the tab or pane, other than `asker`, already showing the
+    /// place `hash` names, selecting it in its pane and its window in its tab
+    /// group. False when no page shows it.
+    func focusOpenPage(hash: String, asker: DashboardWindowController) -> Bool {
+        let want = AppDelegate.placeKey(hash)
+        guard want.hasPrefix("peek=") || want.hasPrefix("view=") else { return false }
+        guard let c = controllers.first(where: { $0 !== asker && AppDelegate.placeKey($0.webView.url?.fragment ?? "") == want }) else {
+            dlog("verdict=palette_focus_none place=\(want)")
+            return false
+        }
+        let root = c.rootHost
+        if let g = c.paneHost?.grid, let id = g.id(of: c) {
+            g.select(c, in: id)
+            g.focus(id)
+        }
+        if let w = root.window {
+            if w.isMiniaturized { w.deminiaturize(nil) }
+            w.tabGroup?.selectedWindow = w
+            w.makeKeyAndOrderFront(nil)
+        }
+        dlog("verdict=palette_focus_existing place=\(want) pane=\(c.paneHost != nil ? 1 : 0)")
+        return true
+    }
+
+    /// Open a dashboard hash in the key window, or a new one.
+    func openHash(_ hash: String) {
+        let safe = hash.allSatisfy { $0.isLetter || $0.isNumber || "#=&:-_.%|@".contains($0) }
+        guard safe else { return }
+        if let c = keyController, let w = c.window, w.isVisible || w.isMiniaturized {
+            if w.isMiniaturized { w.deminiaturize(nil) }
+            w.makeKeyAndOrderFront(nil)
+            c.webView.evaluateJavaScript("location.hash = '\(hash)'") { [weak self] _, err in
+                if err != nil { self?.openWindow(url: self?.url(withHash: hash), frame: nil) }
+            }
+        } else {
+            openWindow(url: url(withHash: hash), frame: nil)
+        }
     }
 
     /// A "needs you" notification opens its card on the board. An open window
@@ -1490,7 +1835,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         c.webView.evaluateJavaScript(currentViewJS) { [weak self] result, _ in
             guard let self = self else { return }
             let hash = (result as? String) ?? ""
-            self.openWindow(url: hash.isEmpty ? c.webView.url : self.url(withHash: hash), frame: nil)
+            self.openWindow(url: hash.isEmpty ? c.webView.url : self.url(withHash: hash, on: c.serverOrigin), frame: nil)
         }
     }
 
@@ -1499,16 +1844,98 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     }
 
     @objc func reload(_ sender: Any?) { keyPage?.webView.reload() }
+    /// ⌘⇧R: the active pane only, past every cache (owner, 2026-10-29: "make it
+    /// so cmd shift r works to clear cache of a particular pane thats active").
+    /// The dashboard's service worker serves its assets from Cache Storage, so
+    /// a plain reload, even from origin, can show the old page: its caches go
+    /// first, then WebKit's memory and disk cache, then the pane reloads from
+    /// the server. The caches belong to the server's address, so the other
+    /// panes on it fetch fresh on their next load; only this pane reloads now.
+    @objc func reloadIgnoringCache(_ sender: Any?) {
+        guard let page = keyPage else { return }
+        let wv = page.webView
+        let js = "(async () => { let n = 0; if (window.caches) { for (const k of await caches.keys()) { if (await caches.delete(k)) n++; } } return n; })()"
+        wv.callAsyncJavaScript("return await \(js)", arguments: [:], in: nil, in: .page) { result in
+            let cleared = (try? result.get()) as? NSNumber
+            let store = wv.configuration.websiteDataStore
+            let types: Set<String> = [WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeDiskCache]
+            store.removeData(ofTypes: types, modifiedSince: .distantPast) {
+                dlog("verdict=pane_reload_ignoring_cache sw_caches_cleared=\(cleared?.intValue ?? -1) url=\(wv.url?.absoluteString.prefix(120) ?? "")")
+                wv.reloadFromOrigin()
+            }
+        }
+    }
     // Zoom goes through the dashboard's own zoom (root font size on WebKit).
     // WKWebView.pageZoom shrank the page's CSS viewport without the dashboard
     // re-measuring it, so the file viewer kept its old height and its bottom
     // ran off the window at 130% (Ethan, 2026-10-19: "cant scroll to the
     // bottom without zooming out"). pageZoom is only the fallback for a page
     // without the dashboard's zoom, such as the connect page.
+    //
+    // With View > Zoom All Windows on, every other window, tab and pane takes
+    // the new level too (Ethan, 2026-10-28). The page's own zoom controls
+    // report theirs through amuxZoom (app.js _zoomShare).
     func zoom(_ fn: String, fallback: @escaping (WKWebView) -> Void) {
-        guard let wv = keyPage?.webView else { return }
-        wv.evaluateJavaScript("typeof \(fn) === 'function' ? (\(fn)(), 'dashboard') : 'none'") { r, _ in
-            if (r as? String) != "dashboard" { fallback(wv) }
+        guard let page = keyPage else { return }
+        let wv = page.webView
+        wv.evaluateJavaScript("typeof \(fn) === 'function' ? (\(fn)(), _zoomLevel) : 'none'") { [weak self] r, _ in
+            if let n = r as? NSNumber { self?.zoomOthers(from: page, level: n.intValue); return }
+            fallback(wv)
+            self?.zoomOthers(from: page, level: Int((wv.pageZoom * 100).rounded()))
+        }
+    }
+
+    var zoomAllWindows: Bool { config.zoomAllWindows ?? true }
+
+    @objc func toggleZoomAllWindows(_ sender: Any?) {
+        config = loadConfig()
+        config.zoomAllWindows = !zoomAllWindows
+        saveConfig(config)
+        dlog("verdict=zoom_all_toggled on=\(zoomAllWindows ? 1 : 0)")
+        // Turning it on brings every window to the level of the one you are in.
+        guard zoomAllWindows, let page = keyPage else { return }
+        page.webView.evaluateJavaScript("typeof _zoomLevel === 'number' ? _zoomLevel : 0") { [weak self] r, _ in
+            let n = (r as? NSNumber)?.intValue ?? 0
+            self?.zoomOthers(from: page, level: n > 0 ? n : Int((page.webView.pageZoom * 100).rounded()))
+        }
+    }
+
+    /// Every page the app shows: each window and every tab of each of its panes.
+    var allPages: [DashboardWindowController] {
+        var seen = Set<ObjectIdentifier>()
+        var out: [DashboardWindowController] = []
+        for c in controllers {
+            for p in pages(under: c) where seen.insert(ObjectIdentifier(p)).inserted {
+                out.append(p)
+            }
+        }
+        return out
+    }
+
+    /// `c` and every page in its grid, and in the splits inside those.
+    func pages(under c: DashboardWindowController) -> [DashboardWindowController] {
+        var out = [c]
+        for p in c.grid?.all ?? [] where p !== c { out += pages(under: p) }
+        return out
+    }
+
+    /// Puts every page but `src` at `level` percent: the dashboard's own zoom
+    /// where the page has it, pageZoom elsewhere (the connect page).
+    func zoomOthers(from src: DashboardWindowController, level: Int) {
+        guard zoomAllWindows else { return }
+        let lv = min(300, max(25, level))
+        let others = allPages.filter { $0 !== src }
+        var dashboard = 0, fallback = 0, pending = others.count
+        func done() {
+            pending -= 1
+            if pending == 0 { dlog("verdict=zoom_all level=\(lv) pages=\(others.count) dashboard=\(dashboard) page_zoom=\(fallback)") }
+        }
+        if others.isEmpty { dlog("verdict=zoom_all level=\(lv) pages=0"); return }
+        for p in others {
+            p.webView.evaluateJavaScript("typeof _applyZoom === 'function' ? (_zoomLevel = \(lv), _applyZoom(), 'dashboard') : 'none'") { r, _ in
+                if (r as? String) == "dashboard" { dashboard += 1 } else { p.webView.pageZoom = CGFloat(lv) / 100; fallback += 1 }
+                done()
+            }
         }
     }
     @objc func zoomIn(_ sender: Any?) { zoom("zoomIn") { $0.pageZoom = min(3, $0.pageZoom + 0.1) } }
@@ -1520,6 +1947,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         if item.action == #selector(toggleNotifications(_:)) { item.state = (config.notifications ?? true) ? .on : .off }
         if item.action == #selector(toggleDockBadge(_:)) { item.state = (config.dockBadge ?? true) ? .on : .off }
         if item.action == #selector(toggleSnap(_:)) { item.state = snapEnabled ? .on : .off }
+        if item.action == #selector(toggleZoomAllWindows(_:)) { item.state = zoomAllWindows ? .on : .off }
         // Window > Panes acts on a window split into panes; elsewhere its keys
         // (⌘1-9 among them) go on to the page.
         let paneActions: [Selector] = [#selector(paneCloseTab(_:)), #selector(paneZoom(_:)), #selector(paneNextTab(_:)),
@@ -1622,10 +2050,12 @@ func buildMenuBar(_ d: AppDelegate) {
     let viewItem = NSMenuItem()
     let view = NSMenu(title: "View")
     add(view, "Reload", #selector(AppDelegate.reload(_:)), "r", target: d)
+    add(view, "Reload Pane Ignoring Cache", #selector(AppDelegate.reloadIgnoringCache(_:)), "r", [.command, .shift], target: d)
     view.addItem(.separator())
     add(view, "Zoom In", #selector(AppDelegate.zoomIn(_:)), "+", target: d)
     add(view, "Zoom Out", #selector(AppDelegate.zoomOut(_:)), "-", target: d)
     add(view, "Actual Size", #selector(AppDelegate.zoomReset(_:)), "0", target: d)
+    add(view, "Zoom All Windows", #selector(AppDelegate.toggleZoomAllWindows(_:)), "", target: d)
     view.addItem(.separator())
     add(view, "Show Tab Bar", #selector(NSWindow.toggleTabBar(_:)), "t", [.command, .shift])
     add(view, "Show All Tabs", #selector(NSWindow.toggleTabOverview(_:)), "\\", [.command, .shift])

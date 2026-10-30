@@ -49,6 +49,32 @@ class ServerManager: ObservableObject {
         if let signInLink { serverURL = signInLink }
     }
 
+    /// Opens a copied file link (DeepLink.swift) on its server. An `amux://` link
+    /// can come from any web page, so it opens only a server already saved or in
+    /// use. An https link reached the app only because its domain's
+    /// apple-app-site-association names this app (an amux server), so its server
+    /// is opened, and saved if new; the server still asks for its own sign-in.
+    @discardableResult
+    func open(deepLink url: URL) -> Bool {
+        guard let link = DeepLink.parse(url) else {
+            logger.info("deep_link verdict=not_a_link")
+            return false
+        }
+        let origin = link.server.absoluteString
+        let known = savedServers.contains { DeepLink.origin(of: URL(string: $0.url) ?? link.server)?.absoluteString == origin }
+            || serverURL.flatMap { DeepLink.origin(of: $0) }?.absoluteString == origin
+        let universal = url.scheme?.lowercased() == "https"
+        guard known || universal else {
+            logger.info("deep_link verdict=unknown_server_refused host=\(link.server.host ?? "-", privacy: .public)")
+            return false
+        }
+        if !known { _ = addServer(name: link.server.host ?? origin, urlString: origin) }
+        selectServer(origin)
+        serverURL = link.load
+        logger.info("deep_link verdict=opened host=\(link.server.host ?? "-", privacy: .public)")
+        return true
+    }
+
     func addServer(name: String, urlString: String) -> Bool {
         guard let _ = URL(string: urlString), urlString.hasPrefix("http") else { return false }
         let normalized = urlString.hasSuffix("/") ? String(urlString.dropLast()) : urlString

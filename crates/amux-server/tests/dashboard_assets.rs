@@ -412,10 +412,11 @@ fn worker_card_and_peek_share_actions_and_the_canonical_file_entry() {
     // 29 SOURCE entries since 9af1c88b: `pause` and `resume` are the two arms of
     // one ternary, so the source carries both while a worker renders exactly one
     // of them. This counts the inventory in source, not the rendered menu.
+    // 30 with copy-worker-link (a /w/<worker> deep link, api/deep_links.rs).
     assert_eq!(
         inventory.matches("{ key: '").count(),
-        29,
-        "the shared worker-action inventory has 29 source entries (27 actions plus the pause/resume pair)"
+        30,
+        "the shared worker-action inventory has 30 source entries (28 actions plus the pause/resume pair)"
     );
 
     let browse_start = app

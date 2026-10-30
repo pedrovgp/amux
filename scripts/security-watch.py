@@ -12,7 +12,10 @@ Sources:
   - Tailscale security bulletins, plus the installed client against the
     newest stable release.
   - cargo audit, npm audit and pip-audit over every lockfile under
-    SECURITY_WATCH_REPOS.
+    SECURITY_WATCH_REPOS, read from each repo's origin/main. The checkouts
+    under ~/Dev are shared and can sit far behind main (mixpeek was 1660
+    commits behind on 2026-10-26), so auditing the working tree reports
+    advisories main already fixed and misses ones main introduced.
   - macOS software updates.
 
 Every source reports whether it ran. A source that failed is listed as
@@ -27,9 +30,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait
+from functools import lru_cache
 from pathlib import Path
 
 HOME = Path.home()
@@ -120,33 +125,72 @@ def src_tailscale():
     return out, len(ids)
 
 
+@lru_cache(maxsize=None)
+def committed(repo):
+    """origin/main of `repo` (fetched first), or HEAD when there is no remote."""
+    run(["git", "fetch", "-q", "origin", "main"], cwd=repo, timeout=90)
+    for ref in ("origin/main", "HEAD"):
+        rc, so, _ = run(["git", "rev-parse", "--verify", "-q", ref + "^{commit}"], cwd=repo, timeout=30)
+        if rc == 0:
+            return ref, so.strip()[:12]
+    raise RuntimeError("no origin/main or HEAD commit")
+
+
+def tracked(repo, pattern):
+    ref, _ = committed(repo)
+    _, so, _ = run(["git", "ls-tree", "-r", "--name-only", ref], cwd=repo, timeout=60)
+    return [l for l in so.splitlines() if re.search(pattern, l) and "node_modules/" not in l]
+
+
+def materialize(repo, rels, dest):
+    """Write the committed bytes of `rels` under `dest`, keeping their paths."""
+    ref, _ = committed(repo)
+    for rel in rels:
+        p = subprocess.run(["git", "show", f"{ref}:{rel}"], cwd=repo, capture_output=True, timeout=60)
+        if p.returncode == 0:
+            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+            (dest / rel).write_bytes(p.stdout)
+
+
 def src_cargo(repo):
     if not shutil.which("cargo-audit") and not (HOME / ".cargo/bin/cargo-audit").exists():
         raise RuntimeError("cargo-audit is not installed")
-    out = []
-    locks = [p for p in [repo / "Cargo.lock"] if p.exists()]
+    out, sha = [], committed(repo)[1]
+    td = tempfile.TemporaryDirectory(prefix="secwatch-")
+    materialize(repo, ["Cargo.lock"], Path(td.name))
+    locks = [p for p in [Path(td.name) / "Cargo.lock"] if p.exists()]
+    if not locks:
+        raise RuntimeError("no Cargo.lock on origin/main")
     for lock in locks:
-        _, so, se = run(["cargo", "audit", "--json", "-f", str(lock)], cwd=repo)
+        _, so, se = run(["cargo", "audit", "--json", "-f", str(lock)], cwd=td.name)
         d = json.loads(so or "{}")
         if "vulnerabilities" not in d:
             raise RuntimeError("cargo audit gave no report: " + se[-200:])
         for x in d["vulnerabilities"]["list"]:
             a = x["advisory"]
             out.append({"id": f"rustsec:{a['id']}:{repo.name}:{x['package']['name']}@{x['package']['version']}",
-                        "source": "cargo-audit", "severity": "advisory", "repo": str(repo),
+                        "source": "cargo-audit", "severity": "advisory", "repo": str(repo), "commit": sha,
                         "title": f"{a['id']} {x['package']['name']} {x['package']['version']}: {a['title']}",
                         "action": "patched in " + ", ".join(x["versions"]["patched"] or ["no release"])})
     return out, len(locks)
 
 
 def src_npm(repo):
-    _, so, _ = run(["git", "ls-files", "*package-lock.json"], cwd=repo, timeout=60)
-    files = [l for l in so.splitlines() if l and "node_modules" not in l]
+    files = tracked(repo, r"(^|/)package-lock\.json$")
+    sha = committed(repo)[1]
+    td = tempfile.TemporaryDirectory(prefix="secwatch-")
+    root = Path(td.name)
+    materialize(repo, files + [str(Path(l).parent / "package.json") for l in files], root)
 
     def one(rel):
         try:
-            _, j, se = run(["npm", "audit", "--json", "--package-lock-only"], cwd=repo / Path(rel).parent, timeout=300)
+            cwd = root / Path(rel).parent
+            _, j, se = run(["npm", "audit", "--json", "--package-lock-only"], cwd=cwd, timeout=300)
             rep = json.loads(j or "{}")
+            # Reachability: what is still flagged with devDependencies left out
+            # ships or runs in production; the rest is build and test tooling.
+            _, j2, _ = run(["npm", "audit", "--json", "--package-lock-only", "--omit=dev"], cwd=cwd, timeout=300)
+            prod = json.loads(j2 or "{}").get("vulnerabilities")
         except Exception as e:
             return [], f"{rel}: {e}"[:200]
         if "vulnerabilities" not in rep:
@@ -156,9 +200,10 @@ def src_npm(repo):
             if v.get("severity") not in ("high", "critical"):
                 continue
             via = [x.get("title") for x in v.get("via", []) if isinstance(x, dict)]
+            scope = "unknown" if prod is None else ("runtime" if name in prod else "dev-only")
             found.append({"id": f"npm:{repo.name}/{rel}:{name}:{v.get('range')}", "source": "npm-audit",
-                          "severity": v["severity"], "repo": str(repo),
-                          "title": f"{name} ({v['severity']}) in {repo.name}/{rel}: {'; '.join(via)[:160]}",
+                          "severity": v["severity"], "repo": str(repo), "commit": sha, "scope": scope,
+                          "title": f"{name} ({v['severity']}, {scope}) in {repo.name}/{rel}: {'; '.join(via)[:160]}",
                           "action": "fix available" if v.get("fixAvailable") else "no fix yet"})
         return found, None
 
@@ -170,12 +215,15 @@ def src_pip(repo):
     pa = shutil.which("pip-audit") or str(HOME / ".local/bin/pip-audit")
     if not Path(pa).exists():
         raise RuntimeError("pip-audit is not installed")
-    _, so, _ = run(["git", "ls-files", "*requirements*.txt"], cwd=repo, timeout=60)
-    files = [l for l in so.splitlines() if l][:40]
+    files = tracked(repo, r"requirements[^/]*\.txt$")[:40]
+    sha = committed(repo)[1]
+    td = tempfile.TemporaryDirectory(prefix="secwatch-")
+    # Every requirements/constraints file, so `-r other.txt` includes resolve.
+    materialize(repo, tracked(repo, r"(requirements|constraints)[^/]*\.txt$"), Path(td.name))
 
     def one(rel):
         try:
-            _, j, se = run([pa, "-r", rel, "-f", "json", "--progress-spinner", "off"], cwd=repo, timeout=600)
+            _, j, se = run([pa, "-r", rel, "-f", "json", "--progress-spinner", "off"], cwd=td.name, timeout=600)
             rep = json.loads(j)
         except Exception as e:
             return [], f"{rel}: {e}"[:200]
@@ -183,7 +231,7 @@ def src_pip(repo):
         for dep in rep.get("dependencies", []):
             for v in dep.get("vulns", []):
                 found.append({"id": f"pip:{repo.name}/{rel}:{v['id']}:{dep['name']}", "source": "pip-audit",
-                              "severity": "advisory", "repo": str(repo),
+                              "severity": "advisory", "repo": str(repo), "commit": sha,
                               "title": f"{v['id']} {dep['name']} {dep.get('version')} in {repo.name}/{rel}",
                               "action": "fixed in " + ", ".join(v.get("fix_versions") or ["no release"])})
         return found, None
@@ -216,6 +264,12 @@ def main():
                         (f"npm:{repo.name}", lambda r=repo: src_npm(r)),
                         (f"pip:{repo.name}", lambda r=repo: src_pip(r))]
     report = {"ts": int(time.time()), "sources": {}, "findings": [], "budget_s": BUDGET_S}
+    for repo in REPOS:  # fetch each repo once, before its three sources run in parallel
+        if (repo / ".git").exists():
+            try:
+                committed(repo)
+            except Exception:
+                pass  # each source raises it again and is reported unmeasured
 
     def measure(fn):
         res = fn()
@@ -239,6 +293,9 @@ def main():
         except Exception as e:  # a failed source is unmeasured, never clean
             report["sources"][name] = {"measured": False, "why_unmeasured": str(e)[:300]}
     pool.shutdown(wait=False, cancel_futures=True)
+    # pip-audit can list one advisory twice for a package (2026-10-26:
+    # PYSEC-2026-3552 on cryptography); a finding is its id.
+    report["findings"] = list({f["id"]: f for f in report["findings"]}.values())
     new = [f for f in report["findings"] if f["id"] not in state["reported"]]
     unmeasured = [n for n, s in report["sources"].items() if not s["measured"]]
     report["new"] = len(new)
@@ -259,11 +316,14 @@ def main():
     if new or unmeasured:
         lines = [f"Ask: triage these and land patches; file a needsyou card for anything that needs Ethan (installs that need his password, paid tiers). {summary}.", ""]
         rank = {"exploited": 0, "critical": 1, "update": 2, "high": 3, "advisory": 4}
-        new.sort(key=lambda f: rank.get(f["severity"], 9))
+        new.sort(key=lambda f: (f.get("scope") == "dev-only", rank.get(f["severity"], 9)))
         by_where = {}
         for f in new:
             k = (f["source"], Path(f.get("repo", "")).name or "host")
             by_where[k] = by_where.get(k, 0) + 1
+        dev = sum(1 for f in new if f.get("scope") == "dev-only")
+        if dev:
+            lines.append(f"{dev} of the {len(new)} new are npm dev-only (build and test tooling), listed last.")
         lines.append("New, by source and repo: " + "; ".join(f"{s}/{r} {n}" for (s, r), n in sorted(by_where.items(), key=lambda x: -x[1])))
         lines.append("")
         lines += [f"- [{f['severity']}] {f['title']} -> {f.get('action') or ''}" for f in new[:40]]

@@ -218,6 +218,22 @@ def stop_group(proc):
              note='the supervised process did not exit within 10s of SIGKILL')
 
 
+# When a host runs out of memory the kernel kills the process with the highest
+# oom_score_adj. A build and the amux server it serves used to tie at 200 on
+# amux Cloud (both are user units), so the kernel could pick the server. Any
+# process may raise its own score without privilege; the build's compilers
+# inherit it. Linux only; elsewhere there is nothing to set.
+OOM_SCORE_ADJ = os.environ.get('AMUX_CARGO_OOM_SCORE_ADJ', '900')
+
+
+def first_to_go():
+    try:
+        with open('/proc/self/oom_score_adj', 'w') as f:
+            f.write(OOM_SCORE_ADJ)
+    except OSError:
+        pass
+
+
 def supervise(command, targets, *, max_rss, max_seconds, max_target, min_free,
               interval=2, disk_interval=30, profile=None):
     started = time.monotonic()
@@ -287,7 +303,8 @@ def supervise(command, targets, *, max_rss, max_seconds, max_target, min_free,
          unenforced=sorted(unenforced))
     # Preserve the inherited Cargo lifetime lease in the child. If this monitor
     # is killed, cleanup must still see the active compiler/test as leased.
-    proc = subprocess.Popen(command, start_new_session=True, close_fds=False)
+    proc = subprocess.Popen(command, start_new_session=True, close_fds=False,
+                            preexec_fn=first_to_go)
     interrupted = []
     prior = {}
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -352,6 +369,12 @@ def supervise(command, targets, *, max_rss, max_seconds, max_target, min_free,
         # WHAT WAS ACTUALLY ENFORCED, beside the result (ethos rule 4). A green
         # run with every probe broken and a green run with every probe working
         # used to print the same line.
+        oom = scope_oom_kills()
+        if oom:
+            emit('cargo_oom_killed', measured=True, n_considered=1, verdict='cargo_oom_killed',
+                 oom_kills=oom, peak_rss_bytes=peak, exit_code=proc.returncode,
+                 note='the kernel killed a build process at this build scope\'s memory limit; '
+                      'the failure below is that kill, not the code')
         emit('cargo_budget_finished',
              measured=considered > 0 and not unenforced, n_considered=considered,
              elapsed_s=round(time.monotonic() - started, 2), peak_rss_bytes=peak,
@@ -361,12 +384,27 @@ def supervise(command, targets, *, max_rss, max_seconds, max_target, min_free,
              unenforced=sorted(unenforced), probe_failures=probe_failures,
              never_measured=sorted(l for l in PROBED_LIMITS
                                    if l not in measured_limits and l not in unenforced),
-             exit_code=proc.returncode)
+             exit_code=proc.returncode, oom_kills=oom)
         return proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
     finally:
         stop_group(proc)
         for sig, handler in prior.items():
             signal.signal(sig, handler)
+
+
+def scope_oom_kills():
+    """Processes the kernel OOM-killed in this build's own cgroup (Linux, v2),
+    or None where that cannot be read. A rustc killed at the scope's limit makes
+    cargo exit 101 like any compile error; on 2026-10-28 a day of sandbox deploy
+    builds failed that way and the builder's log never said why."""
+    try:
+        with open('/proc/self/cgroup') as f:
+            line = next(l for l in f if l.startswith('0::'))
+        with open('/sys/fs/cgroup' + line[3:].strip() + '/memory.events') as f:
+            events = dict(l.split() for l in f if l.strip())
+        return int(events.get('oom_kill', 0))
+    except (OSError, StopIteration, ValueError):
+        return None
 
 
 def main():

@@ -88,7 +88,10 @@ libc = "0.2"
 # feature additions to the same crate: ecdh for the RFC 8291 key agreement,
 # pem so the Python server's PKCS#8 PEM VAPID key (~/.amux/vapid_private.pem)
 # loads unchanged and existing dashboard subscriptions keep verifying.
-p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pem"] }
+p256 = { version = "0.14", features = ["ecdsa", "ecdh", "pem", "getrandom"] }
+# OS randomness for nonces, keys and tokens. Taken directly rather than through
+# p256's re-exported rand_core, which moved in 0.14 (RUSTSEC-2026-0387 bump).
+getrandom = "0.4"
 hkdf = "0.12"
 aes-gcm = "0.10"
 aes = "0.8"

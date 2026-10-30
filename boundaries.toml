@@ -32,6 +32,9 @@
 #   path        file tools (Read, Edit, Write, ...): regex on the file path
 #   content_any file tools: the rule applies only if the written text matches
 #   reason      what the worker is told, including the sanctioned route
+#   requires_receipt  Bash: the rule refuses only when no fresh receipt for
+#               the parsed target exists (see tenant-workload-gate). Its
+#               match_all/match_none are tested per command segment.
 # Regexes are Python `re`, case-insensitive.
 
 version = 1
@@ -289,7 +292,11 @@ agent stops at once. Keep the number of subagents you run at the same time
 small: a new one is refused while you already have the limit running
 (AMUX_MAX_SUBAGENTS, default below) or while the account has less usage left
 than the floor below. When refused, wait for one of your agents to finish, do
-the step yourself, or retry after the window resets. `amux usage` and
+the step yourself, or retry after the window resets. The refusal lists your
+running subagents with their ages: if the new task matters more, stop your
+lowest-priority or stale one (TaskStop) and retry. A task that is your most
+important one may start one over the cap when its description begins with
+`[P1]` (or `#1`); use that sparingly. `amux usage` and
 GET $AMUX_URL/api/sessions/<you>/quota show the remaining window.
 """
 enforced_by = [
@@ -312,6 +319,50 @@ min_headroom_pct = 10
 # no_meta_warm_s.
 stale_s = 1800
 no_meta_warm_s = 240
+# Priority (2026-10-27, MSG-98201: mxp-gs12 was refused 11 times that day,
+# including for its most important task). With the cap full, an Agent call
+# whose description or prompt start matches one of these regexes still
+# starts, up to over_cap_max above the cap (0 turns the allowance off), and is
+# logged as subagent_cap_preempt_allowed. A hook cannot stop another agent,
+# so the refusal lists the running ones with their ages for the lane to stop
+# its lowest-priority or stale one (TaskStop). The headroom floor still holds.
+priority_markers = ['^\s*\[P1\]', '^\s*#1\b']
+priority_example = ["[P1]", "#1"]
+over_cap_max = 1
+# An Agent call while any running subagent is older than this logs
+# subagent_long_running (WARN), so a sweep finds agents running for hours.
+# 0 turns it off.
+long_running_s = 7200
+
+[[boundary]]
+id = "orchestrator-modal"
+title = "Orchestrator lanes never wait on a modal prompt"
+kind = "modal"
+rule = """
+An orchestrator lane (listed in this boundary's `orchestrators`, or with
+AMUX_ORCHESTRATOR=1 in its scope) runs while the owner is away and other lanes
+wait on it. It never opens a modal prompt (AskUserQuestion, EnterPlanMode,
+ExitPlanMode): such a prompt blocks the whole turn until a human answers, so
+peer messages queue unread and scheduled wakeups cannot fire. Put a question in
+your turn output as plain text with numbered options, decide it yourself inside
+your standing authority, say which option you took, and keep working.
+"""
+enforced_by = [
+  "hook: boundary-guard (AskUserQuestion, EnterPlanMode and ExitPlanMode refused for orchestrator lanes)",
+]
+
+[boundary.modal]
+# 2026-10-24/25: the orchestrator amux-helper called AskUserQuestion while the
+# owner slept. The turn blocked for about 8 h, peer messages queued unread and
+# its wakeup chain could not fire (scripts/worker-stall-watch.sh header).
+# The guard's settings matcher must name every tool here
+# (scripts/hooks/install-claude-status-hooks.py; the test checks it).
+tools = ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]
+# Workers that are orchestrators. The scoped env below wins over this list:
+# AMUX_ORCHESTRATOR=1 adds a worker, AMUX_ORCHESTRATOR=0 removes a listed one.
+orchestrators = ["amux-helper", "mxp-gs12", "tubescience-parity"]
+env = "AMUX_ORCHESTRATOR"
+verdict = "modal_prompt_refused"
 
 [[boundary]]
 id = "fleet-tmux"
@@ -357,6 +408,214 @@ block_examples = [
   "tmux -S /private/tmp/tmux-501/default kill-server",
 ]
 allow_examples = ["tmux -L default ls", "tmux -S /tmp/tmux-501/demo kill-server"]
+
+[[boundary]]
+id = "tenant-workload-gate"
+title = "Read what scales a tenant workload before you change it"
+rule = """
+Before you scale, patch, restart, delete, apply to, roll back, drain or
+load-test anything in a live tenant Kubernetes namespace (mixpeek-* and
+ephemeral-*), run the read-only gate for that namespace and read its output:
+
+  ~/.amux/hooks/tenant-gate.sh <kube-context> <namespace> "<why>"
+
+(in the amux repo it is scripts/tenant-gate.sh; use `default` as the context
+when your command names no --context). It lists every ScaledObject, HPA, PDB,
+Deployment and StatefulSet in the namespace and says what scales what,
+including triggers that watch another workload's pods. Workloads depend on
+each other there: on 2026-10-27 scaling deploy/api to zero made a separate
+ScaledObject deactivate the mvs-primary shard mid index rebuild. The gate
+records a receipt for your session, and mutating commands in that namespace
+are refused without one from the last 30 minutes. Restart deployments one at
+a time and watch the node, and keep load and replay bursts off live tenant
+shards unless the task is that test.
+"""
+enforced_by = [
+  "hook: boundary-guard (kubectl/helm mutations and named load tools in a tenant namespace need a fresh gate receipt from this session)",
+]
+
+# The 2026-10-27 incidents are the block examples: a scale to zero that killed
+# a shard through another ScaledObject, a teardown deleting a booting pod, a
+# mass rollout restart that OOMed a node, and a replay burst that wedged a
+# shard. Each is refused without a receipt and allowed with a fresh one
+# (scripts/hooks/test-boundary-guard.py builds the receipts).
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['(?:^|\s)(?:(?:kubectl|oc)\s(?:[^;&|]*\s)?(?:scale|patch|delete|apply|replace|edit|annotate|label|drain|cordon|uncordon|taint|create|autoscale|rollout\s+(?:restart|undo|pause|resume)|set\s+(?:env|image|resources))|helm\s(?:[^;&|]*\s)?(?:upgrade|rollback|uninstall|delete|install)|(?:hey|k6\s+run|vegeta\s+attack|locust|wrk|ab|ghz|oha)|\S*(?:replay|load[-_]?test)\S*)(?=\s|$)']
+match_none = ['^\s*(?:grep|rg|man|which|echo|printf)\b', '(?:^|\s)auth\s+can-i\b', 'tenant-gate\.sh\b', '(?:^|\s)--dry-run=(?:client|server)(?=\s|$)']
+reason = "This changes a live tenant workload, and this session has not read what scales it."
+block_examples = [
+  "kubectl -n ephemeral-r40255478404 scale deploy/api --replicas=0",
+  "kubectl -n ephemeral-r40255478404 annotate scaledobject api autoscaling.keda.sh/paused=true --overwrite",
+  "kubectl --context gke_mixpeek-inference-463103_us-central1_mixpeek-engine delete pod mvs-primary-0 -n mixpeek-tenant-a",
+  "for d in api worker mvs-primary; do kubectl -n mixpeek-tenant-a rollout restart deploy/$d; done",
+  "hey -z 60s -c 200 http://api.ephemeral-r40255478404.svc.cluster.local/v1/retrievers/x/execute",
+  "python3 scripts/replay_requests.py --namespace ephemeral-r40255478404 --rate 500",
+  "helm upgrade mvs charts/mvs -n mixpeek-tenant-a --set replicas=3",
+  "bash -c 'kubectl patch deploy api -n ephemeral-r1 -p {}'",
+  "kubectl delete ns ephemeral-r40255478404",
+]
+allow_examples = [
+  "kubectl -n ephemeral-r40255478404 get scaledobjects.keda.sh,hpa,deploy -o wide",
+  "kubectl -n ephemeral-r40255478404 describe scaledobject mvs-primary-scale-to-zero",
+  "kubectl -n mixpeek-tenant-a logs deploy/api --tail=50",
+  "kubectl -n mixpeek-tenant-a top pods",
+  "kubectl -n mixpeek-tenant-a get events --sort-by=.lastTimestamp",
+  "kubectl auth can-i delete pods -n mixpeek-tenant-a",
+  "kubectl -n mixpeek-tenant-a port-forward svc/api 8080:80",
+  "kubectl -n mixpeek-tenant-a rollout status deploy/api",
+  "kubectl -n kube-system rollout restart deploy/coredns",
+  "kubectl -n monitoring scale deploy/grafana --replicas=1",
+  "git commit -m 'kubectl -n ephemeral-r1 scale deploy/api --replicas=0 was the incident'",
+  "grep -rn 'kubectl scale -n mixpeek-a' docs/",
+  "~/.amux/hooks/tenant-gate.sh default ephemeral-r40255478404 'scale api to zero'",
+  "kubectl -n ephemeral-r40255478404 scale deploy/api --replicas=0 --dry-run=server",
+]
+
+[boundary.deny.requires_receipt]
+# The rule's match_all/match_none are tested against each command segment (split
+# on ; && || | and newlines, and into bash -c / sh -c / eval / ssh strings). A
+# segment that matches and names a namespace matching `namespaces` needs a
+# receipt at $AMUX_HOME/<dir>/<worker>/<context>__<namespace>.json, written by
+# the gate below for this worker, younger than max_age_s (env max_age_env
+# overrides). The receipt's own fields must name the same worker, context and
+# namespace. Fails CLOSED: no valid receipt, the command is refused.
+dir = "tenant-gates"
+max_age_s = 1800
+max_age_env = "AMUX_TENANT_GATE_MAX_AGE_S"
+namespaces = ['^mixpeek-', '^ephemeral-']
+# First capture group of the first pattern that matches the segment. A service
+# DNS name comes first so `hey -n 1000 http://api.<ns>.svc` reads the host.
+namespace_patterns = [
+  '[\w-]+\.([a-z0-9][-a-z0-9]*)\.svc(?:\.cluster\.local)?\b',
+  '(?:^|\s)(?:-n|--namespace)(?:=|\s+)?([a-z0-9][-a-z0-9.]*)',
+  '(?:^|\s)(?:ns|namespaces?)(?:/|\s+)([a-z0-9][-a-z0-9]*)',
+]
+# A mutation across every namespace can have no one receipt: refused.
+all_namespaces_patterns = ['(?:^|\s)(?:kubectl|oc)\s(?:[^;&|]*\s)?(?:-A|--all-namespaces)(?=\s|=|$)']
+context_patterns = ['(?:^|\s)--(?:kube-)?context(?:=|\s+)(\S+)']
+default_context = "default"
+gate_command = '~/.amux/hooks/tenant-gate.sh {context} {namespace} "<why you are changing it>"'
+verdict_refused = "tenant_gate_refused"
+verdict_allowed = "tenant_gate_allowed_with_receipt"
+
+# A receipt is written by the gate only. Hand-writing one skips the read.
+[[boundary.deny]]
+tools = ["Bash", "Edit", "Write", "MultiEdit"]
+match_all = ['\.amux/tenant-gates\b', '(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\btouch\b|\bln\b|\bpython3?\b|\bnode\b|\bperl\b|\bruby\b)']
+match_none = ['^\s*(cat|ls|jq|head|tail|grep|rg)\b[^>|;&]*$']
+path = '\.amux/tenant-gates/'
+reason = "Gate receipts are written by tenant-gate.sh after it reads the namespace. Run the gate instead of writing a receipt."
+block_examples = ["echo '{}' > ~/.amux/tenant-gates/me/default__ephemeral-r1.json", "Write /Users/ethan/.amux/tenant-gates/me/default__ephemeral-r1.json :: {}"]
+allow_examples = ["ls ~/.amux/tenant-gates/me", "cat ~/.amux/tenant-gates/me/default__ephemeral-r1.json"]
+
+[[boundary]]
+id = "push-gates"
+title = "A push to main runs the repository's own pre-push gates"
+kind = "push_gates"
+rule = """
+A `git push` that writes main or master runs the repository's own pre-push
+hook. Never pass --no-verify, never empty core.hooksPath inline, and never push
+from a clone that has not installed the hook its repository ships (a fresh
+clone installs none until you run the repo's install step: for mixpeek
+`git config core.hooksPath .githooks`, for amux `./scripts/install-hooks.sh`).
+Run the push as its own command after its checks pass, not chained after a
+precheck. If a gate refuses, fix what it reports and push again. In a repo that
+lands through the queue (mixpeek), never push main directly: run
+`amux land --detach`, which rebases, runs the gates and pushes for you.
+"""
+enforced_by = [
+  "hook: boundary-guard (git push to main or master with --no-verify, with core.hooksPath emptied inline, from a repo that ships a pre-push hook it has not installed, or a direct push in a repo that lands through amux land)",
+]
+
+[boundary.push_gates]
+# 2026-10-27 (MSG-98201, MSG-98259): a worker's subagent pushed to mixpeek main
+# from a fresh clone with no pre-push hook installed (1212229610, reverted).
+# Its precheck had refused, but the push was chained after it, and the clone
+# ran no hook. Each command segment is judged on its own, in the directory it
+# runs in (the payload's cwd, `cd <dir>` segments, `git -C <dir>`).
+# A dry run (--dry-run, -n) writes nothing to the remote and is not checked.
+protected_branches = ["main", "master"]
+# A repository SHIPS a pre-push hook when one of these files exists at its
+# top level; `install` is the fix the refusal names.
+shipped_hooks = [
+  { path = ".githooks/pre-push", install = "git config core.hooksPath .githooks" },
+  { path = "scripts/git-hooks/pre-push", install = "./scripts/install-hooks.sh" },
+]
+# Or when any remote URL (or the URL pushed to) matches one of these, even if
+# the checkout lacks the file (a shallow or sparse clone, say).
+#
+# `land = true` (2026-10-27, L-141): that repository lands main through the
+# `amux land` queue, so a direct push to a protected branch is refused and the
+# refusal says to run `land_command`. Lanes that pushed mixpeek main directly
+# lost races to the queue and re-ran its pre-push gates (mixpeek-cicd: 39 min
+# of refusals). Judged on the URL of the remote pushed to. amux has no `land`:
+# its flow is a rebase and a direct `git push origin HEAD:main`. land's own
+# push runs inside its process, so this hook never sees it.
+repos = [
+  { remote = 'github\.com[:/]mixpeek/mixpeek(\.git)?/?$', install = "git config core.hooksPath .githooks", land = true },
+  { remote = 'github\.com[:/]mixpeek/amux(\.git)?/?$', install = "./scripts/install-hooks.sh" },
+]
+land_command = "amux land --detach"
+default_install = "git config core.hooksPath .githooks"
+# Each git probe (rev-parse, config, symbolic-ref) is bounded by this. A probe
+# that fails or times out refuses the push (the check fails closed).
+timeout_s = 3
+verdict_refused = "push_gate_refused"
+verdict_allowed = "push_gate_allowed"
+verdict_land_required = "push_gate_land_required"
+
+[[boundary]]
+id = "delete-gate"
+title = "Preview a cluster or cloud delete before you run it"
+kind = "delete_gate"
+rule = """
+Preview every cluster or cloud delete before you run it, as its own command,
+and read what it lists. Deleting customer or production data needs the owner:
+ask first, preview, then delete. The preview for each delete:
+
+  kubectl delete ARGS              kubectl delete ARGS --dry-run=server -o name
+  gcloud GROUP... delete T         gcloud GROUP... describe T   (each target)
+  gsutil rm [-r] URL...            gsutil ls [-r] URL...
+  gcloud storage rm [-r] URL...    gcloud storage ls [-r] URL...
+
+A delete is refused unless this worker previewed the same target in the last
+15 minutes, and each preview covers one delete. A preview chained in the same
+command as its delete does not count. The refusal prints the preview to run.
+"""
+enforced_by = [
+  "hook: boundary-guard (kubectl delete, gcloud ... delete, gcloud storage rm, gsutil rm and rb need an unused preview of the same target from this worker, recorded in the last 15 minutes)",
+]
+
+[boundary.delete_gate]
+# V7-delete, 2026-10-27. On 2026-10-24 a production delete-all was replayed and
+# data was lost, and the fleet has deleted cloud resources by hand before.
+# Each delete segment (split as push-gates and the tenant gate split) needs a
+# receipt at $AMUX_HOME/<dir>/<worker>/<sha256 of its key>.json, written when
+# this worker ran the matching preview. Keys: a kubectl delete's positionals
+# and flags, less the ones that only change output or pacing (--dry-run, -o,
+# --wait, --timeout, --grace-period, --now, --force, --ignore-not-found);
+# a gcloud delete's command group, one target and its flags, less --quiet,
+# --async, --format, --verbosity, --delete-disks, --keep-disks, --force;
+# a storage delete's URLs and whether it is recursive. The delete removes the
+# receipt. A receipt that cannot be read, consumed or written refuses the
+# command (fails closed). No bypass: the owner turns the boundary off with
+# `enabled = false` in the machine override registry, as for every boundary.
+dir = "state/delete-previews"
+max_age_s = 900
+verdict_refused = "delete_gate_refused"
+verdict_preview = "delete_gate_preview_recorded"
+verdict_allowed = "delete_gate_allowed"
+
+# A receipt is written by the guard when the preview runs. Hand-writing one skips the preview.
+[[boundary.deny]]
+tools = ["Bash", "Edit", "Write", "MultiEdit"]
+match_all = ['\.amux/state/delete-previews\b', '(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\btouch\b|\bln\b|\bpython3?\b|\bnode\b|\bperl\b|\bruby\b)']
+match_none = ['^\s*(cat|ls|jq|head|tail|grep|rg)\b[^>|;&]*$']
+path = '\.amux/state/delete-previews/'
+reason = "Delete preview receipts are written by the guard when the preview runs. Run the preview instead of writing a receipt."
+block_examples = ["echo '{}' > ~/.amux/state/delete-previews/me/0123.json", "Write /Users/ethan/.amux/state/delete-previews/me/0123.json :: {}"]
+allow_examples = ["ls ~/.amux/state/delete-previews/me", "cat ~/.amux/state/delete-previews/me/0123.json"]
 
 [[boundary]]
 id = "boundaries-self"

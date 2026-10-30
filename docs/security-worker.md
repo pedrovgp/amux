@@ -23,13 +23,19 @@ certificate compromise (TS-2026-013).
 - Tailscale's security bulletins, and the installed client against the newest
   stable release
 - `cargo audit`, `npm audit` and `pip-audit` over every lockfile in
-  `SECURITY_WATCH_REPOS`
+  `SECURITY_WATCH_REPOS`, read from each repo's `origin/main`: the shared
+  checkouts under `~/Dev` can sit far behind main, so their working trees
+  are not what ships. npm findings carry `scope`: `runtime` (still flagged
+  with `--omit=dev`) or `dev-only` (build and test tooling)
 - macOS software updates
 
 Each run writes `~/.amux/security-watch/<date>.json`. `state.json` there holds
 the ids already reported, so each finding is sent once. Each source reports
 whether it ran: a source that could not run is listed as unmeasured, never as
-clean. Run it by hand with `python3 scripts/security-watch.py --dry-run`.
+clean. Run it by hand with `python3 scripts/security-watch.py --dry-run`. The
+scheduler stops a shell run at 600s, so checks run in parallel inside
+`SECURITY_WATCH_BUDGET_S` (default 480); one still running at the deadline is
+reported unmeasured.
 
 ## How to work a finding
 

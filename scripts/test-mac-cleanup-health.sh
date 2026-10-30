@@ -107,6 +107,21 @@ check "an orphaned cargo build is kept"               alive "$(alive "$CB")"
 check "a cargo test whose parent is alive is kept"    alive "$(alive "$CTP")"
 check "the summary counts two stopped"                yes   "$(has "$out" 'found 2, stopped 2')"
 
+echo "2b2. a browser launched for a throwaway amux home is stopped once orphaned; the owner's profile is not"
+spawn TCH "$FIX/temp-chrome"
+spawn RCH "$FIX/real-chrome"
+spawn YCH "$FIX/young-chrome"
+{
+  printf '%s 1 %s 14:32:36 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=58172 --user-data-dir=/var/folders/0x/abc/T/amux-reaper-3yinwdn4/home/playwright-auth/profiles/driven --no-first-run\n' "$TCH" "$ME"
+  printf '%s 1 %s 14:32:36 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9333 --user-data-dir=/Users/u/.amux/playwright-auth/profiles/ethan --no-first-run\n' "$RCH" "$ME"
+  printf '%s 1 %s 30:00 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/tmp/amux-e2e-x/home/playwright-auth/profiles/p\n' "$YCH" "$ME"
+} > "$FIX/ps.orph"
+reap_test_orphans 0 > "$FIX/orph.out"; out=$(cat "$FIX/orph.out")
+check "an orphaned temp-home browser is stopped"      gone  "$(alive "$TCH")"
+check "the owner's real profile browser is kept"      alive "$(alive "$RCH")"
+check "a young temp-home browser is kept"             alive "$(alive "$YCH")"
+check "the summary counts one stopped"                yes   "$(has "$out" 'found 1, stopped 1')"
+
 echo "2c. background daemons: a listed one of ours at normal priority goes to background policy"
 {
   printf '87198 %s 58 270.0 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd\n' "$ME"
@@ -174,6 +189,26 @@ done
 HEALTH_VERDICTS=""; check_crash_reports 0 >/dev/null
 check "the crashes line carries what the reports say" yes "$(has "$HEALTH_VERDICTS" '^crashes bash crashed 12 times in 24h (at or over 10) (reports: coalition com.amux.tmux-watchdog x11; parent bash x11; signal SIGSEGV x11; 11/11 under Rosetta; 11 raised by the process itself; 11 alive under 1s (the watchdog started the tmux server: this means a process under tmux, a worker.s shell))$')"
 check "a report with no body adds no context"         ""    "$(crash_context "$FIX/crash" Looper)"
+
+# Mac crashes RCA 20261026-225543: a fault signal a process sends itself with
+# kill() (a test fixture's `kill -SEGV $$`) is not a crash. Frames as macOS
+# writes them: __kill on top and no _sigtramp. A handler re-raising a real
+# fault has _sigtramp, and stays a crash.
+CRASH_DIR="$FIX/crash-self"; mkdir -p "$CRASH_DIR"
+mkrep() { # <file> <pid> <with sigtramp 0|1>
+  python3 -c 'import json,sys
+pid=int(sys.argv[1]); st=sys.argv[2]=="1"
+fr=[{"symbol":"__kill"}]+([{"symbol":"_sigtramp"}] if st else [])+[{"imageIndex":0},{"symbol":"start"}]
+print(json.dumps({"bug_type":"309"}))
+print(json.dumps({"pid":pid,"parentProc":"bash","exception":{"type":"EXC_CRASH","signal":"SIGSEGV"},"termination":{"byPid":pid},"threads":[{"triggered":True,"frames":fr}]}))' "$2" "$3" > "$1"
+}
+for i in $(seq 1 12); do mkrep "$CRASH_DIR/bash-$(stamp $((i * 60))).ips" $((200 + i)) 0; done
+HEALTH_VERDICTS=""; check_crash_reports 1 > "$FIX/crash-self.out"; out=$(cat "$FIX/crash-self.out")
+check "12 self-sent SIGSEGVs are not a crash constraint" no "$(has "$HEALTH_VERDICTS" '^crashes bash')"
+check "the line counts them, with a verdict"           yes "$(has "$out" '12 in 48h are a fault signal the process sent itself.*bash x12.*verdict=crash_reports_self_signaled')"
+for i in $(seq 1 12); do mkrep "$CRASH_DIR/bash-$(stamp $((i * 60 + 30))).ips" $((300 + i)) 1; done
+HEALTH_VERDICTS=""; check_crash_reports 1 > "$FIX/crash-self.out"
+check "a handler re-raising a real fault (_sigtramp) still counts" yes "$(has "$HEALTH_VERDICTS" '^crashes bash crashed 12 times in 24h')"
 
 echo "4b. a loop that stopped crashing 6h+ ago is reported, not escalated (RCA crashes 20261017-022150)"
 CRASH_DIR="$FIX/crash-ended"; mkdir -p "$CRASH_DIR"

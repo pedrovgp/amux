@@ -1,9 +1,10 @@
-//! What the Pages tab provisions besides Pages themselves, one store, three
+//! What the Apps tab (formerly Pages; internal id `pages`) provisions besides
+//! worker-backed HTML apps (api/pages.rs), one store, three
 //! kinds (Ethan, 2026-10-25: "pages = internal apps, external apps, external
 //! facing files", proxies consolidated into it):
 //!
 //! - `internal`: an app on a port, for the signed-in owner only. Opened inside
-//!   the amux UI from Pages, served on the apps origin at `/app/<id>/`
+//!   the amux UI from the Apps tab, served on the apps origin at `/app/<id>/`
 //!   (apps_origin.rs), never on the dashboard's own origin.
 //! - `app`: the same, public: `/pub/<id>/`, anyone with the link, no amux
 //!   sign-in, until turned off.
@@ -45,7 +46,8 @@ fn default_kind() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Link {
     pub id: String,
-    /// `internal`, `app` or `file`.
+    /// `internal`, `app` or `file`. An `internal` link names a port (an app)
+    /// or a `path` (a file or folder shown inside amux).
     #[serde(default = "default_kind")]
     pub kind: String,
     #[serde(default)]
@@ -219,6 +221,18 @@ fn normalize_url(u: &str) -> Option<String> {
 /// a cloud box sets it to https://<its domain>) wins; otherwise the address the
 /// owner last opened the dashboard at. None when neither is known: callers say
 /// so rather than guessing.
+/// The owner's link to a file in amux's file viewer (deep_links.rs), built
+/// the way the dashboard's copy-link builds it: `<address>/f/<path>`, each
+/// segment encoded. Relative to the server when its address is unknown.
+pub(crate) fn file_link(home: &Path, path: &str) -> String {
+    let enc: Vec<String> = path.split('/').map(|seg| {
+        seg.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+    }).collect();
+    let p = enc.join("/");
+    let p = if p.starts_with('/') { p } else { format!("/{p}") };
+    format!("{}/f{p}", public_url(home).unwrap_or_default().trim_end_matches('/'))
+}
+
 pub(crate) fn public_url(home: &Path) -> Option<String> {
     if let Some(u) = crate::api::settings::effective_env(home, "AMUX_PUBLIC_URL").as_deref().and_then(normalize_url) {
         return Some(u);
@@ -275,26 +289,29 @@ pub(crate) fn worker_links_guide(home: &Path) -> String {
     } else {
         "This amux's address is not known yet (AMUX_PUBLIC_URL in server.env sets it; otherwise it is \
          learned the first time the owner opens the dashboard). Give the owner the path, such as \
-         /#view=pages, and say the address is unknown. Do not guess it from an IP address."
+         /#view=apps, and say the address is unknown. Do not guess it from an IP address."
             .to_string()
     };
     format!(
         "{address}\n\n\
-         The owner manages everything below in the Pages tab ({base}/#view=pages), so register what you \
-         build there rather than only printing a link:\n\
-         - An app for the owner, inside amux: `amux publish --internal <port> [title]`. It is listed in \
-         Pages and opens inside the amux UI; its link is {base}/#view=pages&open=<id>, with the id \
-         `amux publish` prints. Never hand the owner localhost or a port. A Page is \
-         {base}/pages/<name>.\n\
-         - An app for anyone with the link (no amux sign-in), only when the owner wants it shared: \
-         `amux publish <port> [title]`, which prints {base}/pub/<id>/.\n\
-         - A file or folder for anyone with the link, only when the owner wants it shared: \
-         `amux publish --file <absolute path> [title]`. Never link a file as {base}/api/file/...: \
-         that needs the owner's sign-in.\n\
-         Anything you add (inside amux or public) stays pending until the owner approves it in \
-         Pages; tell them it is waiting there. Never try to approve it yourself.\n\
+         A file for the owner (a workbook, a report, a deck, an HTML page) is not an App. Name each file \
+         by its absolute path, one per file, never a folder: amux shows the path as a link that opens in \
+         its file viewer, signed in, with nothing to approve. Give the web link, {base}/f/<absolute path>, \
+         only when the owner asks for a link (to copy, send or open outside amux). Never start a web \
+         server (such as `python3 -m http.server`) to show files.\n\n\
+         The Apps tab holds apps with a backend (a server, inside amux or outside it) and files shared \
+         outside amux. Use it only when the owner asks for one of those:\n\
+         - An app for the owner, inside amux: `amux publish --internal <port> [title]`. Its link is \
+         {base}/#view=apps&open=<id>, with the id `amux publish` prints. Never hand the owner localhost \
+         or a port. An HTML app whose backend is a worker is {base}/pages/<name>.\n\
+         - An app for anyone with the link (no amux sign-in): `amux publish <port> [title]`, which prints \
+         {base}/pub/<id>/.\n\
+         - A file or folder for anyone with the link: `amux publish --file <absolute path> [title]`. Never \
+         link a file as {base}/api/file/...: that needs the owner's sign-in.\n\
+         Anything you add stays pending until the owner approves it in the Apps tab; tell them it is waiting \
+         there. Never try to approve it yourself.\n\
          `amux publish --list` lists them and `amux publish --revoke <id>` turns one off.\n\n\
-         Build pages, demos and documents as files in your workspace and register them here. Never \
+         Build demos and documents as files in your workspace and link them as above. Never \
          publish to claude.ai (the Artifact tool): that lives outside this amux, where the owner cannot \
          list, serve or turn it off, and amux denies the tool."
     )
@@ -302,9 +319,11 @@ pub(crate) fn worker_links_guide(home: &Path) -> String {
 
 fn link_json(home: &Path, l: &Link) -> Value {
     let base = public_url(home);
-    // An app inside amux is reached through its Pages entry, which opens it on
-    // the apps origin with a one-time handoff; there is no direct link to it.
-    let path = if l.is_public() { format!("/pub/{}/", l.id) } else { format!("/#view=pages&open={}", l.id) };
+    // An app inside amux is reached through its Apps tab entry, which opens it
+    // on the apps origin with a one-time handoff; there is no direct link to it.
+    // #view=apps is the Apps tab's address; the dashboard still accepts the
+    // older #view=pages that earlier links carry.
+    let path = if l.is_public() { format!("/pub/{}/", l.id) } else { format!("/#view=apps&open={}", l.id) };
     json!({
         "id": l.id, "kind": l.kind, "port": l.port, "file": l.path, "title": l.title,
         "created_by": l.created_by, "created_at": l.created_at,
@@ -338,7 +357,7 @@ pub(crate) async fn list(State(_): State<AppState>) -> Response {
             if l.port > 0 {
                 v["running"] = json!(up);
             }
-            if l.kind == "file" {
+            if !l.path.is_empty() {
                 let (bytes, files) = shared_size(Path::new(&l.path));
                 v["size_bytes"] = json!(bytes);
                 v["files"] = json!(files);
@@ -401,7 +420,7 @@ pub(crate) async fn create(State(state): State<AppState>, headers: HeaderMap, bo
     let Some(Json(body)) = body else { return bad(StatusCode::BAD_REQUEST, "send {\"kind\": ..., \"port\" or \"path\": ...}") };
     let kind = body.kind.clone().unwrap_or_else(|| if body.path.is_some() { "file".into() } else { "app".into() });
     let (port, path) = match kind.as_str() {
-        "app" | "internal" => {
+        "app" | "internal" if !(kind == "internal" && body.path.is_some()) => {
             let Some(port) = body.port else { return bad(StatusCode::BAD_REQUEST, "port is required") };
             if let Some(why) = refused_port(port) {
                 tracing::warn!(port, kind = %kind, measured = true, n_considered = 1, verdict = "public_link_refused", why, "link refused");
@@ -409,7 +428,11 @@ pub(crate) async fn create(State(state): State<AppState>, headers: HeaderMap, bo
             }
             (port, String::new())
         }
-        "file" => {
+        // A file or folder: public ("file"), or for the owner inside amux
+        // ("internal" with a path), served from the apps origin with no server
+        // to start (2026-10-26: rothco ran `python3 -m http.server` over a
+        // whole folder of build scripts to show the owner one HTML file).
+        "file" | "internal" => {
             let raw = body.path.as_deref().unwrap_or("").trim();
             let Ok(canon) = Path::new(raw).canonicalize() else {
                 return bad(StatusCode::BAD_REQUEST, "no such file or folder");
@@ -417,6 +440,23 @@ pub(crate) async fn create(State(state): State<AppState>, headers: HeaderMap, bo
             if let Some(why) = file_refused(&canon) {
                 tracing::warn!(kind = %kind, measured = true, n_considered = 1, verdict = "public_link_refused", why, "file link refused");
                 return bad(StatusCode::BAD_REQUEST, why);
+            }
+            // A FILE FOR THE OWNER IS NOT A PAGE (Ethan, 2026-10-28: "it is
+            // making page apps for just files. pages apps should only be used
+            // if we're being explicitly asked"). A worker showed three
+            // workbooks and a rules doc as four Pages, each waiting for
+            // approval, because this module's own guidance told it to. A
+            // worker gets the file link instead; the owner adding one in
+            // Pages is the explicit ask, so that still works.
+            if kind == "internal" && person_of(&state, &headers).is_none() {
+                let link = file_link(&crate::config::amux_home(), &canon.to_string_lossy());
+                tracing::warn!(created_by = headers.get("x-amux-session").and_then(|v| v.to_str().ok()).unwrap_or("-"),
+                    measured = true, n_considered = 1, verdict = "pages_internal_file_refused", "file for the owner sent to Apps");
+                return (StatusCode::BAD_REQUEST, Json(json!({
+                    "error": format!("a file for the owner is not an App: the Apps tab holds apps with a backend and files shared outside amux. \
+                        Give the owner {link}, which opens it in amux's file viewer with nothing to approve."),
+                    "code": "file_not_a_page", "file_link": link,
+                }))).into_response();
             }
             (0, canon.to_string_lossy().into_owned())
         }
@@ -450,7 +490,7 @@ pub(crate) async fn create(State(state): State<AppState>, headers: HeaderMap, bo
     tracing::warn!(id = %link.id, kind = %kind, port, created_by = %created_by, by_person = person.is_some(), listening,
         public = link.is_public(), pending = link.is_pending(),
         measured = true, n_considered = 1, verdict = "public_link_created",
-        "Pages link created; a public one asked for by a worker serves nobody until the owner approves it in Pages");
+        "Apps link created; a public one asked for by a worker serves nobody until the owner approves it in Apps");
     let mut out = link_json(&home, &link);
     out["listening"] = json!(listening);
     (StatusCode::CREATED, Json(out)).into_response()
@@ -471,7 +511,7 @@ pub(crate) async fn revoke(State(state): State<AppState>, headers: HeaderMap, Ax
     let who = person_of(&state, &headers)
         .or_else(|| headers.get("x-amux-session").and_then(|v| v.to_str().ok()).map(str::to_string))
         .unwrap_or_else(|| "unknown".into());
-    tracing::warn!(id = %id, by = %who, measured = true, n_considered = 1, verdict = "public_link_revoked", "Pages link removed");
+    tracing::warn!(id = %id, by = %who, measured = true, n_considered = 1, verdict = "public_link_revoked", "Apps link removed");
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -481,7 +521,7 @@ pub(crate) async fn approve(State(state): State<AppState>, headers: HeaderMap, A
     let Some(person) = person_of(&state, &headers) else {
         tracing::warn!(id = %id, measured = true, n_considered = 1, verdict = "public_link_approve_refused",
             "a public link approval came from something other than a signed-in person");
-        return bad(StatusCode::FORBIDDEN, "only the owner, signed in to the dashboard, can approve a Pages link");
+        return bad(StatusCode::FORBIDDEN, "only the owner, signed in to the dashboard, can approve an Apps link");
     };
     let home = crate::config::amux_home();
     let _g = WRITE.lock().unwrap_or_else(|e| e.into_inner());
@@ -495,7 +535,7 @@ pub(crate) async fn approve(State(state): State<AppState>, headers: HeaderMap, A
         return bad(StatusCode::INTERNAL_SERVER_ERROR, &format!("could not save: {e}"));
     }
     tracing::warn!(id = %id, by = %person, measured = true, n_considered = 1, verdict = "public_link_approved",
-        "a Pages link was approved (a public one now opens for anyone with it)");
+        "an Apps link was approved (a public one now opens for anyone with it)");
     Json(out).into_response()
 }
 
@@ -629,6 +669,54 @@ fn access_log(id: &str, status: StatusCode, headers: &HeaderMap, path: &str) {
     }
 }
 
+/// A file link's file, or a file inside its folder (an index.html, else a
+/// listing). Shared by public file links (/pub/) and files inside amux (the
+/// apps origin's /app/), so both refuse exactly the same paths.
+pub(crate) async fn serve_link_file(link: &Link, uri_path: &str, tail: &str, method: &Method, headers: &HeaderMap) -> Response {
+    if method != Method::GET && method != Method::HEAD {
+        return not_found();
+    }
+    let Some(root) = Path::new(&link.path).canonicalize().ok().filter(|r| file_refused(r).is_none()) else {
+        tracing::warn!(id = %link.id, kind = %link.kind, measured = true, n_considered = 1, verdict = "public_link_file_gone",
+            "file link opened while its file is gone or no longer allowed");
+        return not_found();
+    };
+    let Some(target) = resolve_shared(&root, tail) else { return not_found() };
+    if target.is_dir() {
+        if !tail.split('?').next().unwrap_or("").ends_with('/') {
+            return axum::response::Redirect::permanent(&format!("{uri_path}/")).into_response();
+        }
+        let index = target.join("index.html");
+        if index.is_file() {
+            return crate::api::file_viewer::serve_file(&index, headers).await;
+        }
+        return folder_listing(link, &target, tail);
+    }
+    as_site_asset(&target, crate::api::file_viewer::serve_file(&target, headers).await)
+}
+
+/// The file viewer serves CSS and scripts as text/plain, so opening one shows
+/// its source. A shared folder is a website, and its pages load those files:
+/// with `nosniff` the browser refused a text/plain stylesheet and the page
+/// rendered unstyled (owner, 2026-10-29, the GTM demos' `../design-system/amux.css`).
+/// Here they go out as what they are.
+fn as_site_asset(path: &Path, mut r: Response) -> Response {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let real = match ext.as_str() {
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" | "cjs" => "text/javascript; charset=utf-8",
+        "wasm" => "application/wasm",
+        "webmanifest" => "application/manifest+json",
+        "map" => "application/json; charset=utf-8",
+        _ => return r,
+    };
+    let plain = r.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_none_or(|ct| ct.starts_with("text/plain") || ct.starts_with("application/octet-stream"));
+    if plain && r.status().is_success() {
+        r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(real));
+    }
+    r
+}
+
 /// Anyone with the link: no amux sign-in. Apps are relayed from loopback,
 /// never redirected to the raw port (a cloud box's firewall closes those).
 pub(crate) async fn serve(method: Method, headers: HeaderMap, uri: Uri, body: Body) -> Response {
@@ -661,26 +749,7 @@ async fn serve_inner(method: Method, headers: &HeaderMap, uri: &Uri, body: Body)
         return axum::response::Redirect::permanent(&format!("/pub/{id}/{}", uri.query().map(|q| format!("?{q}")).unwrap_or_default())).into_response();
     }
     if link.kind == "file" {
-        if method != Method::GET && method != Method::HEAD {
-            return not_found();
-        }
-        let Some(root) = Path::new(&link.path).canonicalize().ok().filter(|r| file_refused(r).is_none()) else {
-            tracing::warn!(measured = true, n_considered = 1, verdict = "public_link_file_gone",
-                "public file link opened while its file is gone or no longer allowed");
-            return not_found();
-        };
-        let Some(target) = resolve_shared(&root, &tail) else { return not_found() };
-        if target.is_dir() {
-            if !tail.split('?').next().unwrap_or("").ends_with('/') {
-                return axum::response::Redirect::permanent(&format!("{}/", uri.path())).into_response();
-            }
-            let index = target.join("index.html");
-            if index.is_file() {
-                return crate::api::file_viewer::serve_file(&index, &headers).await;
-            }
-            return folder_listing(&link, &target, &tail);
-        }
-        return crate::api::file_viewer::serve_file(&target, &headers).await;
+        return serve_link_file(&link, uri.path(), &tail, &method, &headers).await;
     }
     if refused_port(link.port).is_some() {
         return not_found();
@@ -719,6 +788,23 @@ async fn serve_inner(method: Method, headers: &HeaderMap, uri: &Uri, body: Body)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Owner, 2026-10-29: workers handed him <address>/f/<path> web links for
+    // every file "without me explicitly saying so". A file is named by its
+    // path; the web link is for when he asks for one.
+    #[test]
+    fn workers_name_a_file_by_its_path_and_link_it_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        // AMUX_PUBLIC_URL from this machine's server.env would win over the
+        // fixture's learned URL (AF-1007); the guard clears it.
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::write(dir.path().join(LEARNED_URL_FILE), r#"{"url":"https://desk.example:8824"}"#).unwrap();
+        let g = worker_links_guide(dir.path());
+        assert!(g.contains("Name each file by its absolute path"), "{g}");
+        assert!(g.contains("only when the owner asks for a link"), "{g}");
+        assert!(!g.contains("never a bare path"), "the old rule told workers to link every file: {g}");
+        assert!(g.contains("https://desk.example:8824/f/<absolute path>"), "the link, when asked, is still built on the real address: {g}");
+    }
 
     #[test]
     fn ids_are_random_hex_and_only_that_shape_is_accepted() {
@@ -794,6 +880,11 @@ mod tests {
     fn a_shared_folder_serves_only_what_is_inside_it_and_visible() {
         // Under HOME with a visible name: the OS temp dir is ".tmpXXXX" (hidden)
         // and may sit under a system prefix the file guard refuses.
+        // Read HOME under the shared env lock: two session_verbs tests repoint
+        // HOME at a tempdir while holding it, and under one-process cargo test
+        // (rust-nightly-deep) this read used to land on that tempdir after it
+        // was deleted, so tempdir_in failed NotFound (nightly runs 40286105439, 40466394121).
+        let _env = crate::api::settings::test_env::LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
         let base = tempfile::Builder::new().prefix("pubtest-").tempdir_in(&home).unwrap();
         let root = base.path().canonicalize().unwrap().join("share");

@@ -320,10 +320,14 @@ pub async fn clear_sw_landing() -> Response {
       fetch('/api/client-debug', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: body, keepalive: true});
     } catch (e) {}
   }
+  // The page's own link (#peek=worker&tab=chat) comes along: signing in from a
+  // deep link used to land on the home view (2026-10-26). A redirect keeps the
+  // fragment, and the fragment never reaches a server.
+  var hash = /^#[A-Za-z0-9_=&%.~+\-]*$/.test(location.hash) ? location.hash : '';
   function leave(verdict) {
     if (left) return; left = true;
     beacon(verdict);
-    location.replace('/?_fresh=1');
+    location.replace('/?_fresh=1' + hash);
   }
   function bounded(name, run, ms) {
     return new Promise(function (resolve) {
@@ -374,7 +378,7 @@ mod clear_sw_landing_tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let page = String::from_utf8(body.to_vec()).unwrap();
         for needle in ["setTimeout(function () { leave('backstop'); }, 5000)", "bounded('sw'", "bounded('caches'",
-            "amux_clear_sw_n", "n > 3", "kind: 'clear-sw'", "location.replace('/?_fresh=1')", "#0d1117"] {
+            "amux_clear_sw_n", "n > 3", "kind: 'clear-sw'", "location.replace('/?_fresh=1' + hash)", "#0d1117"] {
             assert!(page.contains(needle), "landing page lost {needle:?}");
         }
         assert!(!page.contains("await navigator.serviceWorker"), "an unbounded await is back");
@@ -462,7 +466,14 @@ fn owner_bootstrap_allowed(
     }
 
     let authority = request_authority(headers, uri);
-    let local = super::fs::browser_is_on_this_machine(peer, authority.as_deref());
+    // AMUX_RS_SHELL_AS_REMOTE=1 serves this machine's own browser as a remote
+    // one: no owner token in the shell until it signs in. Every address of a
+    // host is "this machine", so without it no test on one Mac can open a
+    // dashboard the way a phone or another computer does, through the sign-in
+    // and its session cookie (desktop/test/split-button-e2e.py). It only
+    // removes trust; the API's own check is AMUX_RS_NO_LOOPBACK_BYPASS.
+    let local = super::fs::browser_is_on_this_machine(peer, authority.as_deref())
+        && !std::env::var("AMUX_RS_SHELL_AS_REMOTE").is_ok_and(|v| v == "1");
     if let Some((peer_field, authority_field)) = withheld_bootstrap_record(
         state.auth_token.is_some(),
         local,
@@ -723,7 +734,7 @@ mod tests {
     fn state(token: Option<&str>) -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         AppState {
             store,
             started: Instant::now(),

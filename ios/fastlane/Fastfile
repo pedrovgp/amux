@@ -29,6 +29,12 @@ platform :ios do
       app_id.create_capability(siwa, settings: [{ key: "APPLE_ID_AUTH_APP_CONSENT", options: [{ key: "PRIMARY_APP_CONSENT" }] }])
       UI.message("Enabled Sign in with Apple on com.EthanSteininger.nextup")
     end
+    # Copied file links open in the app (applinks:*.amux.io, project.yml).
+    domains = Spaceship::ConnectAPI::BundleIdCapability::Type::ASSOCIATED_DOMAINS
+    if app_id.get_capabilities.none? { |c| c.capability_type == domains }
+      app_id.create_capability(domains)
+      UI.message("Enabled Associated Domains on com.EthanSteininger.nextup")
+    end
 
     match(
       type: "appstore",

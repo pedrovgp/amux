@@ -216,9 +216,11 @@ extension DashboardWindowController {
     /// The deep link this window reopens: the page it is on (or was on, while
     /// the server restarts and it shows the connect page) and its view.
     func savedURL() -> String? {
-        let page = webView.url.flatMap { app?.isServerURL($0) == true ? $0 : nil } ?? lastServerURL
+        // The tab's own server, so a tab on sandbox reopens on sandbox, not on the
+        // default connection.
+        let page = webView.url.flatMap { ($0.scheme == "https" || $0.scheme == "http") ? $0 : nil } ?? lastServerURL
         guard let base = page else { return nil }
-        if !viewHash.isEmpty, let u = app?.url(withHash: viewHash) { return u.absoluteString }
+        if !viewHash.isEmpty, let u = app?.url(withHash: viewHash, on: serverOrigin) { return u.absoluteString }
         return base.absoluteString
     }
 }
@@ -371,7 +373,7 @@ extension AppDelegate {
         // SIGTERM (a logout, a reboot, `kill`) quits the normal way, saving first.
         signal(SIGTERM, SIG_IGN)
         let src = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        src.setEventHandler { NSLog("amux-desktop: verdict=sigterm_quit"); NSApp.terminate(nil) }
+        src.setEventHandler { [weak self] in NSLog("amux-desktop: verdict=sigterm_quit"); self?.sigtermQuitting = true; NSApp.terminate(nil) }
         src.resume()
         sigtermSource = src
         // Another copy (tests, a second server) is driven by its pid, since an
@@ -508,14 +510,37 @@ final class SnapPreview {
         v.layer?.borderWidth = 2
         v.layer?.cornerRadius = 10
         panel.contentView = v
+        // Which level and pane a pane drop lands in, at the outline's top.
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = .white
+        label.drawsBackground = true
+        label.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.9)
+        label.isBezeled = false
+        label.isEditable = false
+        label.isHidden = true
+        label.wantsLayer = true
+        label.layer?.cornerRadius = 5
+        v.addSubview(label)
+    }
+    let label = NSTextField(labelWithString: "")
+    /// The text shown now, "" when none (the test state reads it).
+    var labelText: String { label.isHidden ? "" : label.stringValue }
+    private func setLabel(_ text: String?) {
+        label.isHidden = (text ?? "").isEmpty
+        label.stringValue = " " + (text ?? "") + " "
+        label.sizeToFit()
+        let b = panel.frame.size
+        label.frame.origin = NSPoint(x: max(6, (b.width - label.frame.width) / 2), y: max(6, b.height - label.frame.height - 10))
     }
     func show(_ r: NSRect, below w: NSWindow) {
         panel.setFrame(r, display: true)
+        setLabel(nil)
         if !panel.isVisible { panel.order(.below, relativeTo: w.windowNumber) }
     }
     /// For a tab being dragged out: there is no window under it yet.
-    func showFront(_ r: NSRect) {
+    func showFront(_ r: NSRect, label text: String? = nil) {
         panel.setFrame(r, display: true)
+        setLabel(text)
         if !panel.isVisible { panel.orderFrontRegardless() }
     }
     func hide() { panel.orderOut(nil) }
@@ -607,6 +632,62 @@ extension AppDelegate {
     /// windowWillMove never fires, so dragBegan never sees it. From a press in
     /// a tab bar to the release this previews the zone under the cursor, then
     /// places the window the tab became: in that zone, or snapped to the grid.
+    // ── The Globe key as a hotkey (owner, 2026-10-29: "i want to use the globe
+    // button on my keyboard as a hotkey too") ──
+    // A web page never sees 🌐 (macOS keeps it from WebKit), so the app watches
+    // it while amux is in front and hands it to the page in focus as "Globe"
+    // (pressed and released alone) or "Globe+R" (held with a key). The page's
+    // Hotkeys run it like any other combination (app.js _hkNativeKey). Globe
+    // with an arrow or F-key is left alone: those are Home, End, Page Up and
+    // the function keys.
+    func startGlobeKey() {
+        globeMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { [weak self] e in
+            guard let self = self else { return e }
+            if e.type == .flagsChanged {
+                guard e.keyCode == 63 else {   // kVK_Function
+                    if self.globeDown { self.globeUsed = true }   // another modifier joined in
+                    return e
+                }
+                if e.modifierFlags.contains(.function) {
+                    self.globeDown = true
+                    self.globeUsed = false
+                } else if self.globeDown {
+                    self.globeDown = false
+                    if !self.globeUsed { self.sendGlobe("Globe") }
+                }
+                return e
+            }
+            guard self.globeDown else { return e }
+            // Released where amux could not see it (another app was in front):
+            // the next key decides, so letters are never swallowed afterwards.
+            guard e.modifierFlags.contains(.function) else { self.globeDown = false; return e }
+            // Any key with 🌐 means it was not a tap, Globe+arrow (Home, End) included.
+            self.globeUsed = true
+            guard let k = globeKeyName(e) else { return e }
+            if !e.isARepeat { self.sendGlobe("Globe+" + k) }
+            return nil
+        }
+        // Leaving amux with 🌐 held: its release goes to another app.
+        NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.globeDown = false
+        }
+    }
+
+    func sendGlobe(_ combo: String) {
+        guard let c = focusedPage() else { return }
+        let lit = String(data: (try? JSONSerialization.data(withJSONObject: [combo])) ?? Data(), encoding: .utf8)?.dropFirst().dropLast() ?? ""
+        c.webView.evaluateJavaScript("typeof window._hkNativeKey === 'function' ? window._hkNativeKey(\(lit)) : 'no_hook'") { r, _ in
+            dlog("verdict=globe_key combo=\(combo) page=\(c.viewHash) result=\(r ?? "-")")
+        }
+    }
+
+    /// The page you are typing in: the key window's, or its focused pane's.
+    func focusedPage() -> DashboardWindowController? {
+        guard let w = NSApp.keyWindow, let c = controllers.first(where: { $0.window === w }) else { return nil }
+        if let g = c.grid { let d = deepestFocused(g); if let id = d.focused, let m = d.members[id] { return m } }
+        return c
+    }
+
     func startTabDragTracking() {
         tabDragMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] e in
             self?.tabPressed(e)
@@ -676,7 +757,7 @@ extension AppDelegate {
                 pane = self.paneDropTarget(at: at, excluding: moving)
                 let out = !source.insetBy(dx: -8, dy: -8).contains(at)
                 zone = pane == nil && out ? self.zoneAtCursor() : nil
-                if let p = pane { self.snapPreview.showFront(p.preview) } else if let z = zone { self.snapPreview.showFront(z.frame) } else { self.snapPreview.hide() }
+                if let p = pane { self.snapPreview.showFront(p.preview, label: p.label) } else if let z = zone { self.snapPreview.showFront(z.frame) } else { self.snapPreview.hide() }
                 return
             }
             t.invalidate()
@@ -721,7 +802,7 @@ extension AppDelegate {
             let out = !source.insetBy(dx: -8, dy: -8).contains(at)
             let zone = free || !out || pane != nil ? nil : self.zoneAtCursor()
             if Pointer.buttonDown {
-                if let p = pane { self.snapPreview.showFront(p.preview) } else if let z = zone { self.snapPreview.showFront(z.frame) } else if !windowDrag { self.snapPreview.hide() }
+                if let p = pane { self.snapPreview.showFront(p.preview, label: p.label) } else if let z = zone { self.snapPreview.showFront(z.frame) } else if !windowDrag { self.snapPreview.hide() }
                 return
             }
             t.invalidate()
@@ -765,7 +846,7 @@ extension AppDelegate {
         let m = NSMenu()
         func add(_ title: String, _ sel: Selector) { let i = NSMenuItem(title: title, action: sel, keyEquivalent: ""); i.target = self; m.addItem(i) }
         add("Rename Tab…", #selector(renameTargetTab(_:)))
-        if c.customName != nil { add("Use Page Name", #selector(clearTargetTabName(_:))) }
+        if c.tabName != nil { add(c.grid != nil ? "Use Pane Names" : "Use Page Name", #selector(clearTargetTabName(_:))) }
         m.addItem(.separator())
         add("Move Tab to New Window", #selector(moveTargetTab(_:)))
         add("Close Tab", #selector(closeTargetTab(_:)))
@@ -773,8 +854,8 @@ extension AppDelegate {
         NSMenu.popUpContextMenu(m, with: e, for: w.contentView?.superview ?? w.contentView!)
         return true
     }
-    @objc func renameTargetTab(_ sender: Any?) { if let c = tabMenuTarget { promptRename(c) } }
-    @objc func clearTargetTabName(_ sender: Any?) { tabMenuTarget?.rename(nil) }
+    @objc func renameTargetTab(_ sender: Any?) { if let c = tabMenuTarget { promptRename(c, wholeTab: true) } }
+    @objc func clearTargetTabName(_ sender: Any?) { tabMenuTarget?.renameTab(nil) }
     @objc func moveTargetTab(_ sender: Any?) { tabMenuTarget?.window?.moveTabToNewWindow(nil) }
     @objc func closeTargetTab(_ sender: Any?) { tabMenuTarget?.window?.performClose(nil) }
     @objc func closeOtherTabs(_ sender: Any?) {
@@ -783,18 +864,24 @@ extension AppDelegate {
     }
 
     /// Ask for a tab's name; empty puts the page's own name back.
-    func promptRename(_ c: DashboardWindowController) {
+    /// From the window's tab bar (`wholeTab`), a tab split into panes is
+    /// named as a whole; from a pane's own tab strip, only that page.
+    func promptRename(_ c: DashboardWindowController, wholeTab: Bool = false) {
+        let whole = wholeTab && c.grid != nil
         let a = NSAlert()
         a.messageText = "Rename Tab"
-        a.informativeText = "Leave it empty to use the page's own name."
+        a.informativeText = whole ? "Names the whole tab. Leave it empty to show its panes' names." : "Leave it empty to use the page's own name."
         let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        f.stringValue = c.customName ?? c.pageTitle
+        f.stringValue = whole ? (c.windowName ?? c.window?.title ?? "") : (c.customName ?? c.pageTitle)
         a.accessoryView = f
         a.addButton(withTitle: "Rename")
         a.addButton(withTitle: "Cancel")
         a.window.initialFirstResponder = f
-        let win = (c.paneHost ?? c).window
-        let done: (NSApplication.ModalResponse) -> Void = { r in if r == .alertFirstButtonReturn { c.rename(f.stringValue) } }
+        let win = c.rootHost.window
+        let done: (NSApplication.ModalResponse) -> Void = { r in
+            guard r == .alertFirstButtonReturn else { return }
+            if whole { c.renameTab(f.stringValue) } else { c.rename(f.stringValue) }
+        }
         if let win = win { a.beginSheetModal(for: win, completionHandler: done) } else { done(a.runModal()) }
     }
 
@@ -876,6 +963,7 @@ extension AppDelegate {
         switch url.path {
         case "/pointer": Pointer.testOverride = (NSPoint(x: num("x"), y: num("y")), q.contains { $0.name == "down" && $0.value == "1" })
         case "/pointer-clear": Pointer.testOverride = nil
+        case "/recorder": recorderTestHook(q)
         case "/press-tab": press(true)          // the mouse-down that starts a tab drag
         case "/press-content": press(false)     // a click in the page, which must not
         // What AppKit does with a tab dropped outside every tab bar.
@@ -928,9 +1016,30 @@ extension AppDelegate {
             else { let p = NSPoint(x: num("x"), y: num("y")); DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { v.dragged(to: p); v.dropped(at: p) } }
         // A pane's tab strip and the Panes menu (amux-panes.swift), on the
         // window holding a grid: i is the pane in reading order, t a tab in its strip.
-        case "/pane-tab-select", "/pane-tab-close", "/pane-tab-drag", "/pane-focus", "/pane-action":
-            guard let h = controllers.first(where: { $0.grid?.host === $0 }), let g = h.grid else { break }
+        // "Split this tab" on a pane, as its header button does. `at` walks
+        // down splits inside tabs: "1" is the root grid's second pane, "1.0"
+        // the first pane of the split that pane's tab is.
+        case "/pane-nest":
+            guard let h = controllers.first(where: { $0.grid?.host === $0 && $0.paneHost == nil }), var g = h.grid else { break }
             h.window?.tabGroup?.selectedWindow = h.window
+            let path = (q.first { $0.name == "at" }?.value ?? "0").split(separator: ".").compactMap { Int($0) }
+            for (k, i) in path.enumerated() {
+                let leaves = g.tree.leaves
+                guard i >= 0 && i < leaves.count, let m = g.members[leaves[i]] else { break }
+                if k == path.count - 1 { nestSplit(m, in: g); break }
+                guard m !== g.host, let sub = m.grid else { break }
+                g = sub
+            }
+        case "/pane-tab-select", "/pane-tab-close", "/pane-tab-drag", "/pane-tab-hover", "/pane-focus", "/pane-action":
+            // The window's own grid, or with `at` ("1", "1.0") the split that
+            // pane's tab is, walked down as /pane-nest does.
+            guard let h = controllers.first(where: { $0.grid?.host === $0 && $0.paneHost == nil }), var g = h.grid else { break }
+            h.window?.tabGroup?.selectedWindow = h.window
+            for k in (q.first { $0.name == "at" }?.value ?? "").split(separator: ".").compactMap({ Int($0) }) {
+                let ls = g.tree.leaves
+                guard k >= 0 && k < ls.count, let m = g.members[ls[k]], m !== g.host, let sub = m.grid else { break }
+                g = sub
+            }
             let leaves = g.tree.leaves, i = Int(num("i")), t = Int(num("t"))
             let v = i >= 0 && i < leaves.count ? g.views[leaves[i]] : nil
             switch url.path {
@@ -940,6 +1049,10 @@ extension AppDelegate {
             case "/pane-tab-drag":
                 let p = NSPoint(x: num("x"), y: num("y"))
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { v?.dragged(to: p, tab: t); v?.dropped(at: p, tab: t) }
+            // A tab held over `p`, not let go: the outline and its label show.
+            case "/pane-tab-hover":
+                let p = NSPoint(x: num("x"), y: num("y"))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { v?.dragged(to: p, tab: t) }
             default:
                 // The same actions the menu items send, as a key press reaches them.
                 let item = NSMenuItem(); item.tag = Int(num("n"))
@@ -984,8 +1097,69 @@ extension AppDelegate {
         case "/rename-tab":
             let want = "#" + (q.first { $0.name == "view" }?.value ?? "")
             // A tab still waiting to load has no view yet; its saved URL names it.
-            controllers.first { $0.viewHash == want || $0.savedURL().flatMap { URL(string: $0)?.fragment }.map { "#" + $0 } == want }?
-                .rename(q.first { $0.name == "name" }?.value)
+            let target = controllers.first { $0.viewHash == want || $0.savedURL().flatMap { URL(string: $0)?.fragment }.map { "#" + $0 } == want }
+            if q.contains(where: { $0.name == "whole" && $0.value == "1" }) { target?.renameTab(q.first { $0.name == "name" }?.value) }
+            else { target?.rename(q.first { $0.name == "name" }?.value) }
+        // A notification click, the handler a real click runs (notify-click-e2e.py).
+        case "/notification-click":
+            if let w = q.first(where: { $0.name == "worker" })?.value { openNotificationTab("#peek=" + w, why: "worker") }
+            else if let h = q.first(where: { $0.name == "hash" })?.value { openNotificationTab(h, why: "message") }
+        case "/hide": NSApp.hide(nil)
+        // View > Reload Pane Ignoring Cache, as ⌘⇧R reaches it.
+        case "/reload-ignoring-cache": reloadIgnoringCache(nil)
+        // Run a script in the shown tab's page (download-e2e.py starts a page
+        // download with it). Test mode only, like every hook here.
+        case "/js":
+            if let code = q.first(where: { $0.name == "code" })?.value,
+               let c = controllers.first(where: { isShown($0) }) ?? controllers.first {
+                c.webView.evaluateJavaScript(code) { _, err in if let err = err { dlog("verdict=test_js_failed error=\(err.localizedDescription)") } }
+            }
+        // Run JS in pane `i` of the key window's grid (or its only page) and
+        // write what it returns, as a string, to <state file>.js.
+        case "/js-pane":
+            let i = Int(q.first { $0.name == "i" }?.value ?? "") ?? 0
+            let host = controllers.first { $0.grid != nil && isShown($0) } ?? controllers.first { isShown($0) }
+            let target = host?.grid.flatMap { g in i >= 0 && i < g.tree.leaves.count ? g.members[g.tree.leaves[i]] : nil } ?? host
+            if let code = q.first(where: { $0.name == "code" })?.value, let c = target,
+               let path = ProcessInfo.processInfo.environment["AMUX_DESKTOP_TEST_STATE"] {
+                c.webView.callAsyncJavaScript(code, arguments: [:], in: nil, in: .page) { r in
+                    let out: String
+                    switch r { case .success(let v): out = "\(v)"; case .failure(let e): out = "error: " + e.localizedDescription }
+                    try? out.data(using: .utf8)?.write(to: URL(fileURLWithPath: path + ".js"), options: .atomic)
+                }
+            }
+        // View > Zoom In / Zoom Out / Actual Size / Zoom All Windows (?op=in|out|reset|all).
+        case "/zoom":
+            switch q.first(where: { $0.name == "op" })?.value {
+            case "in": zoomIn(nil)
+            case "out": zoomOut(nil)
+            case "reset": zoomReset(nil)
+            case "all": toggleZoomAllWindows(nil)
+            default: break
+            }
+        // Every page's zoom, in allPages order, to <state file>.zoom:
+        // {"all": on, "levels": [dashboard level, or pageZoom percent as a negative]}.
+        case "/zoom-levels":
+            guard let path = ProcessInfo.processInfo.environment["AMUX_DESKTOP_TEST_STATE"] else { break }
+            let pages = allPages
+            var levels = [Int](repeating: 0, count: pages.count), left = pages.count
+            for (i, c) in pages.enumerated() {
+                c.webView.evaluateJavaScript("typeof _zoomLevel === 'number' ? _zoomLevel : 0") { [weak self] r, _ in
+                    let n = (r as? NSNumber)?.intValue ?? 0
+                    levels[i] = n > 0 ? n : -Int((c.webView.pageZoom * 100).rounded())
+                    left -= 1
+                    if left == 0, let data = try? JSONSerialization.data(withJSONObject: ["all": self?.zoomAllWindows ?? false, "levels": levels]) {
+                        try? data.write(to: URL(fileURLWithPath: path + ".zoom"), options: .atomic)
+                    }
+                }
+            }
+        // A click on the Split button of the focused pane (or the only page).
+        case "/split":
+            let host = controllers.first { $0.grid != nil && isShown($0) } ?? controllers.first { isShown($0) }
+            // The innermost focused pane's page, as a click there would be.
+            if let c = host?.grid.map(deepestFocused).flatMap({ g in g.focused.flatMap { g.members[$0] } }) ?? host {
+                c.webView.evaluateJavaScript("document.getElementById('peek-split-toggle').click()")
+            }
         // Show the tab whose page is on #<view> (perf-bench.py times the switch).
         case "/select-view":
             let want = "#" + (q.first { $0.name == "view" }?.value ?? "")
@@ -998,15 +1172,28 @@ extension AppDelegate {
             let ws = controllers.compactMap { c -> [String: Any]? in
                 guard let w = c.window, w.isVisible else { return nil }
                 var d: [String: Any] = ["title": w.title, "frame": NSStringFromRect(w.frame), "tabs": (w.tabbedWindows ?? [w]).count, "key": w.isKeyWindow, "number": w.windowNumber,
-                                        "view": c.viewHash, "selected": (w.tabGroup?.selectedWindow ?? w) === w,
-                                        "connection": w.tab.accessoryView?.toolTip ?? ""]
+                                        "view": c.viewHash, "selected": (w.tabGroup?.selectedWindow ?? w) === w, "tooltip": w.tab.toolTip ?? "",
+                                        "connection": w.tab.accessoryView?.toolTip ?? "",
+                                        "server": c.serverOrigin?.absoluteString ?? "", "saved": c.savedURL() ?? ""]
                 if let g = c.grid {
                     d["grid"] = g.readingOrder
                     d["panes"] = g.tree.leaves.compactMap { g.members[$0]?.pageTitle }
                     let frames = Dictionary(g.paneFrames().map { ($0.id, $0.frame) }, uniquingKeysWith: { a, _ in a })
                     d["pane_frames"] = g.tree.leaves.map { NSStringFromRect(frames[$0] ?? .zero) }
                     d["pane_views"] = g.tree.leaves.map { g.members[$0]?.viewHash ?? "" }
-                    d["pane_tabs"] = g.tree.leaves.map { g.tabs($0).map { $0.pageTitle } }
+                    d["pane_tabs"] = g.tree.leaves.map { g.tabs($0).map { g.label($0) } }
+                    d["pane_servers"] = g.tree.leaves.map { g.tabs($0).map { $0.serverOrigin?.absoluteString ?? "" } }
+                    // Splits inside tabs: per pane, its shown tab's split, nested the same way.
+                    func nested(_ g: PaneGrid) -> [Any] {
+                        g.tree.leaves.map { id -> Any in
+                            guard let m = g.members[id], m !== g.host, let sub = m.grid else { return NSNull() }
+                            return ["grid": sub.readingOrder, "pane_tabs": sub.tree.leaves.map { sub.tabs($0).map { sub.label($0) } },
+                                    "pane_shown": sub.tree.leaves.map { sub.views[$0]?.window != nil },
+                                    "depth": m.depth, "can_nest": sub.tree.leaves.map { sub.canNest($0) }, "nested": nested(sub)] as [String: Any]
+                        }
+                    }
+                    d["pane_nested"] = nested(g)
+                    d["can_nest"] = g.tree.leaves.map { g.canNest($0) }
                     d["pane_active"] = g.tree.leaves.map { id in g.tabs(id).firstIndex { $0 === g.members[id] } ?? -1 }
                     d["pane_shown"] = g.tree.leaves.map { g.views[$0]?.window != nil }
                     d["focused"] = g.focused.flatMap { g.tree.leaves.firstIndex(of: $0) } ?? -1
@@ -1020,6 +1207,7 @@ extension AppDelegate {
                                      "pointer_window": NSWindow.windowNumber(at: Pointer.location, belowWindowWithWindowNumber: 0),
                                      "pointer_amux": amuxWindow(at: Pointer.location)?.window?.title ?? "",
                                      "content_frame": arrangeTarget.map { NSStringFromRect($0.convertToScreen($0.contentLayoutRect)) } ?? "", "preview_frame": NSStringFromRect(snapPreview.panel.frame),
+                                     "preview_label": snapPreview.labelText,
                                      "tracking": tabDragTimer?.isValid ?? false,
                                      "visible_frame": NSStringFromRect(arrangeTarget?.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero),
                                      "screen_frame": NSStringFromRect(arrangeTarget?.screen?.frame ?? NSScreen.main?.frame ?? .zero),
@@ -1208,4 +1396,13 @@ func buildArrangeMenu(_ d: AppDelegate) -> NSMenu {
     let snap = m.addItem(withTitle: "Snap to Grid While Dragging", action: #selector(AppDelegate.toggleSnap(_:)), keyEquivalent: "")
     snap.target = d
     return m
+}
+
+/// The key held with 🌐, named as the page's Hotkeys name it ("R", "5",
+/// "Space"); nil for keys Globe already means something with.
+func globeKeyName(_ e: NSEvent) -> String? {
+    if e.keyCode == 49 { return "Space" }
+    guard let ch = e.charactersIgnoringModifiers?.uppercased(), ch.count == 1,
+          let u = ch.unicodeScalars.first, CharacterSet.alphanumerics.contains(u), u.isASCII else { return nil }
+    return ch
 }

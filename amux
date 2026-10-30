@@ -238,7 +238,62 @@ _curl() {
   # Kept out of "$@" so the transport breadcrumb below never writes it to disk.
   local _id=()
   [[ -n "${AMUX_WORKER_TOKEN:-}" ]] && _id=(-H "X-Amux-Worker-Token: ${AMUX_WORKER_TOKEN}")
-  command curl --connect-timeout "${AMUX_CURL_CONNECT_TIMEOUT:-10}" ${_id[@]+"${_id[@]}"} "$@" || rc=$?
+  # RIDE OUT A RESTART (NetSuite worker, 2026-10-26: while the server
+  # restarted, the CLI handed back empty output and the caller's JSON parse
+  # failed with nothing saying why). A refused connection (exit 7) never sent
+  # the request, so any method retries it. An empty reply or a dropped
+  # connection (52, 56) may have been processed, so only a GET retries those.
+  # Up to AMUX_CURL_RESTART_WAIT seconds (30; 0 turns this off), said on
+  # stderr, and only for this machine's own server (below).
+  local method="GET" a prev="" waited=0 wait_max="${AMUX_CURL_RESTART_WAIT:-30}" step=1 told=0
+  for a in "$@"; do
+    [[ "$prev" == "-X" || "$prev" == "--request" ]] && method="$a"
+    [[ "$a" == -X* && ${#a} -gt 2 ]] && method="${a#-X}"
+    [[ "$prev" != "-X" && ( "$a" == "-d" || "$a" == "--data"* || "$a" == "--data-binary" ) && "$method" == "GET" ]] && method="POST"
+    prev="$a"
+  done
+  # ONLY THIS MACHINE'S OWN SERVER restarts under a caller, so only a request
+  # to it waits: a localhost URL on endpoint.json's canonical_port. Anything
+  # else (a test's dead port, a throwaway home with no endpoint.json, a remote
+  # server) fails at once, as before. Waiting everywhere doubled the checks
+  # job's runtime and pushed it past its 20 minutes (2026-10-27).
+  local url="" hp host port canon=""
+  for a in "$@"; do [[ "$a" == http://* || "$a" == https://* ]] && url="$a"; done
+  local ep="${CC_HOME:-$HOME/.amux}/endpoint.json"
+  [[ -f "$ep" ]] && canon=$(sed -n 's/.*"canonical_port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$ep" 2>/dev/null)
+  hp="${url#*://}"; hp="${hp%%/*}"; host="${hp%:*}"; port="${hp##*:}"
+  [[ "$hp" == *:* && "$hp" != *"]" ]] || port=$([[ "$url" == https* ]] && echo 443 || echo 80)
+  if [[ -z "$canon" || "$port" != "$canon" ]] || ! [[ "$host" == localhost || "$host" == 127.0.0.1 || "$host" == "[::1]" ]]; then
+    wait_max=0
+  fi
+  # Only the attempt that counts reaches stdout: a failed attempt's -w output
+  # ("000") would otherwise land in the caller's capture ahead of the real one.
+  local out; out=$(mktemp "${TMPDIR:-/tmp}/amux-curl.XXXXXX") || out=""
+  while :; do
+    rc=0
+    if [[ -n "$out" ]]; then
+      command curl --connect-timeout "${AMUX_CURL_CONNECT_TIMEOUT:-10}" ${_id[@]+"${_id[@]}"} "$@" >"$out" || rc=$?
+    else
+      command curl --connect-timeout "${AMUX_CURL_CONNECT_TIMEOUT:-10}" ${_id[@]+"${_id[@]}"} "$@" || rc=$?
+      break
+    fi
+    case "$rc" in
+      7) ;;
+      52|56) [[ "$method" == "GET" ]] || break ;;
+      *) break ;;
+    esac
+    (( waited >= wait_max )) && break
+    if (( told == 0 )); then
+      echo "amux: the server is not answering (restarting?); retrying for up to ${wait_max}s" >&2
+      told=1
+    fi
+    sleep "$step"; waited=$((waited + step)); (( step < 4 )) && step=$((step * 2))
+  done
+  if [[ -n "$out" ]]; then cat "$out"; rm -f "$out"; fi
+  if (( told == 1 )); then
+    if [[ "$rc" -eq 0 ]]; then echo "amux: the server is back after ${waited}s" >&2
+    else echo "amux: the server did not answer within ${waited}s (curl exit $rc); it may still be restarting: retry, or check amux server status" >&2; fi
+  fi
   if [[ "$rc" -ne 0 ]]; then _transport_breadcrumb "$rc" "$@"; fi
   return "$rc"
 }
@@ -394,7 +449,7 @@ load_session() {
   # restore (2026-09-25 17:50) inside ~/.amux/worktrees/amux instead of its
   # repo. Drop inherited values of the keys that pick the checkout and lifecycle.
   local _k _dropped=""
-  for _k in CC_WORKTREE CC_WORKTREE_REPO CC_PROJECT CC_EPHEMERAL CC_DIR CC_PROVIDER; do
+  for _k in CC_WORKTREE CC_WORKTREE_REPO CC_EPHEMERAL CC_DIR CC_PROVIDER; do
     if [[ -n "${!_k+x}" ]]; then _dropped+=" $_k=${!_k}"; unset "$_k"; fi
   done
   # shellcheck disable=SC1090
@@ -505,16 +560,15 @@ need_herdr() {
 
 # Does the SERVER own this worker's start, and with it the worker's workspace?
 # True for the providers whose launch is delegated (AMUX-3164), and for every
-# project or ephemeral worker whatever its provider: the server gives those the
-# project's single checkout or a <repo>/.worktrees/<name> fan-out workspace and
-# enforces the project's start permit. Both `cmd_start` branches read this one
-# function, so the CLI can never create a worktree for a start it hands away
-# (DESKT-55: 8 detached 3.6 GB worktrees under ~/.amux/worktrees, made by
-# `amux start` for project workers whose server-side start was then refused,
+# ephemeral worker whatever its provider: the server gives those a
+# <repo>/.worktrees/<name> fan-out workspace. Both `cmd_start` branches read
+# this one function, so the CLI can never create a worktree for a start it
+# hands away (DESKT-55: 8 detached 3.6 GB worktrees under ~/.amux/worktrees,
+# made by `amux start` for workers whose server-side start was then refused,
 # and never used or removed).
-server_owns_start() { # <provider> <CC_PROJECT> <CC_EPHEMERAL>
+server_owns_start() { # <provider> <CC_EPHEMERAL>
   case "$1" in codex|ollama|gemini|muse|opencode) return 0 ;; esac
-  [[ -n "${2:-}" || "${3:-}" == "1" ]]
+  [[ "${2:-}" == "1" ]]
 }
 
 _start_via_api() {
@@ -1062,7 +1116,7 @@ cmd_start() {
     fi
   fi
   if ! $dry_run && [[ "${CC_WORKTREE:-}" == "1" ]] && ! $_claude_via_server \
-     && ! server_owns_start "$_provider" "${CC_PROJECT:-}" "${CC_EPHEMERAL:-}" \
+     && ! server_owns_start "$_provider" "${CC_EPHEMERAL:-}" \
      && git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
     worktree_dir="$CC_HOME/worktrees/$name"
     if [[ -d "$worktree_dir" ]]; then
@@ -1113,7 +1167,7 @@ cmd_start() {
   # builder below and launched `claude --model sonnet --continue` -- the WRONG AGENT, silently,
   # because the fallback is a default rather than a failure. The server-side arm was correct the
   # whole time; only this door was. Observed live before the fix (muse-hooks-probe).
-  if $_claude_via_server || server_owns_start "$_provider" "${CC_PROJECT:-}" "${CC_EPHEMERAL:-}"; then
+  if $_claude_via_server || server_owns_start "$_provider" "${CC_EPHEMERAL:-}"; then
     if $dry_run; then
       echo "${BOLD}$name${RESET} ($_provider — started via server API: POST /api/sessions/$name/start; the server owns the provider→binary map and the provider-specific setup)"
       return
@@ -1561,22 +1615,95 @@ USAGE
 # X-Amux-Session (api/conversations.rs).
 cmd_post() {
   local conv="${1:-}"
-  [[ -n "$conv" ]] || die "usage: amux post <g:group | #group | w:worker> [text]   (or text on stdin)"
+  [[ -n "$conv" ]] || die "usage: amux post <g:group | #group | w:worker | p:<person email or name>> [--thread <post id>] [text]   (or text on stdin)
+  From a worker, p:<person> posts in your own thread as you, @mentioning them."
   shift
   [[ "$conv" == \#* ]] && conv="g:${conv#\#}"
+  # --thread <id>: reply in that post's thread (a Messages thread, like Slack's).
+  local thread=""
+  if [[ "${1:-}" == "--thread" ]]; then thread="${2:-}"; shift 2 || true; [[ "$thread" =~ ^[0-9]+$ ]] || die "--thread takes a post id"; fi
   local text
   if [[ $# -eq 0 || "${1:-}" == "--stdin" || "${1:-}" == "-" ]]; then text=$(cat); else text="$*"; fi
   [[ -n "${text//[[:space:]]/}" ]] || die "nothing to post"
   local api="${AMUX_API:-https://localhost:8824}" enc out code
   enc=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=":"))' "$conv")
   out=$(printf '%s' "$text" | _curl -sk -m 20 -w $'\n%{http_code}' -X POST \
-        -H 'Content-Type: text/plain' -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -H 'Content-Type: text/plain' -H "X-Amux-Session: ${AMUX_SESSION:-}" ${thread:+-H "X-Amux-Thread: $thread"} \
         --data-binary @- "$api/api/conversations/$enc/posts") || true
   code="${out##*$'\n'}"; out="${out%$'\n'*}"
   case "$code" in
-    2??) echo "posted to $conv" ;;
+    2??) OUT="$out" CONV="$conv" THREAD="$thread" python3 -c 'import json,os
+try: d=json.loads(os.environ["OUT"])
+except Exception: d={}
+to=[m.split(":",1)[1] for m in d.get("mentions",[]) if m.startswith("person:")]
+th=os.environ.get("THREAD")
+print("posted to %s as %s%s%s" % (d.get("conv") or os.environ["CONV"], d.get("author") or d.get("author_name") or "unknown author", (" (thread %s)" % th) if th else "", (" (mentions %s)" % ", ".join(to)) if to else ""))' ;;
     *)   echo "not posted (HTTP ${code:-none}): $out" >&2; return 1 ;;
   esac
+}
+
+# amux audit <worker> [--since 2h] [--kind browser,tool,api] [--limit N] [--json]:
+# what a worker did, newest first: browser verbs (with the page before and
+# after), tool calls, and calls to amux's own API (api/audit.rs). Read-only.
+cmd_audit() {
+  local worker="" since="24h" kind="browser,tool,api" limit=200 raw=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since) since="${2:?--since needs a duration like 30m, 2h, 3d}"; shift 2 ;;
+      --kind)  kind="${2:?--kind needs browser, tool, api or a comma list}"; shift 2 ;;
+      --limit) limit="${2:?--limit needs a number}"; shift 2 ;;
+      --json)  raw=1; shift ;;
+      -h|--help) echo "usage: amux audit <worker> [--since 2h] [--kind browser,tool,api] [--limit N] [--json]"; return 0 ;;
+      *) worker="$1"; shift ;;
+    esac
+  done
+  worker="${worker:-${AMUX_SESSION:-}}"
+  [[ -n "$worker" ]] || die "usage: amux audit <worker> [--since 2h] [--kind browser,tool,api] [--limit N] [--json]"
+  local hours
+  hours=$(python3 -c 'import re,sys
+m=re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)",sys.argv[1].strip())
+if not m: sys.exit(1)
+n=float(m.group(1)); u=m.group(2) or "h"
+print(n*{"s":1/3600,"m":1/60,"h":1,"d":24}[u])' "$since") || die "--since must look like 30m, 2h or 3d"
+  local api="${AMUX_API:-https://localhost:8824}" out
+  out=$(_curl -sk -m 30 -G "$api/api/audit" --data-urlencode "worker=$worker" --data-urlencode "since_h=$hours" \
+        --data-urlencode "kind=$kind" --data-urlencode "limit=$limit") || die "amux server unreachable"
+  if [[ -n "$raw" ]]; then printf '%s\n' "$out"; return 0; fi
+  OUT="$out" python3 - <<'PYAUDIT'
+import json, os
+try:
+    d = json.loads(os.environ["OUT"])
+except Exception:
+    print("amux audit: the server did not answer with JSON"); raise SystemExit(1)
+if d.get("error"):
+    print("amux audit:", d["error"]); raise SystemExit(1)
+for e in reversed(d.get("events") or []):
+    at = (e.get("at") or "")[11:19]
+    det = e.get("detail") or {}
+    k, t = e.get("kind"), e.get("type", "")
+    if k == "browser":
+        bits = [det.get("verb") or det.get("action") or ""]
+        if det.get("action") and det.get("verb"): bits.append(det["action"])
+        tgt = det.get("target") or {}
+        if tgt.get("kind") == "coordinates": bits.append("at %s,%s" % (tgt.get("x"), tgt.get("y")))
+        elif tgt.get("kind"): bits.append(tgt["kind"])
+        if det.get("target_url"): bits.append("-> " + det["target_url"])
+        before, after = det.get("url_before") or det.get("url"), det.get("url_after")
+        if before and after and before != after: bits.append("%s => %s" % (before, after))
+        elif after or before: bits.append("on " + (after or before))
+        if det.get("backend"): bits.append("[%s]" % det["backend"])
+        ok = det.get("ok", det.get("http_success"))
+        line = "%s  browser  %s  %s%s" % (at, t.replace("browser.", ""), " ".join(b for b in bits if b), "" if ok in (None, True) else "  FAILED " + str(det.get("error") or det.get("http_status") or ""))
+    elif k == "tool":
+        ok = det.get("ok")
+        line = "%s  tool     %-10s %s%s" % (at, t, (det.get("input") or "")[:140], "" if ok in (None, True) else "  FAILED" + (" exit %s" % det["exit_code"] if det.get("exit_code") is not None else ""))
+    else:
+        line = "%s  api      %s  %s" % (at, t, det.get("status"))
+    print(line)
+srcs = ", ".join("%s %s/%s" % (s["table"], s["rows"], s["rows_total"]) + (" ERROR " + s["error"] if s.get("error") else "") for s in d.get("sources") or [])
+print("\n%d shown, %d in window%s. sources: %s" % (len(d.get("events") or []), d.get("n_considered", 0), " (truncated, raise --limit)" if d.get("truncated") else "", srcs))
+print("not visible here: " + "; ".join(x.split(":")[0] for x in d.get("blind_spots") or []))
+PYAUDIT
 }
 
 # amux receipts [--keep] [<worker>]: outcomes held so they would not wake you.
@@ -5938,7 +6065,8 @@ card = d.get("selection") or {}
 print("  identity: " + (card.get("identity") or "unknown") + "; role: " + (card.get("role") or "ordinary"), file=sys.stderr)
 print("  use for: " + (card.get("use_for") or "purpose not recorded"), file=sys.stderr)
 print("  avoid: " + (card.get("avoid") or "verify identity before acting"), file=sys.stderr)
-state = "login-cookie evidence (verify live access)" if d.get("signed_in") else "no login-cookie evidence"
+state = ("device-bound session: cookie evidence does not mean signed in" if d.get("session_bound")
+         else "login-cookie evidence (verify live access)" if d.get("signed_in") else "no login-cookie evidence")
 lg = d.get("login") or {}
 exp = f", login expires in {lg['days_left']} day(s)" if lg.get("days_left") is not None else ""
 print(f"  {d['site']}: {state}{exp}", file=sys.stderr)
@@ -5946,7 +6074,8 @@ print(f"  why: {d.get('why','')}", file=sys.stderr)
 if d.get("alternatives"):
     # Live-login alternatives when the pick is signed in; otherwise these are
     # only REGISTERED for the site, which is not the same claim.
-    what = "also has cookie evidence" if d.get("signed_in") else "also registered (no cookie evidence)"
+    what = ("also holds its cookies (device-bound, not proof)" if d.get("session_bound")
+            else "also has cookie evidence" if d.get("signed_in") else "also registered (no cookie evidence)")
     print(f"  {what}: " + ", ".join(d["alternatives"]), file=sys.stderr)
 import shlex
 target = os.environ["TARGET"]
@@ -5971,7 +6100,17 @@ amux browser route state
 amux browser route shot
 amux browser route action '{"action":"click","selector":"#observed-control"}'
 amux browser route action '{"action":"type","text":"exact text"}'
-Click the observed input before typing. Read back values before submitting.
+amux browser route action '{"action":"input","selector":"#email","text":"exact text"}'
+amux browser route action - <<<'{"action":"type","text":"..."}'   # body on stdin: keeps secrets out of ps
+Click the observed input before typing. type inserts at the caret, so a
+pre-filled field keeps its text: input (or type with "replace":true) replaces
+it. Read back values before submitting. amux browser actions lists every action;
+eval runs JavaScript; download '{"action":"download","url":"..."}' saves a file
+with the profile's sign-in. amux browser hold <profile> --for 2h keeps it open.
+A start whose page has not loaded says page_ready:false with a note; run state again.
+Drive the browser with route verbs. Raw CDP is a fallback for what a route
+cannot do: add "cdp_reason":"<why>" to start (or ?cdp_reason= on status) to get
+a logged CDP proxy port; without a reason cdp_port is withheld.
 Native refs and CDP indices require a fresh state; CUA uses screenshot x,y.
 Verify the intended page effect after each action; ok means dispatch only.
 If the session cannot accomplish the goal:
@@ -5990,6 +6129,9 @@ ROUTE_HELP
       [[ "$verb" == "shot" ]] && verb="screenshot"
       local session="${AMUX_SESSION:-${AMUX_WORKER:-browser-owner}}"
       local body="${1:-}"
+      # `-` reads the JSON body from stdin, so a typed secret never appears in
+      # this process's argv (`ps` shows argv to every user on the host).
+      if [[ "$body" == "-" ]]; then body=$(cat); fi
       [[ -n "$body" ]] || body='{}'
       local payload
       payload=$(VERB="$verb" SESSION="$session" BODY="$body" python3 - <<'PYROUTE'
@@ -5998,7 +6140,10 @@ print(json.dumps({"verb":os.environ["VERB"],"session":os.environ["SESSION"],"bod
 PYROUTE
       ) || die "route body must be JSON"
       local result
-      result=$(_curl -sk -m 2760 -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: $session" -d "$payload" "$AMUX_API/api/browser/routing/request") || die "browser route server unreachable"
+      # The payload goes on stdin, never as a curl argument: it carries whatever
+      # the worker types, passwords included, and curl's argv is visible to every
+      # process on the host (NetSuite login, 2026-10-26).
+      result=$(printf '%s' "$payload" | _curl -sk -m 2760 -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: $session" --data-binary @- "$AMUX_API/api/browser/routing/request") || die "browser route server unreachable"
       RESULT="$result" python3 - <<'PYRESULT'
 import os, json, sys
 v=json.loads(os.environ["RESULT"])
@@ -6031,7 +6176,7 @@ if d.get("error"):
 for b in d.get("identified", []):
     raised = "raised" if b.get("raised") else (
         b.get("raise_error") or ("not raised (several windows)" if not d.get("raised") else "raise not supported here"))
-    print(f"  {b['profile']}  pid={b['pid']}  cdp={b['cdp_port']}  "
+    print(f"  {b['profile']}  pid={b['pid']}  cdp={b.get('cdp_port') or 'withheld'}  "
           f"started-by={b.get('started_by') or '?'}  "
           f"labelled {b.get('labeled', 0)}/{b.get('pages', 0)} tab(s)  [{raised}]")
     for e in b.get("errors", []):
@@ -6093,6 +6238,15 @@ amux browser start <profile> [url] [--headed] : launch a profile (headless by de
 amux browser stop [profile]       : stop your browser (attributed to $AMUX_SESSION)
 amux browser status               : what is running, who started it
 amux browser delete <name>        : delete a saved profile
+amux browser for <url>            : the profile to use for a site, and whether it is signed in
+amux browser route start '{"url":"https://..."}'   : open a page to drive (public pages need no profile)
+amux browser route state | shot   : read the page / screenshot it (http(s) incl. localhost; serve a
+                                    local file over http first, file:// is refused)
+amux browser route action '{...}' : click, type, key, scroll, eval ... (amux browser route help)
+
+  A public page that refuses plain HTTP fetches (403, bot wall): try it in a route,
+  which loads it in a real Chrome.
+  To check what a local page looks like, serve it on localhost, route start it and shot.
 
   With no profile: every running amux browser draws a blue bar naming its
   profile, and none is raised. A Chrome window WITHOUT a bar is the human's own.
@@ -6102,7 +6256,17 @@ amux browser delete <name>        : delete a saved profile
   their own and the two are visually identical.
 EOF
       ;;
-    create|new|start|stop|status|delete|rm)
+    actions|help-actions)
+      # Every action `amux browser route action` and /api/browser/action take
+      # (2026-10-26: "unknown action: help" listed nothing).
+      _curl -sk -m 20 -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: ${AMUX_SESSION:-${AMUX_WORKER:-}}" \
+        -d '{"action":"help"}' "$AMUX_API/api/browser/action" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for a in d.get("actions",[]): print("  %-9s %s" % (a["action"], a["takes"]))
+print("  " + d.get("eval_contract",""))'
+      return $?
+      ;;
+    create|new|start|stop|status|delete|rm|hold|keepalive)
       # Profile lifecycle from the CLI (Ethan, 2026-10-02: "store profiles").
       # Thin wrappers over /api/browser/*: the server owns the logic, and every
       # call carries X-Amux-Session so a stop is attributed (an unattributed
@@ -6123,6 +6287,28 @@ EOF
           [[ -n "${1:-}" ]] && body=$(P="$1" python3 -c 'import json,os;print(json.dumps({"profile":os.environ["P"]}))') ;;
         status)
           method="GET"; path="status"; body="" ;;
+        hold)
+          # Keep a browser open for a long task: no idle or age limit closes it
+          # until the hold ends (capped at 24h). `--for 0` releases it.
+          local hp="" hfor=""
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --for) hfor="${2:?--for needs a duration like 2h, 90m or 0}"; shift 2 ;;
+              --release) hfor="0"; shift ;;
+              -*) die "unknown hold option: $1" ;;
+              *) hp="$1"; shift ;;
+            esac
+          done
+          [[ -n "$hfor" ]] || die "usage: amux browser hold [<profile>] --for 2h   (--for 0 or --release ends it)"
+          path="hold"
+          body=$(P="$hp" F="$hfor" python3 -c 'import json,os,re,sys
+f=os.environ["F"].strip().lower()
+m=re.fullmatch(r"(\d+(?:\.\d+)?)\s*(s|m|h|d)?", f)
+if not m: sys.exit("hold: --for takes a duration like 2h, 90m, 3600 or 0")
+n=float(m.group(1))*{"s":1,"m":60,"h":3600,"d":86400}[m.group(2) or "s"]
+print(json.dumps({"profile":os.environ["P"],"for_s":int(n)}))') || die "hold: --for takes a duration like 2h, 90m, 3600 or 0" ;;
+        keepalive)
+          path="keepalive"; body='{}' ;;
         delete|rm)
           [[ -n "${1:-}" ]] || die "usage: amux browser delete <name>"
           method="DELETE"; path="profile/$(P="$1" python3 -c 'import os,urllib.parse;print(urllib.parse.quote(os.environ["P"],safe=""))')"; body="" ;;
@@ -6152,7 +6338,7 @@ if not code.startswith("2") or d.get("ok") is False or d.get("error"):
 print(json.dumps(d, indent=2)[:2000])
 PYEOF
       ;;
-    *) die "amux browser: unknown subcommand '$sub' (try: profiles, identify, create, start, stop, status, delete)" ;;
+    *) die "amux browser: unknown subcommand '$sub' (try: profiles, for, identify, create, start, stop, status, hold, keepalive, actions, delete, route)" ;;
   esac
 }
 
@@ -6474,7 +6660,10 @@ ${BOLD}Interaction:${RESET}
   amux attach <name>             Attach to a running worker (detach: Ctrl-b d)
   amux grid [-c N] <name>...     Tile those workers' terminals in a grid (macOS/iTerm2)
   amux peek <name> [lines]       View last N lines without attaching (default: 30)
-  amux post <conv> [text]        Post to Messages: g:<group>, #group or w:<worker> (text or stdin)
+  amux post <conv> [text]        Post to Messages: g:<group>, #group, w:<worker>, or p:<person> (from a
+                                 worker: lands in your thread as you, @mentioning them). Prints who it posted as
+  amux audit <worker> [--since 2h] [--kind browser,tool,api]
+                                 What a worker did: browser verbs (page before/after), tool calls, API calls
   amux send <name> --stdin       Send a message read from stdin ${GREEN}(preferred)${RESET}
                                  ${DIM}amux send api --stdin <<'EOF'${RESET}
                                  ${DIM}  fix the auth bug in login.ts${RESET}
@@ -6486,16 +6675,27 @@ ${BOLD}Interaction:${RESET}
   amux send <name> --keys 'C-c'  Send raw key sequence (e.g., Ctrl-C)
 
 ${BOLD}Coordination:${RESET}
-  amux land [--branch main]      Rebase and push HEAD holding a per-repo lock, so lanes queue instead of racing
+  amux land [--branch main]      Gate HEAD on origin/main plus the change (scripts/land_gate.py), then rebase and push it holding a per-repo lock
+  amux explain <path>... [--since 14d] [--save]   An explainer of that slice of the code and what changed in it lately
   amux sync-checkout [--check]   Bring this checkout's branch current with origin when that loses nothing; else name what blocks it
   amux sync-checkout --override  Make this checkout match origin exactly; local work is saved to a restore ref first
   amux memory [add --stdin]      Show, or append to, your worker memory (the Memory tab)
   amux signal wait <CARD> <name> Park YOUR card until a peer raises <name>
   amux signal raise <name> --note <text>
                                  Raise it: clears every waiting card, wakes their lanes
+  amux watch add file --path P [--regex R] | add ci --repo O/R --run ID
+                                 Wake YOUR lane once when a file lands or a CI run concludes
+  amux watch ls | rm <ID>        Your watches, measured or not; remove one
+  amux wake <when> --stdin       Wake YOUR lane once later ('20m', 'in 2 hours'): ScheduleWakeup
+  amux wake --every 5m --stdin   Recurring prompt (/loop); --when '<check>' fires when it exits 0
+  amux wake --list | --cancel <ID>
+                                 Your schedules; remove one. amux wake help has the Claude table
   amux social post youtube <file> --caption-stdin [--title T] [--privacy P]
                                  Publish a video; prints the post id. Results land at 24h, 72h, 7d
   amux social track|ls|stats     Measure a post made elsewhere, list posts, read one post live
+  amux social queue youtube,devto <file> --at 2026-11-01T09:00 --title T --caption-stdin
+                                 Queue for later: one row per platform, published by the social-publish job
+  amux social ls --queued | cancel <id> | reschedule <id> <TIME|now> [--force]
 
 ${BOLD}Info:${RESET}
   amux ls                        List all workers with status and previews
@@ -6572,9 +6772,9 @@ ${BOLD}Browser:${RESET}
                                  ${DIM}asking anyone to sign in — amux opens a SECOND${RESET}
                                  ${DIM}Chrome beside their own and they look identical.${RESET}
 
-${BOLD}Pages links (apps and files, managed in the Pages tab):${RESET}
+${BOLD}Apps links (apps and files, managed in the Apps tab):${RESET}
   amux publish [--internal] PORT [TITLE]   An app: public, or inside amux only
-  amux publish --file PATH [TITLE]         A public file or folder; --list, --revoke ID
+  amux publish [--internal] --file PATH    A file or folder: public, or inside amux only; --list, --revoke ID
 
 ${BOLD}Boundaries and resources:${RESET}
   amux boundaries [--json]       The worker boundaries (boundaries.toml), their guard, 24h firings
@@ -6653,11 +6853,22 @@ d = json.load(sys.stdin)
 h = d.get('host') or {}
 p = d.get('pressure') or {}
 la = h.get('load_avg') or [None, None, None]
-ncpu = h.get('cpu_count') or 1
-print('Machine  %s: %d cores, %.0f GB RAM, %.0f GB disk free' % (h.get('hostname', '?'), ncpu, h.get('ram_total_mb', 0) / 1024, h.get('disk_free_gb', 0)))
+# A field the server could not measure prints as "unmeasured", never as 0 or 1:
+# "1 cores, 0 GB RAM, memory 0% used" on a busy 4-core Linux box read as headroom.
+U = 'unmeasured'
+ncpu = h.get('cpu_count')
+cores = '%d cores' % ncpu if ncpu else 'cores ' + U
+ram = '%.0f GB RAM' % (h['ram_total_mb'] / 1024) if 'ram_total_mb' in h else 'RAM ' + U
+disk = '%.0f GB disk free' % h['disk_free_gb'] if 'disk_free_gb' in h else 'disk ' + U
+print('Machine  %s: %s, %s, %s' % (h.get('hostname', '?'), cores, ram, disk))
 if la[1] is not None:
-    print('  load    %.1f / %.1f / %.1f  (%.2f per core over 5 min)' % (la[0], la[1], la[2], la[1] / ncpu))
-print('  memory  %.0f%% used   swap %.1f of %.1f GB' % (h.get('ram_percent', 0), h.get('swap_used_mb', 0) / 1024, h.get('swap_total_mb', 0) / 1024))
+    per = '  (%.2f per core over 5 min)' % (la[1] / ncpu) if ncpu else ''
+    print('  load    %.1f / %.1f / %.1f%s' % (la[0], la[1], la[2], per))
+else:
+    print('  load    ' + U)
+mem = '%.0f%% used' % h['ram_percent'] if 'ram_percent' in h else U
+swap = 'swap %.1f of %.1f GB' % (h.get('swap_used_mb', 0) / 1024, h['swap_total_mb'] / 1024) if 'swap_total_mb' in h else 'swap ' + U
+print('  memory  %s   %s' % (mem, swap))
 line = '  level   %s' % p.get('level', 'unknown')
 if p.get('reasons'):
     line += '  (%s)' % '; '.join(p['reasons'])
@@ -6836,35 +7047,42 @@ if d.get("submitted") is False: print("  nothing was submitted")' 2>/dev/null ||
 }
 
 cmd_tunnel() {
-  # Retired with the Proxies tab and /proxy (MSG-95893): Pages is the one way
+  # Retired with the Proxies tab and /proxy (MSG-95893): the Apps tab is the one way
   # to share a local app. The ChatGPT app's connector relay is published from
   # its panel in the dashboard, not here. Exit non-zero so a script that still
   # calls this learns it did nothing.
-  echo "amux tunnel is retired. Share a local app from the Pages tab, or:" >&2
+  echo "amux tunnel is retired. Share a local app from the Apps tab, or:" >&2
   echo "  amux publish --internal PORT [TITLE]   inside amux only" >&2
   echo "  amux publish PORT [TITLE]              anyone with the link" >&2
   return 2
 }
 
 cmd_publish() {
-  # The Pages tab's links (static_files/public_links.rs): an app for the owner
-  # inside amux (--internal), an app for anyone with the link, or a file or
-  # folder for anyone with the link (--file). All listed and removable in Pages.
+  # The Apps tab's links (static_files/public_links.rs; the tab was named
+  # Pages until 2026-10-29): an app for the owner inside amux (--internal), an
+  # app for anyone with the link, or a file or folder for anyone with the link
+  # (--file). All listed and removable in the Apps tab.
   local AMUX_API="${AMUX_API:-$(cmd_url)}"
   local kind=app target title
   case "${1:-}" in
     ""|-h|--help|help)
       cat <<EOF
-${BOLD}amux publish${RESET} — apps and files in the Pages tab
+${BOLD}amux publish${RESET}: apps and files in the Apps tab
 
-  amux publish --internal PORT [TITLE]   An app for you, opened inside amux (signed in)
-  amux publish PORT [TITLE]              An app for anyone with the link, no amux sign-in
-  amux publish --file PATH [TITLE]       A file or folder for anyone with the link
-  amux publish --list                    List them
+  amux publish --internal PORT [TITLE]         An app for you, opened inside amux (signed in)
+  amux publish PORT [TITLE]                    An app for anyone with the link, no amux sign-in
+  amux publish --file PATH [TITLE]             A file or folder for anyone with the link
+  amux publish --list                          List them
+
+The Apps tab holds apps with a backend and files shared outside amux, used only
+when the owner asks for one. A file for the owner is not an App: name it by its
+absolute path, which amux shows as a link to its file viewer. Give the web link
+<amux address>/f/<absolute path> only when the owner asks for a link. Do not
+start a web server for static files: it serves every file beside them.
   amux publish --revoke ID               Remove one (a public link stops working)
 
 Anything a worker adds stays PENDING (a public link serves nobody, an app
-inside amux does not open) until the owner approves it in the Pages tab.
+inside amux does not open) until the owner approves it in the Apps tab.
 EOF
       return 0
       ;;
@@ -6883,7 +7101,7 @@ if not d.get("public_url"):
 if not links:
     print("nothing published")
 for l in links:
-    what = l["file"] if l["kind"] == "file" else "port %s" % l["port"]
+    what = l["file"] if l.get("file") else "port %s" % l["port"]
     state = "PENDING" if l.get("pending") else ("public" if l.get("public") else "inside")
     print(l["id"], l["kind"], state, what, l.get("url") or l["path"], ("  " + l["title"]) if l.get("title") else "")
 '
@@ -6901,9 +7119,12 @@ for l in links:
     --internal) kind=internal; shift ;;
     --file) kind="file"; shift ;;
   esac
+  local is_path=0
+  [[ "$kind" == file ]] && is_path=1
+  if [[ "$kind" == internal && "${1:-}" == --file ]]; then is_path=1; shift; fi
   target="${1:-}"; title="${2:-}"
-  if [[ "$kind" == file ]]; then
-    [[ -n "$target" ]] || die "usage: amux publish --file PATH [TITLE]"
+  if [[ "$is_path" == 1 ]]; then
+    [[ -n "$target" ]] || die "usage: amux publish [--internal] --file PATH [TITLE]"
     [[ -e "$target" ]] || die "no such file or folder: $target"
     target="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
   else
@@ -6912,13 +7133,13 @@ for l in links:
   local body
   body=$(python3 -c '
 import json, sys
-kind, target, title = sys.argv[1:4]
+kind, target, title, is_path = sys.argv[1:5]
 d = {"kind": kind, "title": title}
-if kind == "file":
+if is_path == "1":
     d["path"] = target
 else:
     d["port"] = int(target)
-print(json.dumps(d))' "$kind" "$target" "$title")
+print(json.dumps(d))' "$kind" "$target" "$title" "$is_path")
   _curl -sk -m 15 -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: ${AMUX_SESSION:-}" \
     -d "$body" "$AMUX_API/api/page-links" | python3 -c '
 import json, sys
@@ -6929,15 +7150,15 @@ except ValueError:
 if "error" in d:
     sys.exit("not published: " + str(d["error"]))
 print(d.get("url") or d["path"] + "   (address unknown: set AMUX_PUBLIC_URL in server.env)")
-if d["kind"] != "file" and not d.get("listening"):
+if not d.get("file") and not d.get("listening"):
     print("note: nothing listens on port %s yet; the link works once the app runs" % d["port"], file=sys.stderr)
 if d.get("pending"):
-    print("PENDING: it does not open until the owner approves it in the Pages tab. Tell the owner it is waiting there.", file=sys.stderr)
+    print("PENDING: it does not open until the owner approves it in the Apps tab. Tell the owner it is waiting there.", file=sys.stderr)
 elif d.get("public"):
     print("public: anyone with the link can open it.", file=sys.stderr)
 else:
     print("only you, signed in.", file=sys.stderr)
-print("Listed in Pages; remove with: amux publish --revoke " + d["id"], file=sys.stderr)
+print("Listed in the Apps tab; remove with: amux publish --revoke " + d["id"], file=sys.stderr)
 '
 }
 
@@ -8709,6 +8930,86 @@ LAND_BEHAVIOR_VERSION="2026-10-18.56"
 # MSG-<id>` trailer, or MSG-<id> anywhere in the message), LIVE when that commit
 # is in the running build, CLOSED when someone closed it with a reason. All of
 # it is computed from the message history, git and /health; no model call.
+# amux velocity [WORKER] [--card ID] [--days N] [--json] | --fleet
+# amux velocity [WORKER] --projection [--backlog]: when the open cards land.
+# Where a worker's time goes, what wastes it and who can fix it, and with
+# --card an estimate of that card's minutes and tokens from the worker's own
+# finished cards (docs/design/worker-velocity.md). WORKER defaults to you.
+cmd_velocity() {
+  local worker="" card="" days=30 raw="" fleet="" proj="" backlog=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --card)  card="${2:-}"; shift 2 ;;
+      --days)  days="${2:-30}"; shift 2 ;;
+      --json)  raw=1; shift ;;
+      --fleet) fleet=1; shift ;;
+      --projection) proj=1; shift ;;
+      --backlog) backlog=1; shift ;;
+      -h|--help) sed -n '/^# amux velocity/,/^cmd_velocity/p' "$0" | sed '$d'; return 0 ;;
+      *)       worker="$1"; shift ;;
+    esac
+  done
+  local base="${AMUX_API:-$(cmd_url)}" url
+  if [[ -n "$fleet" ]]; then
+    url="$base/api/velocity?days=$days"
+  else
+    worker="${worker:-${AMUX_SESSION:-}}"
+    [[ -n "$worker" ]] || die "usage: amux velocity [WORKER] [--card ID] [--days N] [--json] | --fleet  (no WORKER and no \$AMUX_SESSION)"
+    url="$base/api/velocity/$worker?days=$days"
+    [[ -n "$proj" ]] && url="$base/api/velocity/$worker/projection?days=$days${backlog:+&include=backlog}"
+    [[ -n "$card" ]] && url="$url&card=$card"
+  fi
+  local body
+  body=$(_curl -sk --max-time 30 -H "X-Amux-Session: ${AMUX_SESSION:-}" "$url") || die "amux velocity: the server did not answer ($url)"
+  if [[ -n "$raw" ]]; then printf '%s\n' "$body"; return 0; fi
+  python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+if "workers" in d:
+    print("Fleet velocity, last %s days (%s attempts). Most wasted hours first." % (d.get("window_days"), d.get("n_considered")))
+    for r in d["workers"]:
+        print("  %-26s finished %4s  %5s/day  %3s%% of time finished  %5.1f h wasted  top: %s" % (
+            r["worker"], r["finished_cards"], r["finished_per_day"], r["finished_share_of_time"], r["wasted_hours"], r.get("top_bottleneck") or "-"))
+    sys.exit(0)
+if "work_minutes" in d:
+    if not d.get("measured", True):
+        print(d.get("why_unmeasured")); sys.exit(0)
+    wm = d["work_minutes"]; c = d.get("calibration") or {}; pace = d.get("pace") or {}; fb = d.get("finish_by") or {}
+    print("%s: %s open cards%s." % (d["worker"], d["n_considered"], " (with backlog)" if d.get("include_backlog") else ""))
+    for x in d["cards"]:
+        b = (" blocked by " + ", ".join(x["blocked_by"])) if x["blocked_by"] else ""
+        if x.get("over_estimate"):
+            b += "  OVER ESTIMATE: %s min so far, %s expected" % (x["over_estimate"]["elapsed_minutes"], x["over_estimate"]["expected_minutes_p75"])
+        print("  %-10s %-7s %4.0f min (to %4.0f)  done after %5.0f min%s  %s" % (x["card"], x["status"], x["minutes_p50"], x["minutes_p75"], x["work_done_after_minutes"], b, x["title"][:50]))
+    print("Work time: %s min (pessimistic %s)%s." % (wm["p50"], wm["p75"], (", after scaling by %sx: your past cards took that many times their estimate" % c["actual_over_estimate"]) if c else ""))
+    if pace:
+        print("At your recent pace (%s days per finished card): done by %s, %s pessimistic." % (pace["days_per_finished_card"], (fb.get("p50") or "")[:16], (fb.get("p75") or "")[:16]))
+    if d.get("blocked_by_outside"):
+        print("Waits on work outside this queue: %s. The dates assume it lands in time." % ", ".join(d["blocked_by_outside"]))
+    sys.exit(0)
+if not d.get("measured", True):
+    print(d.get("why_unmeasured") or d.get("error") or d); sys.exit(1)
+print("%s, last %s days: finished %s of %s cards (%s a day), %s attempts, %s per card." % (
+    d["worker"], d["window_days"], d["finished_cards"], d["cards"], d["finished_per_day"], d["attempts"], d["attempts_per_card"]))
+print("Time: %s h in all, %s h (%s%%) on attempts that finished." % (d["hours"]["total"], d["hours"]["finished"], d["finished_share_of_time"]))
+m = d["per_finished_card"]["minutes"]; t = d["per_finished_card"]["tokens"]
+fmt = lambda v: "-" if v is None else ("%.0f" % v)
+print("A finished card: %s min median (%s to %s), %s tokens median, over %s cards." % (fmt(m["p50"]), fmt(m["p25"]), fmt(m["p75"]), fmt(t["p50"]), m["n"]))
+print("Waste, by who can fix it:")
+for w in sorted(d["waste"], key=lambda w: -w["hours"]):
+    print("  %-22s %-10s %4s attempts %6.1f h %3s%%  %s" % (w["kind"], w["owner"] or "-", w["attempts"], w["hours"], w["share_of_time"], w["what_it_means"]))
+if d.get("waited_on"):
+    print("Parked work waited on:")
+    for x in d["waited_on"]:
+        print("  %5.1f h  %s attempts  %s" % (x["hours"], x["attempts"], x["waiting"]))
+e = d.get("estimate")
+if e:
+    em, et = e["minutes"], e["tokens"]
+    print("Estimate for %s (%s): %s min (%s to %s), %s tokens, from %s %s." % (
+        e["card"], (e.get("title") or "")[:60], fmt(em["p50"]), fmt(em["p25"]), fmt(em["p75"]), fmt(et["p50"]), e["n"], e["basis"]))
+' "$body"
+}
+
 cmd_requests() {
   local days=7 only_open="" raw="" all="" workers=()
   if [[ "${1:-}" == "close" ]]; then
@@ -8828,6 +9129,12 @@ while True:
     offset += len(page)
     if min(h["ts"] for h in page) < cutoff or offset > 50000:
         break
+answered_cache = {}
+def answered_for(w):
+    if w not in answered_cache:
+        d = get("/api/task-history/requests?session=%s&days=%g" % (urllib.parse.quote(w), days)) or {}
+        answered_cache[w] = {r["id"]: r.get("evidence", "") for r in d.get("requests") or [] if r.get("status") == "answered"}
+    return answered_cache[w]
 by_session = {}
 for h in owner_hist:
     by_session.setdefault(h.get("session"), []).append(h)
@@ -8864,7 +9171,19 @@ for w in workers:
             st, ev = "closed", closed[mid]["reason"]
         elif sha:
             lv = live(repo, sha)
-            st, ev = ("live" if lv else "on-main") if lv is not None else "on-main", sha[:9]
+            # A repo this server never deploys cannot become "live": its landed
+            # work is finished, not held (AF-1058: amux-gtm read 10 "not live").
+            # Decided by the repo, not by live() being None: an unreachable
+            # /health also gives None, and amux work must then stay on-main.
+            if lv is not None:
+                st = "live" if lv else "on-main"
+            else:
+                st = "on-main" if os.path.isdir(os.path.join(repo, "crates", "amux-server")) else "landed"
+            ev = sha[:9]
+        elif ("MSG-" + mid) in answered_for(w):
+            # The server's rule, not a second copy of it (AF-1059): a question
+            # whose own turn ended with a reply before the next message.
+            st, ev = "answered", answered_for(w)["MSG-" + mid]
         else:
             st, ev = "open", ""
         if sha:
@@ -8880,7 +9199,7 @@ for r in rows:
     mid = r["id"][4:]
     if r["status"] == "closed" and (closed.get(mid) or {}).get("at"):
         when[r["id"]] = "%s@%s" % (r["worker"], closed[mid]["at"])
-    elif r["status"] in ("on-main", "live") and r["repo"]:
+    elif r["status"] in ("on-main", "live", "landed") and r["repo"]:
         ct = subprocess.run(["git", "-C", r["repo"], "show", "-s", "--format=%ct", lm_sha.get(r["id"], r["evidence"])],
                             capture_output=True, text=True).stdout.strip()
         if ct.isdigit():
@@ -8897,7 +9216,7 @@ for r in rows:
     t = tasks_at.get(when.get(r["id"], "")) or {}
     r["task"] = t.get("task") or ""
     r["task_ts"] = t.get("ts")
-counts = {k: sum(1 for r in rows if r["status"] == k) for k in ("open", "on-main", "live", "closed")}
+counts = {k: sum(1 for r in rows if r["status"] == k) for k in ("open", "on-main", "live", "landed", "answered", "closed")}
 summary = {"measured": not unmeasured, "n_considered": len(rows), "tasks_measured": tasks_measured, "acks_dropped": dropped, "days": days,
            "build": build[:12], "counts": counts, "fetch_timed_out": stale, "why_unmeasured": unmeasured and ("no history/session for " + ", ".join(unmeasured))}
 # WHY ON MAIN IS NOT LIVE (velocity audit 2026-10-21): the builder's CI gate
@@ -8919,13 +9238,17 @@ if only_open:
 if raw:
     print(json.dumps(dict(summary, requests=rows), indent=1))
     sys.exit(0)
-order = {"open": 0, "on-main": 1, "live": 2, "closed": 3}
+order = {"open": 0, "on-main": 1, "live": 2, "landed": 2, "answered": 3, "closed": 3}
 for r in sorted(rows, key=lambda r: (order[r["status"]], r["worker"], -r["age_h"])):
-    print("%-8s %-18s %-10s %6sh  %-10s %s" % ("held" if r.get("held_by_ci") else r["status"], r["worker"][:18], r["id"], r["age_h"], r["evidence"][:10], r["text"][:90]))
+    answered = r["status"] == "answered"
+    print("%-8s %-18s %-10s %6sh  %-10s %s" % ("held" if r.get("held_by_ci") else r["status"], r["worker"][:18], r["id"], r["age_h"],
+                                              "" if answered else r["evidence"][:10], r["text"][:90]))
+    if answered:  # the reply is the disposition, too long for the sha column
+        print("%59s %s" % ("", r["evidence"][:120]))
     if r.get("task"):
         print("%59s closed during task: %s" % ("", r["task"][:80]))
-print("%d requests from the owner over %g days (%d acks not counted): %d open, %d on main not live, %d live, %d closed%s" % (
-    summary["n_considered"], days, dropped, counts["open"], counts["on-main"], counts["live"], counts["closed"],
+print("%d requests from the owner over %g days (%d acks not counted): %d open, %d on main not live, %d live, %d landed in a repo this server does not deploy, %d answered, %d closed%s" % (
+    summary["n_considered"], days, dropped, counts["open"], counts["on-main"], counts["live"], counts["landed"], counts["answered"], counts["closed"],
     ("; UNMEASURED: " + summary["why_unmeasured"]) if unmeasured else ""))
 if summary.get("held_by_ci"):
     g = summary["held_by_ci"]
@@ -9263,6 +9586,200 @@ cmd_ci() {
   esac
 }
 
+# `amux watch add|ls|status|rm|check`: wake your lane once when a file arrives
+# or a CI run concludes (docs/wake-watch.md). Runs scripts/wake-watch.py from
+# origin/main of the amux checkout (committed bytes, not a peer's draft), and
+# falls back to the working tree with a WARN when origin has no copy yet.
+# amux wake: the amux scheduler as Claude Code's ScheduleWakeup and /loop.
+# One verb over /api/schedules, always kind tmux (a prompt to this lane),
+# always attributed with X-Amux-Session. The prompt is read from --stdin or
+# --file (or one quoted argument) and never evaluated by a shell.
+_wake_help() {
+  cat <<EOF
+${BOLD}amux wake${RESET}: wake YOUR lane later with a prompt (the amux scheduler)
+
+  amux wake <when> --stdin             Once, at <when>: '20m', '+90s', '1h30m', 'in 2 hours',
+                                       or 'YYYY-MM-DDTHH:MM'. Rounded UP to the minute.
+  amux wake --every <expr> --stdin     Recurring: 'every 5m' or '5m', 'daily at 09:00', cron.
+          [--max-runs N] [--until T]   Bound it. Each fire is a full model turn.
+  amux wake --when '<shell check>' --stdin
+          [--check-every 2m] [--until T] [--keep]
+                                       Run the check every --check-every (default 2m); deliver
+                                       the prompt when it exits 0, then stop (--keep: every
+                                       time it passes). --until defaults to 24h from now so a
+                                       condition that never comes true stops polling.
+  amux wake --list                     Your enabled schedules: id, kind, next run, cadence
+  amux wake --cancel <ID>              Delete one
+
+  --title T sets the title (default: the start of the prompt). --file PATH reads the
+  prompt from a file. A busy lane gets the prompt at its next turn boundary.
+  A failing check wakes nobody and costs nothing; Run now in the dashboard skips it.
+
+  Claude Code tool          amux
+  ScheduleWakeup(N, p)      amux wake Ns --stdin
+  /loop 5m p                amux wake --every 5m --stdin
+  self-paced loop           end each turn with: amux wake <next delay> --stdin
+  Monitor until-loop        amux wake --when '<check>' --stdin
+  file or CI run done       amux watch add file|ci ...
+EOF
+}
+
+cmd_wake() {
+  local AMUX_API="${AMUX_API:-$(cmd_url)}"
+  local me="${AMUX_SESSION:-}"
+  local every="" cond="" check_every="2m" until="" max_runs="" keep=0 title="" prompt="" have_prompt=0 list=0 cancel=""
+  local -a pos=()
+  [[ $# -eq 0 ]] && { _wake_help; return 0; }
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      help|-h|--help) _wake_help; return 0 ;;
+      --list|-l|list|ls) list=1; shift ;;
+      --cancel|cancel|rm) [[ -n "${2:-}" ]] || die "usage: amux wake --cancel <SCHED-ID>"; cancel="$2"; shift 2 ;;
+      --every) [[ -n "${2:-}" ]] || die "amux wake: --every needs an expression"; every="$2"; shift 2 ;;
+      --when) [[ -n "${2:-}" ]] || die "amux wake: --when needs a shell check"; cond="$2"; shift 2 ;;
+      --check-every) [[ -n "${2:-}" ]] || die "amux wake: --check-every needs an interval"; check_every="$2"; shift 2 ;;
+      --until) [[ -n "${2:-}" ]] || die "amux wake: --until needs a time"; until="$2"; shift 2 ;;
+      --max-runs) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "amux wake: --max-runs needs a number"; max_runs="$2"; shift 2 ;;
+      --keep) keep=1; shift ;;
+      --title) [[ -n "${2:-}" ]] || die "amux wake: --title needs text"; title="$2"; shift 2 ;;
+      --stdin|-) prompt="$(cat)"; have_prompt=1; shift ;;
+      --file) [[ -r "${2:-}" ]] || die "amux wake: cannot read ${2:-<missing path>}"; prompt="$(cat -- "$2")"; have_prompt=1; shift 2 ;;
+      -*) die "amux wake: unknown flag $1 (amux wake help)" ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+
+  if [[ "$list" == 1 ]]; then
+    [[ -n "$me" ]] || die "amux wake --list: AMUX_SESSION is not set"
+    local out code
+    out="$(mktemp "${TMPDIR:-/tmp}/amux-wake.XXXXXX")" || die "amux wake: mktemp failed"
+    code=$(_curl -sk -m 20 -o "$out" -w '%{http_code}' -G --data-urlencode "session=$me" "$AMUX_API/api/schedules" 2>/dev/null || echo 000)
+    code="${code:0:3}"
+    if [[ "$code" != 2* ]]; then rm -f "$out"; die "amux wake --list: server answered HTTP $code"; fi
+    python3 -c '
+import json, sys
+rows = [r for r in json.load(open(sys.argv[1])) if r.get("enabled") and not r.get("deleted")]
+if not rows:
+    print("no enabled schedules for " + sys.argv[2])
+for r in rows:
+    cadence = r.get("schedule_expr") or ("once" if r.get("sched_type") == "once" else r.get("sched_type") or "")
+    when = ("  when: " + r["when"]) if r.get("when") else ""
+    print("%s  %-5s  next %s  %s  %s%s" % (r["id"], r.get("kind") or "tmux", r.get("next_run") or "-", cadence, r.get("title") or "", when))
+' "$out" "$me"
+    local rc=$?; rm -f "$out"; return $rc
+  fi
+
+  if [[ -n "$cancel" ]]; then
+    local out code
+    out="$(mktemp "${TMPDIR:-/tmp}/amux-wake.XXXXXX")" || die "amux wake: mktemp failed"
+    code=$(_curl -sk -m 20 -o "$out" -w '%{http_code}' -X DELETE -H "X-Amux-Session: $me" "$AMUX_API/api/schedules/$cancel" 2>/dev/null || echo 000)
+    code="${code:0:3}"
+    if [[ "$code" != 2* ]]; then
+      local why; why=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("error",""))
+except Exception: pass' "$out" 2>/dev/null)
+      rm -f "$out"; die "amux wake --cancel $cancel: HTTP $code${why:+: $why}"
+    fi
+    rm -f "$out"; echo "cancelled $cancel"; return 0
+  fi
+
+  [[ -n "$me" ]] || die "amux wake: AMUX_SESSION is not set, so there is no lane to wake"
+  [[ -n "$every" && -n "$cond" ]] && die "amux wake: --every and --when are exclusive (--when uses --check-every)"
+  local when=""
+  if [[ -z "$every" && -z "$cond" ]]; then
+    [[ ${#pos[@]} -gt 0 ]] || die "usage: amux wake <when> --stdin   (amux wake help)"
+    when="${pos[0]}"; pos=("${pos[@]:1}")
+    # `amux wake in 20m` arrives as two words.
+    if [[ "$when" == "in" && ${#pos[@]} -gt 0 ]]; then when="in ${pos[0]}"; pos=("${pos[@]:1}"); fi
+    [[ -n "$max_runs" ]] && die "amux wake: --max-runs applies to --every"
+  fi
+  if [[ "$have_prompt" == 0 ]]; then
+    [[ ${#pos[@]} -eq 1 ]] || die "amux wake: give the prompt with --stdin or --file (or as ONE quoted argument)"
+    prompt="${pos[0]}"
+  elif [[ ${#pos[@]} -gt 0 ]]; then
+    die "amux wake: unexpected argument(s) beside --stdin/--file: ${pos[*]}"
+  fi
+  [[ -n "${prompt//[[:space:]]/}" ]] || die "amux wake: the prompt is empty"
+  if [[ -n "$cond" && -z "$until" ]]; then until="24h"; fi
+
+  local body out code
+  body=$(W_SESSION="$me" W_PROMPT="$prompt" W_TITLE="$title" W_WHEN="$when" W_EVERY="$every" W_COND="$cond" \
+    W_CHECK_EVERY="$check_every" W_UNTIL="$until" W_MAX="$max_runs" W_KEEP="$keep" python3 -c '
+import json, os, re
+e = os.environ
+prompt = e["W_PROMPT"]
+title = e["W_TITLE"] or ("wake: " + " ".join(prompt.split())[:60])
+d = {"title": title, "session": e["W_SESSION"], "command": prompt, "kind": "tmux"}
+def expr(x):
+    x = x.strip()
+    return "every " + x if re.fullmatch(r"\d+\s*[mhd]", x) else x
+if e["W_COND"]:
+    d["schedule_expr"] = expr(e["W_CHECK_EVERY"])
+    d["when"] = e["W_COND"]
+    d["when_once"] = e["W_KEEP"] != "1"
+elif e["W_EVERY"]:
+    d["schedule_expr"] = expr(e["W_EVERY"])
+else:
+    d["once"] = e["W_WHEN"]
+if e["W_UNTIL"]:
+    d["until"] = e["W_UNTIL"]
+if e["W_MAX"]:
+    d["max_runs"] = int(e["W_MAX"])
+print(json.dumps(d))') || die "amux wake: could not build the request"
+  out="$(mktemp "${TMPDIR:-/tmp}/amux-wake.XXXXXX")" || die "amux wake: mktemp failed"
+  code=$(printf '%s' "$body" | _curl -sk -m 20 -o "$out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -H "X-Amux-Session: $me" --data-binary @- "$AMUX_API/api/schedules" 2>/dev/null || echo 000)
+  code="${code:0:3}"
+  python3 -c '
+import json, sys
+path, code = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(path))
+except Exception:
+    d = {}
+if not code.startswith("2"):
+    msg = d.get("error") or ("the server did not answer" if code == "000" else "no error text in the reply")
+    extra = d.get("detail") or ""
+    acc = d.get("accepted")
+    sys.stderr.write("amux wake: refused (HTTP %s): %s%s\n" % (code, msg, (" (" + extra + ")") if extra and extra != msg else ""))
+    if isinstance(acc, dict) and "once" in acc:
+        sys.stderr.write("  once accepts: " + acc["once"] + "\n")
+    sys.exit(1)
+if not d.get("id"):
+    sys.stderr.write("amux wake: HTTP %s but no schedule id in the reply\n" % code)
+    sys.exit(1)
+nxt = d.get("next_run") or "?"
+if d.get("when"):
+    print("%s checks `%s` on %s, first at %s, until %s; %s" % (d["id"], d["when"], d.get("schedule_expr"), nxt, d.get("until") or "-",
+          "fires once when it exits 0" if d.get("when_once", True) else "fires every time it exits 0"))
+elif d.get("schedule_expr"):
+    b = []
+    if d.get("max_runs"): b.append("max %s runs" % d["max_runs"])
+    if d.get("until"): b.append("until %s" % d["until"])
+    print("%s %s, next %s%s" % (d["id"], d["schedule_expr"], nxt, (" (" + ", ".join(b) + ")") if b else ""))
+else:
+    print("%s fires once at %s" % (d["id"], nxt))
+print("  cancel: amux wake --cancel %s" % d["id"])
+' "$out" "$code"
+  local rc=$?; rm -f "$out"; return $rc
+}
+
+cmd_watch() {
+  local repo="${AMUX_REPO_DIR:-$HOME/Dev/amux}" tmp rc
+  case "${1:-}" in ''|-h|--help|help) set -- --help ;; esac
+  tmp="$(mktemp "${TMPDIR:-/tmp}/wake-watch.XXXXXX")" || die "amux watch: mktemp failed"
+  if ! git -C "$repo" show origin/main:scripts/wake-watch.py > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+    if [ -f "$repo/scripts/wake-watch.py" ]; then
+      echo "amux watch: WARN running $repo/scripts/wake-watch.py from a working tree: origin/main has no copy" >&2
+      cp "$repo/scripts/wake-watch.py" "$tmp"
+    else
+      rm -f "$tmp"; die "amux watch: scripts/wake-watch.py is not in $repo (set AMUX_REPO_DIR)"
+    fi
+  fi
+  AMUX_REPO_DIR="$repo" python3 "$tmp" "$@"; rc=$?
+  rm -f "$tmp"; return "$rc"
+}
+
 _ci_wait() {
   local run="" repo="" timeout=3600 poll="${AMUX_CI_WATCH_POLL_S:-60}" json=0
   while [ $# -gt 0 ]; do
@@ -9290,9 +9807,10 @@ _ci_wait() {
   trap "[ \"\$(cat '$lock/pid' 2>/dev/null)\" = '$$' ] && rm -rf -- '$lock'" EXIT
   while :; do
     # Take the poller role when nobody live holds it. A run the shared file
-    # already shows as concluded needs no poller: the previous one finished
-    # and freed the lock, and electing again costs a gh call per late reader.
-    if [ "$role" = reader ] && ! python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("status") == "completed" else 1)' "$state" 2>/dev/null; then
+    # already shows as concluded needs no poller, but only if that was read
+    # after this wait began: a re-run keeps its run id, so an older
+    # "completed" can be the previous attempt (2026-10-29, run 40872577418).
+    if [ "$role" = reader ] && ! python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("status") == "completed" and d.get("polled_at", 0) >= float(sys.argv[2]) else 1)' "$state" "$start" 2>/dev/null; then
       if mkdir "$lock" 2>/dev/null; then
         echo $$ > "$lock/pid"; role=poller
       else
@@ -9306,7 +9824,7 @@ _ci_wait() {
         tok_env="$("$HOME/.amux/github-app/get-token.sh" --min-remaining 600 --raw 2>/dev/null || true)"
       fi
       out="$(GH_TOKEN="${tok_env:-${GH_TOKEN:-}}" gh api "repos/$repo/actions/runs/$run" \
-             --jq '{status: .status, conclusion: .conclusion, url: .html_url, head_sha: .head_sha, name: .name}' 2>&1)" || rc=$?
+             --jq '{status: .status, conclusion: .conclusion, url: .html_url, head_sha: .head_sha, name: .name, run_attempt: .run_attempt}' 2>&1)" || rc=$?
       polls=$((polls + 1))
       printf '%s %s poll repo=%s run=%s rc=%s\n' "$(date -u +%FT%TZ)" "$me" "$repo" "$run" "$rc" >> "$logf"
       python3 - "$state" "$rc" "$out" <<'PY'
@@ -9327,14 +9845,16 @@ PY
     fi
     # Everyone, poller included, decides from the shared file.
     local verdict
-    verdict="$(python3 - "$state" "$poll" <<'PY'
+    verdict="$(python3 - "$state" "$poll" "$start" <<'PY'
 import json, sys, time
 try:
     d = json.load(open(sys.argv[1]))
 except (OSError, ValueError):
     print("pending"); sys.exit()
 fresh = time.time() - d.get("polled_at", 0) <= 3 * float(sys.argv[2]) + 30
-if not d.get("measured"):
+if d.get("polled_at", 0) < float(sys.argv[3]):
+    print("pending")  # read before this wait began: may be an earlier attempt
+elif not d.get("measured"):
     print("unmeasured" if fresh else "pending")
 elif d.get("status") == "completed":
     print("success" if d.get("conclusion") == "success" else "failure")
@@ -9424,6 +9944,61 @@ print(json.dumps({
 PY
   rm -f -- "${out:?}"
   return "$rc"
+}
+
+cmd_explain() {
+  # amux explain <path>... [--since 14d] [--save] [--model M]
+  #
+  # An explainer of one slice of the code, written fresh from the code and its
+  # recent history: what it does, how it is wired, the contracts that guard
+  # it, and what changed lately. The Claude Code team uses this instead of
+  # reading every diff to learn the code ("How the Claude Code team does code
+  # review", 2026-10-26): it takes minutes, is about exactly the slice you are
+  # about to change, and is never out of date. --save writes it to
+  # docs/explainers/<slug>.md in this checkout (committing it is your call).
+  local since=14d save=0 model="${AMUX_EXPLAIN_MODEL:-}" paths=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since) since="${2:?--since needs a value like 14d}"; shift 2 ;;
+      --save) save=1; shift ;;
+      --model) model="${2:?--model needs a value}"; shift 2 ;;
+      -h|--help) sed -n '/^cmd_explain()/,/^  local since/p' "$0" | grep '^  #' | sed 's/^  # \{0,1\}//'; return 0 ;;
+      -*) die "usage: amux explain <path>... [--since 14d] [--save] [--model M]" ;;
+      *) paths+=("$1"); shift ;;
+    esac
+  done
+  [ "${#paths[@]}" -gt 0 ] || die "usage: amux explain <path>... [--since 14d] [--save] [--model M]"
+  command -v claude >/dev/null 2>&1 || die "amux explain needs the claude CLI on PATH"
+  local root days p
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "amux explain runs inside a git checkout"
+  days="${since%d}"
+  case "$days" in ''|*[!0-9]*) die "--since takes days, like 14d" ;; esac
+  for p in "${paths[@]}"; do [ -e "$p" ] || [ -e "$root/$p" ] || die "no such path: $p"; done
+  local prompt
+  prompt="Write an explainer of this slice of the code for an engineer who is about to change it: ${paths[*]}
+
+Read the code itself before writing anything. Cover, in this order:
+1. What it does, in two or three sentences.
+2. How it is wired: entry points, who calls it, what it reads and writes, and the one or two paths a request or event takes through it. Name files and functions so the reader can open them.
+3. The contracts that guard it: tests that pin its behaviour, tree-wide checks it must satisfy, invariants and verdict names it logs.
+4. What changed in it in the last ${days} days: run git log --since=${days}.days -- ${paths[*]} and summarise the changes that matter, citing short shas.
+5. Gotchas: anything surprising, and anything frustrations.md or a comment warns about.
+Plain markdown with headings, short paragraphs, no filler. Say plainly when something is unclear from the code."
+  local out
+  out="$(cd "$root" && env -u AMUX_SESSION -u AMUX_WORKER -u TMUX -u TMUX_PANE claude -p "$prompt" \
+    --setting-sources project --strict-mcp-config --no-session-persistence \
+    --allowedTools Read Grep Glob 'Bash(git log:*)' 'Bash(git show:*)' 'Bash(git blame:*)' 'Bash(git grep:*)' \
+    --disallowedTools Edit Write NotebookEdit ${model:+--model "$model"})" || die "amux explain: claude exited non-zero"
+  [ -n "$out" ] || die "amux explain: claude printed nothing"
+  if [ "$save" = 1 ]; then
+    local slug file
+    slug="$(printf '%s' "${paths[*]}" | tr '/ ' '--' | tr -cd 'A-Za-z0-9._-' | cut -c1-80)"
+    file="$root/docs/explainers/${slug}.md"
+    mkdir -p "$root/docs/explainers"
+    { printf '<!-- amux explain %s, %s, since %sd -->\n\n' "${paths[*]}" "$(git -C "$root" rev-parse --short HEAD)" "$days"; printf '%s\n' "$out"; } > "$file"
+    echo "saved: $file" >&2
+  fi
+  printf '%s\n' "$out"
 }
 
 cmd_land() {
@@ -9523,7 +10098,7 @@ cmd_land() {
       for _jx in "$@"; do [ "$_jx" = --json ] || _ja+=("$_jx"); done
       _land_json ${_ja[@]+"${_ja[@]}"}; return $? ;;
   esac
-  local remote=origin branch=main tries=8 max_hold=3600 batch=1 priority=0 batch_max="${AMUX_LAND_BATCH_MAX:-}" detach=0 land_sha="" prio_reason=""
+  local remote=origin branch=main tries=8 max_hold=3600 batch=1 priority=0 batch_max="${AMUX_LAND_BATCH_MAX:-}" detach=0 land_sha="" prio_reason="" land_gate=1
   local fwd_args=()
   local orig_args=(${1+"$@"})
   while [ $# -gt 0 ]; do
@@ -9533,6 +10108,7 @@ cmd_land() {
       --tries) tries="${2:?}"; fwd_args+=("$1" "$2"); shift 2 ;;
       --max-hold) max_hold="${2:?}"; fwd_args+=("$1" "$2"); shift 2 ;;
       --no-batch) batch=0; fwd_args+=("$1"); shift ;;
+      --no-gate) land_gate=0; shift ;;
       --priority) priority=1; fwd_args+=("$1"); shift ;;
       --reason) prio_reason="${2:?}"; fwd_args+=("$1" "$2"); shift 2 ;;
       --demote) shift; _land_demote "${1:-}"; return $? ;;
@@ -9545,7 +10121,7 @@ cmd_land() {
       --to-head) shift; _land_to_head "$@"; return $? ;;
       --status) _land_status; return $? ;;
       -h|--help) sed -n '/^cmd_land()/,/^  local remote/p' "$0" | grep '^  #' | sed 's/^  # \{0,1\}//'; return 0 ;;
-      *) die "usage: amux land [--remote origin] [--branch main] [--tries 8] [--max-hold 3600] [--no-batch] [--batch-max N] [--priority --reason <text>] [--detach] [--sha <commit>] [--json] | amux land --cancel [pid|--all] | --cancel-for <lane> <pid> --reason <text> | --to-head <waiter pid> --reason <text> | --status | --demote <lane> | --adopt [pid|--all]" ;;
+      *) die "usage: amux land [--remote origin] [--branch main] [--tries 8] [--max-hold 3600] [--no-batch] [--no-gate] [--batch-max N] [--priority --reason <text>] [--detach] [--sha <commit>] [--json] | amux land --cancel [pid|--all] | --cancel-for <lane> <pid> --reason <text> | --to-head <waiter pid> --reason <text> | --status | --demote <lane> | --adopt [pid|--all]" ;;
     esac
   done
   # LAND GUARDS before anything queues, on either path (the server queue below
@@ -9563,6 +10139,24 @@ cmd_land() {
         echo "amux land: refused before queueing by a land guard (details above and in ~/.amux/logs/land.log); nothing queued" >&2
         return 4
       }
+    fi
+  fi
+  # LAND GATE (scripts/land_gate.py): in a repo whose origin/main has one, run
+  # the checks main runs on origin/main plus this change before it queues, so
+  # a red result comes back here instead of turning main red for every lane.
+  # origin/main's copy runs, never this checkout's. --no-gate skips it; the
+  # pre-push hook still refuses an agent's commits with no passing receipt.
+  if [ "${AMUX_LAND_GUARDED:-0}" != 1 ] && [ "$land_gate" = 1 ] && [ -z "$land_sha" ] \
+     && git cat-file -e "$remote/$branch:scripts/land_gate.py" 2>/dev/null; then
+    local _lg_dir _lg_rc=0
+    _lg_dir="$(mktemp -d "${TMPDIR:-/tmp}/amux-land-gate.XXXXXX")"
+    git show "$remote/$branch:scripts/land_gate.py" > "$_lg_dir/land_gate.py" \
+      && git show "$remote/$branch:scripts/land_review.py" > "$_lg_dir/land_review.py" \
+      && python3 "$_lg_dir/land_gate.py" || _lg_rc=$?
+    rm -rf "$_lg_dir"
+    if [ "$_lg_rc" != 0 ]; then
+      echo "amux land: the land gate did not pass (above); nothing queued. Fix it and run amux land again." >&2
+      return 5
     fi
   fi
   # CONTRACT RULE 5 (AH-380): where the server owns landing for this lane, queue
@@ -10866,12 +11460,18 @@ cmd_social() {
   case "$sub" in
     status|"")
       _curl -sk "$AMUX_API/api/social" | python3 -m json.tool ;;
-    post)
+    post|queue)
+      # `queue` with no arguments lists the queue; with arguments it is `post`
+      # with a publish time (--at, default now). Several platforms are one
+      # comma-separated argument: one queued row each, sharing a group id.
+      if [[ "$sub" == queue && $# -eq 0 ]]; then cmd_social ls --queued; return; fi
       local platform="${1:-}" file="${2:-}"; shift 2 2>/dev/null || true
-      [[ -n "$platform" && -n "$file" ]] || die "Usage: amux social post <platform> <file> [--title T] [--privacy public|unlisted|private] [--tag T]... [--account A] (--caption-stdin | --caption TEXT)"
-      local title="" privacy="" account="" caption="" tags=()
+      [[ -n "$platform" && -n "$file" ]] || die "Usage: amux social $sub <platform[,platform...]> <file> [--at TIME] [--title T] [--privacy public|unlisted|private] [--tag T]... [--account A] (--caption-stdin | --caption TEXT)"
+      local title="" privacy="" account="" caption="" at="" tags=()
+      [[ "$sub" == queue ]] && at="now"
       while [[ $# -gt 0 ]]; do
         case "$1" in
+          --at) at="${2:-}"; shift 2 ;;
           --title) title="${2:-}"; shift 2 ;;
           --privacy) privacy="${2:-}"; shift 2 ;;
           --account) account="${2:-}"; shift 2 ;;
@@ -10882,10 +11482,13 @@ cmd_social() {
         esac
       done
       [[ "$file" == /* ]] || file="$PWD/$file"
-      P="$platform" F="$file" T="$title" V="$privacy" A="$account" C="$caption" G="$(printf '%s\n' "${tags[@]+"${tags[@]}"}")" python3 -c '
+      P="$platform" F="$file" T="$title" V="$privacy" A="$account" C="$caption" W="$at" G="$(printf '%s\n' "${tags[@]+"${tags[@]}"}")" python3 -c '
 import json, os
-b = {"platform": os.environ["P"], "file": os.environ["F"], "caption": os.environ["C"]}
-for k, e in (("title", "T"), ("privacy", "V"), ("account", "A")):
+ps = [p for p in os.environ["P"].split(",") if p]
+b = {"file": os.environ["F"], "caption": os.environ["C"]}
+if len(ps) > 1: b["platforms"] = ps
+else: b["platform"] = ps[0]
+for k, e in (("title", "T"), ("privacy", "V"), ("account", "A"), ("scheduled_at", "W")):
     if os.environ[e]: b[k] = os.environ[e]
 b["tags"] = [t for t in os.environ["G"].splitlines() if t]
 print(json.dumps(b))' | _curl -sk --max-time 900 -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: $me" -d @- "$AMUX_API/api/social/posts" | python3 -m json.tool ;;
@@ -10909,6 +11512,17 @@ if os.environ["U"]: b["url"] = os.environ["U"]
 if os.environ["A"]: b["account"] = os.environ["A"]
 print(json.dumps(b))' | _curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: $me" -d @- "$AMUX_API/api/social/posts/track" | python3 -m json.tool ;;
     ls)
+      if [[ "${1:-}" == --queued || "${1:-}" == --queue ]]; then
+        local st="${2:-}"
+        _curl -sk "$AMUX_API/api/social/queue?status=${st:-all}" | python3 -c '
+import json, sys, time
+d = json.load(sys.stdin)
+for r in d.get("queue", []):
+    when = time.strftime("%m-%d %H:%M", time.localtime(r["scheduled_at"]))
+    tail = r.get("url") or r.get("error") or r.get("title") or r.get("file") or ""
+    print("%-5s %-10s %-9s %-11s %s  try %s  %s" % (r["id"], r["status"], r["platform"], when, r["group_id"][-8:], r["attempts"], tail))
+print("%d queued post(s)" % len(d.get("queue", [])))' ; return
+      fi
       _curl -sk "$AMUX_API/api/social/posts${1:+?platform=$1}" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -10920,7 +11534,16 @@ print("%d post(s)" % len(d.get("posts", [])))' ;;
     stats)
       [[ -n "${1:-}" ]] || die "Usage: amux social stats <id>"
       _curl -sk "$AMUX_API/api/social/posts/$1/metrics" | python3 -m json.tool ;;
-    *) die "Usage: amux social [status|post|track|ls|stats]" ;;
+    cancel)
+      [[ -n "${1:-}" ]] || die "Usage: amux social cancel <queue id>"
+      _curl -sk -X POST -H "X-Amux-Session: $me" "$AMUX_API/api/social/queue/$1/cancel" | python3 -m json.tool ;;
+    reschedule)
+      [[ -n "${1:-}" && -n "${2:-}" ]] || die "Usage: amux social reschedule <queue id> <TIME|now> [--force]   (--force re-sends a post marked uncertain, which may already be live)"
+      local force=false; [[ "${3:-}" == --force ]] && force=true
+      I="$2" Fz="$force" python3 -c '
+import json, os
+print(json.dumps({"scheduled_at": os.environ["I"], "force": os.environ["Fz"] == "true"}))' | _curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: $me" -d @- "$AMUX_API/api/social/queue/$1/reschedule" | python3 -m json.tool ;;
+    *) die "Usage: amux social [status|post|queue|track|ls [--queued]|stats|cancel|reschedule]" ;;
   esac
 }
 
@@ -11029,6 +11652,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     peek|p)           shift; cmd_peek "$@" ;;
     send)             shift; cmd_send "$@" ;;
     post)             shift; cmd_post "$@" ;;
+    audit)            shift; cmd_audit "$@" ;;
     receipts)         shift; cmd_receipts "$@" ;;
     stop|kill)        shift; cmd_stop "$@" ;;
     pause)            shift; cmd_pause "$@" ;;
@@ -11048,12 +11672,16 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     social)           shift; cmd_social "$@" ;;
     memory|mem)       shift; cmd_memory "$@" ;;
     land)             shift; cmd_land "$@" ;;
+    explain)          shift; cmd_explain "$@" ;;
     ci)               shift; cmd_ci "$@" ;;
+    watch)            shift; cmd_watch "$@" ;;
+    wake)             shift; cmd_wake "$@" ;;
     sync-checkout)    shift; cmd_sync_checkout "$@" ;;
     publish)          shift; cmd_publish "$@" ;;
     contribute)       shift; cmd_contribute "$@" ;;
     github)           shift; cmd_github "$@" ;;
     requests)         shift; cmd_requests "$@" ;;
+    velocity)         shift; cmd_velocity "$@" ;;
     browser|br)      shift; cmd_browser "$@" ;;
     cdp)              shift; cmd_cdp "$@" ;;
     computer|cu)     shift; cmd_computer "$@" ;;

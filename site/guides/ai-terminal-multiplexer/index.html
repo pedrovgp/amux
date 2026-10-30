@@ -67,14 +67,14 @@
     <p>These properties make tmux the ideal runtime for autonomous AI agents. But raw tmux is not designed for managing fleets of AI sessions. That is where amux comes in.</p>
 
     <h2>What amux adds to tmux</h2>
-    <p>amux is a Python server that wraps tmux with everything you need to run, monitor, and coordinate multiple Claude Code agents. Think of it as "tmux for AI" or, more precisely, an agent multiplexer built on top of tmux.</p>
+    <p>amux is a single Rust binary (with SQLite storage) that wraps tmux with everything you need to run, monitor, and coordinate multiple Claude Code agents. Think of it as "tmux for AI" or, more precisely, an agent multiplexer built on top of tmux.</p>
 
     <table>
       <thead><tr><th>Capability</th><th>Raw tmux</th><th>amux</th></tr></thead>
       <tbody>
         <tr><td>Create/destroy sessions</td><td>Manual commands</td><td>CLI + REST API + dashboard</td></tr>
         <tr><td>View agent output</td><td>Attach to pane</td><td>Web dashboard with live streaming</td></tr>
-        <tr><td>Monitor health</td><td>None</td><td>Self-healing watchdog (auto-restart, compaction)</td></tr>
+        <tr><td>Monitor health</td><td>None</td><td>Stall detection and owner alerts; resumes after usage limits</td></tr>
         <tr><td>Agent coordination</td><td>None</td><td>Shared kanban board, REST API, inter-agent messaging</td></tr>
         <tr><td>Token tracking</td><td>None</td><td>Per-session cost tracking in real-time</td></tr>
         <tr><td>Git conflict detection</td><td>None</td><td>File overlap warnings across sessions</td></tr>
@@ -84,15 +84,15 @@
     </table>
 
     <h2>Setting up your AI terminal environment</h2>
-    <p>Getting started with amux takes about two minutes. You need Python 3, tmux, and a Claude Code API key:</p>
+    <p>Getting started with amux takes about two minutes. You need macOS or Linux, tmux 3.2+, and an agent CLI such as Claude Code:</p>
     <pre><code># Install amux
-git clone https://github.com/mixpeek/amux && cd amux && ./install.sh
+curl -fsSL https://amux.io/install.sh | bash
 
 # Register a project (--yolo enables autonomous mode for Claude Code)
 amux register myproject --dir ~/Dev/myproject --yolo
 
-# Start 4 parallel agents
-amux start myproject --sessions 4
+# Start it (register more workers the same way to run agents in parallel)
+amux start myproject --detach
 
 # Launch the web dashboard
 amux serve</code></pre>
@@ -134,12 +134,13 @@ amux start myproject/perf --prompt "Profile the /dashboard endpoint and optimize
 curl -sk https://your-machine:8824/api/sessions | python3 -m json.tool</code></pre>
     <p>This is not possible with IDE-based AI tools. You cannot close Cursor and expect it to keep coding. The terminal model, with session persistence via tmux, makes "fire and forget" agent workflows practical.</p>
 
-    <h2>Self-healing and watchdog</h2>
-    <p>When you run AI agents for extended periods, things go wrong. Claude Code might hit a context limit, an API call might time out, or an agent might get stuck in a loop. amux includes a self-healing watchdog that monitors every session and takes corrective action:</p>
+    <h2>Recovery and monitoring</h2>
+    <p>When you run AI agents for extended periods, things go wrong. Claude Code might hit a context limit, a provider usage limit might hit, or an agent might get stuck in a loop. amux handles what it can and flags the rest:</p>
     <ul>
-      <li><strong>Auto-compaction:</strong> When a session's context approaches the limit, amux triggers Claude Code's <code>/compact</code> command to summarize and continue.</li>
-      <li><strong>Crash recovery:</strong> If a Claude Code process exits unexpectedly, amux restarts it with the original prompt and context.</li>
-      <li><strong>Stall detection:</strong> If an agent produces no output for a configurable timeout, amux sends a nudge or restarts the session.</li>
+      <li><strong>Usage limits:</strong> amux holds message delivery and resumes the agent at the provider's reset time.</li>
+      <li><strong>Context:</strong> Claude Code compacts its own context, and amux lets you set the compaction threshold.</li>
+      <li><strong>Restarts:</strong> launchd or systemd restarts the amux server itself, and on macOS a login job brings every worker back in its own conversation after a reboot. Restarting a crashed agent process is not built into the server; an optional macOS script (<code>scripts/tmux-watchdog.sh</code>, not installed by default) does that for Claude Code workers.</li>
+      <li><strong>Stall detection:</strong> board work that stops moving and stuck orchestrators are flagged, and an owner alert fires.</li>
       <li><strong>Resource monitoring:</strong> The dashboard shows CPU, memory, and token spend per session, so you can identify runaway agents before they burn through your API budget.</li>
     </ul>
 
@@ -163,10 +164,8 @@ curl -sk https://your-machine:8824/api/sessions | python3 -m json.tool</code></p
     </ul>
     <p>For interactive, single-file editing where you want real-time visual feedback, an IDE is still the right tool. The ideal setup for many developers in 2026 is both: an IDE for hands-on work, and amux for autonomous parallel agent work.</p>
 
-    <div class="cta-box"><h3>Get started with amux</h3><p>Run an AI engineering team of Claude Code, Codex and Gemini CLI agents from one dashboard or your phone. One Rust binary. Open source.</p><pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
-amux register myproject --dir ~/Dev/myproject --yolo
-amux start myproject
-amux serve  # → https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
+    <div class="cta-box"><h3>Get started with amux</h3><p>Run an AI engineering team of Claude Code, Codex and Gemini CLI agents from one dashboard or your phone. One Rust binary, MIT + Commons Clause, free to self-host on macOS or Linux.</p><pre><code>curl -fsSL https://amux.io/install.sh | bash
+# then open https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
   </main>
   <footer class="sub-footer">
     <div class="footer-inner">

@@ -141,15 +141,41 @@ CHURN_SAMPLE_ROOTS=${AMUX_CLEANUP_CHURN_SAMPLE_ROOTS:-$HOME:/private/tmp:/privat
 CHURN_FSWATCH=$(command -v fswatch 2>/dev/null || { [ -x /opt/homebrew/bin/fswatch ] && echo /opt/homebrew/bin/fswatch; } || { [ -x /usr/local/bin/fswatch ] && echo /usr/local/bin/fswatch; } || true)
 CHURN_SAMPLE_CMD=${AMUX_CLEANUP_CHURN_SAMPLE_CMD:-${CHURN_FSWATCH:+churn_fswatch}}
 [ "$CHURN_SAMPLE_CMD" = off ] && CHURN_SAMPLE_CMD=""
+# The sample reads FSEvents from fseventsd, the daemon it is measuring, so a
+# wedged fseventsd reads as a quiet disk (RCA 20261028-133155: pid 347 at 100%
+# CPU holding 51G delivered 0 of 500 files written during a sample). A control:
+# write CHURN_CONTROL_N files under the state dir while sampling and require the
+# sample to see one. auto = on for the real fswatch sampler; 1 forces it on.
+CHURN_CONTROL=${AMUX_CLEANUP_CHURN_CONTROL:-auto}
+CHURN_CONTROL_N=20
 # Seam: prints "<gb> <cpu_pct>" for fseventsd, or nothing when it is not running.
 # The suites stub it so the live daemon cannot decide a test (as PRESSURE_CMD does).
 FSEVENTSD_CMD=${AMUX_CLEANUP_FSEVENTSD_CMD:-fseventsd_reading}
+# RESTART A BLOATED fseventsd ITSELF (Mac memory RCA 20261027-180101). fseventsd
+# keeps every byte it grows for its whole life: 7.8G -> 30G in one day on this
+# Mac, 21G of it compressed, and the only way back is a restart (launchd brings
+# it straight back; no reboot). Three escalations in a row asked the owner to
+# run it by hand. Over FSEVENTSD_RESTART_GB the tick runs it, at most once per
+# FSEVENTSD_RESTART_COOLDOWN_H, through `sudo -n`, so it needs one sudoers line
+# from the owner (printed when missing) and never prompts. Off with
+# AMUX_CLEANUP_FSEVENTSD_RESTART_GB=0.
+FSEVENTSD_RESTART_GB=${AMUX_CLEANUP_FSEVENTSD_RESTART_GB:-12}
+FSEVENTSD_RESTART_COOLDOWN_H=${AMUX_CLEANUP_FSEVENTSD_RESTART_COOLDOWN_H:-6}
+FSEVENTSD_RESTART_CMD=${AMUX_CLEANUP_FSEVENTSD_RESTART_CMD:-sudo -n /usr/bin/killall fseventsd}
+FSEVENTSD_SUDOERS_LINE="$(id -un 2>/dev/null || echo "$USER") ALL=(root) NOPASSWD: /usr/bin/killall fseventsd"
 # A spin is escalated once per fseventsd process. The same pid still spinning
 # is the owner's restart still pending, so the next escalation waits for a new
 # pid or this many hours (RCA fseventsd 20261021-195930: pid 34409 re-asked 6h
 # after 20261021-135901 with nothing new and nothing a lane could do).
 FSEVENTSD_PID_CMD=${AMUX_CLEANUP_FSEVENTSD_PID_CMD:-pgrep -x fseventsd}
 FSEVENTSD_SPIN_REMIND_H=${AMUX_CLEANUP_FSEVENTSD_SPIN_REMIND_H:-24}
+# A memory constraint whose holder is an fseventsd already escalated and waiting
+# on the owner's restart is the same ask again: memory RCAs 20261028-081710,
+# 20261029-003047 and 20261029-063250 each named fseventsd (43G, 65G, 68G) and
+# the one owner step, six hours apart, while the fseventsd class itself said
+# "owner pending, not escalated again". At or over this size, fseventsd counts
+# as the holder and memory waits with it.
+MEM_FSE_HOLDER_GB=${AMUX_CLEANUP_MEM_FSE_HOLDER_GB:-8}
 # Churn this many times the floor on an already-escalated pid is a new cause and
 # escalates; less is ordinary work on top of the same stuck process (RCA
 # fseventsd 20261022-075928: 228 events in 20s from cargo builds, floor 134,
@@ -295,6 +321,12 @@ VM_IMAGE_PRUNE_AGE=${AMUX_CLEANUP_VM_IMAGE_PRUNE_AGE:-6h}
 # land precheck had to kill), while the host fell toward 100 GB free.
 USER_TMP_ROOT=${AMUX_CLEANUP_USER_TMP_ROOT:-$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}")}
 USER_TMP_IDLE_MIN=${AMUX_CLEANUP_USER_TMP_IDLE_MIN:-1440}
+# The same dir holds the Rust tempfile crate's .tmpXXXXXX dirs. 57 amux test
+# helpers leaked theirs (std::mem::forget) until test_tempdirs::keep: 11,735
+# dirs, 29 GB, ~400 more an hour (disk RCA 20261029-103955). Tests that are
+# killed still leave them. One whose holder-lock names a live pid is kept, and
+# at most this many go per tick.
+USER_TMP_MAX=${AMUX_CLEANUP_USER_TMP_MAX:-3000}
 # Workers with workspace isolation get TMPDIR=~/.amux/tmp/<worker>, outside the
 # per-user temp dir above, so nothing reaped them: 101 GB in 13,336 entries
 # idle over 12 h on 2026-10-04 with the disk at 57 GB free.
@@ -588,6 +620,10 @@ STALE_SHELL_SNAPSHOT_H=${AMUX_CLEANUP_STALE_SHELL_SNAPSHOT_H:-6}
 # Seam: the test points this at a fixture so the arm can be fed elapsed times
 # without a real process. The default is what the scheduler actually runs.
 STALE_PS_CMD=${AMUX_CLEANUP_STALE_PS_CMD:-ps -eo pid=,etime=,args=}
+# The parent of a candidate shell. Only an orphan (parent 1: its Claude session
+# has ended) is stale; a shell whose claude process is still its parent is a
+# live background task, however long it has run.
+STALE_PPID_CMD=${AMUX_CLEANUP_STALE_PPID_CMD:-ps -o ppid= -p}
 # Orphaned `sqlite3 <amux db> .backup` copies (DESKT-94). SQLite's online backup
 # restarts whenever another connection writes the source, so a .backup of the
 # live amux.db never finishes (AMUX-3491 measured it; VACUUM INTO is the fix).
@@ -905,6 +941,46 @@ needs_reboot() { # <fseventsd_gb> <threshold>
   awk -v f="$1" -v t="$2" 'BEGIN{ exit !(f+0 >= t+0) }'
 }
 
+# Restart fseventsd when it holds over FSEVENTSD_RESTART_GB. Prints one verdict
+# line and returns 0 only when the restart ran. Sets FSE_RESTART_NEEDS_SUDOERS
+# when sudo refused, so the escalation can carry the one line that fixes it.
+fseventsd_try_restart() { # <gb> <dry:0|1>
+  FSE_RESTART_NEEDS_SUDOERS=0
+  [ "${FSEVENTSD_RESTART_GB:-0}" != 0 ] || return 1
+  needs_reboot "$1" "$FSEVENTSD_RESTART_GB" || return 1
+  local last now; now=$(date +%s); last=$(state_get "$STATE_DIR/state" fseventsd_restarted_at || true)
+  if [ -n "$last" ] && [ $(( now - last )) -lt $(( FSEVENTSD_RESTART_COOLDOWN_H * 3600 )) ]; then
+    echo "mac-cleanup:   fseventsd ${1}G: restarted $(( (now - last) / 60 ))m ago, next restart allowed after ${FSEVENTSD_RESTART_COOLDOWN_H}h (verdict=fseventsd_restart_cooldown)"
+    return 1
+  fi
+  # Suites that run the whole tick turn the live probes off so a test can never
+  # stop a real process; the real restart honours that (a test's fake runs).
+  if [ "${HEALTH_PROBES:-on}" = off ] && [ "$FSEVENTSD_RESTART_CMD" = "sudo -n /usr/bin/killall fseventsd" ]; then
+    echo "mac-cleanup:   fseventsd ${1}G: live probes are off, the real restart is not run (verdict=fseventsd_restart_probes_off)"
+    return 1
+  fi
+  if [ "${2:-0}" = 1 ]; then
+    echo "mac-cleanup:   fseventsd ${1}G is over ${FSEVENTSD_RESTART_GB}G: would restart it (dry run) (verdict=fseventsd_restart_dry)"
+    return 1
+  fi
+  local out rc=0
+  out=$($FSEVENTSD_RESTART_CMD 2>&1) || rc=$?
+  if [ "$rc" = 0 ]; then
+    state_put "$STATE_DIR/state" "fseventsd_restarted_at=$now"
+    sleep "${AMUX_CLEANUP_FSEVENTSD_RESTART_SETTLE_S:-3}"
+    local after; after=$($FSEVENTSD_CMD 2>/dev/null); after=${after%% *}
+    echo "mac-cleanup:   fseventsd held ${1}G (over ${FSEVENTSD_RESTART_GB}G): restarted it, launchd brought it back at ${after:-?}G (verdict=fseventsd_restarted measured=true)"
+    return 0
+  fi
+  if printf '%s' "$out" | grep -qi 'password\|sudo\|not allowed\|a terminal is required'; then
+    FSE_RESTART_NEEDS_SUDOERS=1
+    echo "mac-cleanup:   fseventsd ${1}G is over ${FSEVENTSD_RESTART_GB}G but the tick may not restart it: sudo refused. One line from the owner lets it (sudo visudo -f /etc/sudoers.d/amux-fseventsd): $FSEVENTSD_SUDOERS_LINE (verdict=fseventsd_restart_needs_sudoers)"
+  else
+    echo "mac-cleanup:   fseventsd ${1}G: restart failed rc=$rc: ${out:0:200} (verdict=fseventsd_restart_failed)"
+  fi
+  return 1
+}
+
 # Footprint strings from `top` ("1296M", "27G", "512K") into GB.
 to_gb() { # <top-mem-string>
   awk -v v="$1" 'BEGIN{
@@ -983,18 +1059,42 @@ find_cargo_targets() { # <colon-roots> <maxdepth> <budget_s>
 churn_fswatch() { # <seconds>: every path FSEvents reports under CHURN_SAMPLE_ROOTS
   local -a roots
   IFS=':' read -r -a roots <<< "$CHURN_SAMPLE_ROOTS"
-  { perl -e 'alarm shift; exec @ARGV' "$1" "$CHURN_FSWATCH" -r -m fsevents_monitor ${roots[@]+"${roots[@]}"} 2>/dev/null; } 2>/dev/null || true
+  # Stopped with SIGINT, not SIGALRM: fswatch writes through a block buffer when
+  # its output is not a terminal, and only a clean exit flushes it, so an alarm
+  # dropped the tail of every sample.
+  "$CHURN_FSWATCH" -r -m fsevents_monitor ${roots[@]+"${roots[@]}"} 2>/dev/null &
+  local p=$!
+  sleep "$1"; kill -INT "$p" 2>/dev/null; wait "$p" 2>/dev/null || true
 }
 
 # Print "<count> <dir>" for the directories with at least <min_events> FSEvents in
 # a <seconds> sample, grouped by the changed path's parent, busiest first, at most
 # three. Same contract as churn_census; a sample always covers every root, so it
-# sets CHURN_COMPLETE=yes.
+# sets CHURN_COMPLETE=yes. With the control on it also sets CHURN_DELIVERED to
+# yes or no: whether fseventsd delivered any of the control files written during
+# the sample. no means the empty or short list is fseventsd's silence, not a
+# quiet disk. The control's own events are not counted.
 churn_sample() { # <seconds> <min_events>
-  CHURN_COMPLETE=yes
-  $CHURN_SAMPLE_CMD "$1" 2>/dev/null \
+  CHURN_COMPLETE=yes; CHURN_DELIVERED=unknown
+  local ctl="" w="" raw
+  if [ "$CHURN_CONTROL" = 1 ] || { [ "$CHURN_CONTROL" = auto ] && [ "$CHURN_SAMPLE_CMD" = churn_fswatch ]; }; then
+    ctl="$STATE_DIR/fsevents-control"; mkdir -p "$ctl" 2>/dev/null || ctl=""
+  fi
+  raw=$(mktemp "${TMPDIR:-/tmp}/churn-raw.XXXXXX")
+  if [ -n "$ctl" ]; then
+    ( sleep 2; i=0; while [ "$i" -lt "$CHURN_CONTROL_N" ]; do echo "$i" > "$ctl/c$i"; i=$((i+1)); done ) &
+    w=$!
+  fi
+  CHURN_CONTROL_DIR="$ctl" $CHURN_SAMPLE_CMD "$1" > "$raw" 2>/dev/null
+  [ -n "$w" ] && wait "$w" 2>/dev/null
+  if [ -n "$ctl" ]; then
+    if grep -qF "$ctl/" "$raw"; then CHURN_DELIVERED=yes; else CHURN_DELIVERED=no; fi
+    rm -rf -- "${ctl:?}"
+  fi
+  { grep -vF "${ctl:-/nonexistent-churn-control}/" "$raw" || true; } \
     | awk '{ sub(/\/[^\/]*$/, ""); if ($0 != "") c[$0]++ } END { for (k in c) print c[k], k }' \
     | awk -v m="$2" '$1 >= m' | sort -rn | head -3
+  rm -f -- "$raw"
 }
 
 churn_census() { # <colon-roots> <minutes> <budget_s> <min_files>
@@ -1197,6 +1297,14 @@ reap_test_orphans() { # <dry:0|1>
     case "$args" in
       *"/pytest-of-"*) ;;
       *"cargo test"*|*"cargo nextest"*|*/target/debug/deps/*|*/target/release/deps/*) ;;
+      # A browser an amux server launched for a THROWAWAY home (a test or probe
+      # server under a temp amux-*/home). Browsers outlive their server on
+      # purpose (9ef5d12fe) so a restart can adopt them, but a temp home's
+      # server never comes back. CPU RCA 20261027-122513: four Chromes from a
+      # failed reaper probe sat 14.5h, one spawning renderers at ~140% CPU.
+      # The owner's real profiles live under ~/.amux/playwright-auth and have
+      # no /home/ component, so they cannot match.
+      *"--user-data-dir="*"/amux-"*"/home/playwright-auth/profiles/"*) ;;
       *) continue ;;
     esac
     s=$(etime_secs "$et"); case "$s" in ''|*[!0-9]*) continue ;; esac
@@ -1211,7 +1319,7 @@ reap_test_orphans() { # <dry:0|1>
     printf '%s\tstopped\t%s\t%s\t%s\n' "$(date '+%F %T')" "$pid" "$et" "${args:0:300}" >> "$STATE_DIR/test-orphans.log"
   done < <($ORPHAN_PS_CMD 2>/dev/null)
   TEST_ORPHANS_STOPPED=$stopped
-  echo "mac-cleanup: leftover test processes (ppid 1, pytest temp dir or cargo test / test binary, over ${TEST_ORPHAN_MIN}m): found ${found}, stopped ${stopped}$( [ "$DRY" = 1 ] && [ "$found" -gt 0 ] && echo " (dry run)")"
+  echo "mac-cleanup: leftover test processes (ppid 1, pytest temp dir, cargo test / test binary or a temp-home browser, over ${TEST_ORPHAN_MIN}m): found ${found}, stopped ${stopped}$( [ "$DRY" = 1 ] && [ "$found" -gt 0 ] && echo " (dry run)")"
   [ -z "$ex" ] || echo "mac-cleanup:   e.g. $ex (full list in $STATE_DIR/test-orphans.log)"
 }
 
@@ -1302,6 +1410,41 @@ check_limits() {
   echo "mac-cleanup: limits: open files ${f}/${mf}, user processes ${p}/${mp}, inodes ${ip}% used, zombies ${z}$( [ -n "$zname" ] && echo " (most under $zname pid $zpid: $zn)")$( [ -z "$out" ] && echo ", none at a limit" || echo ", $(printf '%s\n' "$out" | grep -c .) constraint(s)")"
 }
 
+# Reports of a fault signal the process sent ITSELF, not a fault: the crashing
+# thread called kill() (a __kill frame) with no signal handler on the stack
+# (no _sigtramp), for SIGSEGV, SIGBUS, SIGILL or SIGFPE, and macOS says the
+# process raised it. Mac crashes RCA 20261026-225543: "bash crashed 14 times"
+# was a test fixture, `kill -SEGV $$` in a fake psql that a lane's test suite
+# runs (customers/tubescience/dropin/tests/test_tspg_conn_retry.py, "crash"
+# mode), once per run, in each of its worktrees. A real fault is
+# EXC_BAD_ACCESS, and a handler re-raising one carries _sigtramp, so neither
+# is matched. A report without thread frames is NOT matched: no evidence, it
+# stays a crash. Prints one report name per line.
+crash_simulated() { # <dir>
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, os, sys, time
+d = sys.argv[1]
+cut = time.time() - 2 * 86400
+for n in os.listdir(d):
+    p = os.path.join(d, n)
+    if not n.endswith(".ips") or not os.path.isfile(p) or os.stat(p).st_mtime < cut:
+        continue
+    try:
+        b = json.loads(open(p, errors="replace").read().split("\n", 1)[1])
+    except Exception:
+        continue
+    if (b.get("exception") or {}).get("signal") not in ("SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE"):
+        continue
+    t = b.get("termination") or {}
+    if t.get("byPid") is None or t.get("byPid") != b.get("pid"):
+        continue
+    th = [x for x in b.get("threads") or [] if x.get("triggered")]
+    syms = [f.get("symbol") or "" for f in (th[0].get("frames") or [])] if th else []
+    if "__kill" in syms and not any("sigtramp" in s for s in syms):
+        print(n)
+PY
+}
+
 # Crash counts per app over the last <minutes>, as "<count> <app>" lines, most
 # first. A report's crash time is the EARLIER of the stamp macOS puts in its
 # name (-YYYY-MM-DD-HHMMSS, local) and its mtime: macOS rewrites a report long
@@ -1312,10 +1455,13 @@ check_limits() {
 crash_counts() { # <dir> <minutes> [app]
   python3 - "$1" "$2" "${3:-}" <<'PY' 2>/dev/null
 import collections, os, re, sys, time
+SKIP = set(os.environ.get("CRASH_SKIP", "").split())
 d, mins, only = sys.argv[1], float(sys.argv[2]), sys.argv[3]
 cut = time.time() - mins * 60
 c = collections.Counter()
 for n in os.listdir(d):
+    if n in SKIP:
+        continue
     p = os.path.join(d, n)
     if not os.path.isfile(p):
         continue
@@ -1346,11 +1492,14 @@ PY
 crash_context() { # <dir> <app>
   python3 - "$1" "$2" <<'PY' 2>/dev/null
 import collections, json, os, re, sys, time
+SKIP = set(os.environ.get("CRASH_SKIP", "").split())
 d, app = sys.argv[1], sys.argv[2]
 cut = time.time() - 86400
 coal, par, sig = collections.Counter(), collections.Counter(), collections.Counter()
 n = tr = selfk = short = 0
 for name in os.listdir(d):
+    if name in SKIP:
+        continue
     if re.sub(r"[-_][0-9]{4}-[0-9]{2}-[0-9]{2}.*", "", name) != app or not name.endswith(".ips"):
         continue
     p = os.path.join(d, name)
@@ -1385,8 +1534,11 @@ PY
 crash_newest() { # <dir> <app>: epoch of the app's newest crash, dated as crash_counts dates it
   python3 - "$1" "$2" <<'PY' 2>/dev/null
 import os, re, sys, time
+SKIP = set(os.environ.get("CRASH_SKIP", "").split())
 d, only, best = sys.argv[1], sys.argv[2], 0
 for n in os.listdir(d):
+    if n in SKIP:
+        continue
     p = os.path.join(d, n)
     if not os.path.isfile(p) or re.sub(r"[-_][0-9]{4}-[0-9]{2}-[0-9]{2}.*", "", n) != only:
         continue
@@ -1405,9 +1557,12 @@ PY
 crash_episode() { # <dir> <app> <gap minutes>: crashes since the app's last quiet gap of at least <gap>
   python3 - "$1" "$2" "$3" <<'PY' 2>/dev/null
 import os, re, sys, time
+SKIP = set(os.environ.get("CRASH_SKIP", "").split())
 d, only, gap = sys.argv[1], sys.argv[2], float(sys.argv[3]) * 60
 ts = []
 for n in os.listdir(d):
+    if n in SKIP:
+        continue
     p = os.path.join(d, n)
     if not os.path.isfile(p) or re.sub(r"[-_][0-9]{4}-[0-9]{2}-[0-9]{2}.*", "", n) != only:
         continue
@@ -1430,8 +1585,11 @@ PY
 crash_since() { # <dir> <app> <epoch>: the app's crashes dated after <epoch>, dated as crash_counts dates them
   python3 - "$1" "$2" "$3" <<'PY' 2>/dev/null
 import os, re, sys, time
+SKIP = set(os.environ.get("CRASH_SKIP", "").split())
 d, only, since, n_after = sys.argv[1], sys.argv[2], float(sys.argv[3]), 0
 for n in os.listdir(d):
+    if n in SKIP:
+        continue
     p = os.path.join(d, n)
     if not os.path.isfile(p) or re.sub(r"[-_][0-9]{4}-[0-9]{2}-[0-9]{2}.*", "", n) != only:
         continue
@@ -1479,6 +1637,7 @@ PY
 check_respawn_loops() {
   local rows cnt name resp rpid key esc_key esc_at n=0
   RESPAWN_LOOPS=""; RESPAWN_ESC_KEY=""
+  export CRASH_SKIP; CRASH_SKIP=$( [ -d "$CRASH_DIR" ] && crash_simulated "$CRASH_DIR" )
   rows=$($RESPAWN_CMD 2>/dev/null || true)
   while read -r cnt name; do
     [ -n "${name:-}" ] && [ "${cnt:-0}" -ge "$RESPAWN_N" ] 2>/dev/null || continue
@@ -1511,6 +1670,13 @@ check_respawn_loops() {
 check_crash_reports() { # <dry:0|1>
   local DRY=${1:-0} top name cnt pruned=0 old newest esc episode since_esc
   if [ ! -d "$CRASH_DIR" ]; then echo "mac-cleanup: crash reports: no directory at $CRASH_DIR"; return 0; fi
+  # A process that sends itself SIGSEGV with kill() did not crash (see
+  # crash_simulated): every count below leaves those reports out, and this
+  # line says how many and whose, so a test fixture never reads as a crash loop.
+  export CRASH_SKIP; CRASH_SKIP=$(crash_simulated "$CRASH_DIR")
+  if [ -n "$CRASH_SKIP" ]; then
+    echo "mac-cleanup: crash reports: $(printf '%s\n' "$CRASH_SKIP" | grep -c .) in 48h are a fault signal the process sent itself with kill(), not a crash, and are not counted ($(printf '%s\n' "$CRASH_SKIP" | sed -E 's/[-_][0-9]{4}-[0-9]{2}-[0-9]{2}.*//' | sort | uniq -c | sort -rn | awk '{printf "%s%s x%s", (NR>1 ? ", " : ""), $2, $1}')) (verdict=crash_reports_self_signaled)"
+  fi
   # The app name is the file name up to the "-YYYY-MM-DD" stamp macOS appends.
   top=$(crash_counts "$CRASH_DIR" 1440 | head -3)
   local recent
@@ -2892,7 +3058,7 @@ reap_lane_tmp() { # <dry:0|1>
 }
 
 reap_user_tmp() { # <dry:0|1>
-  local dry=$1 root="${USER_TMP_ROOT%/}" d b n=0 kb=0 k inuse
+  local dry=$1 root="${USER_TMP_ROOT%/}" d b n=0 kb=0 k inuse nr=0 krs=0 nlive=0 capped=0 pid lk max=${USER_TMP_MAX:-3000}
   [ -d "$root" ] || { echo "mac-cleanup: user tmp: no $root"; return 0; }
   # Resolved here, not only at the top: the suites run this function on its own.
   local raw lsof_bin=${LSOF_BIN:-${AMUX_CLEANUP_LSOF_BIN:-$(command -v lsof 2>/dev/null || echo /usr/sbin/lsof)}}
@@ -2902,18 +3068,35 @@ reap_user_tmp() { # <dry:0|1>
     echo "mac-cleanup: user tmp: WARN in-use directories UNMEASURED ($lsof_bin gave nothing), reaped nothing this tick (verdict=user_tmp_cwd_unmeasured)"
     return 0
   fi
-  inuse=$(printf '%s\n' "$raw" | grep -oE '/tmp\.[A-Za-z0-9]+' | sort -u)
+  inuse=$(printf '%s\n' "$raw" | grep -oE '/\.?tmp[.A-Za-z0-9]+' | sort -u)
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     b=${d##*/}
     printf '%s\n' "$inuse" | grep -qx "/$b" && continue
+    if [ "$((n + nr))" -ge "$max" ]; then capped=1; break; fi
+    case $b in
+      .tmp*)
+        # A test still running holds its store: keep the dir while that pid lives.
+        pid=
+        for lk in "$d"/*.holder-lock; do
+          [ -f "$lk" ] || continue
+          pid=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$lk" 2>/dev/null | head -1)
+          [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && break
+          pid=
+        done
+        if [ -n "$pid" ]; then nlive=$((nlive+1)); continue; fi
+        k=$(du -sk "$d" 2>/dev/null | cut -f1)
+        if [ "$dry" = 1 ]; then nr=$((nr+1)); krs=$((krs+${k:-0})); continue; fi
+        rm -rf -- "${root:?}/${b:?}" 2>/dev/null && { nr=$((nr+1)); krs=$((krs+${k:-0})); }
+        continue ;;
+    esac
     k=$(du -sk "$d" 2>/dev/null | cut -f1)
     if [ "$dry" = 1 ]; then n=$((n+1)); kb=$((kb+${k:-0})); continue; fi
     rm -rf -- "${root:?}/${b:?}" 2>/dev/null && { n=$((n+1)); kb=$((kb+${k:-0})); }
   done <<EOF
-$(find "$root" -maxdepth 1 -name 'tmp.*' -type d -mmin +"$USER_TMP_IDLE_MIN" 2>/dev/null)
+$(find "$root" -maxdepth 1 \( -name 'tmp.*' -o -name '.tmp*' \) -type d -mmin +"$USER_TMP_IDLE_MIN" 2>/dev/null)
 EOF
-  echo "mac-cleanup: user tmp: $([ "$dry" = 1 ] && echo 'would remove' || echo removed) $n tmp.* dir(s) idle over ${USER_TMP_IDLE_MIN} min, $(awk -v k="$kb" 'BEGIN{printf "%.1fG", k/1048576}') ($root)"
+  echo "mac-cleanup: user tmp: $([ "$dry" = 1 ] && echo 'would remove' || echo removed) $n tmp.* dir(s) idle over ${USER_TMP_IDLE_MIN} min, $(awk -v k="$kb" 'BEGIN{printf "%.1fG", k/1048576}'), and $nr .tmp* test dir(s), $(awk -v k="$krs" 'BEGIN{printf "%.1fG", k/1048576}') ($root)$([ "$nlive" -gt 0 ] && echo "; kept $nlive whose holder-lock pid is alive")$([ "$capped" = 1 ] && echo "; capped at $max this tick, the rest next tick") (verdict=user_tmp_reaped)"
 }
 
 # Over <cap> of build cache in docker context <ctx>, prune cache unused for
@@ -3266,7 +3449,14 @@ done
 # servers, CI polls). They persist after the session that created them ends, and
 # occasionally hold busy-loops that burn a full core. Safe to kill: they are
 # abandoned scaffolding, not user work.
-stale_killed=0; stale_found=0
+#
+# ONLY ORPHANS (2026-10-28). This arm used to kill every shell past the age
+# floor, so a live lane's long-running background loop died at the first :57
+# tick after 6h: mxp-gs12 lost fallback-alarm (6h39m), restore-watch (6h05m) and
+# export-watch (06:29:07, "killed stale shell-snapshot pid=57216") to it. A shell
+# whose parent is still its claude process is that session's work; only a shell
+# reparented to pid 1 has outlived its session. An unreadable parent is kept.
+stale_killed=0; stale_found=0; stale_live=0
 stale_cutoff_s=$((STALE_SHELL_SNAPSHOT_H * 3600))
 while IFS= read -r line; do
   [ -n "$line" ] || continue
@@ -3283,6 +3473,12 @@ while IFS= read -r line; do
   case "$elapsed_s" in ''|*[!0-9]*) continue ;; esac
   [ "$elapsed_s" -ge "$stale_cutoff_s" ] || continue
   stale_found=$((stale_found+1))
+  ppid=$($STALE_PPID_CMD "$pid" 2>/dev/null | tr -d ' ')
+  if [ "$ppid" != 1 ]; then
+    stale_live=$((stale_live+1))
+    echo "mac-cleanup: kept shell-snapshot pid=$pid age=${elapsed_raw} parent=${ppid:-unreadable}: its session is alive (verdict=stale_shell_kept_live_session)"
+    continue
+  fi
   cpu=$(ps -o pcpu= -p "$pid" 2>/dev/null | tr -d ' ')
   if [ "$DRY" = "1" ]; then
     echo "mac-cleanup: stale shell-snapshot pid=$pid age=${elapsed_raw} cpu=${cpu}% would be killed (dry run)"
@@ -3293,7 +3489,7 @@ while IFS= read -r line; do
 done <<EOF
 $($STALE_PS_CMD 2>/dev/null | grep 'shell-snapshots/snapshot-bash' | grep -v grep)
 EOF
-echo "mac-cleanup: shell-snapshots found=${stale_found} killed=${stale_killed} (floor ${STALE_SHELL_SNAPSHOT_H}h)"
+echo "mac-cleanup: shell-snapshots found=${stale_found} killed=${stale_killed} kept_live=${stale_live} (floor ${STALE_SHELL_SNAPSHOT_H}h, orphans only)"
 
 # ── act: stop orphaned sqlite .backup copies of amux's databases ─────────────
 reap_orphan_sqlite_backups "$DRY"
@@ -3424,12 +3620,17 @@ if [ -n "$fse_reading" ]; then
     fse_hot=0
     echo "mac-cleanup: fseventsd ${fse_cpu:-?}% CPU after this tick's own deletions, ${fse_pre_cpu:-?}% before them: the burst is this tick's, not a constraint (verdict=fseventsd_burst_self_inflicted)"
   fi
+  if [ "$fse_hot" = 1 ] && fseventsd_try_restart "$fse_gb" "$DRY"; then
+    fse_hot=0
+    reported=$((reported+1))
+  fi
   if [ "$fse_hot" = 1 ]; then
     echo "mac-cleanup: fseventsd holds ${fse_gb}G at ${fse_cpu:-?}% CPU and is SIP-protected; the feed and the owner's remedy follow"
     # In this shell, not $(...): churn_census sets CHURN_COMPLETE, which a subshell would lose.
     churn_f=$(mktemp "${TMPDIR:-/tmp}/churn-out.XXXXXX")
     churn_unit="files modified in ${CHURN_MIN}m"; churn_top_unit="files in ${CHURN_MIN}m"; churn_floor=$CHURN_FILES
-    if ! tick_arm "fseventsd churn census" CHURN_BUDGET_S; then CHURN_COMPLETE=no; : > "$churn_f"
+    churn_measured=1
+    if ! tick_arm "fseventsd churn census" CHURN_BUDGET_S; then CHURN_COMPLETE=no; churn_measured=0; : > "$churn_f"
     elif [ -n "$CHURN_SAMPLE_CMD" ]; then
       churn_s=$CHURN_SAMPLE_S; [ "$churn_s" -le "$CHURN_BUDGET_S" ] 2>/dev/null || churn_s=$CHURN_BUDGET_S
       # The census floor is per CHURN_MIN minutes; scale it to the sample window.
@@ -3441,9 +3642,23 @@ if [ -n "$fse_reading" ]; then
       churn_census "$CHURN_ROOTS" "$CHURN_MIN" "$CHURN_BUDGET_S" "$CHURN_FILES" > "$churn_f"
     fi
     churn=$(cat "$churn_f"); rm -f -- "${churn_f:?}"
-    if [ -n "$churn" ]; then
+    if [ "${CHURN_DELIVERED:-unknown}" = no ]; then
+      # The sample cannot see the feed: fseventsd delivered none of the control
+      # files, so whatever it did report is a fraction of the churn and an empty
+      # list is its silence. The daemon is wedged or far behind either way, and
+      # a restart is the remedy that needs no measurement of the feed.
+      fse_top="not measured: fseventsd delivered 0 of ${CHURN_CONTROL_N} control files written during the ${churn_s}s sample, so it is wedged or far behind and the sample cannot see the feed"
+      echo "mac-cleanup:   fseventsd feed: $fse_top (verdict=fseventsd_not_delivering)"
+      fse_spin=1; fse_wedged=1
+    elif [ -n "$churn" ]; then
       printf '%s\n' "$churn" | while read -r n d; do echo "mac-cleanup:   fseventsd feed: $n $churn_unit under $d"; done
       fse_top=$(printf '%s\n' "$churn" | head -1 | { read -r n d; echo "$n $churn_top_unit under $d"; })
+    elif [ "$churn_measured" = 0 ]; then
+      # Nothing was sampled, so there is no "no directory over N" to report: that
+      # line used to print here and reached the escalation as the measured feed
+      # (Mac fseventsd RCA 20261026-130357, with the census skipped out of time).
+      fse_top="not measured: the churn census was skipped because the tick ran out of time"
+      echo "mac-cleanup:   fseventsd feed: $fse_top (verdict=fseventsd_feed_unmeasured)"
     elif [ -n "$CHURN_SAMPLE_CMD" ]; then
       fse_top="no directory over ${churn_floor} ${churn_unit} (FSEvents sample, deletions included)"
       echo "mac-cleanup:   fseventsd feed: $fse_top"
@@ -3470,12 +3685,16 @@ if [ -n "$fse_reading" ]; then
        && [ $(( $(date +%s) - ${fse_esc_at:-0} )) -lt $(( FSEVENTSD_SPIN_REMIND_H * 3600 )) ] \
        && { [ "${fse_spin:-0}" = 1 ] || [ "$fse_feed_n" -lt $(( churn_floor * FSEVENTSD_CHURN_NEW_X )) ]; }; then
       echo "mac-cleanup:   fseventsd pid $fse_pid (${fse_gb}G) is the process the last fseventsd escalation named $(( ($(date +%s) - fse_esc_at) / 60 ))m ago and it is still hot$( [ "${fse_spin:-0}" = 1 ] || echo ", with churn under ${FSEVENTSD_CHURN_NEW_X}x the floor"): the owner's restart is pending (sudo killall fseventsd, which also returns its memory); not escalated again until a new pid, churn over ${FSEVENTSD_CHURN_NEW_X}x the floor, or ${FSEVENTSD_SPIN_REMIND_H}h (verdict=fseventsd_spin_owner_pending)"
-      reported=$((reported+1))
+      reported=$((reported+1)); fse_owner_pending=1
+    elif [ "${fse_wedged:-0}" = 1 ]; then
+      fse_verdict="fseventsd at ${fse_cpu:-?}% CPU holding ${fse_gb}G is not delivering file events ($fse_top): the owner restarts it with sudo killall fseventsd (launchd brings it back, no reboot), then the next tick can measure the feed"
+      [ "${FSE_RESTART_NEEDS_SUDOERS:-0}" = 1 ] && fse_verdict="$fse_verdict. The tick restarts it itself once the owner adds: $FSEVENTSD_SUDOERS_LINE"
     elif [ "${fse_spin:-0}" = 1 ]; then
       fse_verdict="fseventsd at ${fse_cpu:-?}% CPU (over ${FSEVENTSD_CPU_PCT}%) holding ${fse_gb}G with no file churn to feed it ($fse_top): a stuck fseventsd thread, not a writer; the owner restarts it with sudo killall fseventsd (launchd brings it back, no reboot)"
     else
       echo "mac-cleanup:   fseventsd remedy: stop the churn, then the owner runs sudo killall fseventsd to return its memory (launchd restarts it; no reboot)"
       fse_verdict="fseventsd holds ${fse_gb}G at ${fse_cpu:-?}% CPU (over ${FSEVENTSD_REBOOT_GB}G or ${FSEVENTSD_CPU_PCT}%); stop the file churn feeding it, then sudo killall fseventsd returns its memory (launchd restarts it, no reboot). Top feed: $fse_top"
+      [ "${FSE_RESTART_NEEDS_SUDOERS:-0}" = 1 ] && fse_verdict="$fse_verdict. The tick restarts it itself once the owner adds: $FSEVENTSD_SUDOERS_LINE"
     fi
   else
     echo "mac-cleanup: fseventsd ${fse_gb}G ${fse_cpu:-?}% CPU, under the ${FSEVENTSD_REBOOT_GB}G/${FSEVENTSD_CPU_PCT}% thresholds"
@@ -3552,6 +3771,22 @@ if printf '%s\n' "$verdicts" | grep -q '^disk '; then
     esac
   fi
 fi
+# A cargo test binary (target/<profile>/deps/<crate>-<hash>) runs one test
+# thread per core unless RUST_TEST_THREADS caps it, so one plain `cargo test`
+# takes all 28 cores of this shared Mac (2026-10-28: amux at 1088% CPU from one
+# test binary). The repo's .cargo/config.toml sets the cap; this names a binary
+# running without one, so the next escalation shows the cause, not just a pid.
+test_binary_note() { # pid command-path
+  case "$2" in */deps/*-[0-9a-f][0-9a-f][0-9a-f]*) ;; *) return 0 ;; esac
+  local thr cap
+  thr=$(ps -M -p "$1" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+  cap=$(ps -E -o command= -p "$1" 2>/dev/null | grep -o 'RUST_TEST_THREADS=[0-9]*' | head -1)
+  if [ -n "$cap" ]; then
+    echo " [cargo test binary, $thr threads, $cap]"
+  else
+    echo " [cargo test binary, $thr threads, RUST_TEST_THREADS unset: one test thread per core (verdict=cpu_test_threads_unbounded)]"
+  fi
+}
 escalated=0
 if [ -z "$verdicts" ]; then
   echo "mac-cleanup: constraints none"
@@ -3571,7 +3806,7 @@ else
       echo "- $mem pid=$pid $cmd — $(owner_label_for_pid "$pid"), lane: $(lane_for_pid "$pid" "$pmap")"; done
     echo; echo "## Top CPU (with owner)"
     ps -Ao pid=,pcpu=,comm= 2>/dev/null | sort -k2 -rn | head -10 | while read -r pid cpu cmd; do
-      echo "- ${cpu}% pid=$pid $(basename "$cmd") — $(owner_label_for_pid "$pid"), lane: $(lane_for_pid "$pid" "$pmap")"; done
+      echo "- ${cpu}% pid=$pid $(basename "$cmd") — $(owner_label_for_pid "$pid"), lane: $(lane_for_pid "$pid" "$pmap")$(test_binary_note "$pid" "$cmd")"; done
     if printf '%s\n' "$verdicts" | grep -q '^disk '; then
       echo; echo "## Files over 500M written in the last hour (the writers)"
       # Open files first: wherever they live, and only seconds of the budget.
@@ -3608,6 +3843,11 @@ else
   while IFS= read -r v; do
     cls=${v%% *}
     if [ "$DRY" = "1" ]; then echo "mac-cleanup: constraint $v — would escalate (dry run)"; continue; fi
+    if [ "$cls" = memory ] && [ "${fse_owner_pending:-0}" = 1 ] \
+       && awk -v g="${fse_gb:-0}" -v t="$MEM_FSE_HOLDER_GB" 'BEGIN{exit !(g+0 >= t+0)}'; then
+      echo "mac-cleanup: constraint $v — not escalated: macOS fseventsd holds ${fse_gb}G and its restart is already with the owner (sudo killall fseventsd, or the sudoers line that lets this tick do it); escalating memory again names the same holder and the same step (verdict=memory_owner_pending_fseventsd)"
+      continue
+    fi
     if ! escalation_due "$STATE" "$cls" "$now" "$ESCALATE_COOLDOWN_H"; then
       echo "mac-cleanup: constraint $v — escalation suppressed (last $cls escalation under ${ESCALATE_COOLDOWN_H}h ago)"; continue
     fi
@@ -3617,7 +3857,10 @@ else
     page=-; pcard=-
     if [ -n "$plast" ]; then
       page=$(awk -v a="$now" -v b="$plast" 'BEGIN{printf "%.1f", (a-b)/3600}')
-      pcard=$(tr -d '[:space:]' < "$STATE_DIR/rca/$pstamp.$cls.card" 2>/dev/null); [ -n "$pcard" ] || pcard="none written (the previous turn did not record one)"
+      # Squeeze, not delete: a lane with no board writes its card as a sentence
+      # (none:board_off. ...), and deleting whitespace quoted it back as one
+      # unreadable word (memory RCA 20261029-063250).
+      pcard=$(tr -s '[:space:]' ' ' < "$STATE_DIR/rca/$pstamp.$cls.card" 2>/dev/null | sed 's/^ //; s/ $//'); [ -n "$pcard" ] || pcard="none written (the previous turn did not record one)"
       [ -n "$psnap" ] || psnap="not recorded"
     fi
     escalation_message "$cls" "$v" "$bundle" "$cardf" "$nowsnap" "$page" "$pcard" "$psnap" > "$msg"

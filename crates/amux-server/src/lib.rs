@@ -4,9 +4,11 @@
 //! Module layout mirrors docs/rust-rebuild-plan.md §Crate structure. Modules
 //! land phase by phase; each `pub mod` line appears when its RR item starts.
 
+pub mod test_tempdirs;
 pub mod highlight;
 pub mod api;
 pub mod backend;
+pub mod bridge;
 mod cargo_target_guard;
 pub mod config;
 mod fanout_retirement;
@@ -16,7 +18,6 @@ pub mod fanout_workspace;
 pub mod legacy_port;
 pub mod listener_handoff;
 pub mod log_dedupe;
-pub mod project_execution;
 
 /// Should this process exec itself when its binary changes on disk? (AEAB-52)
 ///
@@ -163,14 +164,35 @@ pub fn build_hash() -> String {
         .clone()
 }
 
+/// Stack for every runtime worker thread. Tokio's default is 2 MiB, and a debug
+/// build's board-drive pass overflowed it on `amux-maintenance` once tmux calls
+/// went over the control connection (3126420d3): "thread 'amux-maintenance' has
+/// overflowed its stack", aborting the server in the harness-recovery pool and
+/// conversation-recycle scenarios. `AMUX_THREAD_STACK_MB` overrides it.
+fn worker_stack_bytes() -> usize {
+    std::env::var("AMUX_THREAD_STACK_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb >= 2)
+        .unwrap_or(8)
+        * 1024
+        * 1024
+}
+
 pub fn run() {
+    let stack = worker_stack_bytes();
     let maintenance = tokio::runtime::Builder::new_multi_thread()
         .thread_name("amux-maintenance")
+        .thread_stack_size(stack)
         .enable_all()
         .build()
         .expect("maintenance runtime");
     runtime_jobs::executor::install(maintenance.handle().clone());
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(stack)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     rt.block_on(async_main());
 }
 
@@ -347,6 +369,16 @@ async fn async_main() {
     tracing::info!(port = cfg.port, db = %cfg.db_path.display(), pid = std::process::id(),
         commit = env!("AMUX_BUILD_COMMIT_FULL"), build = %running_build,
         self_adopted = std::env::var("AMUX_SELF_ADOPTED").is_ok(), "starting amux-rust");
+    {
+        let dir = crate::api::session_verbs::tmux_fleet_shim_dir();
+        match crate::api::session_verbs::refresh_fleet_shims(&dir) {
+            Ok(true) => tracing::info!(dir = %dir.display(), measured = true, n_considered = 3, verdict = "fleet_shims_refreshed", "installed fleet shims match this build"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(dir = %dir.display(), error = %e, measured = false, n_considered = 0, verdict = "fleet_shims_refresh_failed", "installed fleet shims could not be refreshed; workers keep the old copies until a launch rewrites them"),
+        }
+    }
+    tracing::info!(stack_bytes = worker_stack_bytes(), measured = true, n_considered = 2,
+        verdict = "runtime_stack_configured", "runtime worker threads use this stack size");
     // Resolve the dashboard source now, so an unreadable AMUX_DASHBOARD_DIR
     // fails at startup instead of on the first page load, and say which
     // bytes this process serves. Production never sets it (embedded).
@@ -365,7 +397,7 @@ async fn async_main() {
             .any(|root| home.starts_with(root))
     {
         tracing::warn!(home=%home.display(),db=%cfg.db_path.display(),measured=true,n_considered=1,
-            verdict="volatile_amux_home","Amux state is under a temporary directory; project history and worker metadata may disappear while the advertised server URL remains configured");
+            verdict="volatile_amux_home","Amux state is under a temporary directory; board history and worker metadata may disappear while the advertised server URL remains configured");
     }
 
     // WAS THIS RESTART ANNOUNCED? (AF-176)
@@ -566,6 +598,9 @@ async fn async_main() {
             tracing::info!(resumed = n, measured = true, "interrupted-start resume pass complete");
             let r = crate::api::session_verbs::resume_interrupted_recycles(&state).await;
             tracing::info!(resumed = r, measured = true, "interrupted-recycle resume pass complete");
+            // A release that changes the instructions every worker gets
+            // reaches the running ones too, not only their next start.
+            crate::api::session_verbs::refresh_changed_worker_contexts(&state).await;
         });
     }
     // Chat workers have no tmux to outlive this exec(): report turns it cut
@@ -595,28 +630,6 @@ async fn async_main() {
             }
         });
     }
-    // Project lifecycle driver. Projects have their own contract, retained
-    // evidence, verifier and main-integration gates; tying this to the legacy
-    // board sweeper meant a preview server could either stay reachable with
-    // board-drive disabled, or verify project work, but not both. Keep the
-    // modern project harness accountable on its own cadence.
-    {
-        let state = state.clone();
-        let secs = cfg
-            .env
-            .get("AMUX_PROJECT_EXECUTION_SECS")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(10);
-        drop(runtime_jobs::spawn_periodic(
-            jobs::ids::PROJECT_EXECUTION,
-            secs,
-            move || {
-                let state = state.clone();
-                async move { crate::project_execution::driver::tick(&state).await }
-            },
-        ));
-    }
-
     // Automatic accountability (AMUX-2990, Ethan: "the accountability shit needs
     // to be automatic"). Sweeps for lanes with human messages but no board card
     // and steers each to open one — server-side, so it reaches any group. One
@@ -668,6 +681,8 @@ async fn async_main() {
     drop(runtime_jobs::heartbeat::spawn(store.clone()));
     drop(runtime_jobs::storage::spawn(state.clone()));
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
+    // Storage tiers: watched folders between the internal disk and a cold drive.
+    drop(crate::api::tiering::spawn(state.clone()));
     drop(runtime_jobs::host_metrics::spawn(state.clone()));
     drop(runtime_jobs::trace_archive::spawn(state.clone()));
     drop(runtime_jobs::host_guard::spawn());
@@ -677,11 +692,16 @@ async fn async_main() {
     // Record tab transcripts (AMUX-4624): the folder is the work list, so a
     // restart or a late model install resolves on the next tick.
     drop(runtime_jobs::recordings_transcribe::spawn(state.clone()));
+    drop(runtime_jobs::recordings_live::spawn(state.clone()));
     drop(runtime_jobs::tailnet_watch::spawn());
     // Telegram long-poll (idles with no error when TELEGRAM_BOT_TOKEN is
     // unset — see runtime_jobs::telegram_poll's module doc for why polling,
     // not a webhook).
     drop(runtime_jobs::telegram_poll::spawn(state.clone()));
+    // The chat bridge (bridge/mod.rs): replies back to the chat, and Discord's
+    // channel reads. WhatsApp and Slack arrive by webhook (api/bridge.rs).
+    drop(bridge::spawn(state.clone()));
+    drop(bridge::adapters::spawn_discord(state.clone()));
     // Auto-relay: send session replies back to Telegram when linked sessions respond
     // to Telegram-routed messages. Works for all workers without per-session configuration.
     drop(runtime_jobs::telegram_relay::spawn(state.clone()));
@@ -748,6 +768,7 @@ async fn async_main() {
     drop(runtime_jobs::browser_login_sync::spawn());
     drop(runtime_jobs::connector_maintenance::spawn());
     drop(runtime_jobs::social_metrics::spawn(state.clone()));
+    drop(runtime_jobs::social_publish::spawn(state.clone()));
     drop(runtime_jobs::episodes::spawn(state.clone()));
     // CDC poller (migration 0061): tails board_change_log so the catch-up
     // endpoint (/api/board/changes) stays current.
@@ -1201,7 +1222,7 @@ async fn async_main() {
             .unwrap_or(0);
         if saved > 0 {
             tracing::info!(saved, verdict = "retired_proxies_data_present",
-                "proxies: the Proxies tab is retired; its saved rows are kept on disk and no longer read (use Pages)");
+                "proxies: the Proxies tab is retired; its saved rows are kept on disk and no longer read (use the Apps tab)");
         }
     });
 

@@ -83,11 +83,18 @@ struct WebView: UIViewRepresentable {
         // Map > Location history talks to the native recorder through this
         // bridge (AMUX-5458): status, enable, disable, upload.
         config.userContentController.add(context.coordinator, name: "amuxLocation")
+        // The Record tab drives the native recorder, which keeps recording
+        // while the app is hidden (RecorderBridge.swift).
+        config.userContentController.add(context.coordinator, name: "amuxRecorder")
+        // Messages notifications (NotifyBridge.swift).
+        config.userContentController.add(context.coordinator, name: "amuxNotify")
         // Teleprompter selfie takes go to Photos through this bridge (AA-39).
         config.userContentController.addScriptMessageHandler(MediaBridge(), contentWorld: .page, name: "amuxMedia")
         config.userContentController.addUserScript(script)
 
         context.coordinator.requestedURL = url
+        RecorderBridge.shared.setUp(webView: webView)
+        NotifyBridge.shared.setUp(webView: webView)
         webView.load(URLRequest(url: url))
         context.coordinator.armWatchdog(host: url.host)
         logger.info("Loading URL: \(url.absoluteString)")
@@ -202,6 +209,14 @@ struct WebView: UIViewRepresentable {
 
         // JS console → os_log bridge
         func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+            if message.name == "amuxNotify" {
+                NotifyBridge.shared.handle(message.body as? [String: Any] ?? [:])
+                return
+            }
+            if message.name == "amuxRecorder" {
+                RecorderBridge.shared.handle(message.body as? [String: Any] ?? [:])
+                return
+            }
             if message.name == "amuxLocation" {
                 let op = (message.body as? [String: Any])?["op"] as? String ?? "status"
                 Task { @MainActor in

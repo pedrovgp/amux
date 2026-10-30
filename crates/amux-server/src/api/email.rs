@@ -55,6 +55,9 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
             "/message/{id}/attachments/{attachment_id}",
             get(message_attachment),
         )
+        // The same download with both ids in the query, for a Message-ID that
+        // carries a "/" and for the spelling a worker guesses first.
+        .route("/attachment", get(attachment_by_query))
         .route("/search", get(search))
         .route("/log", get(send_log))
         // AMUX-3510: the human approval half of the external-send gate.
@@ -73,7 +76,41 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
         // AMUX-3998: the ranked inbox + owner themes, nested here so they get the
         // same EmailCtx rather than opening a second client.
         .merge(super::email_intel::nested_routes())
+        // A path that is not here names the ones that are (NetSuite worker,
+        // 2026-10-26: "no way to fetch an email attachment, the endpoint
+        // returns 404", when the route existed under another path).
+        .route("/{*rest}", axum::routing::any(email_route_not_found))
         .layer(Extension(ctx))
+}
+
+async fn email_route_not_found(axum::extract::OriginalUri(uri): axum::extract::OriginalUri) -> Response {
+    tracing::info!(path = %uri.path(), verdict = "email_route_not_found", "an /api/email path that does not exist was asked for");
+    err(StatusCode::NOT_FOUND, json!({
+        "error": format!("no email route {}", uri.path()),
+        "routes": [
+            "GET /api/email/inbox?count=&days=&account=",
+            "GET /api/email/search?q=&days=&limit=&account=&mailbox=",
+            "GET /api/email/message/{message_id} (its attachments list carries each attachment_id)",
+            "GET /api/email/message/{message_id}/attachments/{attachment_id}?filename=&content_type=",
+            "GET /api/email/attachment?message_id=&attachment_id=&filename=&content_type= (the same, ids in the query)",
+            "POST /api/email/send", "POST /api/email/reply", "GET /api/email/log",
+        ],
+    }))
+}
+
+/// GET /api/email/attachment?message_id=&attachment_id= — [`message_attachment`]
+/// with both ids in the query.
+async fn attachment_by_query(
+    ctx: Extension<Arc<EmailCtx>>,
+    Query(mut qs): Query<HashMap<String, String>>,
+) -> Response {
+    let id = qs.remove("message_id").or_else(|| qs.remove("id")).unwrap_or_default();
+    let att = qs.remove("attachment_id").unwrap_or_default();
+    if id.trim().is_empty() || att.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, json!({"error": "message_id and attachment_id are required",
+            "hint": "GET /api/email/message/{message_id} lists the message's attachments with their attachment_id"}));
+    }
+    message_attachment(ctx, Path((id, att)), Query(qs)).await
 }
 
 // ---- shared helpers -------------------------------------------------------
@@ -2165,6 +2202,24 @@ mod tests {
             .nest("/api/email", routes_with(ctx))
             .with_state(state);
         (router, dir, registry)
+    }
+
+    /// NetSuite worker, 2026-10-26: "no way to fetch an email attachment (the
+    /// endpoint returns 404)". A wrong path now names the real ones, the ids
+    /// can travel in the query, and the catch-all does not swallow a real route.
+    #[tokio::test]
+    async fn a_wrong_email_path_names_the_attachment_routes() {
+        let home = tempfile::tempdir().unwrap();
+        let (app, _d, _r) = app_with(MockHttp::new(vec![]), home.path());
+        let (st, v) = send_req(&app, "GET", "/api/email/attachments/abc", None, &[]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(v["routes"].as_array().unwrap().iter().any(|r| r.as_str().unwrap().contains("/attachments/{attachment_id}")), "{v}");
+        let (st, v) = send_req(&app, "GET", "/api/email/attachment?message_id=x", None, &[]).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("attachment_id"));
+        // A real route still answers as itself, not as the catch-all.
+        let (_st, v) = send_req(&app, "GET", "/api/email/approval/apr_0000000000000000", None, &[]).await;
+        assert!(v.get("routes").is_none(), "{v}");
     }
 
     /// AF-540. gtm-engine measured every approval ever created: 60 total, and

@@ -29,7 +29,9 @@ class DoorToken(unittest.TestCase):
         cls.amux_port, cls.door_port = free_port(), free_port()
         home = os.path.join(cls.tmp, "home"); os.makedirs(home)
         cls.amux = subprocess.Popen([BIN], env={"HOME": home, "PATH": os.environ["PATH"], "AMUX_HOME": os.path.join(cls.tmp, "amux"),
-                                    "AMUX_RS_PORT": str(cls.amux_port), "AMUX_NO_SELF_ADOPT": "1"},
+                                    "AMUX_RS_PORT": str(cls.amux_port), "AMUX_NO_SELF_ADOPT": "1",
+                                    # The apps origin binds AMUX_RS_PORT+1, often the door port picked next.
+                                    "AMUX_APPS_PORT": "0"},
                                     stdout=open(os.path.join(cls.tmp, "amux.log"), "w"), stderr=subprocess.STDOUT)
         for _ in range(120):
             try:
@@ -125,6 +127,26 @@ class DoorToken(unittest.TestCase):
         c.request("GET", "/_door/check", headers={"Accept": "text/html", "X-Forwarded-Method": "GET", "X-Forwarded-Uri": "/"})
         r = c.getresponse(); r.read()
         self.assertEqual((r.status, r.getheader("Location")), (302, "https://cloud.example/?server=alice"))
+
+    def test_0b_a_copied_link_survives_cloud_sign_in(self):
+        # Signed out, a copied file link goes to cloud.amux.io to sign in; the door keeps
+        # where it was going and /_door/enter lands there (deep_links.rs, Ethan 2026-10-26).
+        dest = "/f/home/amux/deck%20v2.html"
+        c = http.client.HTTPConnection("127.0.0.1", self.door_port, timeout=10)
+        c.request("GET", "/_door/check", headers={"Accept": "text/html", "X-Forwarded-Method": "GET", "X-Forwarded-Uri": dest})
+        r = c.getresponse(); r.read()
+        self.assertEqual(r.status, 302)
+        self.assertTrue(r.getheader("Location").startswith("https://cloud.example/?server=alice&next="), r.getheader("Location"))
+        keep = (r.getheader("Set-Cookie") or "").split(";")[0]
+        self.assertTrue(keep.startswith("amux_door_next="), keep)
+        t = tokens.sign({"aud": self.slug, "sub": "owner@example.com", "role": "owner"}, self.secret, 60)
+        code, headers, _ = self.door(f"/_door/enter?t={t}", keep)
+        self.assertEqual((code, headers.get("Location")), (303, dest))
+        # Without it, home; and a kept destination is only ever a path on this server.
+        t = tokens.sign({"aud": self.slug, "sub": "owner@example.com", "role": "owner"}, self.secret, 60)
+        self.assertEqual(self.door(f"/_door/enter?t={t}")[1].get("Location"), "/")
+        t = tokens.sign({"aud": self.slug, "sub": "owner@example.com", "role": "owner"}, self.secret, 60)
+        self.assertEqual(self.door(f"/_door/enter?t={t}", "amux_door_next=//evil.example/x")[1].get("Location"), "/")
 
     def test_2_tokens_for_another_server_expired_or_unknown_people_are_refused(self):
         self.assertEqual(self.enter("owner@example.com", secret=tokens.new_secret())[0], 401)     # other server's key

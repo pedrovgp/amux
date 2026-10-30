@@ -401,6 +401,83 @@ fn de_present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Op
     Ok(Some(Option::<T>::deserialize(d)?))
 }
 
+/// The pass condition of one create/PATCH body, validated: `None` = not
+/// mentioned, `Some(None)` = clear, `Some(Some(cmd))` = set. Pass/fail on with
+/// no check, or a check bash cannot parse, is refused here, so no schedule can
+/// say it has a condition it does not have.
+fn pass_check_input(body: &ScheduleBody) -> Result<Option<Option<String>>, Box<Response>> {
+    if body.pass_fail == Some(0) {
+        return Ok(Some(None));
+    }
+    let required = || {
+        tracing::info!(verdict = "schedule_pass_check_refused", reason = "missing", measured = true, n_considered = 1,
+            "pass/fail turned on without a pass check");
+        err(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "pass/fail needs a pass check: a shell command that exits 0 when the schedule's work is done",
+                "code": "pass_check_required",
+                "example": "test -s ~/reports/$(date +%F).md",
+            }),
+        )
+    };
+    match &body.pass_check {
+        None if body.pass_fail == Some(1) => Err(Box::new(required())),
+        None => Ok(None),
+        Some(c) => match crate::runtime_jobs::schedule_check::validate(c.as_deref()) {
+            Ok(None) if body.pass_fail == Some(1) => Err(Box::new(required())),
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                tracing::info!(verdict = "schedule_pass_check_refused", reason = "invalid", measured = true,
+                    n_considered = 1, "{e}");
+                Err(Box::new(err(StatusCode::BAD_REQUEST, json!({ "error": e, "code": "pass_check_invalid" }))))
+            }
+        },
+    }
+}
+
+/// The wake condition of one create/PATCH body, validated like a pass check:
+/// `None` = not mentioned, `Some(None)` = clear, `Some(Some(cmd))` = set.
+fn when_input(body: &ScheduleBody) -> Result<Option<Option<String>>, Box<Response>> {
+    let Some(c) = &body.when else { return Ok(None) };
+    match crate::runtime_jobs::schedule_check::validate(c.as_deref()) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            let e = e.replace("the pass check", "the wake condition");
+            tracing::info!(verdict = "schedule_when_refused", reason = "invalid", measured = true, n_considered = 1, "{e}");
+            Err(Box::new(err(StatusCode::BAD_REQUEST, json!({ "error": e, "code": "when_invalid" }))))
+        }
+    }
+}
+
+/// A wake condition on a shell schedule would be a condition it does not
+/// have: the fire path checks `when` only before a prompt delivery.
+fn when_on_shell_refusal() -> Response {
+    tracing::info!(verdict = "schedule_when_refused", reason = "shell", measured = true, n_considered = 1,
+        "a wake condition was set on a shell schedule");
+    err(
+        StatusCode::BAD_REQUEST,
+        json!({
+            "error": "when applies to kind 'tmux' schedules; a shell schedule's command can test the condition itself",
+            "code": "when_on_shell",
+        }),
+    )
+}
+
+/// The note a create/PATCH response carries for a schedule with `when`.
+fn when_note(o: &serde_json::Map<String, Value>) -> Option<Value> {
+    let check = o.get("when_check").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty())?;
+    let once = o.get("when_once").and_then(Value::as_i64).unwrap_or(1) != 0;
+    Some(json!(format!(
+        "Each scheduled fire first runs `{check}` as the owner (up to {}s). A fire whose check fails is \
+         skipped: no prompt, no model turn, no max_runs spent, run status 'skipped'. So the cadence cost \
+         above applies only to fires whose check passes. {} Run now skips the check.",
+        crate::runtime_jobs::schedule_wake::WHEN_TIMEOUT_S,
+        if once { "when_once: the schedule disables itself after the first fire that passes and delivers." }
+        else { "when_once is off: it fires every time the check passes." }
+    )))
+}
+
 /// The lifecycle fields of one create/PATCH body, validated. Each is
 /// `None` = not mentioned, `Some(None)` = clear, `Some(Some(v))` = set.
 #[derive(Default)]
@@ -418,9 +495,9 @@ fn bounds_refusal(error: String) -> Response {
             "error": error,
             "code": "schedule_bounds_invalid",
             "accepted": {
-                "once": "YYYY-MM-DDTHH:MM (local) or RFC 3339: fire one time, then done",
-                "after": "datetime: no fire before it",
-                "until": "datetime: no fire after it; the schedule ends",
+                "once": "YYYY-MM-DDTHH:MM (local), RFC 3339, or a delay ('in 20m', '+90s', '1h30m', 'in 2 hours'; units s/m/h/d): fire one time, then done. Run times are whole minutes, so a delay rounds UP to the next minute",
+                "after": "datetime or delay: no fire before it",
+                "until": "datetime or delay: no fire after it; the schedule ends",
                 "max_runs": "integer >= 1: scheduled fires allowed (Run now not counted)",
             },
         }),
@@ -763,6 +840,12 @@ fn expose_instants(v: &mut Value) {
             .unwrap_or(Value::Null);
         o.insert(ms_field.into(), ms);
     }
+    // The wake condition under the API's own field names (stored as
+    // `when_check`/`when_once`).
+    let when = o.get("when_check").cloned().filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())).unwrap_or(Value::Null);
+    let once = o.get("when_once").and_then(Value::as_i64).map(|n| n != 0).unwrap_or(true);
+    o.insert("when".into(), when);
+    o.insert("when_once".into(), json!(once));
 }
 
 pub async fn get_one(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -852,6 +935,25 @@ pub struct ScheduleBody {
     pub trigger_sessions: Option<String>,
     #[serde(default)]
     pub exit_actions: Option<Value>,
+    /// Pass/fail (runtime_jobs/schedule_check.rs): a shell command whose exit
+    /// code is the verdict, 0 = pass. `null` or "" clears it.
+    #[serde(default, deserialize_with = "de_present")]
+    pub pass_check: Option<Option<String>>,
+    /// The editor's pass/fail switch. On requires a `pass_check` in the same
+    /// body; off clears the check.
+    #[serde(default, deserialize_with = "de_flag")]
+    pub pass_fail: Option<i64>,
+    /// Wake condition (runtime_jobs/schedule_wake.rs, stored as `when_check`):
+    /// a shell command run before each scheduled fire of a tmux schedule.
+    /// Exit 0 delivers the prompt; anything else skips the fire. `null` or ""
+    /// clears it.
+    #[serde(default, deserialize_with = "de_present")]
+    pub when: Option<Option<String>>,
+    /// With `when`: disable the schedule after the first fire whose check
+    /// passed and that delivered (default true). False keeps it firing every
+    /// time the check passes.
+    #[serde(default, deserialize_with = "de_flag")]
+    pub when_once: Option<i64>,
     /// When set, the scheduler creates an ephemeral worktree session for each
     /// firing instead of sending the command to the named session directly.
     /// The worktree is torn down after the command completes and pushes.
@@ -1074,6 +1176,17 @@ pub async fn create(
     if !dead.is_empty() {
         return unhonoured_refusal(&dead);
     }
+    let pass_in = match pass_check_input(&body) {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
+    let when_in = match when_input(&body) {
+        Ok(w) => w,
+        Err(r) => return *r,
+    };
+    if matches!(when_in, Some(Some(_))) && body.kind.as_deref() == Some("shell") {
+        return when_on_shell_refusal();
+    }
     let by = mutation_by(&headers, body.by.as_deref());
     let now = Local::now();
     let now_ts = chrono::Utc::now().timestamp();
@@ -1211,6 +1324,16 @@ pub async fn create(
             _ => Value::Null,
         },
     );
+    if let Some(Some(check)) = &pass_in {
+        // `probe`: the sweep runs the check once to show the current state.
+        m.insert("pass_check".into(), json!(check));
+        m.insert("pass_state".into(), json!("probe"));
+        m.insert("pass_next_at".into(), json!(now_ts));
+    }
+    if let Some(Some(check)) = &when_in {
+        m.insert("when_check".into(), json!(check));
+    }
+    m.insert("when_once".into(), json!(body.when_once.unwrap_or(1)));
     m.insert("created".into(), json!(now_ts));
     m.insert("updated".into(), json!(now_ts));
     m.insert("deleted".into(), Value::Null);
@@ -1294,6 +1417,9 @@ pub async fn create(
                         measured = true, n_considered = 1,
                         "schedule created with a fixed-date cron and no bound; told it recurs yearly");
                     o.insert("fixed_date_note".into(), json!(lifecycle::fixed_date_note(&expr)));
+                }
+                if let Some(n) = when_note(o) {
+                    o.insert("when_note".into(), n);
                 }
                 attach_isolated_note(o, "create");
             }
@@ -1390,6 +1516,14 @@ pub async fn patch(
     if !dead.is_empty() {
         return unhonoured_refusal(&dead);
     }
+    let pass_in = match pass_check_input(&body) {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
+    let when_in = match when_input(&body) {
+        Ok(w) => w,
+        Err(r) => return *r,
+    };
     let by = mutation_by(&headers, body.by.as_deref());
     let now = Local::now();
     let bounds_in = match parse_bounds(&body, now) {
@@ -1409,6 +1543,7 @@ pub async fn patch(
             deleted_by: Option<String>,
         },
         Locked(DurableSchedule),
+        WhenOnShell,
         Applied(Value, Option<(DurableSchedule, String)>),
     }
     let slot: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
@@ -1533,6 +1668,20 @@ pub async fn patch(
                 };
                 s.set("exit_actions", stored);
             }
+            let mut pass_changed = false;
+            if let Some(v) = &pass_in {
+                pass_changed = s.str_field("pass_check").trim() != v.as_deref().unwrap_or("");
+                s.set("pass_check", v.clone().map(Value::from).unwrap_or(Value::Null));
+            }
+            if let Some(v) = &when_in {
+                s.set("when_check", v.clone().map(Value::from).unwrap_or(Value::Null));
+            }
+            if let Some(v) = body.when_once {
+                s.set("when_once", json!(v));
+            }
+            if s.str_field("kind") == "shell" && !s.str_field("when_check").trim().is_empty() {
+                return finish(&slot_w, Outcome::WhenOnShell, no_write());
+            }
             apply_bounds(&mut s, &bounds_in);
 
             // Disable / enable bookkeeping: why it is off, and the owner lock.
@@ -1614,6 +1763,19 @@ pub async fn patch(
             }
             s.set("updated", json!(chrono::Utc::now().timestamp()));
             update_schedule(conn, &s)?;
+            if pass_changed {
+                // A new condition starts over: probe it now, no attempts used.
+                let armed = !s.str_field("pass_check").trim().is_empty();
+                let ts = chrono::Utc::now().timestamp();
+                conn.execute(
+                    "UPDATE schedules SET pass_state=?1, pass_next_at=?2, pass_attempts=0, pass_detail=NULL,
+                            pass_checked_at=NULL WHERE id=?3",
+                    rusqlite::params![armed.then_some("probe"), armed.then_some(ts), s.id()],
+                )?;
+                for (k, v) in [("pass_state", json!(armed.then_some("probe"))), ("pass_attempts", json!(0))] {
+                    s.set(k, v);
+                }
+            }
             // A new max_runs budget, or re-enabling a row that spent its
             // budget, starts counting from zero. Otherwise re-enable would end
             // it again at its next fire with nothing having run.
@@ -1686,6 +1848,9 @@ pub async fn patch(
                     if let Some(n) = cadence_note(&expr, &kind) {
                         o.insert("cadence_note".into(), n);
                     }
+                    if let Some(n) = when_note(o) {
+                        o.insert("when_note".into(), n);
+                    }
                     attach_isolated_note(o, "patch");
                 }
                 expose_instants(&mut v);
@@ -1693,6 +1858,7 @@ pub async fn patch(
             }
             Some(Outcome::NotFound) => not_found(),
             Some(Outcome::Locked(s)) => owner_lock_refusal(&id, "re-enable", &by_outer, &s),
+            Some(Outcome::WhenOnShell) => when_on_shell_refusal(),
             Some(Outcome::Tombstone {
                 deleted_at,
                 deleted_by,
@@ -2599,6 +2765,98 @@ mod tests {
         assert_eq!(row["by_who"], json!("tester-session"));
         assert_eq!(row["source"], json!("api-create"));
         assert!(row["new_value"].as_str().unwrap().contains("\"enabled\":1"));
+    }
+
+    /// Pass/fail cannot be on without a condition, the condition must parse,
+    /// and a saved condition is probed at once (schedule_check.rs).
+    #[tokio::test]
+    async fn pass_fail_requires_a_measurable_check() {
+        let (app, _dir) = app();
+        let base = || json!({ "title": "report", "kind": "shell", "command": "make-report", "schedule_expr": "daily at 09:00" });
+        let with = |extra: Value| {
+            let mut b = base();
+            for (k, v) in extra.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            b
+        };
+        let (st, r) = send(&app, "POST", "/api/schedules", Some(with(json!({ "pass_fail": 1 }))), &SES).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+        assert_eq!(r["code"], json!("pass_check_required"));
+        let (st, r) = send(&app, "POST", "/api/schedules", Some(with(json!({ "pass_fail": 1, "pass_check": "  " }))), &SES).await;
+        assert_eq!((st, r["code"].clone()), (StatusCode::BAD_REQUEST, json!("pass_check_required")));
+        let (st, r) = send(&app, "POST", "/api/schedules", Some(with(json!({ "pass_check": "if then (" }))), &SES).await;
+        assert_eq!((st, r["code"].clone()), (StatusCode::BAD_REQUEST, json!("pass_check_invalid")), "{r}");
+
+        let (st, c) = send(&app, "POST", "/api/schedules",
+            Some(with(json!({ "pass_fail": 1, "pass_check": " test -s /tmp/report.md " }))), &SES).await;
+        assert_eq!(st, StatusCode::CREATED, "{c}");
+        assert_eq!(c["pass_check"], json!("test -s /tmp/report.md"));
+        assert_eq!(c["pass_state"], json!("probe"), "a new condition is checked at once");
+
+        // Off clears the condition and its state; the change is audited.
+        let (st, p) = send(&app, "PATCH", "/api/schedules/SCHED-1", Some(json!({ "pass_fail": 0 })), &SES).await;
+        assert_eq!(st, StatusCode::OK, "{p}");
+        assert_eq!((p["pass_check"].clone(), p["pass_state"].clone()), (Value::Null, Value::Null));
+        let (_, audit) = send(&app, "GET", "/api/schedules/audit?id=SCHED-1", None, &[]).await;
+        assert!(audit.as_array().unwrap().iter().any(|r| r["field"] == json!("pass_check")
+            && r["old_value"] == json!("test -s /tmp/report.md")), "{audit}");
+        // On again without a check is refused on PATCH too.
+        let (st, _) = send(&app, "PATCH", "/api/schedules/SCHED-1", Some(json!({ "pass_fail": 1 })), &SES).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    /// `when` (0141): validated like a pass check, refused on a shell
+    /// schedule, published as `when`/`when_once`, and a relative `once` is
+    /// accepted and rounded up to a whole minute.
+    #[tokio::test]
+    async fn a_wake_condition_is_validated_published_and_refused_on_shell() {
+        let (app, _dir) = app();
+        let base = json!({ "title": "ci done", "command": "CI finished; read it", "schedule_expr": "every 2m", "session": "lane" });
+        let mut bad = base.clone();
+        bad["when"] = json!("if then (");
+        let (st, r) = send(&app, "POST", "/api/schedules", Some(bad), &SES).await;
+        assert_eq!((st, r["code"].clone()), (StatusCode::BAD_REQUEST, json!("when_invalid")), "{r}");
+        assert!(r["error"].as_str().unwrap().contains("wake condition"), "{r}");
+        let mut shell = base.clone();
+        shell["when"] = json!("true");
+        shell["kind"] = json!("shell");
+        let (st, r) = send(&app, "POST", "/api/schedules", Some(shell), &SES).await;
+        assert_eq!((st, r["code"].clone()), (StatusCode::BAD_REQUEST, json!("when_on_shell")), "{r}");
+
+        let mut good = base.clone();
+        good["when"] = json!(" test -f /tmp/ci-done ");
+        good["until"] = json!("24h");
+        let (st, c) = send(&app, "POST", "/api/schedules", Some(good), &SES).await;
+        assert_eq!(st, StatusCode::CREATED, "{c}");
+        assert_eq!((c["when"].clone(), c["when_once"].clone()), (json!("test -f /tmp/ci-done"), json!(true)), "{c}");
+        assert!(c["when_note"].as_str().unwrap().contains("skipped"), "{c}");
+        assert!(c["until"].as_str().is_some_and(|u| u.len() == 16), "a relative until is stored as a minute: {c}");
+        let id = c["id"].as_str().unwrap().to_string();
+        let (_, g) = send(&app, "GET", &format!("/api/schedules/{id}"), None, &[]).await;
+        assert_eq!(g["when"], json!("test -f /tmp/ci-done"));
+
+        // PATCH: keep firing, then clear; switching to shell with a check is refused.
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "when_once": false })), &SES).await;
+        assert_eq!((st, p["when_once"].clone()), (StatusCode::OK, json!(false)), "{p}");
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "kind": "shell" })), &SES).await;
+        assert_eq!((st, p["code"].clone()), (StatusCode::BAD_REQUEST, json!("when_on_shell")), "{p}");
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "when": null })), &SES).await;
+        assert_eq!((st, p["when"].clone()), (StatusCode::OK, Value::Null), "{p}");
+        let (_, audit) = send(&app, "GET", &format!("/api/schedules/audit?id={id}"), None, &[]).await;
+        assert!(audit.as_array().unwrap().iter().any(|r| r["field"] == json!("when_check")), "{audit}");
+
+        // A relative once.
+        let (st, o) = send(&app, "POST", "/api/schedules",
+            Some(json!({ "title": "later", "command": "look", "session": "lane", "once": "in 20m" })), &SES).await;
+        assert_eq!(st, StatusCode::CREATED, "{o}");
+        let next = crate::runtime_jobs::scheduler::parse_minute(o["next_run"].as_str().unwrap()).unwrap();
+        let mins = (next - Local::now()).num_seconds();
+        assert!((19 * 60..=21 * 60).contains(&mins), "in 20m, rounded up to the minute: {o}");
+        let (st, r) = send(&app, "POST", "/api/schedules",
+            Some(json!({ "title": "later", "command": "look", "once": "in 20" })), &SES).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+        assert!(r["accepted"]["once"].as_str().unwrap().contains("in 20m"), "{r}");
     }
 
     #[tokio::test]

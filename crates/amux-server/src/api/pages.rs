@@ -281,7 +281,7 @@ fn contract(name: &str, dir: &Path, instructions: &str) -> String {
     format!(
         "# Page: {name}\n\n\
 This folder is an amux page. You are its worker: you build it and you are its backend.\n\n\
-- `index.html` is the page. It is served at `/pages/{name}` and in the dashboard's Pages tab,\n  \
+- `index.html` is the page. It is served at `/pages/{name}` and in the dashboard's Apps tab,\n  \
 inside a sandboxed frame: keep it one self-contained file (inline CSS and JavaScript). External\n  \
 links and CDNs work; relative files do not (use `amux.file(path)` for those).\n\
 - `page.db` is its SQLite database ({db}). Read and write it with `sqlite3 page.db`.\n  \
@@ -879,7 +879,7 @@ mod tests {
     fn app_state(token: Option<&str>) -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         AppState {
             store,
             started: Instant::now(),

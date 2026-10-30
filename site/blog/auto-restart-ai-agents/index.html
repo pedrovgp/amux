@@ -7,7 +7,7 @@
   <title>Detecting When Your AI Agent Dies (By Reading the Terminal) — amux</title>
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <meta name="description" content="How to build a watchdog that detects when Claude Code exhausts its context window and exits — by parsing terminal output for shell prompts.">
-  <meta name="keywords" content="ai agent watchdog, claude code auto restart, terminal monitoring, agent reliability">
+  <meta name="keywords" content="ai agent watchdog, claude code crash detection, terminal monitoring, agent reliability">
   <link rel="canonical" href="https://amux.io/blog/auto-restart-ai-agents/">
   <meta property="og:title" content="Detecting When Your AI Agent Dies (By Reading the Terminal) — amux">
   <meta property="og:description" content="How to build a watchdog that detects when Claude Code exhausts its context window and exits — by parsing terminal output for shell prompts.">
@@ -49,11 +49,12 @@
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/blog/">Blog</a> <span class="sep">›</span> <span>Auto-Restart AI Agents</span></div>
     <h1>Detecting When Your AI Agent Dies (By Reading the Terminal)</h1>
-<p class="subtitle">A watchdog that screen-scrapes tmux to detect crashed agents and restart them. It's crude and it works.</p>
+<p class="subtitle">A watchdog that screen-scrapes tmux to detect crashed agents and restart them. It's crude and it worked.</p>
+<p class="correction"><em>Correction, 2026-10-29: the amux server does not restart crashed agent processes today. It resumes agents after usage limits, restarts its own server process through launchd or systemd, and on macOS brings every worker back after a reboot. An optional macOS script restarts crashed Claude Code workers; it is not installed by default.</em></p>
 
 <p>When you run AI coding agents in long-running sessions, they eventually hit a wall. Claude Code exhausts its context window, prints a farewell message, and exits to a bare shell prompt. If you're running one agent interactively, you notice immediately. If you're running 20 overnight, you wake up to find half of them have been sitting at a <code>$</code> prompt for 6 hours.</p>
 
-<p>amux solves this with a watchdog that periodically reads the terminal output, detects the shell prompt pattern, and auto-restarts the agent. The detection is a screen scrape. It's the kind of thing that feels wrong but works surprisingly well.</p>
+<p>amux's original Python server handled this with a watchdog that periodically reads the terminal output, detects the shell prompt pattern, and auto-restarts the agent. The detection is a screen scrape. It's the kind of thing that feels wrong but works surprisingly well.</p>
 
 <h2>The detection problem</h2>
 
@@ -265,10 +266,8 @@ CC_AUTO_CONTINUE=1</code></pre>
 
 <p>The result: overnight batch runs that used to stall when one agent hit context limits now self-heal. The dashboard shows an alert ("auto-restarted"), and the agent keeps working. Crude, simple, effective.</p>
 
-<div class="cta-box"><h3>Get started with amux</h3><p>Run an AI engineering team of Claude Code, Codex and Gemini CLI agents from one dashboard or your phone. One Rust binary. Open source.</p><pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
-amux register myproject --dir ~/Dev/myproject --yolo
-amux start myproject
-amux serve  # → https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
+<div class="cta-box"><h3>Get started with amux</h3><p>Run an AI engineering team of Claude Code, Codex and Gemini CLI agents from one dashboard or your phone. One Rust binary, MIT + Commons Clause, free to self-host on macOS or Linux.</p><pre><code>curl -fsSL https://amux.io/install.sh | bash
+# then open https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
   </main>
   <footer class="sub-footer">
     <div class="footer-inner">

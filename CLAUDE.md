@@ -1,7 +1,7 @@
 # amux
 
 - Whenever you fix a bug: 1) fix it at the root cause, 2) make it surface in amux logs so a sweep would catch it.
-- Standing harness rule: if normal project or worker progress needs a manual
+- Standing harness rule: if normal worker progress needs a manual
   override, restart, retry, board-status edit, or file move, treat that need as
   an Amux defect. Implement bounded, logged discovery and recovery, then rerun
   the original lifecycle case. Preserve failed evidence; never bypass budget,
@@ -21,13 +21,6 @@ The Python server was deleted at `792ce1f`. Do not resurrect it.
 Gut-check every feature against `.claude/rules/ethos.md` (8 rules). The core question:
 when the next model is better, does this feature get better with it, or become the ceiling?
 
-## Project checkout ownership
-
-A project owns one worktree and branch under its repository’s `.worktrees` directory.
-All project workers use that checkout; workers and retries must not create their own.
-Serialize task writes and retain task evidence independently. Publish the reviewed
-project result once, then expire its workers and remove only the published checkout.
-
 ## Isolated workers
 
 Isolated means direct owner-to-CLI transport: no board capture or attribution,
@@ -35,7 +28,7 @@ command decomposition, injected prompts, automated schedule/steering, or Amux
 routing, behavioral hooks or MCP. Passive provider lifecycle observation is allowed
 for status only: it must not add context, change permissions, send prompts, or
 trigger boards. Preserve owner input, delivery receipts and message history.
-Explicit owner queuing is transport only. Isolation overrides stale project
+Explicit owner queuing is transport only. Isolation overrides stale worker
 metadata; a restarted raw CLI must not inherit harness routing.
 Three owner-configured exceptions reach isolated workers: their schedules, the
 goal keeper continuing an owner-set Claude Code `/goal` that is not met
@@ -98,13 +91,30 @@ Verify a hook by what it WROTE, not by the settings file.
   `git fetch origin main && git rebase origin/main && git push origin HEAD:main` (retry on a
   lost race). The pre-commit hook refuses a commit onto a branch that has forked from
   `origin/main` (`fork_commit`), because those commits can never deploy.
-- **Only main deploys.** The builder activates the newest `origin/main` commit that passed
-  CI (`rust` and `checks`), within about a minute. A local commit, a branch, a fork or a
+- **Gate before main: `amux land` (or `scripts/land_gate.py`, then push).** It replays
+  your commits onto origin/main and runs what turns main red: the tests of every changed
+  Rust module and crate, the e2e specs `scripts/ci-affected.mjs` selects, and a
+  fresh-context review against `REVIEW.md`. A test that passes on rerun, or that also fails
+  on origin/main, is named and does not block. The pre-push hook refuses an agent's
+  commits with no passing receipt (`AMUX_SKIP_LAND_GATE=1` with
+  `AMUX_SKIP_LAND_GATE_REASON` skips once, logged). Tiers in `scripts/review-tiers.txt`,
+  read from origin/main: `[owner]` paths (money, credentials, the guards) need the owner's
+  approval of that exact diff; `[deep]` paths need a `Revert:` trailer. A review finding is
+  fixed or closed with `scripts/land_gate.py --resolve <id> "<why>"`; after three rounds the
+  review stops hunting and says to rethink. `amux explain <path>` writes an explainer of a
+  slice of the code. Reviewer scoring: `scripts/land_review_eval.py --score`.
+- **Only main deploys.** The builder activates the newest `origin/main` commit whose
+  `checks` workflow passed, within about a minute. It compiles the tip while its CI runs
+  (`scripts/rust-prebuild.sh`), and puts the previous binary back if the new one does not
+  report healthy (`AMUX_ACTIVATION_ROLLBACK`, on by default). The gate is
+  `AMUX_CI_REQUIRED_WORKFLOWS` (default `checks`) in `~/.amux/server.env`; the slow `rust`
+  e2e suite runs after deploy (owner, 2026-10-29). A local commit, a branch, a fork or a
   hand-built binary deploys nothing and is replaced. Never copy a build over
   `~/.local/bin/amux-server-rs`: on 2026-10-24 a hand build of a two-week-old fork ran the
   Mac for hours. Settings shows what the server runs against main (`GET /api/pull`).
-- **A red main holds the server.** Until one main commit passes both `rust` and `checks`,
-  nothing newer deploys (2026-10-24: a week red, 73 commits behind). SCHED-713
+- **A red main holds the server.** Until one main commit passes `checks`, nothing newer
+  deploys (2026-10-24: a week red, 73 commits behind). A red `rust` run no longer holds it;
+  it is the first thing to fix all the same. SCHED-713
   (`scripts/main-ci-watch.sh`) re-runs a first attempt that failed only in e2e once, then
   keeps ONE card on the amux lane per red stretch. `deploy.served_commit_is_current` in
   `/api/health/invariants` says when the gate is holding. A red main is the first thing to fix.
@@ -574,4 +584,8 @@ Scope refusals remain refusals. Login-cookie evidence is not live auth proof.
 `amux browser route goal '{"task":"..."}'` hands a whole task to an agent method
 from `browser-methods.toml` (OpAgent first; disabled until its model is served),
 which drives the route and returns its answer and a trajectory.
-Standalone `/chrome-cdp` remains available for explicit tab work.
+Raw CDP (`/chrome-cdp`, Playwright `connectOverCDP`) is a fallback only when a
+route cannot do the job (Ethan, 2026-10-27): `cdp_port` is withheld from
+`/api/browser/status`, `start` and route responses unless the caller passes
+`cdp_reason`, and what it then gets is a logging proxy (`api/cdp_proxy.rs`), so
+the grant and every page-acting command land in `amux audit <worker>`.

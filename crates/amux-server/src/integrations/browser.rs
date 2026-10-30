@@ -792,6 +792,18 @@ pub fn touch_verb_for_session(session: &str) {
                 b.last_verb_at = now;
                 return;
             }
+            // Then the browser this session JOINED. A joiner drives a tab in a
+            // browser another session started, so `started_by` never matches it,
+            // and with more than one browser running the fallback below does not
+            // fire either: the shared browser read as idle while a joiner drove it
+            // and the activity reaper released it mid-task (NetSuite session,
+            // 2026-10-26, "since_verb_s=327" while the joiner was fetching CSVs).
+            if let Some(profile) = joined_profile(session) {
+                if let Some(b) = g.values_mut().find(|b| b.profile == profile) {
+                    b.last_verb_at = now;
+                    return;
+                }
+            }
         }
         // Single-browser fallback: mirrors port_for_session.
         if g.len() == 1 {
@@ -1012,6 +1024,14 @@ pub(crate) fn persisted_last_exit(home: &Path) -> Option<serde_json::Value> {
     Some(v)
 }
 
+/// Does an already-recorded exit explain the death of `pid`? Same pid and
+/// recorded within the last day. A pid is reused eventually, and a day-old
+/// record about a recycled pid must not mask a real unobserved death.
+pub(crate) fn last_exit_explains(prev: &serde_json::Value, pid: u32, now: i64) -> bool {
+    prev["pid"].as_u64() == Some(pid as u64)
+        && now.saturating_sub(prev["ts"].as_i64().unwrap_or(0)) < 86_400
+}
+
 /// The running-file, as a MAP keyed by profile (AMUX-3828).
 ///
 /// One file holding every browser, rather than one file per profile: profile
@@ -1121,6 +1141,60 @@ fn persist_running(
     write_running_file(home, &map);
 }
 
+/// On a Linux host run by systemd, Chrome starts in its OWN scope unit, so
+/// nothing done to the server's unit reaches it. A process group (below) is
+/// not enough there: systemd stops a unit by its cgroup, and an amux.service
+/// installed before KillMode=process (INIT-1, 2026-08-31) SIGKILLs everything
+/// in it on every restart. That is the "found dead on adopt" a NetSuite worker
+/// hit twice on 2026-10-26, losing its login each time. `systemd-run --scope`
+/// execs Chrome in place, so the pid recorded is still Chrome's. Probed once;
+/// `AMUX_BROWSER_SYSTEMD_SCOPE=0` turns it off. Off a systemd host: None.
+async fn chrome_systemd_scope() -> Option<&'static [&'static str]> {
+    static SCOPE: tokio::sync::OnceCell<Option<&'static [&'static str]>> = tokio::sync::OnceCell::const_new();
+    *SCOPE
+        .get_or_init(|| async {
+            if !cfg!(target_os = "linux") || !Path::new("/run/systemd/system").exists() {
+                return None;
+            }
+            if std::env::var("AMUX_BROWSER_SYSTEMD_SCOPE").is_ok_and(|v| v == "0") {
+                tracing::info!(verdict = "browser_scope_off", reason = "AMUX_BROWSER_SYSTEMD_SCOPE=0", "browser: Chrome starts in the server's own cgroup");
+                return None;
+            }
+            // SAFETY: getuid has no preconditions and cannot fail.
+            let root = unsafe { libc::getuid() } == 0;
+            let prefix: &'static [&'static str] = if root {
+                &["systemd-run", "--scope", "--quiet", "--collect"]
+            } else {
+                &["systemd-run", "--user", "--scope", "--quiet", "--collect"]
+            };
+            let probe = tokio::process::Command::new(prefix[0])
+                .args(&prefix[1..])
+                .arg("true")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(Duration::from_secs(5), probe).await {
+                Ok(Ok(out)) if out.status.success() => {
+                    tracing::info!(verdict = "browser_scope_on", user = !root, "browser: Chrome starts in its own systemd scope, so a server restart cannot take it down");
+                    Some(prefix)
+                }
+                other => {
+                    let why = match other {
+                        Ok(Ok(out)) => String::from_utf8_lossy(&out.stderr).trim().chars().take(200).collect::<String>(),
+                        Ok(Err(e)) => e.to_string(),
+                        Err(_) => "timed out after 5s".to_string(),
+                    };
+                    tracing::warn!(verdict = "browser_scope_unavailable", why = %why, user = !root,
+                        "browser: systemd-run --scope did not work, so Chrome starts in the server's cgroup and a restart of an amux unit without KillMode=process kills it");
+                    None
+                }
+            }
+        })
+        .await
+}
+
 /// Drop ONE profile's record. The others must survive — clearing the whole file
 /// on a single browser's death is how the remaining ones become unadoptable
 /// orphans after a restart.
@@ -1214,6 +1288,23 @@ async fn adopt_one(home: &Path, v: &serde_json::Value) -> bool {
              no server was watching, most likely killed alongside a server restart; \
              recording last_exit and clearing the file"
         );
+        // A reaper or /stop that killed THIS pid already wrote why. Overwriting
+        // it with "died while the server was down" turned a known activity
+        // reap into a false server-restart story, and two lanes chased the
+        // wrong cause (2026-10-26). Keep the specific record; log that we did.
+        if let Some(prev) = persisted_last_exit(home) {
+            if last_exit_explains(&prev, pid, chrono::Utc::now().timestamp()) {
+                tracing::info!(
+                    pid, port, profile, started_by,
+                    prev_reason = prev["reason"].as_str().unwrap_or(""),
+                    verdict = "adopt_kept_recorded_exit_reason",
+                    "browser: running-file names a dead browser whose exit was already recorded; \
+                     keeping that reason instead of guessing a server restart"
+                );
+                clear_running_for(home, profile);
+                return false;
+            }
+        }
         record_last_exit(
             home,
             serde_json::json!({
@@ -1654,6 +1745,12 @@ pub struct StartedBrowser {
     /// signal — the caller must not treat a mismatch as failure, only as a fact
     /// worth showing. `None` when CDP listed no page tab at all.
     pub launch_url: Option<String>,
+    /// Whether the requested page finished loading before start returned.
+    /// `None` when no page was requested. False comes with `note`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// The tail of Chrome's launch stderr, formatted for an error message, or "" if
@@ -2057,7 +2154,24 @@ pub async fn start(
     }
 
     let port = ephemeral_port()?;
-    let mut cmd = tokio::process::Command::new(&binary);
+    // Chrome on Linux reads its certificate store from ~/.local/share/pki/nssdb
+    // and logs an error on every launch when the folder is missing (NetSuite
+    // worker, 2026-10-26: harmless, but it reads as a failure in the log the
+    // worker is debugging from). An empty folder is what Chrome expects.
+    if cfg!(target_os = "linux") {
+        if let Some(h) = std::env::var_os("HOME") {
+            let _ = std::fs::create_dir_all(PathBuf::from(h).join(".local/share/pki/nssdb"));
+        }
+    }
+    let scope = chrome_systemd_scope().await;
+    let mut cmd = match scope {
+        Some(prefix) => {
+            let mut c = tokio::process::Command::new(prefix[0]);
+            c.args(&prefix[1..]).arg(&binary);
+            c
+        }
+        None => tokio::process::Command::new(&binary),
+    };
     // OWN PROCESS GROUP (AMUX-3414 root cause). Chrome inherited this server's
     // group, and the builder's self-adoption relaunch (`launchctl kickstart -k`)
     // kills the whole group — so every build adoption, several per hour on this
@@ -2308,9 +2422,7 @@ pub async fn start(
     // observed about:blank in the same second). Bounded: a slow site returns
     // with what it has, and says so.
     let wants_page = !url.is_empty() && url != "about:blank";
-    if wants_page {
-        settle_launch_tab(port, session, url).await;
-    }
+    let settle = if wants_page { Some(settle_launch_tab(port, session, url).await) } else { None };
     let launch_page = cdp_list(port).await.ok().and_then(|tabs| {
         tabs.as_array()
             .and_then(|ts| {
@@ -2384,6 +2496,8 @@ pub async fn start(
         user_data_dir: target.user_data_dir.display().to_string(),
         started_at,
         launch_url,
+        page_ready: settle.as_ref().map(|s| s.settled),
+        note: settle.as_ref().and_then(unsettled_start_note),
     };
     // `child.id()` is None only once the child has been reaped; a browser we
     // just spawned always has one. Refusing here beats persisting pid 0, which
@@ -2557,6 +2671,15 @@ pub async fn stop_profile_as_reason(
     // flush Cookies and Local Storage. `run_kill` validates before spawning.
     // Browser.close runs Chrome's normal shutdown path, which commits cookies
     // installed through CDP. TERM alone can exit before that store is flushed.
+    // The login a site keeps in session cookies goes to disk first, so the
+    // next start of this profile is still signed in (keep_session_cookies).
+    match keep_session_cookies(running.cdp_port).await {
+        Ok(n) if n > 0 => tracing::info!(profile = %running.profile, kept = n, verdict = "browser_session_cookies_kept",
+            measured = true, n_considered = n, "browser stop: session cookies kept so the login survives (values not logged)"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(profile = %running.profile, error = %e, verdict = "browser_session_cookies_not_kept",
+            measured = false, n_considered = 0, "browser stop: could not keep session cookies; a session login may be lost"),
+    }
     if let Ok(tabs)=cdp_list(running.cdp_port).await {
         if let Some(ws)=tabs.as_array().and_then(|a|a.iter().find(|t|t["type"]=="page")).and_then(|t|t["webSocketDebuggerUrl"].as_str()) {
             if let Ok(mut c)=CdpClient::connect(ws).await {
@@ -2610,6 +2733,130 @@ pub async fn stop_profile_as_reason(
         clean_exit: Some(clean_exit),
         locks_cleaned,
     }
+}
+
+/// A running profile's SESSION cookies, made persistent for
+/// `browser_login_sync::SESSION_TTL_DAYS` (2026-10-26, a NetSuite worker:
+/// "browser profiles drop login sessions when the browser stops, so every
+/// closure means a full NetSuite login again"). Chrome writes only persistent
+/// cookies to disk, so a login a site keeps in a session cookie was lost on
+/// every stop, reap or restart: measured on Chrome 151, a session cookie never
+/// survived a relaunch, after Browser.close, SIGTERM or SIGKILL alike. Made
+/// persistent, it survived Browser.close and (once Chrome's ~30s cookie flush
+/// ran) SIGKILL. Same bounded policy as imported and synced logins; the site
+/// can still end the session on its side.
+///
+/// Pure over the Storage.getCookies rows, so it is tested without a browser.
+pub(crate) fn session_cookies_to_keep(rows: &[Value], now: i64) -> Vec<Value> {
+    let until = now + crate::integrations::browser_login_sync::SESSION_TTL_DAYS * 86_400;
+    rows.iter()
+        .filter(|c| c.get("session").and_then(Value::as_bool).unwrap_or(false))
+        .map(|c| {
+            let mut c = c.clone();
+            c["expires"] = serde_json::json!(until);
+            c["session"] = serde_json::json!(false);
+            c
+        })
+        .collect()
+}
+
+/// Apply [`session_cookies_to_keep`] to the browser on `port`. Called by the
+/// reaper on every tick for each running profile, and by a stop before
+/// Browser.close. Counts only; values are never logged.
+pub async fn keep_session_cookies(port: u16) -> anyhow::Result<usize> {
+    let tabs = cdp_list(port).await?;
+    let Some(ws) = tabs
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["type"] == "page"))
+        .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+    else {
+        return Ok(0);
+    };
+    let mut c = CdpClient::connect(ws).await?;
+    let seen = c.call("Storage.getCookies", serde_json::json!({}), Duration::from_secs(10)).await?;
+    let rows = seen["cookies"].as_array().cloned().unwrap_or_default();
+    let keep = session_cookies_to_keep(&rows, chrono::Utc::now().timestamp());
+    if keep.is_empty() {
+        return Ok(0);
+    }
+    let params = crate::integrations::computer::cookie_params(&keep);
+    c.call("Storage.setCookies", serde_json::json!({ "cookies": params }), Duration::from_secs(10)).await?;
+    Ok(keep.len())
+}
+
+/// What a browser's pages are doing, read from Chrome itself, for the reaper.
+///
+/// The activity clock only moved on amux's own verbs, so a worker driving
+/// Chrome over CDP directly, or keeping it alive by polling `route state`,
+/// read as idle and lost its browser mid-report (NetSuite, 2026-10-26). Three
+/// things Chrome does report are evidence someone is using it:
+/// `fingerprint` (each page's id, URL and title: a change since the last look
+/// is work), `attached` (pages a debugger client is attached to, which is a
+/// driver connected right now; `/json/list` cannot show this, Target.getTargets
+/// can), and `loading` (pages whose document has not finished loading, which
+/// must never be closed under someone).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PageActivity {
+    pub pages: usize,
+    pub attached: usize,
+    pub loading: usize,
+    pub fingerprint: String,
+}
+
+pub async fn page_activity(port: u16) -> anyhow::Result<PageActivity> {
+    let version = cdp_json(
+        reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/json/version"))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await?,
+        &format!("CDP /json/version on port {port}"),
+    )
+    .await?;
+    let ws = version["webSocketDebuggerUrl"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("CDP /json/version on port {port} named no browser socket"))?;
+    let mut browser = CdpClient::connect(ws).await?;
+    let targets = browser.call("Target.getTargets", serde_json::json!({}), Duration::from_secs(5)).await?;
+    let mut out = PageActivity::default();
+    let mut keys = vec![];
+    for t in targets["targetInfos"].as_array().into_iter().flatten() {
+        if t["type"] != "page" {
+            continue;
+        }
+        out.pages += 1;
+        if t["attached"].as_bool() == Some(true) {
+            out.attached += 1;
+        }
+        keys.push(format!(
+            "{}|{}|{}",
+            t["targetId"].as_str().unwrap_or(""),
+            t["url"].as_str().unwrap_or(""),
+            t["title"].as_str().unwrap_or("")
+        ));
+    }
+    keys.sort();
+    out.fingerprint = keys.join("\n");
+    drop(browser);
+    // Load state needs the page itself; only real pages, and only a few.
+    let listed = cdp_list(port).await?;
+    for t in listed.as_array().into_iter().flatten().filter(|t| t["type"] == "page").take(8) {
+        let Some(ws) = t["webSocketDebuggerUrl"].as_str() else { continue };
+        let Ok(mut c) = CdpClient::connect(ws).await else { continue };
+        let state = c
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({ "expression": "document.readyState", "returnByValue": true }),
+                Duration::from_secs(3),
+            )
+            .await;
+        if let Ok(v) = state {
+            if v["result"]["value"].as_str().is_some_and(|s| s != "complete") {
+                out.loading += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// CDP over plain HTTP: the tab list. (Command traffic — screenshot, eval,
@@ -4225,10 +4472,29 @@ pub async fn join_running(session: &str, profile: &str, url: &str) -> Result<Dri
     }
     JOINED.lock().expect("joined registry poisoned")
         .insert(session.to_string(), Join { profile: profile.to_string(), tab: target_id.clone() });
+    // Joining IS a verb. Without this stamp a browser adopted long ago and joined
+    // a moment ago still carried its old activity clock (2026-10-26: reaped 90s
+    // after a join).
+    touch_verb(profile);
     NATIVE_TARGETS.lock().expect("native targets poisoned").insert(session.to_string(), target_id.clone());
     tracing::info!(session, profile, cdp_port = port, target = %target_id, measured = true, n_considered = 1,
         verdict = "browser_joined", "a session joined the browser already running its profile, in its own tab");
     Ok(DriverPage { cdp_port: port, target_id, ws_url, url: url.to_string(), title: String::new() })
+}
+
+/// Every session currently joined to `profile`'s browser, sorted. The reaper
+/// tells these as well as the owner when it releases the browser: a joiner is
+/// driving a tab in it and is the session most likely to be mid-task.
+pub fn joiners_of(profile: &str) -> Vec<String> {
+    let mut v: Vec<String> = JOINED
+        .lock()
+        .expect("joined registry poisoned")
+        .iter()
+        .filter(|(_, j)| j.profile == profile)
+        .map(|(s, _)| s.clone())
+        .collect();
+    v.sort();
+    v
 }
 
 /// The profile `session` joined, if it is a joiner rather than an owner.
@@ -4377,6 +4643,50 @@ mod multi_browser_tests {
             assert_eq!(profile_for_session("lane").as_deref(), Some("netsuite"), "order {order:?}");
         }
         test_clear_running();
+    }
+
+    /// A joined session's verbs keep the SHARED browser alive. With two
+    /// browsers running, neither the owner match nor the single-browser
+    /// fallback reached a joiner, so the browser it was driving read as idle
+    /// and the activity reaper released it (2026-10-26).
+    #[test]
+    fn a_joiner_stamps_activity_on_the_browser_it_joined() {
+        let _reg = TEST_REGISTRY.blocking_lock();
+        test_clear_running();
+        test_seed_running_port("shared", "owner-lane", 501, 9201);
+        test_seed_running_port("other", "someone-else", 502, 9202);
+        JOINED.lock().unwrap().insert("joiner-lane".into(), Join { profile: "shared".into(), tab: "T1".into() });
+        assert_eq!(joiners_of("shared"), vec!["joiner-lane".to_string()]);
+        assert!(joiners_of("other").is_empty(), "joiners are per profile");
+        touch_verb_for_session("joiner-lane");
+        let stamp = |p: &str| running_all().into_iter().find(|r| r.0 == p).map(|r| r.5).unwrap();
+        assert!(stamp("shared") > 0, "the joined browser must carry the joiner's verb");
+        assert_eq!(stamp("other"), 0, "an unrelated browser must not be stamped");
+        JOINED.lock().unwrap().remove("joiner-lane");
+        test_clear_running();
+    }
+
+    /// The adopt path keeps a recent exit record for the SAME pid instead of
+    /// overwriting it with "died while the server was down", and still
+    /// records an unexplained death (other pid, or a stale record).
+    #[test]
+    fn adopt_keeps_a_recorded_exit_reason_for_the_same_pid() {
+        let now = 1_800_000_000;
+        let prev = serde_json::json!({"ts": now - 30, "pid": 4242, "reason": "stopped", "by": "activity-reaper"});
+        assert!(last_exit_explains(&prev, 4242, now));
+        assert!(!last_exit_explains(&prev, 4243, now), "another pid's record explains nothing");
+        let stale = serde_json::json!({"ts": now - 90_000, "pid": 4242, "reason": "stopped"});
+        assert!(!last_exit_explains(&stale, 4242, now), "a day-old record may be a recycled pid");
+    }
+
+    /// A start whose page never loaded says so to the caller, not only to the log.
+    #[test]
+    fn an_unsettled_start_carries_a_note() {
+        let blank = LaunchSettle { landed: "about:blank".into(), ready_state: String::new(), settled: false, waited_ms: 10_021 };
+        let note = unsettled_start_note(&blank).expect("an unsettled start must carry a note");
+        assert!(note.contains("about:blank") && note.contains("10021ms") && note.contains("run state again"), "{note}");
+        let done = LaunchSettle { landed: "https://x.test/".into(), ready_state: "complete".into(), settled: true, waited_ms: 300 };
+        assert_eq!(unsettled_start_note(&done), None);
     }
 
     #[test]
@@ -5343,7 +5653,16 @@ pub async fn click_grounded(
 /// Wait (bounded) until the launch tab has left about:blank and finished
 /// loading. Logs `browser_start_settle_timeout` when the page is still loading
 /// at the deadline, so a sweep sees starts that return early.
-async fn settle_launch_tab(port: u16, session: &str, url: &str) {
+/// What [`settle_launch_tab`] saw at the end of its wait.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaunchSettle {
+    pub landed: String,
+    pub ready_state: String,
+    pub settled: bool,
+    pub waited_ms: u64,
+}
+
+async fn settle_launch_tab(port: u16, session: &str, url: &str) -> LaunchSettle {
     let budget = std::time::Duration::from_millis(
         std::env::var("AMUX_BROWSER_START_SETTLE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000),
     );
@@ -5389,7 +5708,8 @@ async fn settle_launch_tab(port: u16, session: &str, url: &str) {
     }
     let ready = if blank(&last_url) { String::new() } else { ready };
     let waited_ms = began.elapsed().as_millis() as u64;
-    if ready == "complete" {
+    let settled = ready == "complete";
+    if settled {
         tracing::info!(session, url, landed = %last_url, waited_ms, measured = true, n_considered = 1,
             verdict = "browser_start_settled", "browser start waited for the requested page to load");
     } else {
@@ -5397,6 +5717,24 @@ async fn settle_launch_tab(port: u16, session: &str, url: &str) {
             verdict = "browser_start_settle_timeout",
             "browser start returned before the requested page finished loading; the first read may see a partial or blank page");
     }
+    LaunchSettle { landed: last_url, ready_state: ready, settled, waited_ms }
+}
+
+/// The caller-facing sentence for a start whose page had not loaded. The
+/// timeout used to reach only the server log, so the worker got `ok: true`,
+/// read `about:blank` and had to discover the gap itself (2026-10-26, four
+/// times in one NetSuite session).
+pub fn unsettled_start_note(s: &LaunchSettle) -> Option<String> {
+    if s.settled {
+        return None;
+    }
+    let landed = if s.landed.is_empty() { "about:blank" } else { s.landed.as_str() };
+    Some(format!(
+        "the requested page had not finished loading after {}ms (tab is on {landed}, readyState {:?}); \
+         run state again before acting, and do not treat this page as the target yet",
+        s.waited_ms,
+        if s.ready_state.is_empty() { "unknown" } else { s.ready_state.as_str() }
+    ))
 }
 
 pub async fn navigate_and_settle(c: &mut CdpClient, url: &str) -> anyhow::Result<Value> {
@@ -7338,6 +7676,56 @@ mod tests {
         assert_eq!(safe_file_component(".."), "amux");
     }
 
+    /// The reaper sees a driver amux never carried (NetSuite, 2026-10-26: a
+    /// worker drove Chrome over raw CDP and lost the browser mid-report). Real
+    /// Chrome, the real `tick`, a 5s activity window: a page navigated over a
+    /// raw CDP socket every second keeps the browser open past the window,
+    /// and once the driving stops it is released.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome; run explicitly with -- --ignored"]
+    async fn live_raw_cdp_driving_keeps_the_browser_open() {
+        let _serial = LIVE_BROWSER.lock().await;
+        if chrome_binary().is_none() {
+            eprintln!("no Chrome binary on this machine; skipping");
+            return;
+        }
+        let home = fake_home();
+        let info = start(home.path(), "default", "about:blank", "raw-cdp", "raw-cdp", true).await.expect("start");
+        let list = cdp_list(info.cdp_port).await.expect("list");
+        let ws = list.as_array().unwrap().iter().find(|t| t["type"] == "page").unwrap()["webSocketDebuggerUrl"]
+            .as_str().unwrap().to_string();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s2 = stop.clone();
+        let driver = tokio::spawn(async move {
+            let mut c = CdpClient::connect(&ws).await.expect("raw cdp");
+            let mut i = 0;
+            while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+                i += 1;
+                let _ = c.call("Page.navigate", serde_json::json!({"url": format!("data:text/html,step{i}")}), Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        // 12s of raw driving against a 5s window: never released.
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let reaped = crate::runtime_jobs::browser_reaper::tick_with_limits(home.path(), None, 0, 5, 0).await;
+            assert!(reaped.is_empty(), "released while a raw CDP driver was working: {reaped:?}");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = driver.await;
+        // Driving stopped (socket closed): released within a few windows.
+        let mut released = false;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !crate::runtime_jobs::browser_reaper::tick_with_limits(home.path(), None, 0, 5, 0).await.is_empty() {
+                released = true;
+                break;
+            }
+        }
+        assert!(released, "a browser nobody drives must still be released");
+        let _ = stop_profile_as(home.path(), "default", "raw-cdp").await;
+    }
+
     /// Live-Chrome smoke test: launches a real Chrome on a THROWAWAY temp
     /// user-data-dir (never a saved profile), checks CDP answers, stops it.
     /// #[ignore]d: `cargo test -- --ignored` runs it only where a human asked.
@@ -8015,6 +8403,24 @@ mod adoption_activity_tests {
 #[cfg(test)]
 mod running_file_ownership_tests {
     use super::*;
+    #[test]
+    fn session_cookies_are_kept_for_the_bounded_ttl_and_others_left_alone() {
+        let rows = vec![
+            serde_json::json!({"name": "JSESSIONID", "value": "v", "domain": ".netsuite.com", "path": "/", "session": true, "expires": -1}),
+            serde_json::json!({"name": "pref", "value": "x", "domain": ".netsuite.com", "path": "/", "session": false, "expires": 2_000_000_000.0}),
+        ];
+        let kept = session_cookies_to_keep(&rows, 1_000);
+        assert_eq!(kept.len(), 1, "only the session cookie needs keeping");
+        assert_eq!(kept[0]["name"], "JSESSIONID");
+        assert_eq!(kept[0]["session"], false);
+        let ttl = crate::integrations::browser_login_sync::SESSION_TTL_DAYS * 86_400;
+        assert_eq!(kept[0]["expires"], serde_json::json!(1_000 + ttl));
+        // The CDP parameters carry the new expiry, so Chrome stores it on disk.
+        let params = crate::integrations::computer::cookie_params(&kept);
+        assert_eq!(params[0]["expires"], serde_json::json!((1_000 + ttl) as f64));
+        assert!(session_cookies_to_keep(&rows[1..], 1_000).is_empty());
+    }
+
     #[test]
     fn parallel_profile_updates_preserve_peer_restart_records() {
         let home = tempfile::tempdir().unwrap();

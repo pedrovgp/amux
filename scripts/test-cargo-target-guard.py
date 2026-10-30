@@ -72,7 +72,12 @@ class CargoReclaimTests(unittest.TestCase):
         scope.write_text('#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n'); scope.chmod(0o755)
         cargo = bin_dir / 'cargo'
         cargo.write_text('#!/bin/sh\nif [ "$1" = clean ]; then rm "$CLEAN_MARKER"; exit 0; fi\nprintf "ready\\n"\nread -r release\n'); cargo.chmod(0o755)
-        env = {**os.environ, 'PATH':str(bin_dir)+':'+os.environ['PATH'], 'CARGO_TARGET_DIR':str(self.root), 'CLEAN_MARKER':str(self.marker), 'AMUX_HOME':str(self.base/'fixture-home'), 'AMUX_SESSION':'target-guard-fixture'}
+        env = {**os.environ, 'PATH':str(bin_dir)+':'+os.environ['PATH'], 'CARGO_TARGET_DIR':str(self.root), 'CLEAN_MARKER':str(self.marker), 'AMUX_HOME':str(self.base/'fixture-home'), 'AMUX_SESSION':'target-guard-fixture',
+               # Two slots: this pins the cleanup LEASE, not the build throttle. On a
+               # host under 16 GB safe-cargo.sh now allows one build at a time
+               # (27d00777b), so the clean below queued behind the holder until the
+               # 15s timeout on a GitHub runner instead of reaching the lease check.
+               'AMUX_CARGO_MAX_CONCURRENT':'2'}
         wrapper = str(SCRIPT.with_name('safe-cargo.sh'))
         holder = subprocess.Popen(['bash',wrapper,'test'], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         try:
@@ -87,6 +92,25 @@ class CargoReclaimTests(unittest.TestCase):
         idle = subprocess.run(['bash',wrapper,'clean'], env=env, capture_output=True, text=True, timeout=15)
         self.assertEqual(idle.returncode,0,idle.stdout+idle.stderr)
         self.assertFalse(self.marker.exists(), 'the same cleanup works after lease release')
+
+    def test_a_busy_lock_names_the_process_holding_it(self):
+        # AF-1067: a leaked daemon holding the lease read only as "lock busy".
+        lock = guard.lease_path(self.root)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen([sys.executable, '-c', 'import fcntl,os,sys,time\n'
+                                   'fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT)\n'
+                                   'fcntl.flock(fd,fcntl.LOCK_SH)\nprint("held",flush=True)\ntime.sleep(30)',
+                                   str(lock)], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), 'held')
+            with self.assertRaises(guard.Deferred) as raised:
+                self.mutate()
+            self.assertIn('lock busy', str(raised.exception))
+            self.assertIn('held by pid %d ' % holder.pid, str(raised.exception))
+            self.assertTrue(self.marker.exists())
+        finally:
+            holder.kill()
+            holder.wait()
 
     def test_native_cargo_lock_blocks_unwrapped_build(self):
         lock = self.root / 'debug' / '.cargo-lock'
@@ -318,6 +342,53 @@ class CargoReclaimTests(unittest.TestCase):
         finally:
             proc.kill()
             proc.wait()
+
+    def test_build_target_reads_out_dir_target_dir_and_env(self):
+        """AF-983: which target a compiler writes into, from its own argv/env."""
+        bt = guard.build_target
+        self.assertEqual(bt('rustc', ['rustc', '--crate-name', 'x', '--out-dir', '/t/a/debug/deps'], {}),
+                         Path('/t/a/debug/deps'))
+        self.assertEqual(bt('clippy-driver', ['clippy-driver', 'rustc', '--out-dir=/t/b/debug/deps'], {}),
+                         Path('/t/b/debug/deps'))
+        self.assertEqual(bt('cargo', ['cargo', 'build', '--target-dir', '/t/c'], {'CARGO_TARGET_DIR': '/t/d'}),
+                         Path('/t/c'), 'the flag wins over the environment, as in cargo')
+        self.assertEqual(bt('cargo', ['cargo', 'test'], {'CARGO_TARGET_DIR': '/t/d'}), Path('/t/d'))
+        self.assertIsNone(bt('cargo', ['cargo', 'test'], {}), 'a default target cannot be named')
+        self.assertIsNone(bt('rustc', ['rustc', '-vV'], {'CARGO_TARGET_DIR': '/t/d'}),
+                          "rustc's target is its --out-dir, never the environment")
+
+    def test_a_compiler_writing_into_another_target_does_not_block_this_one(self):
+        """AF-983. On 2026-10-28 the shared target sat over budget all day.
+
+        Its purge was deferred by cargo/rustc processes building into OTHER
+        target dirs. A compiler that provably writes elsewhere no longer
+        blocks; one writing here, or one whose target cannot be read, still does.
+        """
+        bin_dir = self.base / 'bin'
+        bin_dir.mkdir()
+        binary = bin_dir / 'rustc'
+        source = self.base / 'slow.c'
+        source.write_text('#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n')
+        subprocess.run(['cc', str(source), '-o', str(binary)], check=True, capture_output=True)
+        proc = subprocess.Popen([str(binary)])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        other = self.base / 'rust-build-target-other' / 'debug' / 'deps'
+        cases = [
+            ('elsewhere', (['rustc', '--out-dir', str(other)], {}), False),
+            ('this target', (['rustc', '--out-dir', str(self.artifacts)], {}), True),
+            ('unreadable', None, True),
+            ('no out-dir', (['rustc', '-vV'], {}), True),
+        ]
+        for label, seen, blocks in cases:
+            with self.subTest(label):
+                def reader(pid, seen=seen):
+                    return seen if pid == str(proc.pid) else guard.process_argv_env(pid)
+                try:
+                    active, _ = guard.active_processes([self.root], read_process=reader)
+                except guard.Deferred as unmeasured:
+                    self.skipTest('ambient process table unmeasurable on this host: %s' % unmeasured)
+                self.assertEqual(str(proc.pid) in active, blocks, label)
 
     def test_consecutive_deferrals_on_one_condition_count_up_and_reset_on_a_new_one(self):
         """AMUX-4944. 243 identical refusals logged exactly like one.

@@ -37,7 +37,6 @@ jobs:
           # "Executable doesn't exist ... chrome-headless-shell").
           npx playwright install --only-shell chromium
           node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs tests/e2e-teardown-ratchet.test.mjs tests/e2e-plan.test.mjs
-          npm run test:project-setup
           npm run test:outbox
           npm run test:offline
           npm run test:state
@@ -56,6 +55,11 @@ jobs:
         run: python3 scripts/site-funnel.py --self-test
       - name: browser methods registry and agent adapters
         run: node --test tests/browser-methods.test.mjs
+      # The stall watchdog pages the owner only for a wake that is absent from
+      # the worker's history after a retry, and counts a worker's own sends as
+      # progress (2026-10-26 13:47Z false page).
+      - name: worker stall watchdog wake confirmation
+        run: node --test tests/worker-stall-watch.test.mjs
       # AMUX-5397: the ChatGPT front door's tenant rules (a grant reaches only
       # its own workspace; a tunnel answer only from its own org). The real
       # gateway handler against fake workspaces: no cloud, Clerk or Docker.
@@ -261,6 +265,9 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-mac-pressure-tripwire.sh
+          # A trip wakes the host-health worker first and pages the owner
+          # only when a worker cannot help (2026-10-30).
+          ./scripts/test-host-responder.sh
       # AMUX-4810. The soak's leak verdict used to be peak-minus-a-30-second
       # baseline, which measured warm-up: it failed on 100% of runs that ever
       # executed, including one whose second HALF was negative. The replacement
@@ -295,6 +302,24 @@ jobs:
         run: |
           set -uo pipefail
           python3 scripts/git-hooks/test_pre_push_harness_wired.py
+      # Velocity audit 2026-10-26: pre-push runs the dashboard node:test suites
+      # on the pushed commit, so a spa-gates red is caught before main holds
+      # every deploy. Synthetic fixture suites; needs only node.
+      - name: the pre-push SPA gates refuse a dashboard red, and only this push's (velocity audit 2026-10-26)
+        run: |
+          set -euo pipefail
+          python3 scripts/git-hooks/test_pre_push_spa_gates.py
+      # The land gate (scripts/land_gate.py): the push legs on the real hook
+      # with a fake approvals server, and the review's round rules on a fake
+      # claude. No model, no network.
+      - name: the land gate refuses unreceipted, unapproved and unrevertable pushes; the review converges
+        run: |
+          set -euo pipefail
+          python3 scripts/git-hooks/test_land_gate.py
+      - name: the PR watcher wakes its handler once per change, never on a failed read
+        run: |
+          set -euo pipefail
+          bash scripts/test-pr-watch.sh
       # AF-926 via AMUX-4759, same reasoning as the step below: CI-safe by
       # construction (synthetic fixture in a temp dir, zero network refs, and
       # its own header says it deliberately avoids the real frustrations.md).
@@ -404,8 +429,10 @@ jobs:
       - name: the scheduled disk reclaim moves only idle, unowned build output, through the server (SCHED-783)
         run: |
           set -uo pipefail
-          ./scripts/test-disk-reclaim-tick.sh
-          ./scripts/test-pkill-guard-shim.sh
+          # No -e here, so each line carries its own exit: only the last one counted.
+          ./scripts/test-disk-reclaim-tick.sh || exit 1
+          ./scripts/test-pkill-guard-shim.sh || exit 1
+          ./scripts/test-shim-copies.sh
       - name: a red main rust run is re-run once only for a flaky e2e spec or a truncated test archive
         run: ./scripts/test-rust-flake-rerun-classify.sh
       - name: orch-pace projects the proof rate to its checkpoint
@@ -421,6 +448,10 @@ jobs:
           set -uo pipefail
           ./scripts/test-sync-checkout-override.sh
           ./scripts/test-contribute.sh
+      - name: amux-cloud opens a Cloud instance's workers over SSH as its amux user, messages byte for byte
+        run: ./scripts/test-amux-cloud.sh
+      - name: The Cloud sign-in door queues a page load's burst instead of dropping it
+        run: python3 cloud/desktop/test_door_backlog.py
       - name: Python reading a shared site-packages defaults grpc to fork-safe (Mac crashes RCA 20261018-105230)
         run: |
           set -uo pipefail
@@ -458,6 +489,11 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-mac-cleanup-fseventsd.sh
+          ./scripts/test-mac-health-pass.sh
+      - name: cargo tests run at most AMUX_TEST_THREADS threads, and the tick names an uncapped test binary
+        run: |
+          set -uo pipefail
+          ./scripts/test-test-threads-cap.sh
       - name: an orphaned sqlite .backup of an amux db is stopped, and nothing else (DESKT-94)
         run: |
           set -uo pipefail
@@ -529,6 +565,10 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-cli-memory.sh
+      - name: amux wake creates, lists and cancels the lane's own wakeups
+        run: |
+          set -uo pipefail
+          bash scripts/test-cli-wake.sh
       - name: amux stop records the stop through the server
         run: |
           set -uo pipefail
@@ -557,6 +597,10 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-post-commit-open-requests.sh
+      - name: a request landed in a repo the server does not deploy reads landed, not "not live" (AF-1058)
+        run: |
+          set -uo pipefail
+          bash scripts/test-requests-landed.sh
       - name: install.sh's hook install references the real source path
         run: |
           set -uo pipefail
@@ -639,6 +683,8 @@ jobs:
           python3 scripts/test-send-retry-identity.py
       - name: board help never registers an artifact
         run: python3 scripts/test-board-help.py
+      - name: wake watches fire once, expire, cap, share one CI poller, and never read unreadable as no event
+        run: python3 scripts/test-wake-watch.py
       - name: Board linked source messages
         run: python3 scripts/test-board-show-messages.py
       - name: the shared-checkout guard attributes a block to the real actor
@@ -728,6 +774,7 @@ jobs:
           # AMUX-3932 was a live bypass in it found by hand rather than by this
           # file. Cheap (no cargo), so there is no reason it was not here.
           python3 ./scripts/git-hooks/test_remove_correction.py || exit $?
+          python3 ./scripts/git-hooks/test_token_print.py || exit $?
           python3 ./scripts/git-hooks/test_git_shared_guard.py || exit $?
           python3 ./scripts/git-hooks/test_post_push_verify.py || exit $?
           python3 ./scripts/git-hooks/test_land_push_guard.py
@@ -763,6 +810,10 @@ jobs:
       # here said the step above reports only its last script. It does not: run
       # blocks execute under bash -e, so that step fails on its first failing
       # script. Corrected under AMUX-4651.)
+      # Branch hygiene (Ethan 2026-10-27): merged branches pruned, unmerged
+      # past 48h reported. Runs against a throwaway bare remote; no network.
+      - name: Branch hygiene report and merged-only prune
+        run: ./scripts/test-branch-hygiene.sh
       - name: CLI refusal remedies (board doing)
         run: ./scripts/test-board-continuation-hint.sh
       # AMUX-4652: board needs reports a refused blocker link instead of claiming it.
@@ -861,6 +912,17 @@ jobs:
           # persistent listener loss makes the external watchdog reload only the
           # exact configured launch agent.
           ./scripts/test-build-atomic-install.sh
+          # AMUX-6530: a long deploy build logs a heartbeat, and the heartbeat
+          # can neither outlive the build nor abort it under set -e.
+          ./scripts/test-build-heartbeat.sh
+          # AF-1012: a link failure on unresolved symbols clears the stale
+          # amux_server incremental trees and retries once; a compile error does not.
+          ./scripts/test-build-link-retry.sh
+          # Cloud follows main's tip without the CI wait: an activation that does
+          # not come up healthy is put back and held.
+          ./scripts/test-build-activation-rollback.sh
+          # The builder compiles main's tip while its CI runs (2026-10-29).
+          ./scripts/test-rust-prebuild.sh
           python3 ./scripts/test-watchdog-recovery.py
           # AEAB-36: a board write that never reached the server must say so,
           # and must never be confused with one the server refused. Its (c)/(d)

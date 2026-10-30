@@ -82,8 +82,9 @@ test('calendar subscription renders without the retired tunnel and stays dismiss
 });
 
 test('dialog surfaces are opaque and readable in both themes and report theme regressions',async({page})=>{
+ // Switch themes the way the app does: a theme sets every token, not just the class.
  for(const light of [true,false]){
-  await page.evaluate(light=>document.body.classList.toggle('light',light),light);
+  await page.evaluate(light=>(window as any).themeActivate(light?'amux-light':'amux-dark',{local:true}),light);
   for(const [open,root] of [
    ["_connScopePicker('github','worker',true)",'.conn-picker-overlay'],
    ['_jrnlShowConfig()','#jrnl-config-overlay'],
@@ -96,6 +97,13 @@ test('dialog surfaces are opaque and readable in both themes and report theme re
    await page.locator(root).evaluate(e=>e.remove());
   }
  }
+ // Themed colors arrive as color(srgb ...) with 0-1 channels; an unreadable
+ // dialog in that form must still be reported (680b0ecd3's CI red came from
+ // reading them as 0-255, which flagged a readable one).
+ await page.evaluate(()=>{(0,eval)("_upgradeModalShown=false;_showUpgradeModal({error:'trial_expired'})");});
+ await page.locator('#upgrade-modal > div').evaluate(e=>{e.style.color='color-mix(in srgb, '+getComputedStyle(e).backgroundColor+' 96%, white)';});
+ await expect.poll(()=>page.evaluate(()=>(window as any)._modalLayoutCheck().clipped)).toContain('upgrade-modal:low-contrast');
+ await page.locator('#upgrade-modal').evaluate(e=>e.remove());
  await page.evaluate(()=>{(window as any)._jrnlShowConfig();});
  const beacon=page.waitForRequest(r=>r.url().endsWith('/api/client-debug')&&r.postDataJSON()?.clipped?.includes('jrnl-config-overlay:transparent'));
  await page.locator('#jrnl-config-overlay > div').evaluate(e=>{e.style.background='transparent';});await page.evaluate(()=>window.dispatchEvent(new Event('resize')));

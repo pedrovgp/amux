@@ -53,6 +53,8 @@ const SIDECAR_KIND: &str = "amux-recording";
 /// A day of 32 kbps speech is about 350 MB. This bounds a mistake, not a use.
 const MAX_UPLOAD_BYTES: usize = 1 << 30;
 const MAX_TRANSCRIBE_ATTEMPTS: i64 = 3;
+/// Gemini gets a long recording in pieces of this many seconds.
+const GEMINI_PIECE_S: u64 = 600;
 /// A `running` transcript older than this belongs to a process that died.
 const RUNNING_STALE_MS: i64 = 30 * 60 * 1000;
 /// One job tick stops STARTING new transcriptions after this long, so a
@@ -87,6 +89,8 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}", get(get_one))
         .route("/{id}/transcribe", post(retranscribe))
+        .merge(super::recording_sessions::routes())
+        .merge(super::recording_live::routes())
 }
 
 // ---- folder ----------------------------------------------------------------
@@ -127,6 +131,25 @@ async fn current_dir(state: &AppState) -> anyhow::Result<(PathBuf, &'static str)
         Ok(resolve_dir(&conn))
     })
     .await?
+}
+
+/// The recordings folder for a handler: resolved and checked against the
+/// write policy, or the error response to return.
+pub(crate) async fn folder(state: &AppState) -> Result<PathBuf, Response> {
+    let (dir, source) = current_dir(state)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    validate_dir(&dir.display().to_string())
+        .map_err(|(s, m)| err(s, format!("the recordings folder ({source}) is refused: {m}")))?;
+    Ok(dir)
+}
+
+pub(crate) fn folder_lock_pub() -> std::sync::MutexGuard<'static, ()> {
+    folder_lock()
+}
+
+pub(crate) fn find_sidecar_pub(dir: &Path, id: &str) -> Option<(PathBuf, Value)> {
+    find_sidecar(dir, id)
 }
 
 /// Where recordings may be written. The Files API's own path policy, so the
@@ -203,6 +226,19 @@ pub struct UploadQuery {
     device: Option<String>,
     #[serde(default)]
     recovered: Option<String>,
+}
+
+impl UploadQuery {
+    /// The same fields from a session manifest, so a session is checked by
+    /// exactly the rules a one-shot upload is.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        id: Option<String>, started_at: Option<String>, ended_at: Option<String>, dur_ms: Option<String>,
+        tz_offset_min: Option<String>, mime: Option<String>, lat: Option<String>, lon: Option<String>,
+        accuracy_m: Option<String>, device: Option<String>, recovered: Option<String>,
+    ) -> Self {
+        UploadQuery { id, started_at, ended_at, dur_ms, tz_offset_min, mime, lat, lon, accuracy_m, device, recovered }
+    }
 }
 
 fn ext_for_mime(mime: &str) -> Option<&'static str> {
@@ -410,7 +446,7 @@ pub(crate) fn metadata_args(meta: &RecordingMeta, input: &Path, output: &Path) -
 /// Run a tool to completion under a deadline. The error names the tool and
 /// carries the tail of its stderr, which goes to a file so a chatty tool can
 /// never fill a pipe and hang.
-fn run_bounded(bin: &Path, args: &[String], timeout: Duration) -> Result<(), String> {
+pub(crate) fn run_bounded(bin: &Path, args: &[String], timeout: Duration) -> Result<(), String> {
     use std::io::{Read, Seek};
     let name = bin
         .file_name()
@@ -500,6 +536,29 @@ fn find_sidecar(dir: &Path, id: &str) -> Option<(PathBuf, Value)> {
     })
 }
 
+/// Change a sidecar under the folder lock, keeping every field `f` leaves alone.
+pub(crate) fn update_sidecar(path: &Path, f: impl FnOnce(&mut Value)) -> std::io::Result<Value> {
+    let _g = folder_lock();
+    let mut v = read_json(path).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "unreadable sidecar"))?;
+    f(&mut v);
+    write_atomic(path, &serde_json::to_vec_pretty(&v).unwrap_or_default())?;
+    if let Some(ms) = v["started_at"].as_i64() {
+        let _ = stamp_times(path, ms);
+    }
+    Ok(v)
+}
+
+/// The recordings folder, for a job (no HTTP response to build).
+pub(crate) async fn folder_path(state: &AppState) -> anyhow::Result<PathBuf> {
+    current_dir(state).await.map(|(d, _)| d)
+}
+
+/// `write_transcript` for the live path (recording_live.rs).
+pub(crate) fn write_transcript_pub(dir: &Path, sidecar: &Value, segments: &[Segment], engine: &str, model: &str,
+    language: Value, t0: Instant) -> Result<Value, String> {
+    write_transcript(dir, sidecar, segments, engine, model, language, t0)
+}
+
 /// Replace a sidecar's `transcript` object, keeping every other field exactly
 /// as it is on disk.
 fn set_transcript(path: &Path, transcript: Value) -> std::io::Result<Value> {
@@ -543,25 +602,52 @@ pub(crate) fn store_upload(
     let _g = folder_lock();
     std::fs::create_dir_all(dir)?;
     let sha = hex::encode(sha2::Sha256::digest(bytes));
-    if let Some((_, existing)) = find_sidecar(dir, &meta.id) {
-        let have = existing["upload_sha256"].as_str().unwrap_or("").to_string();
-        if have == sha {
-            return Ok((existing, true));
-        }
-        let file = existing["file"].as_str().unwrap_or("").to_string();
-        return Err(StoreError::Conflict {
-            existing_sha256: have,
-            file,
-        });
+    if let Some(found) = existing_upload(dir, meta, &sha) {
+        return found;
+    }
+    let upload_tmp = dir.join(format!(".{}.upload.{}", base_name(meta), meta.ext));
+    std::fs::write(&upload_tmp, bytes)?;
+    file_upload(dir, meta, &upload_tmp, &sha, bytes.len() as u64, ffmpeg, None)
+}
+
+/// The sidecar already filed under this id: the same bytes again is a
+/// duplicate (Ok, deduped), different bytes are a conflict.
+fn existing_upload(dir: &Path, meta: &RecordingMeta, sha: &str) -> Option<Result<(Value, bool), StoreError>> {
+    let (_, existing) = find_sidecar(dir, &meta.id)?;
+    let have = existing["upload_sha256"].as_str().unwrap_or("").to_string();
+    if have == sha {
+        return Some(Ok((existing, true)));
+    }
+    let file = existing["file"].as_str().unwrap_or("").to_string();
+    Some(Err(StoreError::Conflict { existing_sha256: have, file }))
+}
+
+/// File an audio file that is already on disk (`src`, in `dir`, renamed into
+/// place) and write its sidecar. `extra` is merged into the sidecar (a
+/// session's tracks and gaps). Caller holds `folder_lock`.
+pub(crate) fn file_upload(
+    dir: &Path,
+    meta: &RecordingMeta,
+    src: &Path,
+    sha: &str,
+    upload_len: u64,
+    ffmpeg: Option<&Path>,
+    extra: Option<Value>,
+) -> Result<(Value, bool), StoreError> {
+    if let Some(found) = existing_upload(dir, meta, sha) {
+        let _ = std::fs::remove_file(src);
+        return found;
     }
     let base = base_name(meta);
     let audio = dir.join(format!("{base}.{}", meta.ext));
     let upload_tmp = dir.join(format!(".{base}.upload.{}", meta.ext));
-    std::fs::write(&upload_tmp, bytes)?;
+    if src != upload_tmp {
+        std::fs::rename(src, &upload_tmp)?;
+    }
     let (embedded, metadata_error): (bool, Option<String>) = match ffmpeg {
         Some(ff) if embeddable(meta.ext) => {
             let out_tmp = dir.join(format!(".{base}.meta.{}", meta.ext));
-            let budget = Duration::from_secs(60 + (bytes.len() as u64 >> 20) * 2);
+            let budget = Duration::from_secs(60 + (upload_len >> 20) * 2);
             let ran = run_bounded(ff, &metadata_args(meta, &upload_tmp, &out_tmp), budget);
             let wrote = std::fs::metadata(&out_tmp)
                 .map(|m| m.len() > 0)
@@ -611,7 +697,7 @@ pub(crate) fn store_upload(
         "path": audio.display().to_string(),
         "mime": meta.mime,
         "bytes": final_bytes,
-        "upload_bytes": bytes.len(),
+        "upload_bytes": upload_len,
         "upload_sha256": sha,
         "started_at": meta.started_at_ms,
         "ended_at": meta.ended_at_ms,
@@ -629,6 +715,10 @@ pub(crate) fn store_upload(
         "synced_at": now_ms(),
         "transcript": { "status": "pending", "attempts": 0 },
     });
+    let mut sidecar = sidecar;
+    if let (Some(obj), Some(Value::Object(more))) = (sidecar.as_object_mut(), extra) {
+        obj.extend(more);
+    }
     let sidecar_path = dir.join(format!("{base}.json"));
     write_atomic(
         &sidecar_path,
@@ -747,7 +837,7 @@ const GEMINI_MAX_AUDIO: usize = 18 * 1024 * 1024;
 
 /// Run a future from the blocking transcription pass: the job runs it on a
 /// blocking thread inside the runtime, a unit test on a bare thread.
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(h) => h.block_on(f),
         Err(_) => tokio::runtime::Builder::new_current_thread()
@@ -775,26 +865,34 @@ pub(crate) fn transcribe_one_gemini(
     }
     let dur_s = (sidecar["dur_ms"].as_i64().unwrap_or(0) / 1000).max(0) as u64;
     let work = tempfile::tempdir().map_err(|e| e.to_string())?;
-    // Small mono speech audio when ffmpeg is here: 32 kbps is about 14 MB an hour.
-    let (bytes, mime) = match ffmpeg {
+    // Small mono speech audio when ffmpeg is here, in GEMINI_PIECE_S pieces:
+    // one request per piece, so a two-hour meeting is twelve requests of about
+    // 2.4 MB rather than one request over the inline cap (it failed every
+    // recording longer than about an hour, 2026-10-27 audit).
+    let pieces: Vec<(Vec<u8>, String)> = match ffmpeg {
         Some(ff) => {
-            let mp3 = work.path().join("audio.mp3");
             let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-y", "-i"].iter().map(|s| s.to_string()).collect();
             a.push(audio.display().to_string());
-            a.extend(["-ac", "1", "-ar", "16000", "-b:a", "32k"].iter().map(|s| s.to_string()));
-            a.push(mp3.display().to_string());
+            a.extend(["-ac", "1", "-ar", "16000", "-b:a", "32k", "-f", "segment", "-segment_time"].iter().map(|s| s.to_string()));
+            a.push(GEMINI_PIECE_S.to_string());
+            a.push(work.path().join("piece%04d.mp3").display().to_string());
             run_bounded(ff, &a, Duration::from_secs(120 + dur_s / 4))?;
-            (std::fs::read(&mp3).map_err(|e| e.to_string())?, "audio/mpeg".to_string())
+            let mut names: Vec<PathBuf> = std::fs::read_dir(work.path()).map_err(|e| e.to_string())?
+                .flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "mp3")).collect();
+            names.sort();
+            names.iter().map(|p| std::fs::read(p).map(|b| (b, "audio/mpeg".to_string())).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?
         }
-        None => (
+        None => vec![(
             std::fs::read(&audio).map_err(|e| e.to_string())?,
             sidecar["mime"].as_str().unwrap_or("audio/webm").split(';').next().unwrap_or("audio/webm").to_string(),
-        ),
+        )],
     };
-    if bytes.len() > GEMINI_MAX_AUDIO {
+    if let Some((b, _)) = pieces.iter().find(|(b, _)| b.len() > GEMINI_MAX_AUDIO) {
         return Err(format!(
-            "the audio is {} MB, more than the {} MB Gemini takes in one request; choose a local engine in {}",
-            bytes.len() >> 20,
+            "the audio is {} MB, more than the {} MB Gemini takes in one request, and without ffmpeg it cannot be split; \
+             install ffmpeg or choose a local engine in {}",
+            b.len() >> 20,
             GEMINI_MAX_AUDIO >> 20,
             super::transcription::SETTING
         ));
@@ -807,14 +905,22 @@ pub(crate) fn transcribe_one_gemini(
         prompt.push('\n');
         prompt.push_str(vocab);
     }
-    let timeout = (90 + dur_s / 2).min(600);
-    let text = block_on(super::transcription::gemini_transcribe(key, &mime, &bytes, &prompt, timeout))?;
+    let total_ms = sidecar["dur_ms"].as_i64().unwrap_or(0);
+    let piece_ms = (GEMINI_PIECE_S * 1000) as i64;
+    let n = pieces.len();
+    let mut segments: Vec<Segment> = Vec::new();
+    for (i, (bytes, mime)) in pieces.iter().enumerate() {
+        let piece_s = if n > 1 { GEMINI_PIECE_S } else { dur_s };
+        let timeout = (90 + piece_s / 2).min(600);
+        let text = block_on(super::transcription::gemini_transcribe(key, mime, bytes, &prompt, timeout))
+            .map_err(|e| if n > 1 { format!("piece {} of {n}: {e}", i + 1) } else { e })?;
+        if !text.trim().is_empty() {
+            let from = i as i64 * piece_ms;
+            let to = if i + 1 == n { total_ms.max(from) } else { from + piece_ms };
+            segments.push(Segment { from_ms: from, to_ms: to, text: text.trim().to_string() });
+        }
+    }
     let model = super::dictation::dictation_model();
-    let segments: Vec<Segment> = if text.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![Segment { from_ms: 0, to_ms: sidecar["dur_ms"].as_i64().unwrap_or(0), text: text.trim().to_string() }]
-    };
     write_transcript(dir, sidecar, &segments, "gemini", &model, Value::Null, t0)
 }
 
@@ -1030,6 +1136,14 @@ fn write_transcript(
     }))
 }
 
+/// The attempt about to start: (attempts, crashes, resumed after a crash).
+/// A stale `running` died with its process and does not spend an attempt.
+pub(crate) fn next_attempt(t: &Value) -> (i64, i64, bool) {
+    let crashed = t["status"] == "running";
+    let attempts = t["attempts"].as_i64().unwrap_or(0) + i64::from(!crashed);
+    (attempts, t["crashes"].as_i64().unwrap_or(0) + i64::from(crashed), crashed)
+}
+
 /// Does this transcript state still owe work? `unavailable` does, so a
 /// recording made before a model was installed is picked up afterwards.
 pub(crate) fn needs_transcription(t: &Value, now: i64) -> bool {
@@ -1070,7 +1184,16 @@ pub(crate) fn mark_unavailable(owed: &[(PathBuf, Value)], why: &str) {
 /// One pass over `dir`: every recording that still owes a transcript, oldest
 /// first, one at a time, until the tick budget is spent. Returns how many
 /// transcripts were written.
+#[cfg(test)]
 pub(crate) fn transcribe_pending_in(dir: &Path, budget: Duration, plan: &Plan) -> usize {
+    let opts = super::recording_live::Options { live: true, notes: false, organize: false };
+    transcribe_pending_with(dir, budget, plan, opts)
+}
+
+/// The pass, with the Record options: a recording transcribed live is
+/// finished from its live pieces, and a finished transcript owes notes when
+/// the options ask for them.
+pub(crate) fn transcribe_pending_with(dir: &Path, budget: Duration, plan: &Plan, opts: super::recording_live::Options) -> usize {
     let now = now_ms();
     let mut owed: Vec<(PathBuf, Value)> = read_sidecars(dir)
         .into_iter()
@@ -1102,19 +1225,38 @@ pub(crate) fn transcribe_pending_in(dir: &Path, budget: Duration, plan: &Plan) -
             break;
         }
         let id = v["id"].as_str().unwrap_or("").to_string();
-        let attempts = v["transcript"]["attempts"].as_i64().unwrap_or(0) + 1;
+        // A stale `running` is an attempt whose process died (a crash, a
+        // deploy): it is retried without spending another attempt. Crashes are
+        // counted on their own, so a recording that kills the process every
+        // time still stops after MAX_TRANSCRIBE_ATTEMPTS.
+        let (attempts, crashes, crashed) = next_attempt(&v["transcript"]);
+        if crashes >= MAX_TRANSCRIBE_ATTEMPTS {
+            tracing::warn!(id, crashes, measured = true, n_considered = 1, verdict = "recording_transcribe_crashed_out",
+                "[recordings] transcription died with its process every time; giving up on this recording");
+            let _ = set_transcript(&path, json!({"status": "failed", "attempts": MAX_TRANSCRIBE_ATTEMPTS, "crashes": crashes,
+                "error": format!("the transcription process died {crashes} times on this recording"), "finished_at": now_ms()}));
+            continue;
+        }
+        if crashed {
+            tracing::warn!(id, crashes, measured = true, n_considered = 1, verdict = "recording_transcribe_resumed_after_crash",
+                "[recordings] a transcription whose process died is retried without spending an attempt");
+        }
         if set_transcript(
             &path,
-            json!({"status": "running", "running_since": now_ms(), "attempts": attempts}),
+            json!({"status": "running", "running_since": now_ms(), "attempts": attempts, "crashes": crashes}),
         )
         .is_err()
         {
             continue;
         }
-        let result = match (&local, &plan.gemini) {
-            (Some((ffmpeg, tr)), _) => transcribe_one(dir, &v, tr, ffmpeg),
-            (None, Some((key, vocab))) => transcribe_one_gemini(dir, &v, ffmpeg_for_gemini.as_deref(), key, vocab),
-            (None, None) => Err("no transcription engine".to_string()),
+        // Transcribed live: the pieces are kept and only the tail is new work.
+        let from_live = super::recording_live::ClipEngine::from_plan(plan).ok()
+            .and_then(|eng| super::recording_live::transcribe_with_live(dir, &v, &eng));
+        let result = match (from_live, &local, &plan.gemini) {
+            (Some(r), _, _) => r,
+            (None, Some((ffmpeg, tr)), _) => transcribe_one(dir, &v, tr, ffmpeg),
+            (None, None, Some((key, vocab))) => transcribe_one_gemini(dir, &v, ffmpeg_for_gemini.as_deref(), key, vocab),
+            (None, None, None) => Err("no transcription engine".to_string()),
         };
         match result {
             Ok(mut t) => {
@@ -1124,7 +1266,10 @@ pub(crate) fn transcribe_pending_in(dir: &Path, budget: Duration, plan: &Plan) -
                     t["words"],
                     t["secs"]
                 );
-                let _ = set_transcript(&path, t);
+                let _ = update_sidecar(&path, |s| {
+                    s["transcript"] = t;
+                    super::recording_live::owe_notes(s, opts);
+                });
                 done += 1;
             }
             Err(e) => {
@@ -1151,17 +1296,28 @@ pub async fn transcribe_pending(state: AppState) {
         }
     };
     let store = state.store.clone();
+    let notes_dir = dir.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let plan = match store.read() {
-            Ok(conn) => Plan::read(&conn),
+        // Sessions first: a finished or abandoned session becomes a filed
+        // recording, which this same tick can then transcribe.
+        let ffmpeg = super::file_viewer::find_bin("ffmpeg");
+        let (filed, failed) = super::recording_sessions::finish_sessions_in(&dir, ffmpeg.as_deref(), now_ms());
+        if filed + failed > 0 {
+            tracing::info!(filed, failed, measured = true, n_considered = filed + failed,
+                verdict = "recording_sessions_tick", "recordings: assembled finished sessions");
+        }
+        let (plan, opts) = match store.read() {
+            Ok(conn) => (Plan::read(&conn), super::recording_live::options(&conn)),
             Err(e) => {
                 tracing::warn!("[recordings] could not read the transcription setting: {e}");
                 return 0;
             }
         };
-        transcribe_pending_in(&dir, TICK_BUDGET, &plan)
+        transcribe_pending_with(&dir, TICK_BUDGET, &plan, opts)
     })
     .await;
+    // Notes and meeting understanding follow the transcripts, in this tick.
+    super::recording_live::notes_pass(&state, &notes_dir).await;
 }
 
 // ---- handlers --------------------------------------------------------------------
@@ -1309,6 +1465,17 @@ async fn get_one(State(state): State<AppState>, AxPath(id): AxPath<String>) -> R
         if let Some(md) = v["transcript"]["md"].as_str().map(str::to_string) {
             if let Ok(text) = std::fs::read_to_string(dir.join(md)) {
                 v["transcript"]["text"] = json!(strip_front_matter(&text));
+            }
+        }
+        // The lines, for the transcript view: who, when, what.
+        if let Some(f) = v["transcript"]["segments_file"].as_str().map(str::to_string) {
+            if let Some(j) = read_json(&dir.join(f)) {
+                v["transcript"]["segments"] = j["segments"].clone();
+            }
+        }
+        if let Some(md) = v["notes"]["md"].as_str().map(str::to_string) {
+            if let Ok(text) = std::fs::read_to_string(dir.join(md)) {
+                v["notes"]["text"] = json!(text);
             }
         }
         Some(v)
@@ -1985,5 +2152,14 @@ mod tests {
         } else {
             eprintln!("SKIPPED the Local only half: this host has whisper.cpp");
         }
+    }
+
+    #[test]
+    fn a_crashed_transcription_is_retried_without_spending_an_attempt_and_crashes_are_bounded() {
+        assert_eq!(next_attempt(&json!({"status": "pending", "attempts": 0})), (1, 0, false));
+        assert_eq!(next_attempt(&json!({"status": "failed", "attempts": 1})), (2, 0, false));
+        // Died mid-run at attempt 1: the retry is still attempt 1, and one crash is counted.
+        assert_eq!(next_attempt(&json!({"status": "running", "attempts": 1, "running_since": 0})), (1, 1, true));
+        assert_eq!(next_attempt(&json!({"status": "running", "attempts": 1, "crashes": 2})), (1, 3, true));
     }
 }

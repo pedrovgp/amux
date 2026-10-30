@@ -52,7 +52,7 @@
 //!   shutil.which quietly fails there.
 
 use super::fs::{
-    expanduser, git_show_file, is_dangerous_write, is_path_allowed, j, mtime_secs, not_found,
+    abs_to_repo_rel, expanduser, git_show_file, is_dangerous_write, is_path_allowed, j, mtime_secs, not_found,
     parse_body, parse_qs, pystr, qs_get, real_list_dirs, resolve_rel_candidates,
     resolve_rel_descend,
 };
@@ -85,10 +85,79 @@ pub fn routes() -> Router<AppState> {
         .route("/hls", any(hls))
         .route("/prepare", any(prepare))
         .route("/transcode", any(transcode))
+        .route("/history", any(history))
         .route("/{*rest}", any(not_found))
         // Python has no body cap on PUT /api/file; axum's 2MB default would
         // 413 a large markdown save the python origin accepts.
         .layer(DefaultBodyLimit::disable())
+}
+
+// ---------------------------------------------------------------------------
+// History (the markdown editor's History tab, owner 2026-10-29)
+// ---------------------------------------------------------------------------
+
+/// A file's git history: the commits that touched it, newest first, and
+/// whether it has edits not committed yet. With `sha=<commit>`, the file as it
+/// was in that commit. A file outside a git repository answers `in_repo:
+/// false`, measured, so "no history" and "could not look" stay different.
+async fn history(req: Request) -> Response {
+    if req.method() != Method::GET {
+        return not_found().await;
+    }
+    let qs = parse_qs(req.uri().query().unwrap_or(""));
+    let p = match qpath(&qs) {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
+    if !is_path_allowed(&p) {
+        return j(403, json!({"error": "access denied"}));
+    }
+    let Some((top, rel)) = abs_to_repo_rel(&p).await else {
+        return j(200, json!({"measured": true, "n_considered": 0, "in_repo": false, "commits": [],
+                             "why": "not in a git repository"}));
+    };
+    let git = |args: Vec<String>| {
+        let top = top.clone();
+        async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::process::Command::new("git").arg("-C").arg(&top).args(&args).output(),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+        }
+    };
+    if let Some(sha) = qs_get(&qs, "sha") {
+        if sha.len() < 4 || sha.len() > 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return j(400, json!({"error": "sha must be a commit id"}));
+        }
+        return match git(vec!["show".into(), format!("{sha}:{rel}")]).await {
+            Some(o) if o.status.success() => j(200, json!({"measured": true, "n_considered": 1, "in_repo": true, "sha": sha,
+                                                           "content": String::from_utf8_lossy(&o.stdout)})),
+            Some(o) => j(404, json!({"measured": true, "n_considered": 0, "in_repo": true, "error": "not in that commit",
+                                     "detail": String::from_utf8_lossy(&o.stderr).trim()})),
+            None => j(503, json!({"measured": false, "n_considered": 0, "why_unmeasured": "git did not answer in 10 s"})),
+        };
+    }
+    let limit = qs_get(&qs, "limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50).clamp(1, 200);
+    let log = git(vec!["log".into(), "--follow".into(), format!("-n{limit}"),
+                       "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s".into(), "--".into(), rel.clone()]).await;
+    let Some(log) = log.filter(|o| o.status.success()) else {
+        return j(503, json!({"measured": false, "n_considered": 0, "in_repo": true, "why_unmeasured": "git log failed or timed out"}));
+    };
+    let commits: Vec<Value> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\x1f').collect();
+            (f.len() == 5).then(|| json!({"sha": f[0], "short": f[1], "author": f[2],
+                                          "at": f[3].parse::<i64>().unwrap_or(0), "subject": f[4]}))
+        })
+        .collect();
+    let dirty = git(vec!["status".into(), "--porcelain".into(), "--".into(), rel.clone()]).await
+        .map(|o| !o.stdout.is_empty());
+    j(200, json!({"measured": true, "n_considered": commits.len(), "in_repo": true, "repo": top, "rel": rel,
+                  "commits": commits, "uncommitted": dirty}))
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +424,21 @@ const B64: base64::engine::general_purpose::GeneralPurpose =
 // GET /api/file — viewer payload (py:67956-68067) · PUT — write-back
 // ---------------------------------------------------------------------------
 
+/// A filesystem error as the status it really is (AMUX-6437). Every read and
+/// write here answered 500, so an OS refusal ("Permission denied (os error
+/// 13)" on a file the server user cannot read) read as amux failing and
+/// autofix filed it as a server fault. Permission denied is 403 and a file
+/// that vanished between the stat and the read is 404; anything else is
+/// still a 500.
+fn io_fail(e: &std::io::Error) -> Response {
+    let code = match e.kind() {
+        std::io::ErrorKind::PermissionDenied => 403,
+        std::io::ErrorKind::NotFound => 404,
+        _ => 500,
+    };
+    j(code, json!({"error": e.to_string()}))
+}
+
 async fn file_root(state: State<AppState>, req: Request) -> Response {
     let _ = state; // reserved: keeps the handler signature uniform in this router
     match *req.method() {
@@ -407,7 +491,7 @@ async fn view(req: Request) -> Response {
         if sz <= img_inline_max() {
             let bytes = match std::fs::read(&p) {
                 Ok(b) => b,
-                Err(e) => return j(500, json!({"error": e.to_string()})),
+                Err(e) => return io_fail(&e),
             };
             out["data_url"] = json!(format!("data:{mime};base64,{}", B64.encode(&bytes)));
         } else {
@@ -428,7 +512,7 @@ async fn view(req: Request) -> Response {
         if sz <= 10_000_000 {
             let raw = match std::fs::read(&p) {
                 Ok(b) => b,
-                Err(e) => return j(500, json!({"error": e.to_string()})),
+                Err(e) => return io_fail(&e),
             };
             out["data_url"] = json!(format!("data:application/pdf;base64,{}", B64.encode(&raw)));
         }
@@ -521,7 +605,7 @@ async fn view(req: Request) -> Response {
     // per-sequence — divergence only inside already-mangled bytes.
     let raw = match std::fs::read(&p) {
         Ok(b) => b,
-        Err(e) => return j(500, json!({"error": e.to_string()})),
+        Err(e) => return io_fail(&e),
     };
     let mut content = String::from_utf8_lossy(&raw).into_owned();
     let is_md = matches!(ext.as_str(), ".md" | ".markdown" | ".mdx");
@@ -535,6 +619,8 @@ async fn view(req: Request) -> Response {
             "path": pystr(&p), "content": content,
             "is_markdown": is_md, "is_csv": is_csv, "is_html": is_html,
             "truncated": truncated, "total_chars": total_chars,
+            // The version this content is, sent back with a save.
+            "etag": current_etag(&p),
         }),
     )
 }
@@ -679,66 +765,39 @@ async fn view_from_git(cwd: &str, fpath: &str) -> Option<Response> {
 /// Entries like ".env"/".gitignore" are reachable only as real suffixes
 /// ("foo.env") — a FILE named ".env" has no suffix and passes the
 /// extensionless branch, exactly as in python.
-const WRITABLE_EXTS: &[&str] = &[
-    ".md",
-    ".markdown",
-    ".mdx",
-    ".mdai",
-    ".txt",
-    ".json",
-    ".yml",
-    ".yaml",
-    ".toml",
-    ".ini",
-    ".cfg",
-    ".sh",
-    ".bash",
-    ".zsh",
-    ".py",
-    ".js",
-    ".ts",
-    ".jsx",
-    ".tsx",
-    ".mjs",
-    ".cjs",
-    ".css",
-    ".scss",
-    ".less",
-    ".html",
-    ".htm",
-    ".xml",
-    ".svg",
-    ".csv",
-    ".sql",
-    ".graphql",
-    ".proto",
-    ".go",
-    ".rs",
-    ".java",
-    ".rb",
-    ".php",
-    ".swift",
-    ".kt",
-    ".c",
-    ".cpp",
-    ".h",
-    ".cs",
-    ".r",
-    ".lua",
-    ".pl",
-    ".env",
-    ".gitignore",
-    ".dockerignore",
-    ".tf",
-    ".hcl",
-    ".conf",
-    ".log",
-    ".makefile",
-    // The Draw tab autosaves drawings and its shared component library as
-    // these (standard Excalidraw JSON).
-    ".excalidraw",
-    ".excalidrawlib",
+/// Formats that are bytes, never text: a text save over one would corrupt it.
+/// Every other file may be saved as text from the viewer (Ethan, 2026-10-26:
+/// "make sure we have a file editor for every file, i cannot edit html
+/// files"), unless the file on disk is itself not text (`existing_is_text`),
+/// which catches a binary under an extension this list does not name.
+const TEXT_UNWRITABLE_EXTS: &[&str] = &[
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".icns", ".tif", ".tiff", ".heic", ".avif",
+    ".pdf", ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".tar", ".dmg", ".iso", ".pkg",
+    ".mp3", ".mp4", ".m4a", ".m4v", ".mov", ".wav", ".flac", ".ogg", ".webm", ".mkv", ".avi", ".aac",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".exe", ".dll", ".so", ".dylib", ".a", ".o", ".class", ".jar", ".wasm", ".pyc", ".node", ".bin",
+    ".sqlite", ".sqlite3", ".db", ".parquet", ".arrow", ".npy", ".pt", ".onnx", ".safetensors",
+    ".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt", ".odt", ".ods", ".key", ".numbers", ".pages",
+    ".epub", ".mobi", ".psd", ".sketch", ".fig",
 ];
+
+/// Whether the file already at `p` reads as text (UTF-8, no NUL in its first
+/// 64 KB). A missing file is a new one and counts as text.
+fn existing_is_text(p: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(p) else { return true };
+    let mut buf = vec![0u8; 65536];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let head = &buf[..n];
+    if head.contains(&0) {
+        return false;
+    }
+    // A multi-byte character cut at the 64 KB edge is still text.
+    match std::str::from_utf8(head) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none(),
+    }
+}
 
 async fn put_file(req: Request) -> Response {
     let bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
@@ -771,10 +830,12 @@ async fn put_file(req: Request) -> Response {
                 json!({"error": format!("binary content not writable for: {ext}")}),
             );
         }
-    } else if !ext.is_empty() && !WRITABLE_EXTS.contains(&ext.as_str()) {
+    } else if TEXT_UNWRITABLE_EXTS.contains(&ext.as_str()) || !existing_is_text(&p) {
+        tracing::info!(path = %p.display(), ext = %ext, verdict = "file_text_write_refused_binary",
+            measured = true, n_considered = 1, "text save refused: the file is binary");
         return j(
             400,
-            json!({"error": format!("file type not writable: {ext}")}),
+            json!({"error": format!("file type not writable: {}", if ext.is_empty() { "binary file".to_string() } else { ext.clone() })}),
         );
     }
     // Code-execution-vector writes are refused even when extensionless
@@ -787,7 +848,7 @@ async fn put_file(req: Request) -> Response {
     }
     if let Some(parent) = p.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            return j(500, json!({"error": e.to_string()}));
+            return io_fail(&e);
         }
     }
     // A save based on an older copy must not overwrite a newer one. The
@@ -835,17 +896,29 @@ async fn put_file(req: Request) -> Response {
             200,
             json!({"ok": true, "path": pystr(&p), "etag": current_etag(&p).unwrap_or_default()}),
         ),
-        Err(e) => j(500, json!({"error": e.to_string()})),
+        Err(e) => io_fail(&e),
     }
 }
 
-/// Formats the viewer may write as bytes. Kept separate from WRITABLE_EXTS:
+/// Formats the viewer may write as bytes. Kept separate from TEXT_UNWRITABLE_EXTS:
 /// those are text the editor round-trips as a string.
 const BINARY_WRITABLE_EXTS: &[&str] = &[".xlsx"];
 
 /// The same ETag GET /api/file/raw serves for this path, or None when absent.
+/// The file's version, for a save to say which one it edited. mtime+size alone
+/// cannot tell two saves in the same second of the same length apart, which
+/// two people editing one note do (owner, 2026-10-29: "proper collision
+/// reconciliation ... for multiple users in a workspace"), so a text-sized
+/// file adds a hash of its bytes.
 fn current_etag(p: &std::path::Path) -> Option<String> {
     let meta = std::fs::metadata(p).ok().filter(|m| m.is_file())?;
+    if meta.len() <= 4 * 1024 * 1024 {
+        if let Ok(bytes) = std::fs::read(p) {
+            use sha2::Digest;
+            let h = sha2::Sha256::digest(&bytes);
+            return Some(format!("\"{}-{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\"", mtime_secs(&meta), meta.len(), h[0], h[1], h[2], h[3], h[4], h[5]));
+        }
+    }
     Some(format!("\"{}-{}\"", mtime_secs(&meta), meta.len()))
 }
 
@@ -959,7 +1032,7 @@ async fn vtt(method: Method, RawQuery(q): RawQuery) -> Response {
     };
     let raw = match raw {
         Ok(b) => b,
-        Err(e) => return j(500, json!({"error": e.to_string()})),
+        Err(e) => return io_fail(&e),
     };
     let srt_text = String::from_utf8_lossy(&raw);
     static TS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -1155,8 +1228,10 @@ async fn raw(req: Request) -> Response {
     };
     let mime = raw_mime(&py_suffix(&p));
     let file_size = meta.len();
-    // ETag from mtime+size (py:68097) — If-None-Match short-circuits to 304.
-    let etag = format!("\"{}-{}\"", mtime_secs(&meta), file_size);
+    // ETag from mtime+size (py:68097), plus a content hash for a text-sized
+    // file — If-None-Match short-circuits to 304. The same value a save checks
+    // (current_etag): the spreadsheet and Draw editors save with this header.
+    let etag = current_etag(&p).unwrap_or_else(|| format!("\"{}-{}\"", mtime_secs(&meta), file_size));
     if req
         .headers()
         .get("if-none-match")
@@ -1262,7 +1337,7 @@ async fn raw(req: Request) -> Response {
         if file_size <= INMEM_MAX {
             match std::fs::read(&p) {
                 Ok(bytes) => b.body(Body::from(bytes)).expect("200 response"),
-                Err(e) => j(500, json!({ "error": e.to_string() })),
+                Err(e) => io_fail(&e),
             }
         } else {
             b.body(stream_file(p, 0, file_size)).expect("200 response")
@@ -2457,7 +2532,7 @@ pub(crate) mod tests {
     fn state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         AppState {
             store,
             started: std::time::Instant::now(),
@@ -2545,8 +2620,7 @@ pub(crate) mod tests {
         let p = dir.path().join("clip.mp4");
         let payload: Vec<u8> = (0u8..=99).collect();
         std::fs::write(&p, &payload).unwrap();
-        let meta = std::fs::metadata(&p).unwrap();
-        let etag = format!("\"{}-{}\"", mtime_secs(&meta), 100);
+        let etag = super::current_etag(&p).unwrap();
         let uri = format!("/api/file/raw?path={}", enc(p.to_str().unwrap()));
 
         // Bounded range.
@@ -2768,6 +2842,29 @@ pub(crate) mod tests {
         let (_, v) = get(&app, &format!("/api/file?path={}", enc(w.to_str().unwrap()))).await;
         assert_eq!(v["stream"]["hls_checked"], false);
         assert!(v.get("hls_url").is_none());
+    }
+
+    /// AMUX-6437: a file the server user cannot read is refused with 403,
+    /// not reported as a 500 server fault.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_file_is_403_not_500() {
+        use std::os::unix::fs::PermissionsExt;
+        let app = app();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("locked.txt");
+        std::fs::write(&p, "secret").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&p).is_ok() {
+            // Running as root: the OS grants the read, so there is no refusal to observe.
+            return;
+        }
+        let (status, v) = get(&app, &format!("/api/file?path={}", enc(p.to_str().unwrap()))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+        assert!(v["error"].as_str().unwrap_or("").contains("Permission denied"), "{v}");
+        let (status, _) = get(&app, &format!("/api/file/raw?path={}", enc(p.to_str().unwrap()))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "/raw too");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[tokio::test]
@@ -3201,6 +3298,35 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["error"], "file type not writable: .exe");
+
+        // Every other text file saves: HTML, and a type no list ever named.
+        for name in ["page.html", "App.vue", "notes.rst"] {
+            let p = dir.path().join(name);
+            let (status, _, body) = send(
+                &app,
+                HttpRequest::builder().method("PUT").uri("/api/file")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"path": p.to_str().unwrap(), "content": "<b>hi</b>\n"}).to_string()))
+                    .unwrap(),
+            )
+            .await;
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(status, StatusCode::OK, "{name} must be writable: {v}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "<b>hi</b>\n");
+        }
+        // A binary file under an extension no list names is still not overwritten as text.
+        let blob = dir.path().join("model.weights");
+        std::fs::write(&blob, [0u8, 159, 146, 150, 0, 1]).unwrap();
+        let (status, _, body) = send(
+            &app,
+            HttpRequest::builder().method("PUT").uri("/api/file")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"path": blob.to_str().unwrap(), "content": "x"}).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(std::fs::read(&blob).unwrap(), vec![0u8, 159, 146, 150, 0, 1], "the binary file is untouched");
 
         // Extensionless code-execution vector → 403 refused.
         let ak = dir.path().join("authorized_keys");

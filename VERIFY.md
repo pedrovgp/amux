@@ -162,6 +162,19 @@ keystore; the Keychain backend is checked once on the live server by adding a
 throwaway item and running `security find-generic-password -s amux-vault-master`
 WITHOUT `-w`, which prints the item's attributes and never the key.
 
+## The land gate (`scripts/land_gate.py`, `land_review.py`, `review-tiers.txt`)
+
+```bash
+python3 scripts/git-hooks/test_land_gate.py
+scripts/land_gate.py            # on a real change: the receipt it prints is the proof
+```
+
+Pass: `land gate: N passed, 0 failed`, and for a real change `verdict=land_gate_pass`
+with every leg's verdict on the same line in `~/.amux/logs/land-gate.log`. A leg that
+reads `_unmeasured` did not run and is not a pass. Changing the reviewer's prompts,
+tools or model: rescore with `scripts/land_review_eval.py --score` and quote its
+`recall ... noise ...` line beside the previous one.
+
 ## A deployed server change
 
 A fix in `git log` is not live until the running binary carries it.
@@ -179,6 +192,18 @@ so bracket every measurement with `build`.
 The hand-run is not the scheduled run: the exec environment differs, and that is
 where the restic chain broke once already (launchd does not inherit shell PATH).
 Evidence is a log line carrying a timestamp from a run nobody started by hand.
+
+## Wake watches (`scripts/wake-watch.py`, `amux watch`, docs/wake-watch.md)
+
+```bash
+python3 scripts/test-wake-watch.py      # -> Ran 15 tests ... OK
+scripts/safe-cargo.sh test -p amux-server --lib -- shell_wake a_wake_exit_action
+```
+
+A pass is `OK` from the first and `test result: ok. 3 passed` from the second.
+Live evidence is a `verdict=watch_fired` line in `~/.amux/logs/wake-watch.log`
+followed by `verdict=shell_wake_delivered` (or `shell_wake_queued`) for the same
+lane in `~/.amux/logs/server-rs.log`.
 
 ## The /codex skill (`skills/codex.md`, `skills/codex/scripts/`)
 

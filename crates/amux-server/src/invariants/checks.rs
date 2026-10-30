@@ -765,22 +765,62 @@ pub struct DeployLag {
     /// behind, and its text sent the reader to the builder log. The builder
     /// was fine. main was red, and the fix was in CI, not in the builder.
     pub gate_hold: Option<String>,
+    /// A build newer than the served one is INSTALLED and the server has not
+    /// restarted onto it yet (AF-1028). The builder installs, then the server
+    /// re-execs; in between, /health still names the old commit. On
+    /// 2026-10-29 the 262909fcc install landed at 23:09:37, the restart at
+    /// 23:11:13, and the tick at 23:10:23 failed with a 1814 s lag against
+    /// 1800 s, filing a card for a deploy that was seconds from done. Some only
+    /// while the install is fresh ([`RESTART_PENDING_S`]), so a restart that
+    /// never comes still fails.
+    pub restart_pending: Option<String>,
 }
+
+/// How long an installed-but-not-yet-served build is treated as a restart in
+/// progress rather than a stall.
+pub const RESTART_PENDING_S: i64 = 300;
 
 /// The gate's own words for a hold, from `activation-gate.json`. Pure so the
 /// mapping is tested; the caller reads the file.
-pub fn gate_hold_reason(gate: &serde_json::Value) -> Option<String> {
-    if gate["verdict"].as_str() != Some("ci_gate_no_green") {
-        return None;
-    }
+pub fn gate_hold_reason(gate: &serde_json::Value, served: &str) -> Option<String> {
     let tip = gate["tip"].as_str().unwrap_or("");
     let state = gate["tip_state"].as_str().unwrap_or("unknown");
-    let held = gate["held"].as_i64().map(|n| format!(" in the last {n}")).unwrap_or_default();
-    Some(format!(
-        "the CI gate is holding: no main commit{held} passed both `rust` and `checks`, and \
-         main's tip {} is {state}",
-        short(tip)
-    ))
+    // Same commit when one id is a prefix of the other (served is often short).
+    let same = |a: &str, b: &str| {
+        let n = a.len().min(b.len());
+        n >= 7 && a[..n] == b[..n]
+    };
+    match gate["verdict"].as_str() {
+        Some("ci_gate_no_green") => {
+            let held = gate["held"].as_i64().map(|n| format!(" in the last {n}")).unwrap_or_default();
+            Some(format!(
+                "the CI gate is holding: no main commit{held} passed CI, and main's tip {} is {state}",
+                short(tip)
+            ))
+        }
+        // AMUX-6540: the gate's two other hold verdicts. 477 failures in a day
+        // read "the builder may be ticking and still shipping nothing" while the
+        // gate file said ci_gate_held_back: the server was ALREADY on the newest
+        // green commit and the commits after it had not passed CI. That is CI's
+        // to fix, as much as no_green is. held_back counts only when the served
+        // commit IS the gate's target: a target the builder has not shipped is
+        // still the builder's.
+        Some("ci_gate_held_back") if same(gate["target"].as_str().unwrap_or(""), served) => {
+            let n = gate["held"].as_i64().unwrap_or(0);
+            Some(format!(
+                "the CI gate is holding: the server already runs the newest green commit {}, and \
+                 the {n} newer commit(s) up to main's tip {} are {state}",
+                short(served),
+                short(tip)
+            ))
+        }
+        Some("ci_gate_no_rollback") => Some(format!(
+            "the CI gate is holding: the newest green commit is older than the live build, so it \
+             keeps the live build rather than roll back; main's tip {} is {state}",
+            short(tip)
+        )),
+        _ => None,
+    }
 }
 
 /// When did origin/main first move PAST `served`?
@@ -878,8 +918,9 @@ pub fn served_commit_is_current(
         "measured": true,
         "age_source": lag.age_source,
         "gate_hold": lag.gate_hold,
+        "restart_pending": lag.restart_pending,
     });
-    if lag.oldest_unserved_age_s <= threshold_s {
+    if lag.oldest_unserved_age_s <= threshold_s || lag.restart_pending.is_some() {
         // Behind, but not yet longer than a build plausibly takes.
         return vec![InvariantResult::pass(ID).evidence(evidence)];
     }
@@ -1085,9 +1126,30 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // off the migrations. 44 numeric timestamp columns; 5 are milliseconds and
     // they are the whole trap.
     ("_amux_invariant_incident", "resolved_at", false),
+    // Messages (0137): api/conversations.rs writes epoch milliseconds.
+    ("conversation_posts", "edited_at", true),
+    ("conversation_posts", "deleted_at", true),
+    ("profiles", "updated_at", true),
+    // Channel settings (0139): conversations.rs writes the channel columns
+    // with Utc::now().timestamp() and membership rows with now_ms().
+    ("conversation_members", "ts", true),
+    ("group_config", "channel_created_at", false),
+    ("group_config", "channel_archived_at", false),
+    ("link_previews", "fetched_at", true),
+    // The chat bridge (0136): bridge/mod.rs writes epoch milliseconds.
+    ("bridge_links", "linked_at", true),
+    ("bridge_inbound", "received_at", true),
+    ("bridge_outbound", "created_at", true),
+    ("bridge_outbound", "sent_at", true),
     // Social posts (0134): api/social.rs now() is chrono timestamp(), epoch seconds.
     ("social_posts", "posted_at", false),
     ("social_post_metrics", "fetched_at", false),
+    // The posting queue (0138): social_publish.rs uses the same social::now().
+    ("social_queue", "scheduled_at", false),
+    ("social_queue", "next_attempt_at", false),
+    ("social_queue", "claimed_at", false),
+    ("social_queue", "created_at", false),
+    ("social_queue", "updated_at", false),
     // Map store (0128): map_store::now() is epoch seconds as f64.
     ("map_meta", "updated_at", false),
     ("map_pins", "created_at", false),
@@ -1099,6 +1161,8 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("land_queue", "done_at", false), // land_queue.rs: now_f64(); live 1791295108.5
     ("land_queue", "queued_at", false),
     ("schedules", "locked_at", false), // api/schedules.rs: Utc::now().timestamp()
+    ("schedules", "pass_next_at", false), // runtime_jobs/schedule_check.rs: Utc::now().timestamp()
+    ("schedules", "pass_checked_at", false), // runtime_jobs/schedule_check.rs: Utc::now().timestamp()
     ("land_queue", "started_at", false),
     ("card_contracts", "frozen_at", false), // measured: 1791242852.2 on 2026-10-06
     ("card_contracts", "review_at", false),
@@ -1512,6 +1576,27 @@ pub enum LockHolder {
     Held(String),
     Unheld,
     Unmeasured(String),
+}
+
+#[cfg(test)]
+mod ui_stuck_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_stuck_control_fails_and_an_old_one_passes() {
+        let mut rows = BTreeMap::new();
+        rows.insert("composer_send_stuck".to_string(), (2u64, 1_000u64, "composer".to_string(), "id=x".to_string()));
+        // Within the window: named in the failure.
+        let r = controls_do_not_stick(Some(&rows), 1_500, 86_400);
+        assert_eq!(r[0].status, Status::Fail, "{:?}", r[0]);
+        assert!(r[0].observed.contains("composer_send_stuck x2"), "{:?}", r[0]);
+        // Out of the window: clear.
+        let r = controls_do_not_stick(Some(&rows), 1_000 + 86_401, 86_400);
+        assert_eq!(r[0].status, Status::Pass);
+        // Unreadable: unknown, never a pass.
+        assert_eq!(controls_do_not_stick(None, 0, 86_400)[0].status, Status::Unknown);
+    }
 }
 
 #[cfg(test)]
@@ -2859,6 +2944,20 @@ pub const LARGE_READ_GUARD: InstalledScript = InstalledScript {
     noun: "large-read router",
 };
 
+/// The boundary guard (payments, email, credentials, resources, the subagent
+/// cap). Mac disk RCAs 20261025-190143, 20261026-140441 and 20261026-235522:
+/// its fix letting the per-worker disk budget measure a big scratch
+/// (f47ddbe29) sat uninstalled for two days. The installed guard kept timing
+/// out on mxp-gs12's scratch, so the 100 GB budget never applied while that
+/// scratch passed 800 GB and the disk filled, and /api/boundaries'
+/// `guard_matches_build: false` was a field nobody's health page showed.
+pub const BOUNDARY_GUARD: InstalledScript = InstalledScript {
+    id: "hooks.boundary_guard_matches_committed",
+    runtime_path: "~/.amux/hooks/boundary-guard.py",
+    committed_path: "scripts/hooks/boundary-guard.py",
+    noun: "boundary guard",
+};
+
 /// AF-132: the committed side must be read at CHECK time, not baked at build
 /// time. These scripts are not compiled into the binary's deploy unit — the
 /// builder rebuilds only on crates//Cargo.* commits — so a script-only commit
@@ -2923,8 +3022,9 @@ pub fn installed_script_matches_committed(
         } else {
             format!(
                 "runtime {} sha {} DRIFTED from {} at HEAD ({}) and matches the worktree \
-                 copy of neither — the fleet is running an unreviewed hand-edit. Reinstall \
-                 from source (install.sh) or fold the edit back into the committed copy.",
+                 copy of neither: an older install that missed later fixes, or an unreviewed \
+                 hand-edit. Reinstall from source (./install.sh, or scripts/install-hooks.sh \
+                 for the hooks alone) or fold the edit back into the committed copy.",
                 spec.noun,
                 &runtime_sha[..12],
                 spec.committed_path,
@@ -3046,7 +3146,10 @@ pub fn todo_is_reachable_by_dispatch(
         "total_live_todo": total_live_todo,
         "pct_of_live_todo": pct,
         "by_lane": stranded.iter().map(|(l, c)| json!({"lane": l, "todo": c})).collect::<Vec<_>>(),
-    }))]
+    }))
+    // The stranded count is the size of this fault: a card discarded at 1
+    // stranded card does not speak for 49 (AF-1045).
+    .magnitude(n)]
 }
 
 /// A credential-shaped `NAME=VALUE` seen in a live process argument list.
@@ -3068,6 +3171,47 @@ pub struct ArgvSecret {
     /// incident or a habit worth changing. AMUX-4946's original harm was
     /// measured at 3d22h precisely because the carrier outlived everything.
     pub age_s: Option<u64>,
+    /// The carrier's executable name and its parent pid (AMUX-6586). The
+    /// verdict kept only a pid, and the carriers are often seconds old, so
+    /// 8 credentials in one 5 s process (2026-10-29 13:40Z) could not be
+    /// traced to whatever launched it. Names only; never an argument.
+    pub exe: String,
+    pub ppid: String,
+    /// The first words of the carrier's command line, each credential masked
+    /// (AF/AMUX-6586). `exe` alone said "bash under pid 1" for a detached
+    /// carrier, which names no script. See [`argv_command_head`].
+    pub cmd_head: String,
+}
+
+/// The first [`CMD_HEAD_WORDS`] words of a command line, each capped at 40
+/// characters, with every `NAME=VALUE` word whose NAME is env-shaped reduced
+/// to `NAME=<len N>`. Short on purpose: the scanner only recognises
+/// `NAME=VALUE`, so a longer excerpt could carry a secret in another form
+/// (`--password x`); five short words name a script without that risk.
+pub const CMD_HEAD_WORDS: usize = 5;
+
+pub fn argv_command_head(command: &str) -> String {
+    command
+        .split_whitespace()
+        .take(CMD_HEAD_WORDS)
+        .map(|w| match w.split_once('=') {
+            Some((k, v)) if argv_key_is_env_shaped(k.trim_start_matches(['\'', '"'])) => {
+                format!("{}=<len {}>", k, v.len())
+            }
+            _ => w.chars().take(40).collect(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Is this argv value a shell expansion rather than a value? (AMUX-6586)
+///
+/// `ssh host 'PLANE_KEY=$(cat plane.key) cmd'` puts the text `$(cat` in the
+/// local argv; the remote shell expands it, so no secret is here. Split on
+/// whitespace, such a value starts with `$` or a backtick. It flagged 104 of
+/// the 171 failures on 2026-10-29 as two "credentials" of length 5 and 6.
+pub fn argv_value_is_expansion(value: &str) -> bool {
+    value.starts_with('$') || value.starts_with('`')
 }
 
 /// Does this argv key have the SHAPE of an environment variable? (AMUX-4964)
@@ -3126,12 +3270,13 @@ pub fn no_secrets_in_process_argv(
     pids.dedup();
     let who: Vec<String> = found
         .iter()
-        .map(|f| match f.age_s {
-            Some(a) => format!(
-                "pid {} {} (len {}, alive {}s)",
-                f.pid, f.key, f.value_len, a
-            ),
-            None => format!("pid {} {} (len {}, age unknown)", f.pid, f.key, f.value_len),
+        .map(|f| {
+            let what = if f.exe.is_empty() { String::new() } else { format!(", {} under pid {}", f.exe, f.ppid) };
+            let what = if f.cmd_head.is_empty() { what } else { format!("{what}, `{}`", f.cmd_head) };
+            match f.age_s {
+                Some(a) => format!("pid {} {} (len {}, alive {}s{what})", f.pid, f.key, f.value_len, a),
+                None => format!("pid {} {} (len {}, age unknown{what})", f.pid, f.key, f.value_len),
+            }
         })
         .collect();
     vec![InvariantResult::fail(
@@ -3153,7 +3298,8 @@ pub fn no_secrets_in_process_argv(
         "n_considered": n_considered,
         "measured": true,
         "keys": found.iter().map(|f| json!({
-            "pid": f.pid, "key": f.key, "value_len": f.value_len, "age_s": f.age_s}))
+            "pid": f.pid, "key": f.key, "value_len": f.value_len, "age_s": f.age_s,
+            "exe": f.exe, "ppid": f.ppid, "cmd_head": f.cmd_head}))
             .collect::<Vec<_>>(),
         "max_age_s": found.iter().filter_map(|f| f.age_s).max(),
     }))]
@@ -4018,6 +4164,43 @@ mod guard_reach_tests {
 /// be guessed. It also doubles as the AMUX-2936 uptake meter: as lanes recycle
 /// onto the new hook this falls on its own, and the breach clearing IS the
 /// remediation landing.
+/// INCIDENT: the Send button sat greyed out and the Pages tab sat on
+/// "Loading..." (owner, 2026-10-29), each because a request's receipt never
+/// settled, and nothing anywhere said so until the owner screenshotted it.
+///
+/// INVARIANT: no client reports a control or view that stayed stuck within
+/// `window_s`. `rows` is the server's tally (api::ui_stuck_snapshot): verdict
+/// -> (count, last seen, kind, client). Fails naming each verdict, so a sweep
+/// of the invariants finds the class without anyone watching a screen.
+/// verdict -> (count, last seen unix s, last kind, last client): api::ui_stuck_snapshot.
+pub type StuckRows = std::collections::BTreeMap<String, (u64, u64, String, String)>;
+
+pub fn controls_do_not_stick(
+    rows: Option<&StuckRows>,
+    now_s: u64,
+    window_s: u64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "ui.controls_do_not_stick";
+    let Some(rows) = rows else {
+        return vec![InvariantResult::unknown(ID, "the stuck-UI tally could not be read")];
+    };
+    let recent: Vec<_> = rows.iter().filter(|(_, v)| now_s.saturating_sub(v.1) <= window_s).collect();
+    if recent.is_empty() {
+        return vec![InvariantResult::pass(ID).evidence(json!({"verdicts_seen_since_start": rows.len(), "window_s": window_s}))];
+    }
+    let summary: Vec<String> = recent.iter().map(|(k, v)| format!("{k} x{} ({}, {}s ago)", v.0, v.2, now_s.saturating_sub(v.1))).collect();
+    vec![InvariantResult::fail(
+        ID,
+        "no client reports a control or view that stayed stuck",
+        format!("{} stuck-UI verdict(s) in the last {}h: {}. Grep server-rs.log for \"client UI stuck\" for the payloads.",
+            recent.len(), window_s / 3600, summary.join("; ")),
+    )
+    .evidence(json!({
+        "window_s": window_s,
+        "verdicts": recent.iter().map(|(k, v)| json!({"verdict": k, "count": v.0, "last_ts": v.1, "kind": v.2, "client": v.3})).collect::<Vec<_>>(),
+    }))]
+}
+
 pub fn reports_are_attributed(total: i64, unattributed: i64) -> Vec<InvariantResult> {
     const ID: &str = "hooks.reports_are_attributed";
     // No reports at all is not health: it is the control plane being down, which
@@ -8379,6 +8562,15 @@ mod negative_controls {
             read_guard[0].invariant_id,
             "hooks.large_read_guard_matches_committed"
         );
+        let boundary = installed_script_matches_committed(
+            &BOUNDARY_GUARD,
+            committed,
+            Some(committed),
+            Some(committed),
+            Ok("# an older guard\n".into()),
+        );
+        assert_eq!(boundary[0].invariant_id, "hooks.boundary_guard_matches_committed");
+        assert_ne!(boundary[0].status, Status::Pass, "an older installed boundary guard is not a pass");
         // ...and the prose must follow the spec, not stay hardcoded to the guard.
         let rep_drift = installed_script_matches_committed(
             &REPORT_HOOK,
@@ -9209,6 +9401,12 @@ pub struct UnrecordedScheduleOutcome {
 /// genuinely stopped within one and a half turns.
 const OVERDUE_CADENCE_NUM: i64 = 3;
 const OVERDUE_CADENCE_DEN: i64 = 2;
+/// The least slack any schedule gets past its owed fire (AMUX-6582). Half a
+/// cadence is 30 s for an every-1m schedule, below the scheduler's own
+/// dispatch jitter: on 2026-10-29 the every-1m wake-watch schedules ran with
+/// gaps of 60 to 128 s, every run ok, and were reported silent 44 times in 6 h.
+/// A cadence of 4 min or more already has at least this much.
+const OVERDUE_MIN_SLACK_S: i64 = 120;
 
 impl UnrecordedScheduleOutcome {
     /// Is this tick genuinely missing, as opposed to waiting for its next fire?
@@ -9448,8 +9646,9 @@ impl EnabledScheduleClock {
         match self.cadence_s {
             Some(c) if c > 0 => {
                 let owed = self.first_due_s.unwrap_or(c).max(0);
-                let slack = c.saturating_mul(OVERDUE_CADENCE_NUM - OVERDUE_CADENCE_DEN)
-                    / OVERDUE_CADENCE_DEN;
+                let slack = (c.saturating_mul(OVERDUE_CADENCE_NUM - OVERDUE_CADENCE_DEN)
+                    / OVERDUE_CADENCE_DEN)
+                    .max(OVERDUE_MIN_SLACK_S);
                 self.silent_s > owed.saturating_add(slack)
             }
             _ => false,
@@ -9663,6 +9862,16 @@ mod enabled_schedule_firing_tests {
         }
     }
     const UP: i64 = 86_400;
+
+    /// AMUX-6582: an every-1m schedule running with the scheduler's real gaps
+    /// (60-128 s) is firing; one silent for 4 min is not.
+    #[test]
+    fn a_minute_schedule_is_not_silent_inside_scheduler_jitter() {
+        assert!(!clock("W", Some(60), 128, false).is_past_deadline(), "a 128 s gap is jitter");
+        assert!(!clock("W", Some(60), 180, false).is_past_deadline(), "the floor: owed 60 s + 120 s");
+        assert!(clock("W", Some(60), 240, false).is_past_deadline(), "4 min silent on a 1 min cadence has stopped");
+        assert!(clock("F", Some(300), 451, false).is_past_deadline(), "5 min cadences keep their 3/2 bound");
+    }
 
     #[test]
     fn on_time_schedules_pass_with_counts() {
@@ -10930,7 +11139,20 @@ mod served_commit_tests {
             oldest_unserved_age_s: age,
             age_source: "origin_reflog_arrival".into(),
             gate_hold: None,
+            restart_pending: None,
         }
+    }
+
+    /// AF-1028: past the threshold, a freshly installed newer build is a
+    /// restart in progress (pass, and says so); without one it still fails.
+    #[test]
+    fn an_installed_build_awaiting_its_restart_is_not_a_stall() {
+        let mut l = lag(4, 1_814);
+        assert_eq!(served_commit_is_current(Some(&l), "", 1_800)[0].status, Status::Fail);
+        l.restart_pending = Some("build 262909fcc installed 46s ago".into());
+        let r = served_commit_is_current(Some(&l), "", 1_800);
+        assert_eq!(r[0].status, Status::Pass, "{:?}", r[0]);
+        assert_eq!(r[0].evidence["restart_pending"], "build 262909fcc installed 46s ago");
     }
 
     /// 2026-10-24: 27 hours failing, 73 behind, and the text pointed at the
@@ -10941,7 +11163,7 @@ mod served_commit_tests {
         let gate = serde_json::json!({"verdict": "ci_gate_no_green", "tip": "210066e2d0a5bd6a",
             "tip_state": "red", "target": "", "held": 40});
         let mut l = lag(73, 97_067);
-        l.gate_hold = gate_hold_reason(&gate);
+        l.gate_hold = gate_hold_reason(&gate, &l.served);
         let held = served_commit_is_current(Some(&l), "", 1_800);
         assert_eq!(held[0].status, Status::Fail);
         let o = &held[0].observed;
@@ -10955,8 +11177,35 @@ mod served_commit_tests {
             serde_json::json!({"verdict": "ci_gate_green", "target": "abc"}),
             serde_json::json!({}),
         ] {
-            assert_eq!(gate_hold_reason(&not_held), None, "{not_held}");
+            assert_eq!(gate_hold_reason(&not_held, "2c375773aaaaaaaa"), None, "{not_held}");
         }
+    }
+
+    /// AMUX-6540: serving the newest green commit while newer ones wait on CI
+    /// is a hold (held_back with target == served); a green target the server
+    /// has NOT shipped is still the builder's; no_rollback is always a hold.
+    #[test]
+    fn a_held_back_gate_on_the_served_commit_is_a_hold_and_an_unshipped_target_is_not() {
+        let served = "19d1dcf1223c";
+        let held = serde_json::json!({"verdict": "ci_gate_held_back", "tip": "2698a2b9e3ca789c",
+            "tip_state": "pending", "target": "19d1dcf1223cdf6ad195c0561d5b25192d8f0000", "held": 28});
+        let why = gate_hold_reason(&held, served).expect("serving the newest green is a CI hold");
+        assert!(why.contains("19d1dcf1223c") && why.contains("28 newer") && why.contains("pending"), "{why}");
+        let mut l = lag(28, 12_930);
+        l.served = served.into();
+        l.gate_hold = Some(why);
+        let r = served_commit_is_current(Some(&l), "", 1_800);
+        assert!(!r[0].observed.contains("cargo_build_backoff"), "not the builder: {}", r[0].observed);
+
+        let unshipped = serde_json::json!({"verdict": "ci_gate_held_back", "tip": "2698a2b9e3ca",
+            "tip_state": "pending", "target": "ee4541f1426442fb", "held": 2});
+        assert_eq!(gate_hold_reason(&unshipped, served), None, "a newer green target unshipped is the builder's");
+
+        let no_rollback = serde_json::json!({"verdict": "ci_gate_no_rollback", "tip": "7ff7d7871596",
+            "tip_state": "red", "target": "aaaaaaaaaaaa", "held": 3});
+        assert!(gate_hold_reason(&no_rollback, served).is_some());
+        let clear = serde_json::json!({"verdict": "ci_gate_clear", "tip": served, "tip_state": "green", "target": served});
+        assert_eq!(gate_hold_reason(&clear, served), None);
     }
 
     /// THE AMUX-4947 PAIR, which is the whole reason this check exists.
@@ -11139,6 +11388,9 @@ mod argv_secret_invariant_tests {
             key: "OPENAI_API_KEY".into(),
             value_len: 51,
             age_s: Some(340_800),
+            exe: "docker".into(),
+            ppid: "77".into(),
+            cmd_head: String::new(),
         };
         let r = no_secrets_in_process_argv(&[long], 900);
         let msg = format!("{:?}", r[0]);
@@ -11147,6 +11399,18 @@ mod argv_secret_invariant_tests {
             "age must be in the message: {msg}"
         );
         assert_eq!(r[0].evidence["max_age_s"], serde_json::json!(340_800));
+        assert!(msg.contains("docker under pid 77"), "the carrier is named: {msg}");
+    }
+
+    /// AMUX-6586: a shell expansion in argv is not a credential.
+    #[test]
+    fn a_shell_expansion_is_not_a_credential_value() {
+        for v in ["$(cat", "$PLANE_TOKEN", "${KEY}", "`cat"] {
+            assert!(argv_value_is_expansion(v), "{v}");
+        }
+        for v in ["sk-abc123", "x$y", "0123456789abcdef"] {
+            assert!(!argv_value_is_expansion(v), "{v}");
+        }
     }
 
     /// And an unknown age must say so rather than read as zero.
@@ -11157,6 +11421,9 @@ mod argv_secret_invariant_tests {
             key: "MIXPEEK_API_KEY".into(),
             value_len: 7,
             age_s: None,
+            exe: String::new(),
+            ppid: String::new(),
+            cmd_head: String::new(),
         };
         let r = no_secrets_in_process_argv(&[unknown], 900);
         let msg = format!("{:?}", r[0]);
@@ -11167,12 +11434,24 @@ mod argv_secret_invariant_tests {
         assert_eq!(r[0].evidence["max_age_s"], serde_json::Value::Null);
     }
 
+    /// AMUX-6586: the head names the command, and never carries a value.
+    #[test]
+    fn the_command_head_names_the_carrier_and_masks_every_value() {
+        let h = argv_command_head("bash -c export APOLLO_KEY=sk-live-123456 CLAUDE_LOGIN_PASSWORD='hunter2-xyz' && ./deploy.sh --all");
+        assert_eq!(h, "bash -c export APOLLO_KEY=<len 14> CLAUDE_LOGIN_PASSWORD=<len 13>");
+        assert!(!h.contains("sk-live") && !h.contains("hunter2"), "{h}");
+        assert_eq!(argv_command_head("/usr/bin/python3 scripts/sync.py ADMIN_TEST_KEY=abc"), "/usr/bin/python3 scripts/sync.py ADMIN_TEST_KEY=<len 3>");
+    }
+
     fn secret(pid: &str, key: &str, len: usize) -> ArgvSecret {
         ArgvSecret {
             pid: pid.into(),
             key: key.into(),
             value_len: len,
             age_s: None,
+            exe: String::new(),
+            ppid: String::new(),
+            cmd_head: String::new(),
         }
     }
 

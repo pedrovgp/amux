@@ -340,6 +340,9 @@ set_env AMUX_AUTH_TOKEN none
 # The address workers build links from (static_files/public_links.rs): without it a worker
 # handed the owner a link on the raw IP (sandbox, 2026-10-25).
 [[ -n "$DOMAIN" ]] && set_env AMUX_PUBLIC_URL "https://$DOMAIN"
+# Where Google and Slack send the browser back after a connector sign-in: the domain, since
+# nothing reaches this server at localhost (sandbox, 2026-10-28: "i cant connect gmail").
+[[ -n "$DOMAIN" ]] && set_env AMUX_OAUTH_ORIGIN "https://$DOMAIN"
 # Apps inside amux run on their own origin (static_files/apps_origin.rs): Caddy serves the
 # apps listener (amux's port + 1) at https://<domain>:8443.
 [[ -n "$DOMAIN" ]] && set_env AMUX_APPS_URL "https://$DOMAIN:8443"
@@ -348,6 +351,13 @@ set_env AMUX_AUTH_TOKEN none
 # One owner, one checkout: Pull from remote sends local amux changes upstream as a pull
 # request (amux contribute), then replaces them with remote main.
 set_env AMUX_PULL_SENDS_LOCAL_AS_PR 1
+# Source mode follows main's tip as it lands (Ethan, 2026-10-27), without waiting for CI: the
+# builder activates each new commit and puts the previous binary back if the server does not
+# report the new commit healthy (scripts/rust-auto-build.sh, AMUX_ACTIVATION_ROLLBACK).
+if [[ "$UPDATES" == source ]]; then
+  set_env AMUX_DEPLOY_CI_GATE 0
+  set_env AMUX_ACTIVATION_ROLLBACK 1
+fi
 chown "$USER_NAME:$USER_NAME" "$ENV_FILE"; chmod 600 "$ENV_FILE"
 
 # ── Claude Code first-run gates ──
@@ -669,10 +679,12 @@ systemctl enable caddy >/dev/null
 systemctl reload caddy 2>/dev/null || systemctl restart caddy
 
 # ── Self-updates for a standalone host (amux Cloud, cloud/start) ──
-# No control plane reaches these servers, so each one keeps itself current: hourly it follows the
-# CI-green image and the checkout, rolls back a build that fails /health, and restarts a dead
-# server (cloud/desktop/update.sh). AMUX_AUTO_UPDATE=0 turns it off.
-if [[ "$FLEET" == 0 && "$UPDATES" == image && "${AMUX_AUTO_UPDATE:-1}" == 1 ]]; then
+# No control plane reaches these servers, so each one keeps itself current: every two minutes it
+# follows main's newest image and the checkout, rolls back (and holds) a build that fails /health,
+# and restarts a dead server (cloud/desktop/update.sh). AMUX_AUTO_UPDATE=0 turns it off.
+# Source mode too: its server is built by the builder, but the door, Caddy snippets and CLIs come
+# from this script, so a source-mode host left without it never got their fixes.
+if [[ "$FLEET" == 0 && "${AMUX_AUTO_UPDATE:-1}" == 1 ]]; then
   cat > /etc/systemd/system/amux-update.service <<UNIT
 [Unit]
 Description=amux: follow the newest CI-green amux and keep the server up (cloud/desktop/update.sh)
@@ -685,11 +697,11 @@ TimeoutStartSec=900
 UNIT
   cat > /etc/systemd/system/amux-update.timer <<'UNIT'
 [Unit]
-Description=amux: hourly self-update and health check
+Description=amux: follow main every two minutes, and health check
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=1h
-RandomizedDelaySec=10min
+OnUnitActiveSec=2min
+RandomizedDelaySec=20s
 Persistent=true
 [Install]
 WantedBy=timers.target

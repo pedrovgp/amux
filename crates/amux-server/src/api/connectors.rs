@@ -53,7 +53,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -83,6 +82,11 @@ fn default_ctx() -> Arc<ConnectorsCtx> {
 enum Auth {
     ApiKey {
         key_env: &'static str,
+    },
+    /// Several keys pasted together, no browser grant (a chat bridge bot:
+    /// a token plus the ids and secrets its webhook needs).
+    ApiKeys {
+        keys: &'static [&'static str],
     },
     OAuth2 {
         client_id_env: &'static str,
@@ -224,6 +228,41 @@ const REGISTRY: &[Provider] = &[
         docs: "https://api.slack.com/apps",
         test_url: "https://slack.com/api/auth.test",
     },
+    // The chat bridge's bots (bridge/adapters.rs): conversations linked to
+    // workers and groups through messages.
+    Provider {
+        id: "whatsapp",
+        label: "WhatsApp",
+        category: "Chat",
+        auth: Auth::ApiKeys {
+            keys: &["WHATSAPP_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_APP_SECRET", "WHATSAPP_VERIFY_TOKEN"],
+        },
+        setup_note: "Create a Meta app with the WhatsApp product (developers.facebook.com). Paste the access token, the phone number id, the app secret, and a verify token you choose. Set the webhook to <public amux URL>/api/bridge/hook/whatsapp with that verify token and subscribe to messages. Then message the number and send /link <worker or group>.",
+        docs: "https://developers.facebook.com/docs/whatsapp/cloud-api/get-started",
+        test_url: "",
+    },
+    Provider {
+        id: "slack-bot",
+        label: "Slack bot",
+        category: "Chat",
+        auth: Auth::ApiKeys {
+            keys: &["SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET"],
+        },
+        setup_note: "In your Slack app, add the chat:write, im:history and channels:history bot scopes, install it, and paste the bot token and signing secret. Point Event Subscriptions at <public amux URL>/api/bridge/hook/slack (message.im, message.channels). Then /link <worker or group> in a channel or DM.",
+        docs: "https://api.slack.com/apps",
+        test_url: "https://slack.com/api/auth.test",
+    },
+    Provider {
+        id: "discord",
+        label: "Discord",
+        category: "Chat",
+        auth: Auth::ApiKeys {
+            keys: &["DISCORD_BOT_TOKEN", "DISCORD_CHANNELS"],
+        },
+        setup_note: "Create a bot at discord.com/developers, enable the Message Content intent, invite it to your server, and paste its token and the channel ids to watch (comma separated; prefix a DM channel with dm:). amux reads them every few seconds, so no public URL is needed. Then /link <worker or group> in the channel.",
+        docs: "https://discord.com/developers/docs/intro",
+        test_url: "",
+    },
     Provider {
         id: "telegram",
         label: "Telegram",
@@ -253,6 +292,21 @@ const REGISTRY: &[Provider] = &[
         // server is wherever MATTERMOST_URL says it is (see mattermost_test_url).
         setup_note: "Self-hosted Mattermost. Paste the server URL (e.g. https://chat.example.com, no trailing slash), plus a login and password. This connector uses the server login endpoint.",
         docs: "",
+        test_url: "",
+    },
+    // Social publishing (api/social_devto.rs). Another account's key is
+    // DEVTO_API_KEY_<ACCOUNT>, declared as a custom connector.
+    Provider {
+        id: "devto",
+        label: "dev.to",
+        category: "Social",
+        auth: Auth::ApiKey {
+            key_env: "DEVTO_API_KEY",
+        },
+        setup_note: "dev.to -> Settings -> Extensions -> DEV Community API Keys: generate a key and paste it. Articles are saved as drafts until AMUX_SOCIAL_PUBLIC=1.",
+        docs: "https://developers.forem.com/api/v1",
+        // Forem reads the key from an api-key header, not a bearer, so the
+        // bearer Test would report a working key as broken.
         test_url: "",
     },
 ];
@@ -371,7 +425,7 @@ struct Def {
 impl From<&'static Provider> for Def {
     fn from(p: &'static Provider) -> Def {
         let (kind, authorize_url, token_url, scopes) = match p.auth {
-            Auth::ApiKey { .. } => ("api_key", String::new(), String::new(), String::new()),
+            Auth::ApiKey { .. } | Auth::ApiKeys { .. } => ("api_key", String::new(), String::new(), String::new()),
             Auth::OAuth2 { scopes, .. } => {
                 ("oauth2", String::new(), String::new(), scopes.to_string())
             }
@@ -480,6 +534,7 @@ fn valid_env_name(k: &str) -> bool {
 fn env_keys(p: &Provider) -> Vec<&'static str> {
     match p.auth {
         Auth::ApiKey { key_env } => vec![key_env],
+        Auth::ApiKeys { keys } => keys.to_vec(),
         Auth::OAuth2 {
             client_id_env,
             client_secret_env,
@@ -495,8 +550,10 @@ fn env_keys(p: &Provider) -> Vec<&'static str> {
 
 /// This server's origin for redirect URIs, canonical-port so it is right in
 /// both the laptop (8824) and the container (8822) with no build flag.
+/// `AMUX_OAUTH_ORIGIN` wins (a cloud server is reached at its domain, so a
+/// localhost redirect reaches nothing there).
 fn origin() -> String {
-    format!("https://localhost:{}", canonical_port())
+    super::gmail_auth::oauth_origin().unwrap_or_else(|| format!("https://localhost:{}", canonical_port()))
 }
 
 /// The redirect URI every google-family grant uses: the GMAIL one, on purpose
@@ -876,7 +933,7 @@ fn pending_take(home: &std::path::Path, state: &str) -> Option<(String, String, 
 
 fn token_urlsafe(nbytes: usize) -> String {
     let mut bytes = vec![0u8; nbytes];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("OS random source");
     base64url_nopad(&bytes)
 }
 
@@ -997,7 +1054,7 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
                 json!("gmail-oauth-client.json (reused)")
             };
             let (kind, oauth) = match p.auth {
-                Auth::ApiKey { .. } => ("apikey", Value::Null),
+                Auth::ApiKey { .. } | Auth::ApiKeys { .. } => ("apikey", Value::Null),
                 Auth::OAuth2 {
                     callback_path,
                     scopes,
@@ -1005,7 +1062,15 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
                 } => (
                     "oauth2",
                     json!({
-                        "redirect_uri": format!("{}{}", origin(), callback_path),
+                        // The URI the grant actually sends: Google reuses the
+                        // gmail one (google_redirect_uri), so showing the
+                        // connectors path told the owner to register a URI no
+                        // request ever used (sandbox, 2026-10-28).
+                        "redirect_uri": if p.category == "Google" {
+                            google_redirect_uri()
+                        } else {
+                            format!("{}{}", origin(), callback_path)
+                        },
                         "scopes": scopes,
                     }),
                 ),
@@ -1573,7 +1638,7 @@ async fn begin_auth(
     }
     let file_env = parse_env_file(&ctx.home.join("server.env"));
     match p.auth {
-        Auth::ApiKey { .. } => Json(json!({
+        Auth::ApiKey { .. } | Auth::ApiKeys { .. } => Json(json!({
             "ok": true,
             "auth": "apikey",
             "note": "key-only connector: paste the API key, no browser grant needed",
@@ -2241,7 +2306,10 @@ pub(crate) fn record_test(home: &std::path::Path, id: &str, result: &Value) {
     if committed.is_err() {
         tracing::warn!(connector=id,verdict="connector_test_record_not_durable", "live test history was not committed; existing receipt retained");
     }
-    if !ok {
+    // The same line the list draws: an untested or needs_credentials answer
+    // tried nothing. Upkeep records dev.to's "untested" every pass, and this
+    // WARN called each one a failed live test (deploy check of 559eede40).
+    if test_failed(result) {
         tracing::warn!(
             connector = id,
             status,
@@ -2254,16 +2322,24 @@ pub(crate) fn record_test(home: &std::path::Path, id: &str, result: &Value) {
     }
 }
 
+/// Whether a recorded test result is a failure the list reports. A "needs_*"
+/// answer is not a failed test (nothing was tried), and neither is
+/// "untested": a connector with no test endpoint (dev.to, which reads its key
+/// from a header the bearer test cannot send) tried nothing.
+pub(crate) fn test_failed(t: &Value) -> bool {
+    let ok = t.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let st = t.get("status").and_then(Value::as_str).unwrap_or("");
+    !ok && !st.starts_with("needs_credentials") && st != "untested"
+}
+
 /// What the list should say given the computed status and the last test: a
-/// connector whose last real test failed reads "error" with that test's own
-/// words. A "needs_*" answer is not a failed test (nothing was tried).
+/// connector whose last real test failed (test_failed) reads "error" with that
+/// test's own words.
 pub(crate) fn status_after_test(computed: &str, last: Option<&Value>) -> (String, Option<String>) {
     let Some(t) = last else {
         return (computed.to_string(), None);
     };
-    let ok = t.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    let st = t.get("status").and_then(Value::as_str).unwrap_or("");
-    if computed == "connected" && !ok && !st.starts_with("needs_credentials") {
+    if computed == "connected" && test_failed(t) {
         let detail = t
             .get("detail")
             .and_then(Value::as_str)
@@ -2439,13 +2515,19 @@ async fn test_connection_inner(
         let ok = checks.iter().all(|c| c["ok"] == true);
         return Json(json!({"ok":ok,"status":if ok {"connected"} else {"error"},"measured":checks.iter().all(|c|c["measured"]==true),"accounts":checks})).into_response();
     }
-    let Auth::ApiKey { key_env } = p.auth else {
-        unreachable!()
+    let key_env = match p.auth {
+        Auth::ApiKey { key_env } => key_env,
+        Auth::ApiKeys { keys } => keys[0],
+        _ => unreachable!(),
     };
     let Some(key) = env_val(&file_env, key_env) else {
         return Json(json!({"ok":false,"status":"needs_credentials","measured":false}))
             .into_response();
     };
+    if p.test_url.is_empty() && id != "telegram" {
+        return Json(json!({"ok": false, "status": "untested", "measured": false,
+            "why_unmeasured": "this connector has no test endpoint; message the bot and check GET /api/bridge"})).into_response();
+    }
     let url = if id == "telegram" {
         format!("https://api.telegram.org/bot{key}/getMe")
     } else {
@@ -2716,7 +2798,7 @@ async fn mint_connector_token(
     }
     let default_scopes = match p.auth {
         Auth::OAuth2 { scopes, .. } => scopes,
-        Auth::ApiKey { .. } => {
+        Auth::ApiKey { .. } | Auth::ApiKeys { .. } => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -3899,6 +3981,16 @@ mod tests {
             .0,
             "connected",
             "a test that could not run is not a failed test"
+        );
+        // SCHED-646, 2026-10-29: dev.to has a key and no test endpoint, and its
+        // "untested" answer listed it as "last live test failed: " (empty).
+        assert_eq!(
+            status_after_test(
+                "connected",
+                Some(&json!({"ok": false, "status": "untested", "measured": false}))
+            ),
+            ("connected".to_string(), None),
+            "a connector with no test endpoint tried nothing, so nothing failed"
         );
         assert_eq!(
             status_after_test("needs_auth", Some(&failed)).0,
@@ -5395,6 +5487,33 @@ mod connector_maintenance_regressions {
             assert_eq!(http.calls.load(Ordering::SeqCst), 1, "disconnect must never be resurrected by upkeep");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), grant.to_string());
         }
+    }
+
+    #[test]
+    fn the_failure_warn_and_the_list_agree_on_what_failed() {
+        // record_test's WARN and status_after_test read one predicate.
+        assert!(!test_failed(&json!({"ok":false,"status":"untested"})), "untested tried nothing");
+        assert!(!test_failed(&json!({"ok":false,"status":"needs_credentials"})));
+        assert!(!test_failed(&json!({"ok":true,"status":"connected"})));
+        assert!(test_failed(&json!({"ok":false,"status":"error","detail":"provider rejected"})));
+    }
+
+    #[tokio::test]
+    async fn connector_maintenance_does_not_probe_a_key_with_no_test_endpoint() {
+        // dev.to has a key and no test_url. Upkeep used to GET the empty URL and
+        // record the transport error, so the list showed it as an error.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("server.env"), "DEVTO_API_KEY=fixture-devto-key\n").unwrap();
+        // What an older pass stored on the live server (2026-10-29 14:03).
+        record_test(home.path(), "devto", &json!({"ok":false,"status":"error","detail":"provider unreachable; inspect network configuration"}));
+        let report = maintenance_pass(&ctx(home.path(), RefreshHttp::new(false))).await;
+        let devto = report["api_keys"].as_array().unwrap().iter().find(|k| k["connector"] == "devto").cloned();
+        assert_eq!(devto.as_ref().map(|k| k["status"].clone()), Some(json!("untested")), "{report}");
+        let recorded = last_tests(home.path()).get("devto").cloned();
+        assert_eq!(recorded.as_ref().map(|t| t["status"].clone()), Some(json!("untested")), "{recorded:?}");
+        assert_eq!(status_after_test("connected", recorded.as_ref()).0, "connected", "untested must not list it as an error");
+        assert_eq!(report["failures"], 0);
+        assert!(!report.to_string().contains("fixture-devto-key"));
     }
 
     #[tokio::test]

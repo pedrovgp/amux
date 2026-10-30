@@ -56,7 +56,6 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -78,7 +77,7 @@ pub(crate) const FRONT_DOOR_CALLBACK: &str = "https://cloud.amux.io/oauth/worksp
 
 fn rand_hex(bytes: usize) -> String {
     let mut b = vec![0u8; bytes];
-    OsRng.fill_bytes(&mut b);
+    getrandom::fill(&mut b).expect("OS random source");
     hex::encode(b)
 }
 

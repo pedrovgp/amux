@@ -111,7 +111,12 @@ async function directStartLocked(ctx, url, previous) {
   return {backend:'cdp',profile:source,cdp_port:port,target:tab.targetId,user_data_dir:dir,url,attempts:previous};
 }
 async function target(state) {
-  const tabs=await api(`http://127.0.0.1:${state.cdp_port}`,'/json/list');
+  // A closed Chrome answered with a bare connection error, with no reason or
+  // way back (2026-10-26). Same code, so recovery still sees a dead port.
+  const tabs=await api(`http://127.0.0.1:${state.cdp_port}`,'/json/list').catch(e=>{
+    if(e.code!=='ECONNREFUSED')throw e;
+    throw Object.assign(new RouteError('this route\'s browser is closed: nothing answers on its port (released after inactivity, stopped, or taken down with a server restart). Run the verb again or `amux browser route start` to reopen it; the profile\'s logins survive. `amux browser hold route:<dir> --for 2h` keeps one open.',409),{code:'ECONNREFUSED'});
+  });
   const page=tabs.find(t=>t.id===state.target&&t.type==='page');
   if(!page)throw Object.assign(new RouteError('this worker\'s CDP tab is gone; reopen the route',502),{code:'cdp_target_gone'});
   return page;
@@ -145,7 +150,7 @@ async function directVerb(ctx,state,verb,b) {
     if(verb==='inspect'||verb==='inspect/clear')throw new RouteError('Inspect is available on the amux route; use state/screenshot on CDP',400);
     if(verb!=='action')throw new RouteError('unsupported CDP verb',400);
     const a=b.action;
-    if(a==='eval')return {ok:true,data:{result:await evaluate(send,b.script||b.js||'')}};
+    if(a==='eval')return {ok:true,data:{result:await evaluate(send,b.script||b.expression||b.code||b.js||'')}};
     if(a==='click') {
       let x=b.x,y=b.y;
       if(Number.isInteger(b.index)) {
@@ -159,7 +164,16 @@ async function directVerb(ctx,state,verb,b) {
       if(!Number.isFinite(x)||!Number.isFinite(y))throw new RouteError('CDP click needs an observed selector or x,y; refresh state after handoff',400);
       await send('Input.dispatchMouseEvent',{type:'mousePressed',x,y,button:'left',clickCount:1});await send('Input.dispatchMouseEvent',{type:'mouseReleased',x,y,button:'left',clickCount:1});return {ok:true};
     }
-    if(a==='type'||a==='input') {if(b.selector)await evaluate(send,`(()=>{const e=document.querySelector(${JSON.stringify(b.selector)});if(!e)throw Error('selector missing; refresh state before typing');e.focus();})()`);await send('Input.insertText',{text:b.text||''});return {ok:true};}
+    // input (and type at a selector) REPLACES the field: its contents are
+    // selected and the text typed over them, which a framework-controlled
+    // field hears. Appending to a pre-filled email doubled it (2026-10-26).
+    if(a==='type'||a==='input') {
+      const replace=a==='input'||(b.selector&&b.append!==true)||b.replace===true;
+      const select=`if(typeof e.select==='function'&&('value' in e))e.select();else{const r=document.createRange();r.selectNodeContents(e);const s=getSelection();s.removeAllRanges();s.addRange(r);}`;
+      if(b.selector)await evaluate(send,`(()=>{const e=document.querySelector(${JSON.stringify(b.selector)});if(!e)throw Error('selector missing; refresh state before typing');e.focus();${replace?select:''}})()`);
+      else if(replace)await evaluate(send,`(()=>{const e=document.activeElement;if(!e||e===document.body)return;${select}})()`);
+      await send('Input.insertText',{text:b.text||''});return {ok:true};
+    }
     if(a==='key') {const k=b.key||'Enter';const codes={Enter:13,Tab:9,Backspace:8,Escape:27,ArrowDown:40,ArrowUp:38};await send('Input.dispatchKeyEvent',{type:'keyDown',key:k,windowsVirtualKeyCode:codes[k]||0});await send('Input.dispatchKeyEvent',{type:'keyUp',key:k,windowsVirtualKeyCode:codes[k]||0});return {ok:true};}
     if(a==='scroll') {await send('Input.dispatchMouseEvent',{type:'mouseWheel',x:100,y:100,deltaX:b.dx||0,deltaY:b.dy||b.amount||300});return {ok:true};}
     if(a==='viewport') {const width=b.width||b.w,height=b.height||b.h;await send('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width<=500});return {ok:true};}

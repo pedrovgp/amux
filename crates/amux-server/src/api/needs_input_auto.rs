@@ -330,6 +330,25 @@ fn ask_text(item: &Value) -> String {
 /// An ask's explicit reservation outranks the default judgment policy. Include
 /// its unblock and context, where GS-199 put the reservation; do not infer a
 /// credential step from the recorder's generic unblock boilerplate.
+/// An approval of a change to a landing guard on the owner tier
+/// (scripts/review-tiers.txt `[owner]`, approved at `#land-approve=<patch-id>`).
+/// That tier exists so a worker cannot approve its own guard change, so the
+/// policy neither approves it nor returns it down the access ladder: on
+/// 2026-10-28 AF-981 (approve a scripts/land_gate.py change) was approved by
+/// policy once and sent back twice as an access ask telling the worker to
+/// approve it through Ethan's browser (AF-987).
+fn is_owner_tier_guard_approval(item: &Value) -> bool {
+    let text = format!("{} {}", ask_text(item), item["context"].as_str().unwrap_or(""))
+        .to_ascii_lowercase();
+    static GUARD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"#land-approve=|\bowner[- ]tier\b|review-tiers|\bland[- ]gate\b[^.?]*\bapprov|\bapprov\w*\b[^.?]*\bland[- ]gate\b",
+        )
+        .expect("constant owner-tier guard regex")
+    });
+    GUARD.is_match(&text)
+}
+
 fn requires_explicit_approval(item: &Value) -> bool {
     let text = format!("{} {}", ask_text(item), item["context"].as_str().unwrap_or(""))
         .to_ascii_lowercase();
@@ -763,6 +782,9 @@ pub fn decide_at(policy: &Policy, item: &Value, now: f64) -> Decision {
     }
     if requires_explicit_approval(item) {
         return Decision::Never("explicit_approval_required");
+    }
+    if is_owner_tier_guard_approval(item) {
+        return Decision::Never("owner_tier_guard_approval");
     }
     // AN OWNER NOTE ON THE ASK MEANS THE OWNER IS IN IT (MG-2017: his note
     // carried the one condition that mattered). The policy does not answer
@@ -1539,12 +1561,19 @@ async fn read_view(state: &AppState, worker: String) -> Response {
     let home = crate::config::amux_home();
     let now = now_f64();
     let h2 = home.clone();
+    let store = state.store.clone();
+    // The queue comes from the shared read (needs_input::shared_queue, AF-1029),
+    // taken BEFORE the ledger read so no pooled connection is held while this
+    // call waits for another caller's build.
+    let items = tokio::task::spawn_blocking(move || needs_input::shared_queue(&store, &h2, now))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|q| q.items.clone())
+        .unwrap_or_default();
     let res = state
         .store
-        .read_async(move |conn| {
-            let items = needs_input::build(conn, &h2, now).map(|q| q.items).unwrap_or_default();
-            Ok((load_ledger(conn).unwrap_or_default(), items))
-        })
+        .read_async(move |conn| Ok((load_ledger(conn).unwrap_or_default(), items)))
         .await;
     match res {
         Ok((led, items)) => Json(crate::api::measured::measured(

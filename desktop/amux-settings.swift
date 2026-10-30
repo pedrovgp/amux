@@ -20,9 +20,24 @@ struct SavedPin: Codable {
 /// before names were kept) what its link shows.
 func savedTabName(_ w: SavedWindow) -> String {
     let own = savedPageName(url: w.url, title: w.title)
-    // A window split into panes (amux-panes.swift) is named by every pane.
+    // A window split into panes (amux-panes.swift) is named by every pane, and
+    // a pane by each of its tabs ("amux-admin + amux-app | amux-app + desktop"),
+    // so the list shows everything Open will put back.
     guard let g = w.grid, !g.panes.isEmpty else { return own }
-    return ([own] + g.panes.map { savedPageName(url: $0.url, title: $0.title) }).joined(separator: " | ")
+    func pane(_ url: String, _ title: String?, _ tabs: [SavedTab]?) -> String {
+        ([savedPageName(url: url, title: title) + savedSubtab(url)] + (tabs ?? []).map { savedPageName(url: $0.url, title: $0.title) + savedSubtab($0.url) })
+            .joined(separator: " + ")
+    }
+    let panes = ([pane(w.url, w.title, g.hostTabs)] + g.panes.map { pane($0.url, $0.title, $0.tabs) }).joined(separator: " | ")
+    if let n = g.name, !n.isEmpty { return n + " (" + panes + ")" }
+    return panes
+}
+
+/// A worker shown on another of its tabs than Terminal: " (Chat)".
+func savedSubtab(_ url: String) -> String {
+    guard let r = url.range(of: "#"), url[r.upperBound...].hasPrefix("peek=") else { return "" }
+    let t = url[r.upperBound...].split(separator: "&").first { $0.hasPrefix("tab=") }.map { String($0.dropFirst(4)) } ?? ""
+    return t.isEmpty || t == "terminal" ? "" : " (" + t.prefix(1).uppercased() + t.dropFirst() + ")"
 }
 
 func savedPageName(url: String, title: String?) -> String {
@@ -33,11 +48,57 @@ func savedPageName(url: String, title: String?) -> String {
     return v.removingPercentEncoding ?? v
 }
 
+/// A workspace change waiting for the server: save (replace or add), delete,
+/// or rename. Replayed on the server's list, so it merges with other Macs'.
+struct WorkspaceOp: Codable {
+    var kind: String
+    var name: String
+    var newName: String? = nil
+    var layout: Layout? = nil
+
+    func apply(to list: inout [Layout]) {
+        switch kind {
+        case "save":
+            guard let l = layout else { return }
+            if let i = list.firstIndex(where: { $0.name == name }) { list[i] = l } else { list.append(l) }
+        case "delete":
+            list.removeAll { $0.name == name }
+        case "rename":
+            guard let n = newName, list.contains(where: { $0.name == name }) else { return }
+            list.removeAll { $0.name == n }
+            if let i = list.firstIndex(where: { $0.name == name }) { list[i].name = n }
+        default:
+            break
+        }
+    }
+}
+
+/// The server's copy of the open windows (prefs key desktop_windows).
+struct ServerWindows: Codable {
+    var schema: Int
+    var windows: [SavedWindow]
+    var savedBy: String?
+    var savedAt: Double
+    var server: String? = nil   // the sending Mac's address for this server (amux-rehome.swift)
+}
+
+/// The server's copy of every saved workspace (prefs key desktop_workspaces).
+struct ServerWorkspaces: Codable {
+    var schema: Int
+    var layouts: [Layout]
+    var savedBy: String?
+    var savedAt: Double
+}
+
 struct Layout: Codable {
     var name: String
     var windows: [SavedWindow]
     var pins: [SavedPin]?
     var savedAt: Double
+    /// The address the saving Mac reached the server at (originKey), so another
+    /// Mac moves those tabs to its own address for it (amux-rehome.swift).
+    /// Absent in a workspace saved before 2026-10-29.
+    var server: String? = nil
 }
 
 // ── Layouts ──
@@ -57,7 +118,8 @@ extension AppDelegate {
             guard let self = self else { return }
             var c = loadConfig()
             var layouts = c.layouts ?? []
-            let l = Layout(name: trimmed, windows: windows, pins: self.snapshotPins(), savedAt: Date().timeIntervalSince1970)
+            let l = Layout(name: trimmed, windows: windows, pins: self.snapshotPins(), savedAt: Date().timeIntervalSince1970,
+                           server: self.serverURL.flatMap(originKey))
             if let i = layouts.firstIndex(where: { $0.name == trimmed }) { layouts[i] = l } else { layouts.append(l) }
             c.layouts = layouts
             saveConfig(c)
@@ -65,25 +127,61 @@ extension AppDelegate {
             NSLog("amux-desktop: verdict=layout_saved name=%@ windows=%d pins=%d shows=%@", trimmed, windows.count, l.pins?.count ?? 0,
                   self.workspaceWindows(l).joined(separator: " | "))
             self.rebuildLayoutsMenu()
-            done?()
+            self.syncWorkspaces(.init(kind: "save", name: trimmed, layout: l)) { _ in done?() }
         }
+    }
+
+    /// The saved windows with every tab, pane and pane tab on the saving Mac's
+    /// server moved to this Mac's address for it (amux-rehome.swift). Logs how
+    /// many moved, so a workspace that opens on the wrong server says so.
+    func rehomed(_ windows: [SavedWindow], savedOn: String?, what: String) -> [SavedWindow] {
+        let here = serverURL
+        var links = 0, moved = 0
+        func move(_ u: String) -> String {
+            let r = rehomedURL(u, savedOn: savedOn, here: here)
+            links += 1
+            if r != u { moved += 1 }
+            return r
+        }
+        func tab(_ t: SavedTab) -> SavedTab {
+            var t = t
+            t.url = move(t.url)
+            t.split = t.split.map { Box(grid($0.value)) }
+            return t
+        }
+        func grid(_ g: SavedGrid) -> SavedGrid {
+            var g = g
+            g.hostTabs = g.hostTabs?.map(tab)
+            g.panes = g.panes.map { p in
+                var p = p
+                p.url = move(p.url)
+                p.split = p.split.map { Box(grid($0.value)) }
+                p.tabs = p.tabs?.map(tab)
+                return p
+            }
+            return g
+        }
+        let out = windows.map { w -> SavedWindow in
+            var w = w
+            w.url = move(w.url)
+            w.grid = w.grid.map(grid)
+            return w
+        }
+        NSLog("amux-desktop: verdict=%@ what=%@ links=%d moved=%d saved_on=%@ here=%@", moved > 0 ? "workspace_rehomed" : "workspace_same_server",
+              what, links, moved, savedOn ?? "unrecorded", here.flatMap(originKey) ?? "not_connected")
+        return out
     }
 
     /// Replace the open windows and pins with the workspace's.
     func openLayout(named name: String) {
         var cfg = loadConfig()
-        if let cur = cfg.activeWorkspace, cur != name, var ls = cfg.layouts, let i = ls.firstIndex(where: { $0.name == cur }) {
-            ls[i].windows = snapshotNow()
-            ls[i].pins = snapshotPins()
-            cfg.layouts = ls
-        }
         guard let l = (cfg.layouts ?? []).first(where: { $0.name == name }) else { return }
         cfg.activeWorkspace = name
         saveConfig(cfg)
         config = cfg
         saveWork?.cancel()
         closeAllPins()
-        openWindows(l.windows, reuse: controllers)
+        openWindows(rehomed(l.windows, savedOn: l.server, what: "workspace " + name), reuse: controllers)
         rebuildLayoutsMenu()
         for p in l.pins ?? [] where !p.paths.isEmpty {
             let f = NSRectFromString(p.frame)
@@ -103,6 +201,7 @@ extension AppDelegate {
         saveConfig(c)
         config = c
         rebuildLayoutsMenu()
+        syncWorkspaces(.init(kind: "delete", name: name))
     }
 
     func renameLayout(_ old: String, to new: String) {
@@ -117,6 +216,115 @@ extension AppDelegate {
         saveConfig(c)
         config = c
         rebuildLayoutsMenu()
+        syncWorkspaces(.init(kind: "rename", name: old, newName: n))
+    }
+
+    // ── Saved on the server ──
+    // Workspaces live in the server's prefs under one key, so they outlast this
+    // Mac and appear on the next one (owner, 2026-10-28: "i want it saved on the
+    // server"). The server's list is the record: a change is applied to a fresh
+    // read of it, then sent back, so two Macs saving keep each other's. This
+    // Mac's file is the copy used while the server cannot be reached; a change
+    // made then is marked and sent at the next sync.
+    /// nil when this copy must not touch the server's: one started with its own
+    /// config (the desktop tests) syncs only to a key it names, so a test never
+    /// writes over the owner's workspaces.
+    var workspacesKey: String? {
+        let env = ProcessInfo.processInfo.environment
+        let k = env["AMUX_DESKTOP_WORKSPACES_KEY"] ?? ""
+        if !k.isEmpty { return k }
+        return (env["AMUX_DESKTOP_CONFIG"] ?? "").isEmpty ? "desktop_workspaces" : nil
+    }
+
+    /// Records a change (if any) as pending, then syncs: reads the server's
+    /// list, replays every pending change on it in order, keeps the result here
+    /// and sends it. A pending change is dropped only once the server has
+    /// confirmed a list that includes it, so neither a crash nor a lost
+    /// connection loses it, and a Mac coming back online adds its changes to
+    /// the other Macs' workspaces instead of replacing them.
+    func syncWorkspaces(_ op: WorkspaceOp? = nil, _ done: ((Bool) -> Void)? = nil) {
+        guard let key = workspacesKey else {
+            NSLog("amux-desktop: verdict=workspaces_sync_off reason=private_config measured=false")
+            done?(false)
+            return
+        }
+        if let op = op {
+            var c = loadConfig()
+            c.workspacesPending = (c.workspacesPending ?? []) + [op]
+            saveConfig(c)
+            config = c
+        }
+        if workspacesSyncBusy {
+            workspacesSyncWaiting.append { reached in done?(reached) }
+            return
+        }
+        workspacesSyncBusy = true
+        let finish: (Bool) -> Void = { [weak self] reached in
+            done?(reached)
+            guard let self = self else { return }
+            self.workspacesSyncBusy = false
+            let waiting = self.workspacesSyncWaiting
+            self.workspacesSyncWaiting = []
+            // Everyone who waited is served by one more sync, which also
+            // carries any change recorded while this one ran.
+            if !waiting.isEmpty { self.syncWorkspaces { r in waiting.forEach { $0(r) } } }
+        }
+        api("/api/prefs?key=" + (key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? key)) { [weak self] obj in
+            guard let self = self else { return }
+            var c = loadConfig()
+            let pending = c.workspacesPending ?? []
+            guard let reply = obj as? [String: Any], reply["key"] as? String == key else {
+                NSLog("amux-desktop: verdict=workspaces_server_unreachable measured=false key=%@ local=%d pending=%d", key, (c.layouts ?? []).count, pending.count)
+                finish(false)
+                return
+            }
+            let raw = (reply["value"] as? String) ?? ""
+            let remote = raw.isEmpty ? nil : (try? JSONDecoder().decode(ServerWorkspaces.self, from: Data(raw.utf8)))?.layouts
+            if !raw.isEmpty, remote == nil {
+                // Unreadable (a newer app's format, or damaged): left as it is.
+                NSLog("amux-desktop: verdict=workspaces_server_unreadable key=%@ bytes=%d pending=%d", key, raw.utf8.count, pending.count)
+                finish(true)
+                return
+            }
+            // The first sync to an empty server uploads this Mac's list.
+            var list = remote ?? (c.layouts ?? [])
+            // A Mac's first sync also keeps the workspaces only it has.
+            let first = c.workspacesSyncedOnce != true
+            if first, remote != nil {
+                for l in c.layouts ?? [] where !list.contains(where: { $0.name == l.name }) { list.append(l) }
+            }
+            for p in pending { p.apply(to: &list) }
+            let source = remote == nil ? "local_first_upload" : "server"
+            c.layouts = list
+            saveConfig(c)
+            self.config = c
+            self.rebuildLayoutsMenu()
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.sortedKeys]
+            let same = remote.flatMap { try? enc.encode($0) } == (try? enc.encode(list))
+            let doc = ServerWorkspaces(schema: 1, layouts: list, savedBy: Host.current().localizedName, savedAt: Date().timeIntervalSince1970)
+            func confirmed() {
+                // Only the changes this list carried; any recorded since stay.
+                var c2 = loadConfig()
+                let left = Array((c2.workspacesPending ?? []).dropFirst(pending.count))
+                c2.workspacesPending = left.isEmpty ? nil : left
+                c2.workspacesSyncedOnce = true
+                saveConfig(c2)
+                self.config = c2
+            }
+            guard !same, let data = try? enc.encode(doc), let text = String(data: data, encoding: .utf8) else {
+                confirmed()
+                NSLog("amux-desktop: verdict=workspaces_synced key=%@ source=%@ layouts=%d applied=%d sent=0", key, source, list.count, pending.count)
+                finish(true)
+                return
+            }
+            self.api("/api/prefs", method: "POST", body: ["key": key, "value": text]) { r in
+                let ok = (r as? [String: Any])?["ok"] as? Bool == true
+                if ok { confirmed() }
+                NSLog("amux-desktop: verdict=%@ key=%@ source=%@ layouts=%d applied=%d bytes=%d", ok ? "workspaces_synced" : "workspaces_send_failed", key, source, list.count, pending.count, data.count)
+                finish(ok)
+            }
+        }
     }
 
     /// What launch opens: the last windows (default), a saved layout, or one window.
@@ -127,9 +335,59 @@ extension AppDelegate {
         } else if launch == "new" {
             openWindow(url: nil, frame: nil)
         } else {
-            openWindows(config.windows ?? [])
+            launchedWithoutWindows = (config.windows ?? []).isEmpty
+            // The last windows too: a Mac that opened a workspace before the
+            // remap existed saved its tabs on its own localhost (2026-10-29), and
+            // reopening them as saved kept every tab on an empty server.
+            openWindows(rehomed(config.windows ?? [], savedOn: nil, what: "last windows"))
         }
         lastSignature = placementSignature()
+    }
+
+    // ── The open windows, on the server too (owner, 2026-10-29: "make sure the
+    // tab names are also saved with the windows and ensure its all saved server
+    // side") ──
+    // Every autosave also sends the windows (each tab, its name, its panes and
+    // their tabs and names, where it sits) to the server, at most every 10 s and
+    // only when they changed. A Mac that starts with no windows of its own (a
+    // new Mac, a cleared config) opens the server's once its first page has
+    // the token to read them.
+    var windowsKey: String? { workspacesKey.map { $0 == "desktop_workspaces" ? "desktop_windows" : $0 + "_windows" } }
+
+    func sendWindowsSoon(_ windows: [SavedWindow]) {
+        guard let key = windowsKey, !windows.isEmpty else { return }
+        windowsSendWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.sortedKeys]
+            guard let body = try? enc.encode(windows), body != self.windowsSent else { return }
+            let doc = ServerWindows(schema: 1, windows: windows, savedBy: Host.current().localizedName, savedAt: Date().timeIntervalSince1970,
+                                    server: self.serverURL.flatMap(originKey))
+            guard let data = try? enc.encode(doc), let text = String(data: data, encoding: .utf8) else { return }
+            self.api("/api/prefs", method: "POST", body: ["key": key, "value": text]) { [weak self] r in
+                let ok = (r as? [String: Any])?["ok"] as? Bool == true
+                if ok { self?.windowsSent = body }
+                NSLog("amux-desktop: verdict=%@ key=%@ windows=%d bytes=%d", ok ? "windows_sent" : "windows_send_failed", key, windows.count, data.count)
+            }
+        }
+        windowsSendWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: w)
+    }
+
+    /// At most once a launch: the server's windows for a Mac that had none.
+    func adoptServerWindows() {
+        guard launchedWithoutWindows, let key = windowsKey else { return }
+        launchedWithoutWindows = false
+        api("/api/prefs?key=" + key) { [weak self] obj in
+            guard let self = self, let raw = (obj as? [String: Any])?["value"] as? String, !raw.isEmpty,
+                  let doc = try? JSONDecoder().decode(ServerWindows.self, from: Data(raw.utf8)), !doc.windows.isEmpty else {
+                NSLog("amux-desktop: verdict=windows_server_none key=%@", key)
+                return
+            }
+            NSLog("amux-desktop: verdict=windows_adopted_from_server key=%@ windows=%d saved_by=%@", key, doc.windows.count, doc.savedBy ?? "-")
+            self.openWindows(self.rehomed(doc.windows, savedOn: doc.server, what: "server windows"), reuse: self.controllers)
+        }
     }
 
     @objc func saveLayoutPrompt(_ sender: Any?) {
@@ -137,7 +395,7 @@ extension AppDelegate {
         var n = existing.count + 1
         while existing.contains("Workspace \(n)") { n += 1 }
         guard let name = askText(title: "Save Workspace",
-                                 message: "Saves every open amux window (what it shows, where it sits, its display and Desktop) and the floating pins. A name that already exists is replaced.",
+                                 message: "Saves every open amux window: its tabs, how each is split into panes and every pane's tabs, what each one shows, where the window sits (display and Desktop), and the floating pins. It is kept on the server, so it also reaches your other Macs. A name that already exists is replaced.",
                                  value: "Workspace \(n)", ok: "Save") else { return }
         saveLayout(named: name)
     }
@@ -226,6 +484,12 @@ extension AppDelegate {
         // Opening Settings checks too, at most every 10 minutes.
         let u = Updater.shared
         if u.state == .idle || (u.state != .checking && u.state != .installing && -(u.checkedAt?.timeIntervalSinceNow ?? -1e9) > 600) { u.check() }
+        // Workspaces another Mac saved show up here: the list redraws when the
+        // server's copy differs from this Mac's.
+        let before = (try? JSONEncoder().encode(loadConfig().layouts ?? [])) ?? Data()
+        syncWorkspaces { [weak self] _ in
+            if (try? JSONEncoder().encode(loadConfig().layouts ?? [])) != before { self?.settings?.reload() }
+        }
     }
 
     @objc func checkForUpdates(_ sender: Any?) {
@@ -291,6 +555,11 @@ final class SettingsWindowController: NSWindowController, WKScriptMessageHandler
             cfg.launch = m["value"] as? String
             saveConfig(cfg)
             app.config = cfg
+        case "splitDirection":
+            cfg.splitDirection = m["value"] as? String
+            saveConfig(cfg)
+            app.config = cfg
+            dlog("verdict=split_direction_set value=\(cfg.splitDirection ?? "right")")
         case "toggle":
             let on = m["value"] as? Bool ?? true
             switch name {
@@ -352,6 +621,9 @@ func settingsHTML(_ app: AppDelegate) -> String {
             </div>
             """
         }.joined()
+    let split = c.splitDirection ?? "right"
+    let splitOptions = [("right", "To the right"), ("below", "Below"), ("longer", "Along the pane's longer side")]
+        .map { "<option value=\"\($0.0)\"\(split == $0.0 ? " selected" : "")>\($0.1)</option>" }.joined()
     let launchOptions = [("last", "Reopen the windows from last time"), ("new", "Open one new window")]
         .map { "<option value=\"\($0.0)\"\(launch == $0.0 ? " selected" : "")>\($0.1)</option>" }.joined()
         + layouts.map { l in
@@ -418,6 +690,9 @@ func settingsHTML(_ app: AppDelegate) -> String {
       \(toggle("menuBar", c.menuBar ?? true, "Show in menu bar", "CPU and memory readout, with your pinned notes one click away."))
       \(toggle("notifications", c.notifications ?? true, "Notify when amux needs you", "A notification for each new item waiting on you."))
       \(toggle("dockBadge", c.dockBadge ?? true, "Show count on Dock icon", "The number of items waiting on you."))
+      <div class="row"><div class="info"><div class="name">Split opens the new pane</div>
+        <small>The Split button, "Open in split pane" and "Split this tab".</small></div>
+        <select onchange="send('splitDirection','',this.value)">\(splitOptions)</select></div>
       \(toggle("snapToGrid", c.snapToGrid ?? true, "Snap windows to a grid", "While you drag, an outline shows where the window lands: a 12 by 8 grid of the screen or another amux window's edge. Hold Option to place it freely."))
     </div>
     <h2>Updates</h2>

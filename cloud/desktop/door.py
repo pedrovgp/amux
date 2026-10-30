@@ -471,6 +471,31 @@ def safe_next(n):
     return n if n.startswith("/") and not n.startswith("//") else "/"
 
 
+# Where a signed-out person was going (a copied /f/<file> or /w/<worker> link), kept
+# through amux Cloud's sign-in, which sends them back to /_door/enter without it.
+NEXT_COOKIE = "amux_door_next"
+
+
+def next_cookie(path):
+    return ("Set-Cookie", "%s=%s; Path=/_door/; Max-Age=900; HttpOnly; Secure; SameSite=Lax"
+            % (NEXT_COOKIE, urllib.parse.quote(safe_next(path), safe="/")))
+
+
+def next_cookie_clear(header):
+    """Spent once used: the next sign-in starts at home unless it too came from a link."""
+    if not next_from_cookie(header):
+        return []
+    return [("Set-Cookie", "%s=; Path=/_door/; Max-Age=0; HttpOnly; Secure; SameSite=Lax" % NEXT_COOKIE)]
+
+
+def next_from_cookie(header):
+    for part in (header or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == NEXT_COOKIE and v:
+            return safe_next(urllib.parse.unquote(v))
+    return ""
+
+
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Sign in to amux</title>
@@ -574,7 +599,10 @@ class Door(BaseHTTPRequestHandler):
                 if cfg.get("AMUX_CONTROL_URL") and cfg.get("AMUX_SLUG") and not users():
                     # amux Cloud: people arrive through cloud.amux.io, which sends them back with a fresh token.
                     loc = "%s/?server=%s" % (cfg["AMUX_CONTROL_URL"].rstrip("/"), urllib.parse.quote(cfg["AMUX_SLUG"]))
-                    return self.send(302, headers=[("Location", loc), ("Cache-Control", "no-store")])
+                    keep = [next_cookie(uri)] if safe_next(uri) != "/" else []
+                    if keep:
+                        loc += "&next=" + urllib.parse.quote(safe_next(uri), safe="")
+                    return self.send(302, headers=[("Location", loc), ("Cache-Control", "no-store")] + keep)
                 loc = "/_door/login?next=" + urllib.parse.quote(safe_next(uri), safe="")
                 return self.send(302, headers=[("Location", loc)])
             return self.send(401, b'{"error":"sign in required"}', [("Content-Type", "application/json"),
@@ -588,8 +616,9 @@ class Door(BaseHTTPRequestHandler):
                 if email in users():       # the server's owner (a standalone server's paying customer)
                     log(event="enter", user=email, ip=ip, role="owner", via=claims.get("via"), verdict="door_enter_ok")
                     note_signin(True)
-                    nxt = safe_next(q.get("next", ["/"])[0])
-                    return self.send(303, headers=[("Location", nxt), ("Cache-Control", "no-store")] + session_cookies(email))
+                    nxt = safe_next(q.get("next", [""])[0] or next_from_cookie(self.headers.get("Cookie")))
+                    return self.send(303, headers=[("Location", nxt), ("Cache-Control", "no-store")] + session_cookies(email)
+                                     + next_cookie_clear(self.headers.get("Cookie")))
                 known = members().get(email)
                 if claims.get("invite") and not (known and member_valid(known)):
                     redeem_invite(email, claims["invite"])     # invites are single use; a member skips this
@@ -604,9 +633,9 @@ class Door(BaseHTTPRequestHandler):
                 return self.send(401, body, [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
             log(event="enter", user=email, ip=ip, role=claims.get("role"), verdict="door_enter_ok")
             note_signin(True)
-            nxt = safe_next(q.get("next", ["/"])[0])
+            nxt = safe_next(q.get("next", [""])[0] or next_from_cookie(self.headers.get("Cookie")))
             return self.send(303, headers=[("Location", nxt), ("Cache-Control", "no-store")] +
-                             session_cookies(email, TOKEN_MAX_AGE))
+                             session_cookies(email, TOKEN_MAX_AGE) + next_cookie_clear(self.headers.get("Cookie")))
         if path.path == "/_door/login":
             q = urllib.parse.parse_qs(path.query)
             return self.page(q.get("next", ["/"])[0])
@@ -709,13 +738,25 @@ class Door(BaseHTTPRequestHandler):
         return self.send(303, headers=[("Location", "/"), ("Cache-Control", "no-store")] + session_cookies(email))
 
 
+class DoorServer(ThreadingHTTPServer):
+    """The listen backlog. Every dashboard request passes through the door
+    (Caddy forward_auth), and a page load fires ~100 at once. socketserver's
+    default backlog is 5: the kernel dropped the rest, each dropped connection
+    was retried a second later, and every call on a sandbox page load took
+    1.2 s against a 5 ms server (TcpExtListenOverflows 21785, 2026-10-28:
+    "the sandbox cloud is very slow")."""
+    request_queue_size = 1024
+    daemon_threads = True
+
+
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "hash":
         print("%s %s" % (sys.argv[2], scrypt_hash(sys.stdin.readline().rstrip("\n"))))
         return
     if len(sys.argv) >= 2 and sys.argv[1] == "serve":
-        log(event="start", port=PORT, users=len(users()), verdict="door_started")
-        ThreadingHTTPServer(("127.0.0.1", PORT), Door).serve_forever()
+        log(event="start", port=PORT, users=len(users()), backlog=DoorServer.request_queue_size,
+            verdict="door_started")
+        DoorServer(("127.0.0.1", PORT), Door).serve_forever()
         return
     sys.exit(__doc__)
 

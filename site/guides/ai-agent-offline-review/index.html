@@ -284,7 +284,7 @@ amux serve   <span class="comment"># → dashboard at https://localhost:8824</sp
 
     <details style="border:1px solid var(--border);border-radius:6px;padding:1rem 1.2rem;margin:0.75rem 0;">
       <summary style="font-weight:600;cursor:pointer;">Does this require amux Cloud?</summary>
-      <p style="margin-top:0.75rem;color:var(--dim);">No. Offline scrollback caching is a client-side feature built into the open-source amux PWA &mdash; it works with any self-hosted amux instance. The IndexedDB cache stores scrollback on your device, not on any amux server. <a href="https://amux.io/cloud/">amux Cloud</a> adds a hosted dashboard, tunnel, and automatic backups, but offline caching works without it.</p>
+      <p style="margin-top:0.75rem;color:var(--dim);">No. Offline scrollback caching is a client-side feature built into the open-source amux PWA &mdash; it works with any self-hosted amux instance. The IndexedDB cache stores scrollback on your device, not on any amux server. <a href="https://amux.io/cloud/">amux Cloud</a> adds an always-on hosted server and automatic backups, but offline caching works without it.</p>
     </details>
 
     <details style="border:1px solid var(--border);border-radius:6px;padding:1rem 1.2rem;margin:0.75rem 0;">
@@ -316,7 +316,7 @@ amux serve   <span class="comment"># → dashboard at https://localhost:8824</sp
     <div style="background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.3);border-radius:8px;padding:20px 24px;margin:32px 0;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
       <div style="flex:1;min-width:200px">
         <div style="font-weight:600;font-size:1rem;margin-bottom:4px">amux &mdash; review your AI agent fleet from anywhere, online or offline (315&#9733; GitHub)</div>
-        <div style="color:var(--muted);font-size:.9rem">Open-source control plane for AI engineering teams. Offline scrollback cache, offline outbox, voice dictation, self-healing watchdog, and full PWA. Run Claude Code, Codex, and Gemini CLI from your phone.</div>
+        <div style="color:var(--muted);font-size:.9rem">Open-source control plane for AI engineering teams. Offline scrollback cache, offline outbox, voice dictation, usage-limit resume, and full PWA. Run Claude Code, Codex, and Gemini CLI from your phone.</div>
       </div>
       <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="posthog&&posthog.capture('exp014_guide_github_cta_click',{page:window.location.pathname})" style="background:#6366f1;color:#fff;padding:10px 20px;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;flex-shrink:0">View on GitHub &#9733;</a>
     </div>
@@ -324,7 +324,7 @@ amux serve   <span class="comment"># → dashboard at https://localhost:8824</sp
     <!-- ─── CTA ─── -->
     <div style="background:linear-gradient(135deg,oklch(0.24 0.015 250),oklch(0.21 0.014 250));border:1px solid var(--border);border-radius:12px;padding:2rem 2.4rem;margin:3rem 0;text-align:center;">
       <h2 style="margin:0 0 0.5rem;font-size:1.4rem;">Review your agents anywhere &mdash; even offline</h2>
-      <p style="color:var(--dim);margin:0 0 1.5rem;max-width:520px;margin-left:auto;margin-right:auto;">Install amux in 30 seconds. Open-source, MIT licensed, single Rust binary, no cloud dependency. The offline scrollback cache is built in &mdash; no configuration needed.</p>
+      <p style="color:var(--dim);margin:0 0 1.5rem;max-width:520px;margin-left:auto;margin-right:auto;">Install amux in 30 seconds. Open-source, MIT + Commons Clause, single Rust binary, no cloud dependency. The offline scrollback cache is built in &mdash; no configuration needed.</p>
       <div style="display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;">
         <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="display:inline-block;background:var(--accent);color:var(--bg);font-weight:600;padding:0.7rem 1.6rem;border-radius:6px;text-decoration:none;font-size:0.95rem;">Star on GitHub</a>
         <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" style="display:inline-block;background:var(--surface-2);border:1px solid var(--border);color:var(--fg);font-weight:500;padding:0.7rem 1.6rem;border-radius:6px;text-decoration:none;font-size:0.95rem;">Download iOS App</a>
@@ -339,7 +339,7 @@ amux serve   <span class="comment"># → dashboard at https://localhost:8824</sp
       <li><a href="/guides/voice-dictation-ai-agents/">Voice Dictation for AI Coding Agents &mdash; Steer Your Fleet by Speaking</a></li>
       <li><a href="/guides/scheduling-ai-agents/">Scheduling AI Agents &mdash; Automated Cron Jobs for Claude Code</a></li>
       <li><a href="/guides/ai-coding-agents-overnight/">Running AI Coding Agents Overnight Unattended</a></li>
-      <li><a href="/guides/self-healing-configuration/">Self-Healing Configuration for AI Coding Agents</a></li>
+      <li><a href="/guides/self-healing-configuration/">Recovery configuration for AI coding agents</a></li>
       <li><a href="/use-cases/ai-agent-daily-standup/">AI Agent Daily Standup &mdash; Morning Review Workflow</a></li>
     </ul>
 

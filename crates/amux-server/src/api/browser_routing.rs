@@ -178,6 +178,43 @@ async fn request_lock(key: String) -> std::sync::Arc<tokio::sync::Mutex<()>> {
 mod tests {
     use super::{request_lock, Config};
 
+    /// AF-1023: a Cloudflare challenge page is named with the headed start
+    /// that passes it; an ordinary page is not.
+    #[test]
+    fn a_cloudflare_challenge_names_the_headed_start() {
+        let challenged = serde_json::json!({"ok":true,"state":{"url":"https://platform.openai.com/apps","title":"Just a moment..."}});
+        let c = super::bot_check(&challenged).expect("challenge recognised");
+        assert_eq!(c["provider"], "cloudflare");
+        let next = c["next"].as_str().unwrap();
+        assert!(next.contains("\"headless\":false") && next.contains("platform.openai.com/apps"), "{next}");
+        let by_frame = serde_json::json!({"url":"https://challenges.cloudflare.com/cdn-cgi/challenge-platform/x","title":""});
+        assert!(super::bot_check(&by_frame).is_some());
+        let plain = serde_json::json!({"ok":true,"state":{"url":"https://platform.openai.com/apps","title":"Apps | OpenAI"}});
+        assert!(super::bot_check(&plain).is_none());
+    }
+
+    #[test]
+    fn a_route_call_is_audited_with_outcome_and_without_typed_secrets() {
+        use super::route_audit_event;
+        use axum::http::StatusCode;
+        let body = serde_json::json!({"action":"type","text":"hunter2-password","selector":"#pw"});
+        let v = serde_json::json!({"ok":true,"url":"https://app.example/login?token=abc123secret&q=1","route":{"backend":"amux","profile":"netsuite"}});
+        let e = route_audit_event("action", &body, &v, StatusCode::OK, 42);
+        let s = e.to_string();
+        assert!(!s.contains("hunter2"), "typed text never recorded: {s}");
+        assert!(!s.contains("abc123secret"), "credential-shaped query values redacted: {s}");
+        assert_eq!((e["verb"].as_str(), e["action"].as_str(), e["backend"].as_str(), e["profile"].as_str()),
+            (Some("action"), Some("type"), Some("amux"), Some("netsuite")));
+        assert_eq!((e["ok"].as_bool(), e["latency_ms"].as_u64(), e["via"].as_str()), (Some(true), Some(42), Some("route")));
+        assert_eq!(e["typed_chars"], 16);
+
+        let failed = route_audit_event("start", &serde_json::json!({"url":"https://x.example/"}),
+            &serde_json::json!({"error":"page did not load; api_key=sk-live-SECRETSECRET1234"}), StatusCode::BAD_GATEWAY, 7);
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["target_url"], "https://x.example/");
+        assert!(!failed.to_string().contains("SECRETSECRET1234"), "errors pass through the secret redactor: {failed}");
+    }
+
     #[test]
     fn the_committed_methods_registry_parses_with_its_ladder_and_a_disabled_opagent() {
         let t = super::methods_layer(super::METHODS_DEFAULT).expect("browser-methods.toml parses");
@@ -318,7 +355,115 @@ struct Request {
     body: Value,
     session: String,
 }
+/// Every route verb, on every backend, leaves one `browser.route.<verb>` event
+/// in the session ledger beside the native `browser.*` events: who, which
+/// backend and profile, what was asked (through the same redaction as native
+/// actions), the page it ended on, the outcome and how long it took. A route
+/// was a tracing line only, so "what did this worker click, on which page"
+/// had no answer for the main way workers drive a browser (2026-10-27).
 async fn request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(r): Json<Request>,
+) -> Response {
+    let started = std::time::Instant::now();
+    let (session, verb, body) = (r.session.clone(), r.verb.clone(), r.body.clone());
+    let response = request_inner(State(state.clone()), headers, Json(r)).await;
+    let (parts, b) = response.into_parts();
+    let bytes = axum::body::to_bytes(b, 256 << 20).await.unwrap_or_default();
+    let mut v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let event = route_audit_event(&verb, &body, &v, parts.status, started.elapsed().as_millis() as u64);
+    super::browser::record_browser_event(&state, Some(&session), &session, &format!("route.{verb}"), event).await;
+    if v.is_null() {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    if let Some(check) = bot_check(&v) {
+        tracing::info!(session = %session, verb = %verb, provider = check["provider"].as_str().unwrap_or(""),
+            measured = true, n_considered = 1, verdict = "browser_route_bot_check",
+            "route landed on a bot check; the response names the headed start that passes it");
+        if let Some(o) = v.as_object_mut() {
+            o.insert("bot_check".into(), check);
+        }
+    }
+    // A route hands back the CDP port of the browser it drove; the raw port
+    // is withheld unless the caller says why the route cannot do the job.
+    let why = body.get("cdp_reason").and_then(Value::as_str);
+    super::cdp_proxy::gate(&state, &session, why, &mut v,
+        &[("/cdp_port", "/profile"), ("/route/cdp_port", "/route/profile"), ("/state/cdp_port", "/state/profile")]).await;
+    (parts.status, Json(v)).into_response()
+}
+
+/// A bot check the route landed on, and the step that gets past it (AF-1023).
+///
+/// A headless Chrome never clears Cloudflare's managed challenge: the ethan
+/// profile sat on "Just a moment..." with a challenges.cloudflare.com
+/// turnstile frame on platform.openai.com (2026-10-12 and 10-13), and the
+/// worker handed the OpenAI plugin portal (MG-1988) to the owner. A HEADED
+/// start was always available (`"headless": false` reaches the native start)
+/// and nothing said so. The route now does, on the page where it matters.
+fn bot_check(v: &Value) -> Option<Value> {
+    let field = |k: &str| {
+        ["", "/state", "/data", "/page"].iter().find_map(|p| v.pointer(&format!("{p}/{k}")).and_then(Value::as_str))
+    };
+    let title = field("title").unwrap_or("").trim().to_ascii_lowercase();
+    let url = field("url").unwrap_or("");
+    let text = field("text").unwrap_or("");
+    let cloudflare = title == "just a moment..."
+        || title == "attention required! | cloudflare"
+        || url.contains("challenges.cloudflare.com")
+        || text.contains("Verify you are human")
+        || text.contains("needs to review the security of your connection");
+    if !cloudflare {
+        return None;
+    }
+    let target = if url.is_empty() || url.contains("challenges.cloudflare.com") { "<the same url>" } else { url };
+    Some(json!({
+        "provider": "cloudflare",
+        "why": "a headless browser does not pass Cloudflare's managed challenge",
+        "next": format!(
+            "try a headed window: amux browser route start '{}' (add \"join\":false if another worker holds this profile headless); if it still shows the check, the challenge needs a person",
+            json!({"url": target, "headless": false})
+        ),
+    }))
+}
+
+/// The audit record for one route call. Pure, so redaction is testable.
+fn route_audit_event(verb: &str, body: &Value, v: &Value, status: StatusCode, latency_ms: u64) -> Value {
+    let first_str = |ptrs: &[&str]| ptrs.iter().find_map(|p| v.pointer(p).and_then(Value::as_str)).map(str::to_string);
+    let page = first_str(&["/url", "/data/url", "/state/url", "/page/url", "/launch_url"]).unwrap_or_default();
+    let mut ev = if verb == "action" {
+        super::browser::action_audit_fields(body, &page)
+    } else {
+        json!({"url": super::browser::audit_url(&page), "sensitive_values_recorded": false})
+    };
+    let ok = status.is_success() && v.get("ok").and_then(Value::as_bool) != Some(false) && v.get("error").is_none();
+    let error = v.get("error").map(|e| {
+        let t = e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string());
+        let t = super::session_verbs::redact_secrets(&t);
+        t.chars().take(300).collect::<String>()
+    });
+    if let Some(o) = ev.as_object_mut() {
+        o.insert("verb".into(), json!(verb));
+        o.insert("url_after".into(), json!(super::browser::audit_url(&page)));
+        if let Some(target) = body.get("url").and_then(Value::as_str) {
+            o.insert("target_url".into(), json!(super::browser::audit_url(target)));
+        }
+        o.insert("backend".into(), v.pointer("/route/backend").cloned().unwrap_or(Value::Null));
+        o.insert("profile".into(), v.pointer("/route/profile").cloned().unwrap_or(Value::Null));
+        o.insert("page_ready".into(), v.get("page_ready").cloned().unwrap_or(Value::Null));
+        o.insert("http_status".into(), json!(status.as_u16()));
+        o.insert("ok".into(), json!(ok));
+        o.insert("error".into(), error.map(Value::from).unwrap_or(Value::Null));
+        o.insert("latency_ms".into(), json!(latency_ms));
+        if let Some(shot) = first_str(&["/path", "/screenshot_path", "/data/path"]) {
+            o.insert("screenshot".into(), json!(shot));
+        }
+        o.insert("via".into(), json!("route"));
+    }
+    ev
+}
+
+async fn request_inner(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(mut r): Json<Request>,
@@ -454,6 +599,32 @@ async fn request(
             if let Err(denied) = super::browser_scope::profile_allowed(&r.session, active) {
                 return denied.response();
             }
+        }
+    }
+    // One spelling of each action for every backend: `evaluate` is eval,
+    // `fill` is input, and `help` lists them (the same table as the native
+    // /api/browser/action).
+    if r.verb == "action" {
+        let canon = super::browser::normalize_action_body(&mut r.body);
+        if canon.is_empty() || canon == "help" {
+            return Json(super::browser::actions_help(&canon)).into_response();
+        }
+    }
+    // EVERY ROUTE VERB IS USE, `state` and `keepalive` included. The idle
+    // reaper read only amux's native verbs and the receipt's mtime, so a worker
+    // keeping its browser alive by polling `route state` every 2 minutes lost
+    // it after 5 (NetSuite, 2026-10-26). Touched before the verb runs: an
+    // attempt is use even when the verb then fails.
+    if r.verb != "stop" {
+        crate::integrations::browser::touch_verb_for_session(&r.session);
+        for p in ["profile", "selected_profile"] {
+            if let Some(p) = receipt.get(p).and_then(Value::as_str) {
+                crate::integrations::browser::touch_verb(p);
+            }
+        }
+        let path = root().join("sessions").join(format!("{}.json", &receipt_key[..24]));
+        if let Ok(f) = std::fs::File::options().append(true).open(&path) {
+            let _ = f.set_modified(std::time::SystemTime::now());
         }
     }
     if pending {

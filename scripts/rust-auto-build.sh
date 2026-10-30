@@ -40,6 +40,7 @@ cleanup() {
   [ -n "${BUILD_OUT:-}" ] && rm -f "$BUILD_OUT"
   [ -n "${INSTALL_TMP:-}" ] && rm -f "$INSTALL_TMP"
   [ -n "${LOCK_HELD:-}" ] && rm -rf "$LOCK"
+  [ -n "${HB_PID:-}" ] && { kill "$HB_PID" 2>/dev/null || true; }
   return 0   # a falsey last test must not make the trap itself fail under set -e
 }
 trap cleanup EXIT
@@ -537,6 +538,15 @@ fi
     case "$failed_at" in ''|*[!0-9]*) failed_at=0 ;; esac
   fi
   retry_now=$(date +%s)
+  # ROLLED BACK (AMUX_ACTIVATION_ROLLBACK, below): that commit built but did not
+  # come up healthy. Retrying it on the failure cooldown would take the server
+  # down again every 15 minutes, so it is held until the build inputs move.
+  rolled_head=''
+  [ -r "${STAMP}.rolled_back" ] && read -r rolled_head _ < "${STAMP}.rolled_back" || true
+  if [ "${AMUX_RS_DISK_CLEAR_ONLY:-0}" != 1 ] && [ -n "$rolled_head" ] && [ "$rolled_head" = "$head" ]; then
+    echo "== activation_rollback_hold trigger=$head: rolled back as unhealthy; waiting for a newer commit verdict=activation_rollback_hold"
+    exit 0
+  fi
   if [ "${AMUX_RS_DISK_CLEAR_ONLY:-0}" != 1 ] && [ "$failed_head" = "$head" ] \
       && [ "$failed_at" -le "$retry_now" ] && [ "$((retry_now - failed_at))" -lt "$retry_s" ]; then
     echo "== cargo_build_backoff trigger=$head retry_in_s=$((retry_s - retry_now + failed_at))"
@@ -623,24 +633,52 @@ fi
     local root="$1" candidate="$2" result
     # Existing deterministic test seam may force a refusal, never bypass a real
     # process/lock check by setting the override empty.
-    if [ -n "${AMUX_BUILD_PEER_PIDS_OVERRIDE:-}" ]; then
-      echo "== WARN cargo_reclaim_deferred DEFERRED: peer build(s) in flight (pid $AMUX_BUILD_PEER_PIDS_OVERRIDE); retry after builds finish."
+    RECLAIM_DEFERRED=1
+    # Test seam: a peer that "finishes" when the test deletes this file.
+    local peer_override="${AMUX_BUILD_PEER_PIDS_OVERRIDE:-}"
+    if [ -n "${AMUX_BUILD_PEER_PIDS_FILE:-}" ] && [ -s "$AMUX_BUILD_PEER_PIDS_FILE" ]; then
+      peer_override=$(cat "$AMUX_BUILD_PEER_PIDS_FILE")
+    fi
+    if [ -n "$peer_override" ]; then
+      [ "${RECLAIM_QUIET:-0}" = 1 ] || echo "== WARN cargo_reclaim_deferred DEFERRED: peer build(s) in flight (pid $peer_override); retry after builds finish."
       return 0
     fi
     local guard_cmd=(python3 "$REPO/scripts/cargo-target-guard.py" clear --target "$root" --path "$candidate")
     [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" != 1 ] || guard_cmd+=(--dry-run)
+    RECLAIM_LAST=""
     if result=$("${guard_cmd[@]}"); then
+      RECLAIM_DEFERRED=0
       echo "== cargo_reclaim_result path=$candidate $result"
     else
-      echo "== WARN cargo_reclaim_deferred DEFERRED path=$candidate $result; retry after builds finish."
+      RECLAIM_LAST="$result"
+      [ "${RECLAIM_QUIET:-0}" = 1 ] || echo "== WARN cargo_reclaim_deferred DEFERRED path=$candidate $result; retry after builds finish."
     fi
+  }
+  # One try per builder run lost every time on 2026-10-27: a lane ran cargo
+  # back to back, the debug lock was held at each 60s run, and debug/ grew to
+  # 64G while the Mac fell to 5.8G free. Retrying the same guarded clear every
+  # 2s found a gap within minutes. So while debug/ is over its cap, keep
+  # trying for a bounded window (it delays this run's build by at most that
+  # window, and only while the cache is oversized). The guard still decides:
+  # nothing is cleared while a build holds the target.
+  reclaim_debug_with_retries() { # <root> <path>
+    local tries=0 window=${AMUX_BUILD_RECLAIM_WINDOW_S:-45} poll=${AMUX_BUILD_RECLAIM_POLL_S:-2} started=$SECONDS
+    while :; do
+      tries=$((tries+1))
+      RECLAIM_QUIET=1 reclaim_target "$1" "$2"
+      [ "$RECLAIM_DEFERRED" = 1 ] || { echo "== cargo_reclaim_retry verdict=cleared attempts=$tries waited_s=$((SECONDS-started))"; return 0; }
+      [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" != 1 ] || break
+      [ $((SECONDS-started)) -lt "$window" ] || break
+      sleep "$poll"
+    done
+    echo "== WARN cargo_reclaim_deferred DEFERRED path=$2 attempts=$tries waited_s=$((SECONDS-started)) verdict=cargo_reclaim_retry_exhausted last=${RECLAIM_LAST:-peer override}; the guard refused for the whole window, the next run retries."
   }
   DEBUG_DIR="$HOME/.amux/rust-build-target/debug"
   if [ -d "$DEBUG_DIR" ]; then
     DEBUG_GB=$(du -sk "$DEBUG_DIR" 2>/dev/null | awk '{print int($1/1048576)}')
     if [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}" ]; then
       echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR. Clearing eligible artifacts only after the Cargo safety guard permits it."
-      reclaim_target "$HOME/.amux/rust-build-target" "$DEBUG_DIR"
+      reclaim_debug_with_retries "$HOME/.amux/rust-build-target" "$DEBUG_DIR"
     fi
   fi
 
@@ -767,6 +805,17 @@ fi
   DEPLOY_NICE="${AMUX_DEPLOY_NICE:-10}"
   DEPLOY_T0=$(date +%s)
   echo "== deploy build settings incremental=1 jobs=$DEPLOY_JOBS nice=$DEPLOY_NICE load=$(/usr/sbin/sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || cut -d' ' -f1 /proc/loadavg 2>/dev/null)"
+  # A HEARTBEAT WHILE CARGO RUNS (AMUX-6530). The build writes to $BUILD_OUT,
+  # so a long one left this log silent: on 2026-10-28 a 21-minute build under
+  # load 70 read as a dead builder (deploy.builder_is_ticking, 600 s budget),
+  # 1171 failures since 09-20. One line per AMUX_BUILD_HEARTBEAT_S while the
+  # build runs; the loop also exits on its own if this script is gone.
+  _builder_pid=$$
+  ( while sleep "${AMUX_BUILD_HEARTBEAT_S:-60}"; do
+      kill -0 "$_builder_pid" 2>/dev/null || exit 0
+      echo "== deploy build running elapsed_s=$(( $(date +%s) - DEPLOY_T0 )) verdict=deploy_build_running"
+    done ) &
+  HB_PID=$!
   BUILD_OK=0
   if [ -n "${AMUX_REMOTE_BUILD_HOST:-}" ]; then
     if "$REPO/scripts/rust-remote-build.sh" "$WORK" \
@@ -790,11 +839,32 @@ fi
       BUILD_OK=1
     fi
   fi
+  # A STALE INCREMENTAL CACHE FAILS THE LINK, NOT THE COMPILE (AF-1012). On
+  # 2026-10-29 two green commits in a row (496d9cff6, ed0421bf3) failed to
+  # deploy with "ld: symbol(s) not found" for a function that compiles fine,
+  # and backoff retried the same cache every ~13 minutes: the server stayed
+  # 11 commits behind until the amux_server incremental trees were cleared by
+  # hand. Clear them through the target guard (it defers while another build
+  # holds the target) and build once more; dependency caches stay.
+  if [ "$BUILD_OK" = 0 ] && grep -aqE 'symbol\(s\) not found|Undefined symbols for architecture|undefined reference to' "$BUILD_OUT"; then
+    echo "== WARN deploy link failed on unresolved symbols; clearing the amux_server incremental trees and retrying once verdict=deploy_incremental_link_retry"
+    for _inc in "$HOME/.amux/rust-build-target/deploy/incremental"/amux_server-*; do
+      [ -d "$_inc" ] || continue
+      python3 "$REPO/scripts/cargo-target-guard.py" clear --target "$HOME/.amux/rust-build-target" --path "$_inc" 2>&1 | sed 's/^/== /' || true
+    done
+    if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) >> "$BUILD_OUT" 2>&1; then
+      BUILD_OK=1
+    fi
+    echo "== deploy_incremental_link_retry ok=$BUILD_OK"
+  fi
   # Explicit exit-code-derived flag, NOT a file-existence check: a stale
   # binary from an earlier successful build sitting at this same path would
   # make `[ -x ... ]` true even after a genuine failure, silently
   # re-installing old code and reporting success — the exact "wrong answer,
   # not wrong-looking" shape ethos rule 4 exists to catch.
+  # Under set -e: a heartbeat that already exited makes `kill` fail, and
+  # `wait` on a killed one returns 143. Either would abort the deploy itself.
+  kill "$HB_PID" 2>/dev/null || true; wait "$HB_PID" 2>/dev/null || true; HB_PID=
   DEPLOY_ELAPSED=$(( $(date +%s) - DEPLOY_T0 ))
   echo "== deploy build elapsed_s=$DEPLOY_ELAPSED ok=$BUILD_OK jobs=$DEPLOY_JOBS"
   # A slow build is the regression this block exists to prevent, and nothing
@@ -883,6 +953,13 @@ d=json.loads(sys.argv[2]); d.update(build=build, trigger=sys.argv[3])
 print(json.dumps(d))
 PYIDENTITY
 )
+    # AMUX_ACTIVATION_ROLLBACK=1 (amux Cloud, which deploys main's tip without
+    # waiting for CI): keep what is live, so a build that installs but does not
+    # come up healthy is put back below.
+    if [ "${AMUX_ACTIVATION_ROLLBACK:-1}" = 1 ] && [ -f "$INSTALL" ]; then
+      cp -p "$INSTALL" "${INSTALL}.rollback" 2>/dev/null || rm -f "${INSTALL}.rollback"
+      if [ -f "${INSTALL}.identity.json" ]; then cp -p "${INSTALL}.identity.json" "${INSTALL}.identity.json.rollback"; else rm -f "${INSTALL}.identity.json.rollback"; fi
+    fi
     # Publish identity before the executable. Readers require its hash to
     # match the candidate, so neither half of the rename pair can lie.
     printf '%s\n' "$PROV_JSON" > "${INSTALL}.identity.json.new.$$"
@@ -918,6 +995,28 @@ PYIDENTITY
     # failure branch below it is left alone, so it keeps naming the last good
     # build — which is exactly what that branch says is still running.
     echo "== installation action=$install_action; running server will verify identity before adoption"
+    if [ "${AMUX_ACTIVATION_ROLLBACK:-1}" = 1 ] && [ "$install_action" = replaced ] && [ -f "${INSTALL}.rollback" ]; then
+      limit="${AMUX_ACTIVATION_HEALTH_S:-300}"; waited=0; healthy=0
+      case "$limit" in ''|*[!0-9]*) limit=300 ;; esac
+      while [ "$waited" -lt "$limit" ]; do
+        if measure_live_identity && [ -n "$live" ]; then
+          case "$built_sha" in "$live"*) healthy=1; break ;; esac
+        fi
+        sleep 5; waited=$((waited + 5))
+      done
+      if [ "$healthy" = 1 ]; then
+        echo "== ACTIVATION HEALTHY sha=$built_sha after ${waited}s verdict=activation_healthy"
+        rm -f "${INSTALL}.rollback" "${INSTALL}.identity.json.rollback" "${STAMP}.rolled_back"
+      else
+        # Identity before the executable, the same order as the install.
+        if [ -f "${INSTALL}.identity.json.rollback" ]; then mv -f "${INSTALL}.identity.json.rollback" "${INSTALL}.identity.json"; else rm -f "${INSTALL}.identity.json"; fi
+        mv -f "${INSTALL}.rollback" "$INSTALL"
+        if [ -n "$last" ]; then echo "$last" > "$STAMP"; else rm -f "$STAMP"; fi
+        printf '%s %s\n' "$head" "$(date +%s)" > "${STAMP}.rolled_back"
+        echo "== !! ACTIVATION ROLLED BACK sha=$built_sha: the server did not report it healthy within ${limit}s" \
+             "(live: ${live:-unmeasured}); the previous binary is back and this commit is held until a newer one verdict=activation_rolled_back"
+      fi
+    fi
   else
     printf '%s %s\n' "$head" "$(date +%s)" > "${STAMP}.failed"
     echo "== BUILD FAILED for $head — running server keeps the last good build"

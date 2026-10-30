@@ -90,6 +90,40 @@ check "a directory under the floor is not named"         "no"  "$(has "$out" "Li
 check "off forces the census"                            "" "$(AMUX_CLEANUP_LIB_ONLY=1 AMUX_CLEANUP_CHURN_SAMPLE_CMD=off bash -c '. "$0" && printf %s "$CHURN_SAMPLE_CMD"' "$TICK")"
 check "the sampler gets the window"                      "20"  "$(cat "$FIX/samp.secs")"
 check "a sample says complete"                           "yes" "$CHURN_COMPLETE"
+
+echo "3f. a sample that cannot see its own control files says fseventsd is not delivering (RCA fseventsd 20261028-133155)"
+# pid 347 at 100% CPU holding 51G delivered 0 of 500 files written during a
+# sample, so a wedged fseventsd read as a quiet disk.
+SEES="$FIX/sees.sh"; { echo '#!/bin/bash'; echo 'sleep 3; ls "$CHURN_CONTROL_DIR" | sed "s|^|$CHURN_CONTROL_DIR/|"'
+  echo 'for i in $(seq 1 60); do echo "/Users/x/Dev/cust/runs/eng-R-A/bodies/f$i.resp.txt"; done'; } > "$SEES"; chmod +x "$SEES"
+BLIND="$FIX/blind.sh"; printf '#!/bin/bash\nsleep 3\n' > "$BLIND"; chmod +x "$BLIND"
+mkdir -p "$FIX/state"
+STATE_DIR="$FIX/state" CHURN_CONTROL=1 CHURN_SAMPLE_CMD="$SEES"
+churn_sample 3 2 > "$FIX/s.out"
+check "a sampler that sees the control: delivered"      "yes" "$CHURN_DELIVERED"
+check "and the control's own events are not counted"   "60 /Users/x/Dev/cust/runs/eng-R-A/bodies" "$(cat "$FIX/s.out")"
+check "and the control files are removed"              "no"  "$([ -e "$FIX/state/fsevents-control" ] && echo yes || echo no)"
+CHURN_SAMPLE_CMD="$BLIND"
+churn_sample 3 2 > "$FIX/s.out"
+check "a sampler that sees nothing: not delivered"     "no"  "$CHURN_DELIVERED"
+CHURN_CONTROL=auto CHURN_SAMPLE_CMD="$BLIND"
+churn_sample 1 2 > "$FIX/s.out"
+check "auto leaves a test sampler alone"               "unknown" "$CHURN_DELIVERED"
+CHURN_CONTROL=auto STATE_DIR="$FIX/tick"
+
+echo "3g. the fswatch sampler flushes its output when the window closes"
+# fswatch block-buffers when piped; SIGALRM killed it with the buffer unwritten.
+FAKEFW="$FIX/fakefw.py"
+cat > "$FAKEFW" <<'PY'
+#!/usr/bin/env python3
+# Prints five paths into a block buffer, then waits; only a clean exit flushes it.
+import time
+for i in range(5):
+    print("/a/b/f%d" % i)
+time.sleep(60)
+PY
+chmod +x "$FAKEFW"
+check "every line the sampler printed arrives"         "5"   "$(CHURN_FSWATCH="$FAKEFW" CHURN_SAMPLE_ROOTS=/a churn_fswatch 1 | grep -c '^/a/b/f')"
 if [ "$(uname)" = Darwin ]; then
   rm -rf -- "${FIX:?}/tick"; rm -f "$FIX/sent.log" "$FIX/sent.msg"
   out=$(AMUX_CLEANUP_CHURN_SAMPLE_CMD="$SAMP" tick "echo 30 120")
@@ -115,6 +149,14 @@ if [ "$(uname)" = Darwin ]; then
   check "and the escalation names the memory and the restart" "yes" "$(grep -q 'holding 30G with no file churn.*sudo killall fseventsd' "$FIX/sent.msg" 2>/dev/null && echo yes || echo no)"
   check "and does not ask anyone to stop churn or reboot" "no" "$(grep -q 'stop the file churn' "$FIX/sent.msg" 2>/dev/null && echo yes || echo no)"
 
+  echo "3e. a census the tick had no time for is reported as unmeasured (RCA fseventsd 20261026-130357)"
+  rm -rf -- "${FIX:?}/tick"; rm -f "$FIX/sent.log" "$FIX/sent.msg"
+  out=$(AMUX_CLEANUP_TICK_BUDGET_S=1 AMUX_CLEANUP_TICK_RESERVE_S=0 AMUX_CLEANUP_CHURN_SAMPLE_CMD="$SAMP" tick "echo 0.02 133")
+  check "the feed says it was not measured, with a verdict" "yes" "$(has "$out" 'verdict=fseventsd_feed_unmeasured')"
+  check "and claims no quiet feed"                       "no"  "$(has "$out" 'fseventsd feed: no directory over')"
+  check "the escalation does not claim a quiet feed"     "no"  "$(grep -q 'no directory over' "$FIX/sent.msg" 2>/dev/null && echo yes || echo no)"
+  check "and does not call it a stuck thread"            "no"  "$(has "$out" 'verdict=fseventsd_spin_no_churn')"
+
   echo "3c. the same spinning pid is escalated once; a new pid is escalated again (RCA fseventsd 20261021-195930)"
   rm -rf -- "${FIX:?}/tick"; rm -f "$FIX/sent.log" "$FIX/sent.msg"
   # Count fseventsd escalations only: a second tick also compares the live disk
@@ -134,6 +176,18 @@ if [ "$(uname)" = Darwin ]; then
   out=$(AMUX_CLEANUP_FSEVENTSD_SPIN_REMIND_H=0 spin 51234)
   check "past the reminder window the same pid escalates" "3" "$(fse_sent)"
 
+  echo "3c2. memory waits with an fseventsd already with the owner (memory RCAs 20261028-081710, 20261029-003047, 20261029-063250)"
+  rm -rf -- "${FIX:?}/tick"; rm -f "$FIX/sent.log"
+  mem_sent() { grep -c 'Mac memory constraint' "$FIX/sent.log" 2>/dev/null || true; }
+  hot() { TICK_REC="$REC3" AMUX_CLEANUP_FSEVENTSD_PID_CMD="echo $1" AMUX_CLEANUP_ESCALATE_COOLDOWN_H=0 AMUX_CLEANUP_PRESSURE_CMD="echo 2" AMUX_CLEANUP_CHURN_SAMPLE_CMD="$QUIET" tick "echo $2 99"; }
+  out=$(hot 34409 30)
+  check "the first tick escalates memory"                "1" "$(mem_sent)"
+  out=$(hot 34409 30)
+  check "a 30G fseventsd with its restart pending holds memory's escalation" "yes" "$(has "$out" 'verdict=memory_owner_pending_fseventsd')"
+  check "and no second memory escalation goes out"       "1" "$(mem_sent)"
+  out=$(hot 34409 0.81)
+  check "a small fseventsd is not the holder: memory escalates" "2" "$(mem_sent)"
+
   echo "3d. the escalated pid with ordinary churn stays the owner's; heavy churn is a new cause (RCA fseventsd 20261022-075928)"
   # Cargo builds wrote 228 events in 20s on top of the stuck pid 34409 (14G),
   # and the tick re-escalated it as "stop the churn".
@@ -150,6 +204,35 @@ if [ "$(uname)" = Darwin ]; then
 else
   echo "  skip (the end-to-end tick needs macOS)"
 fi
+
+echo "6. a bloated fseventsd is restarted by the tick itself, once per cooldown, and a sudo refusal names the line that fixes it"
+RS="$FIX/restart"; mkdir -p "$RS"
+restart_try() { # <gb> <cmd> [dry]
+  ( STATE_DIR="$RS"; FSEVENTSD_RESTART_GB=12; FSEVENTSD_RESTART_COOLDOWN_H=6; FSEVENTSD_RESTART_CMD="$2"
+    FSEVENTSD_CMD="echo 2.0 5"; AMUX_CLEANUP_FSEVENTSD_RESTART_SETTLE_S=0
+    if fseventsd_try_restart "$1" "${3:-0}"; then echo "RC=0"; else echo "RC=1"; fi; echo "SUDOERS=$FSE_RESTART_NEEDS_SUDOERS" )
+}
+out=$(restart_try 8.0 "touch $RS/ran-under")
+check "under the threshold: nothing runs"               "no"  "$([ -e "$RS/ran-under" ] && echo yes || echo no)"
+check "and it is not a restart"                         "yes" "$(has "$out" 'RC=1')"
+out=$(restart_try 30.0 "touch $RS/ran-dry" 1)
+check "a dry run only says it would"                    "yes" "$(has "$out" 'verdict=fseventsd_restart_dry')"
+check "and runs nothing"                                "no"  "$([ -e "$RS/ran-dry" ] && echo yes || echo no)"
+out=$(restart_try 30.0 "touch $RS/ran")
+check "over the threshold: the restart runs"            "yes" "$([ -e "$RS/ran" ] && echo yes || echo no)"
+check "it reports before and after"                     "yes" "$(has "$out" 'held 30.0G.*back at 2.0G (verdict=fseventsd_restarted')"
+check "and returns success so it is not escalated"      "yes" "$(has "$out" 'RC=0')"
+rm -f "$RS/ran"; out=$(restart_try 30.0 "touch $RS/ran")
+check "inside the cooldown it does not run again"       "no"  "$([ -e "$RS/ran" ] && echo yes || echo no)"
+check "and says when it may"                            "yes" "$(has "$out" 'verdict=fseventsd_restart_cooldown')"
+rm -f "$RS/state"; printf '#!/bin/sh\necho "sudo: a password is required" >&2\nexit 1\n' > "$RS/nosudo"; chmod +x "$RS/nosudo"
+out=$(restart_try 30.0 "$RS/nosudo")
+check "a sudo refusal is not a restart"                 "yes" "$(has "$out" 'RC=1')"
+check "it prints the sudoers line"                      "yes" "$(has "$out" 'NOPASSWD: /usr/bin/killall fseventsd (verdict=fseventsd_restart_needs_sudoers)')"
+check "and flags it for the escalation"                 "yes" "$(has "$out" 'SUDOERS=1')"
+out=$( STATE_DIR="$RS"; FSEVENTSD_RESTART_GB=12; FSEVENTSD_RESTART_COOLDOWN_H=6; FSEVENTSD_RESTART_CMD="sudo -n /usr/bin/killall fseventsd"; HEALTH_PROBES=off
+  rm -f "$RS/state"; fseventsd_try_restart 30.0 0; echo "RC=$?" )
+check "with live probes off the real restart never runs" "yes" "$(has "$out" 'verdict=fseventsd_restart_probes_off')"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: mac-cleanup-fseventsd — all checks passed"; exit 0; fi

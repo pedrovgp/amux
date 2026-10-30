@@ -98,7 +98,6 @@ pub mod ids {
     pub const GOAL_KEEPER: &str = "goal-keeper";
     pub const TASK_TITLES: &str = "task-titles";
     pub const ORCH_RUNTIME: &str = "orchestrator-runtime";
-    pub const PROJECT_EXECUTION: &str = "project-execution";
     pub const EVENT_PROCESSORS: &str = "event-processors";
     pub const SCAN: &str = "terminal-scan";
     pub const BOOTSTRAP: &str = "session-bootstrap";
@@ -124,6 +123,8 @@ pub mod ids {
     pub const TAILNET_WATCH: &str = "tailnet-watch";
     pub const TELEGRAM_POLL: &str = "telegram-poll";
     pub const TELEGRAM_RELAY: &str = "telegram-relay";
+    pub const BRIDGE_OUTBOUND: &str = "bridge-outbound";
+    pub const BRIDGE_DISCORD: &str = "bridge-discord";
     pub const MESSAGE_CAPTURE: &str = "message-capture";
     pub const MAC_HEALTH: &str = "mac-health";
     pub const ACCOUNTABILITY_NUDGE: &str = "accountability-nudge";
@@ -134,10 +135,12 @@ pub mod ids {
     pub const BROWSER_LOGIN_SYNC: &str = "browser-login-sync";
     pub const CONNECTOR_MAINTENANCE: &str = "connector-maintenance";
     pub const SOCIAL_METRICS: &str = "social-metrics";
+    pub const SOCIAL_PUBLISH: &str = "social-publish";
     pub const EPISODES: &str = "episodes";
     pub const TOKEN_LEDGER: &str = "token-ledger";
     pub const BOARD_HYGIENE: &str = "board-hygiene";
     pub const RECORDINGS_TRANSCRIBE: &str = "recordings-transcribe";
+    pub const RECORDINGS_LIVE: &str = "recordings-live";
     pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
     pub const WORKER_RESOURCES: &str = "worker-resources";
     pub const CAPTURE_RECONCILE: &str = "capture-reconcile";
@@ -161,7 +164,6 @@ pub const ALL_IDS: &[&str] = &[
     ids::INVARIANTS,
     ids::SCHEDULER,
     ids::ORCH_RUNTIME,
-    ids::PROJECT_EXECUTION,
     ids::EVENT_PROCESSORS,
     ids::SCAN,
     ids::BOOTSTRAP,
@@ -183,6 +185,8 @@ pub const ALL_IDS: &[&str] = &[
     ids::TAILNET_WATCH,
     ids::TELEGRAM_POLL,
     ids::TELEGRAM_RELAY,
+    ids::BRIDGE_OUTBOUND,
+    ids::BRIDGE_DISCORD,
     ids::MESSAGE_CAPTURE,
     ids::MAC_HEALTH,
     ids::ACCOUNTABILITY_NUDGE,
@@ -198,10 +202,12 @@ pub const ALL_IDS: &[&str] = &[
     ids::BROWSER_LOGIN_SYNC,
     ids::CONNECTOR_MAINTENANCE,
     ids::SOCIAL_METRICS,
+    ids::SOCIAL_PUBLISH,
     ids::EPISODES,
     ids::TOKEN_LEDGER,
     ids::BOARD_HYGIENE,
     ids::RECORDINGS_TRANSCRIBE,
+    ids::RECORDINGS_LIVE,
     ids::MODEL_CATALOG_REFRESH,
     ids::CAPTURE_RECONCILE,
     ids::EMAIL_APPROVAL_DIGEST,
@@ -321,18 +327,6 @@ pub const CATALOG: &[Doc] = &[
         ],
         pref: None,
         detail: Some("/api/debug/board-drive"),
-    },
-    Doc {
-        id: ids::PROJECT_EXECUTION,
-        name: "Project execution",
-        purpose: "Drives project-scoped tasks through claim, delivery, verification, retained evidence, main integration, and acceptance without depending on the legacy board-drive lane sweeper.",
-        env: &[EnvControl {
-            var: "AMUX_PROJECT_EXECUTION_SECS",
-            effect: "tick seconds; 0 disables project lifecycle driving",
-            off: Some("0"),
-        }],
-        pref: None,
-        detail: Some("/api/projects"),
     },
     Doc {
         id: ids::CDC_POLLER,
@@ -647,7 +641,7 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::TELEGRAM_RELAY,
         name: "Telegram relay",
-        purpose: "Auto-relays session replies back to Telegram when a session responds to a Telegram-routed message; works for all sessions without per-session configuration.",
+        purpose: "Retired by the chat bridge, which sends replies from the worker's transcript; with AMUX_TELEGRAM_SCREEN_RELAY=1 it reads linked workers' screens and relays new text, the old way.",
         env: &[EnvControl {
             var: "TELEGRAM_BOT_TOKEN",
             effect: "unset = relay idles; set = relays enabled",
@@ -655,6 +649,26 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: Some("/api/telegram/status"),
+    },
+    Doc {
+        id: ids::BRIDGE_OUTBOUND,
+        name: "Chat bridge replies",
+        purpose: "Sends workers' replies to bridged WhatsApp, Slack, Telegram and Discord conversations, holds replies into a conversation with someone other than the owner for approval, and retries failed sends.",
+        env: &[],
+        pref: None,
+        detail: Some("/api/bridge"),
+    },
+    Doc {
+        id: ids::BRIDGE_DISCORD,
+        name: "Discord channel reads",
+        purpose: "Reads the Discord channels in DISCORD_CHANNELS every few seconds and files new messages through the chat bridge; idles while no bot token is set.",
+        env: &[EnvControl {
+            var: "DISCORD_BOT_TOKEN",
+            effect: "unset = idles, checking every 30 s; set = reads every 4 s",
+            off: None,
+        }],
+        pref: None,
+        detail: Some("/api/bridge"),
     },
     Doc {
         id: ids::MAC_HEALTH,
@@ -842,6 +856,14 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/social/posts"),
     },
     Doc {
+        id: ids::SOCIAL_PUBLISH,
+        name: "Social publish",
+        purpose: "Publishes queued social posts when their time comes. A failure that reached nothing is retried up to three times, then marked failed with its error; a send that got no answer is marked uncertain and never sent again on its own.",
+        env: &[EnvControl { var: "AMUX_SOCIAL_PUBLISH_SECS", effect: "pass interval in seconds (default 30, 0 disables)", off: Some("0") }],
+        pref: None,
+        detail: Some("/api/social/queue"),
+    },
+    Doc {
         id: ids::BROWSER_LOGIN_SYNC,
         name: "Browser login sync",
         purpose: "Keeps opted-in browser profiles signed in by mirroring the listed sites' cookies from the owner's Chrome profile signed in as the same account; only sites named in the registry are ever copied.",
@@ -919,6 +941,21 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: Some("/api/recordings/config"),
+    },
+    Doc {
+        id: ids::RECORDINGS_LIVE,
+        name: "Live recording transcripts",
+        purpose: "Transcribes each open recording session in windows of about 15 seconds while it is recorded, so the words up to any crash are already on disk (live.json, live.md) and the finished transcript only adds the tail. Off with the Record tab's live option.",
+        env: &[EnvControl {
+            var: "AMUX_RECORDINGS_LIVE_SECS",
+            effect: "tick seconds (default 5); 0 disables the job",
+            off: Some("0"),
+        }],
+        pref: Some(PrefControl {
+            key: "recordings_live",
+            effect: "off: nothing is transcribed while recording; the finished transcript is made at the end, all at once",
+        }),
+        detail: Some("/api/recordings/options"),
     },
     Doc {
         id: ids::CONVERSE_RETENTION,

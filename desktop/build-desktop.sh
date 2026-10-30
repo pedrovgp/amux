@@ -10,7 +10,7 @@ APP="Amux.app"
 # One binary: the app, the pinned-note overlay and the menu bar readout. The
 # last two keep their own standalone builds; -D AMUX_APP drops their entry
 # points here.
-SRC="desktop/amux-desktop.swift desktop/amux-settings.swift desktop/amux-update.swift desktop/amux-workspace.swift desktop/amux-snapzones.swift desktop/amux-panegrid.swift desktop/amux-panes.swift scripts/pinned-overlay.swift scripts/amux-menubar.swift"
+SRC="desktop/amux-desktop.swift desktop/amux-settings.swift desktop/amux-update.swift desktop/amux-workspace.swift desktop/amux-rehome.swift desktop/amux-snapzones.swift desktop/amux-panegrid.swift desktop/amux-panes.swift desktop/amux-recorder-core.swift desktop/amux-recorder.swift scripts/pinned-overlay.swift scripts/amux-menubar.swift"
 BIN="$APP/Contents/MacOS/amux"
 ICON_SRC="assets/icon-512.png"
 ICNS="$APP/Contents/Resources/AppIcon.icns"
@@ -22,21 +22,36 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 # Compile. AMUX_DESKTOP_UNIVERSAL=1 builds arm64 + x86_64 and joins them, so
 # one download runs on Apple silicon and Intel Macs (CI does this).
-FRAMEWORKS="-framework Cocoa -framework WebKit -framework Carbon -framework UserNotifications -framework ServiceManagement"
+# The oldest macOS the app runs on. Every build names it: without -target,
+# swiftc stamps the BUILD machine's SDK as the minimum (macOS 26 on a current
+# Xcode), and an older Mac refuses the app with "You can't use this version of
+# the application with this version of macOS" (2026-10-26, a user report)
+# while Info.plist still claimed 12.0.
+MIN_MACOS=12.0
+# ScreenCaptureKit (system audio for the recorder) exists from macOS 13, so it
+# is weak-linked: on 12 the app runs and records the microphone only.
+FRAMEWORKS="-framework Cocoa -framework WebKit -framework Carbon -framework UserNotifications -framework ServiceManagement -framework AVFoundation -framework CoreMedia -Xlinker -weak_framework -Xlinker ScreenCaptureKit"
 compile() {  # $1 = output, $2 = optional -target
     # shellcheck disable=SC2086  # SRC and FRAMEWORKS are word lists
     xcrun swiftc -O -parse-as-library -D AMUX_APP ${2:+-target "$2"} -o "$1" $SRC $FRAMEWORKS
 }
 if [ "${AMUX_DESKTOP_UNIVERSAL:-0}" = 1 ]; then
     TMPB=$(mktemp -d)
-    compile "$TMPB/arm64" arm64-apple-macos12.0 && compile "$TMPB/x86_64" x86_64-apple-macos12.0 \
+    compile "$TMPB/arm64" "arm64-apple-macos$MIN_MACOS" && compile "$TMPB/x86_64" "x86_64-apple-macos$MIN_MACOS" \
         && lipo -create -output "$BIN" "$TMPB/arm64" "$TMPB/x86_64" && OK=1 || OK=0
     rm -rf "$TMPB"
 else
-    compile "$BIN" "" && OK=1 || OK=0
+    compile "$BIN" "$(uname -m)-apple-macos$MIN_MACOS" && OK=1 || OK=0
 fi
 if [ "$OK" = 1 ]; then
-    echo "  Compiled successfully ($(lipo -archs "$BIN" 2>/dev/null))"
+    # Check what the binary really requires, per architecture, not what we asked for.
+    for MINOS in $(otool -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; f=0}'); do
+        if [ "$(printf '%s\n%s\n' "$MINOS" "$MIN_MACOS" | sort -V | tail -1)" != "$MIN_MACOS" ]; then
+            echo "  !! verdict=desktop_min_os_mismatch binary needs macOS $MINOS but Info.plist promises $MIN_MACOS"
+            exit 1
+        fi
+    done
+    echo "  Compiled successfully ($(lipo -archs "$BIN" 2>/dev/null), runs on macOS $MIN_MACOS and later)"
 else
     echo "  !! Swift compilation failed."
     echo "  Common fix: xcode-select --install  (or reinstall Command Line Tools)"
@@ -106,6 +121,7 @@ cat > "$APP/Contents/Info.plist" << 'PLIST'
 </dict>
 </plist>
 PLIST
+/usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $MIN_MACOS" "$APP/Contents/Info.plist"   # the one value, from MIN_MACOS
 
 # The commit this build came from, so Settings > Updates can compare it with
 # the desktop-latest release. "-dirty" when the app's sources have uncommitted
@@ -119,7 +135,13 @@ echo "  Built from ${COMMIT:-an unknown commit}"
 
 # Ad-hoc sign so macOS keeps the microphone and notification permissions
 # across rebuilds of the same bundle id.
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 && echo "  Signed (ad hoc)" || echo "  !! codesign failed; permissions may be asked again"
+# Ad hoc, with the bundle id as the designated requirement. macOS keys the
+# microphone and Screen Recording grants on the requirement it saw, and an ad
+# hoc signature's default one is the binary's hash: every rebuild silently
+# lost both grants and asked again (2026-10-28). The id stays the same build
+# to build, so a grant given once carries over.
+codesign --force --deep --sign - -r='designated => identifier "com.amux.desktop"' "$APP" >/dev/null 2>&1 \
+  && echo "  Signed (ad hoc, requirement: identifier com.amux.desktop)" || echo "  !! codesign failed; permissions may be asked again"
 
 # Install to /Applications if requested or by default on build
 # AMUX_DESKTOP_NO_INSTALL=1 leaves the bundle in the repo root (CI zips it).

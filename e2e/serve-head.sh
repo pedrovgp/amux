@@ -118,6 +118,17 @@ export AMUX_NO_SELF_ADOPT=1
 # not turn monitoring into a silent absence.
 export AMUX_ISOLATED=1
 
+# AMUX_ISOLATED stops the loops, not the fleet reads. Started from a worker's
+# pane, this server inherited $TMUX and the fleet shim on PATH, so it listed
+# and captured every real worker's pane (about 15 wrapper processes a sweep,
+# 274% CPU averaged over 30s on 2026-10-26, cpu RCA 20261026-100223) and made
+# any session a test created in the fleet's own tmux server. It gets a private
+# tmux server in its throwaway home instead.
+unset TMUX TMUX_PANE
+export TMUX_TMPDIR="$AMUX_HOME/tmux"
+mkdir -p "$TMUX_TMPDIR"
+echo "[e2e] tmux: a private server under $TMUX_TMPDIR, so the fleet's panes are not read or written (verdict=e2e_tmux_private)."
+
 dirty="$(git -C "$REPO" status --porcelain -- crates/ Cargo.toml Cargo.lock 2>/dev/null || true)"
 
 # CI builds the server ONCE per run (rust.yml `server-bin`) and hands every
