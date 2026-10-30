@@ -47,6 +47,36 @@ The thread rule is strict and Telegram-shaped: **quote any bot message — the
 answer, the "started" ack — to continue that session; any other message starts
 a new one.**
 
+### The general manager (one dispatcher per allowed owner)
+
+For **every id in `ALLOWED_TELEGRAM_USER_IDS`** the gateway keeps a standing
+`general-mgr-<uid>` worker — the dispatcher you route demand through instead
+of a per-conversation manager (owner, 2026-10-30):
+
+- **Provisioned by the gateway, never by hand**: at startup (a background
+  task — provisioning never blocks polling) and on the hourly lifecycle
+  tick, a missing dispatcher is created (pinned, root projects dir, fleet
+  provider), briefed from the packaged `general_mgr_prompt.md` and started.
+  An existing one is left alone (create-only — re-briefing would disturb a
+  live conversation). Every outcome is sweepable: `general_mgr_ensured`,
+  `general_mgr_present` (once per process), `general_mgr_ensure_failed`
+  (uid + status + detail, retried hourly). Override the brief with
+  `GENERAL_MGR_INSTRUCTIONS_FILE`.
+- **Skill**: its `dispatch` skill ships in the package
+  (`telegram_gateway/skills/dispatch/SKILL.md`) and is installed
+  content-idempotently into `~/.config/opencode/skill/dispatch/` — the
+  user-global dir every opencode session reads.
+- **Notes**: `~/.amux/notes/worker/general-mgr/` — the root-projects map
+  (a snapshot; `ls` is the truth) and the hard facts (group chat id
+  `-1004274385104`, the `POST /topic` endpoint, never the Bot API).
+- **Its brief covers the management contract**: dispatch fast or answer
+  fast and stay free for the next demand; open a topic for a fresh worker
+  through `POST /topic` (`chat_id` required for sessions no chat has seen);
+  when the group is missing or the bot lacks admin, ask the owner to create
+  the group and invite @homuxBot with **manage topics**; suggest deleting a
+  topic when its task is closed, superseded or stale (bots cannot delete
+  topics); reply with `—— answer ——` so the relay can deliver.
+
 ### Forum topics (groups with Topics enabled)
 
 In a forum group the **topic replaces the quote**:

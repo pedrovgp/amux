@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import time
+from pathlib import Path
 
 import httpx
 
@@ -27,7 +28,14 @@ from .amux import AmuxClient, AmuxError, session_id_from_flags
 from .config import Config
 from .control import ControlServer
 from .guard import Guard, allow_only
-from .manager import PROVIDERS, create_manager, new_manager_name, new_opencode_session_id
+from .manager import (
+    PROVIDERS,
+    create_manager,
+    general_manager_name,
+    load_instructions_file,
+    new_manager_name,
+    new_opencode_session_id,
+)
 from .menu import (
     EFFORTS,
     PREFIX,
@@ -3418,11 +3426,143 @@ async def compaction_loop(app: Application) -> None:
     while True:
         await asyncio.sleep(COMPACTION_TICK_S)
         try:
+            await ensure_general_managers(app)
             await compaction_once(app)
         except asyncio.CancelledError:
             raise
         except Exception:  # never let one bad cycle kill the loop
             log.exception("compaction_failed")
+
+
+# ---------------------------------------------------------------------------
+# general managers: one dispatcher per allowed owner (Milestone 11)
+# ---------------------------------------------------------------------------
+
+GENERAL_SKILL_NAME = "dispatch"
+# One `general_mgr_present` INFO per process, not one per hourly tick.
+_general_mgr_seen: set[str] = set()
+
+
+def _general_mgr_skill_source() -> Path:
+    """The skill as it ships in the package (installed onto the machine)."""
+    return Path(__file__).parent / "skills" / GENERAL_SKILL_NAME / "SKILL.md"
+
+
+def install_general_mgr_skill(
+    *, source=None, dest_root: str | Path | None = None
+) -> str:
+    """Ship the `dispatch` skill into opencode's user-global skill dir.
+
+    That dir is how a skill reaches ANY opencode session on this box
+    (``~/.config/opencode/skill/`` — ``feature``/``resume``/``standup`` are
+    served from there). Content-idempotent: identical → ``"fresh"``,
+    written → ``"installed"``; a failure is a logged WARN and a returned
+    string, never an exception — the skill enriches the dispatcher, its
+    absence must not stop provisioning. ``source``/``dest_root`` keep tests
+    inside tmp.
+    """
+    src = Path(source) if source else _general_mgr_skill_source()
+    root = (
+        Path(dest_root).expanduser()
+        if dest_root
+        else Path("~/.config/opencode/skill").expanduser()
+    )
+    try:
+        text = src.read_text(encoding="utf-8")
+        dest = root / GENERAL_SKILL_NAME / "SKILL.md"
+        if dest.exists() and dest.read_text(encoding="utf-8") == text:
+            return "fresh"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding="utf-8")
+        return "installed"
+    except OSError as exc:
+        log.warning(
+            "general_mgr_skill_install_failed source=%s error=%s", src, exc
+        )
+        return f"failed: {exc}"
+
+
+async def ensure_general_managers(
+    app: Application, *, skill_root: str | Path | None = None
+) -> list[str]:
+    """The owner's invariant (Milestone 11): one briefed ``general-mgr-<uid>``
+    per allowed Telegram owner.
+
+    **Create-only** — an existing dispatcher is left alone (re-briefing would
+    disturb a live conversation, and ``start_session_as`` replays the
+    instructions on start, so a create IS the brief). The skill is installed
+    first, so the very first turn can use it. Runs as a startup task (never
+    blocking polling) and on the hourly lifecycle tick, so one transient
+    amux outage heals on the next pass instead of waiting for a redeploy.
+
+    Every outcome is logged for a sweep: ``general_mgr_ensured`` (with the
+    pin and the skill state), ``general_mgr_present`` (once per process),
+    ``general_mgr_ensure_failed`` (uid + status + detail). Returns the names
+    created this pass.
+    """
+    cfg: Config = app.bot_data["cfg"]
+    client: AmuxClient = app.bot_data["client"]
+    # `skill_root` exists so the suite never writes the real skill dir.
+    skill = install_general_mgr_skill(dest_root=skill_root)
+    ensured: list[str] = []
+    for uid in sorted(cfg.allowed_user_ids):
+        name = general_manager_name(uid)
+        try:
+            await client.find(name)
+        except AmuxError as exc:
+            if exc.status != 404:
+                log.warning(
+                    "general_mgr_ensure_failed uid=%s name=%s status=%s detail=%s",
+                    uid,
+                    name,
+                    exc.status,
+                    exc.detail,
+                )
+                continue
+        else:
+            if name not in _general_mgr_seen:
+                _general_mgr_seen.add(name)
+                log.info("general_mgr_present uid=%s name=%s", uid, name)
+            continue
+        try:
+            _name, row = await create_manager(
+                client,
+                cfg,
+                name=name,
+                flags=f"--session {new_opencode_session_id()}",
+                instructions=load_instructions_file(
+                    cfg.general_mgr_instructions_file
+                ),
+            )
+        except AmuxError as exc:
+            log.warning(
+                "general_mgr_ensure_failed uid=%s name=%s status=%s detail=%s",
+                uid,
+                name,
+                exc.status,
+                exc.detail,
+            )
+            continue
+        _general_mgr_seen.add(name)
+        ensured.append(name)
+        log.info(
+            "general_mgr_ensured uid=%s name=%s status=%s skill=%s",
+            uid,
+            name,
+            row.get("status"),
+            skill,
+        )
+    return ensured
+
+
+async def ensure_general_managers_task(app: Application) -> None:
+    """The startup fire-and-forget wrapper: provisioning never blocks polling."""
+    try:
+        await ensure_general_managers(app)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # a bug here must not take the gateway down
+        log.exception("general_mgr_ensure_crashed")
 
 
 async def post_init(app: Application) -> None:
@@ -3445,6 +3585,11 @@ async def post_init(app: Application) -> None:
     app.bot_data["title_task"] = asyncio.create_task(sync_topic_titles_loop(app))
     if cfg.manager_reset_days:
         app.bot_data["compaction_task"] = asyncio.create_task(compaction_loop(app))
+    # The dispatcher ring: one general-mgr per allowed owner, briefed from the
+    # packaged prompt — created if missing, never blocking startup (M11).
+    app.bot_data["general_mgr_task"] = asyncio.create_task(
+        ensure_general_managers_task(app)
+    )
     log.info(
         "gateway_started allowed_users=%d amux_url=%s voice=%s relay_interval_s=%s "
         "idle_stop_s=%s topic_sync_s=%s",

@@ -48,17 +48,28 @@ def new_opencode_session_id(now: time.struct_time | None = None) -> str:
     return f"ses_tg{time.strftime('%m%d%H%M', t)}{secrets.token_hex(3)}"
 
 
-def load_instructions(cfg: Config) -> str:
+def general_manager_name(uid: int) -> str:
+    """The dispatcher lane for ONE allowed Telegram owner.
+
+    The owner's invariant (2026-10-30): *"for each allowed user_id in the
+    .env, there should be a general-mgr-<userid> worker"* — one ring member
+    per allowed owner, provisioned by the gateway (which owns the allow-list),
+    never by hand.
+    """
+    return f"general-mgr-{uid}"
+
+
+def load_instructions_file(path) -> str:
     try:
-        text = cfg.manager_instructions_file.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        log.warning(
-            "manager_instructions_missing path=%s error=%s",
-            cfg.manager_instructions_file,
-            exc,
-        )
+        log.warning("instructions_missing path=%s error=%s", path, exc)
         return FALLBACK_INSTRUCTIONS
     return text.strip() or FALLBACK_INSTRUCTIONS
+
+
+def load_instructions(cfg: Config) -> str:
+    return load_instructions_file(cfg.manager_instructions_file)
 
 
 async def create_manager(
@@ -69,8 +80,13 @@ async def create_manager(
     provider: str | None = None,
     model: str | None = None,
     flags: str | None = None,
+    instructions: str | None = None,
 ) -> tuple[str, dict]:
-    """Create the lane, brief it, start it, and wait until it can take a task."""
+    """Create the lane, brief it, start it, and wait until it can take a task.
+
+    ``instructions`` overrides the brief (the general-manager flow passes its
+    own dispatcher prompt); ``None`` keeps the per-conversation manager's.
+    """
     name = name or new_manager_name()
     provider = provider or cfg.manager_provider
     model = cfg.manager_model if model is None else model
@@ -83,7 +99,9 @@ async def create_manager(
         flags=flags,
         start=False,
     )
-    await client.set_instructions(name, load_instructions(cfg))
+    await client.set_instructions(
+        name, load_instructions(cfg) if instructions is None else instructions
+    )
     await client.start(name)
     row = await client.wait_until_running(name)
     log.info(

@@ -52,6 +52,11 @@ Optional
     conversation is started, the topic follows it, and the old lane retires.
     The board and the notes hold the durable state, never the conversation;
     ``0`` disables the automatic reset (`/reset` still works).
+``GENERAL_MGR_INSTRUCTIONS_FILE`` default: the packaged
+    ``general_mgr_prompt.md`` — the dispatcher brief saved as the standing
+    instructions of each ``general-mgr-<uid>`` worker (one per allowed
+    Telegram owner), which the gateway provisions at startup and re-checks
+    hourly.
 ``TELEGRAM_GATEWAY_CONTROL_PORT`` default ``8834`` — the gateway's own
     localhost control endpoint (``POST /topic``), the one path managers may use
     to open a topic; ``0`` disables it
@@ -142,6 +147,11 @@ class Config:
     )
     # Auto-compaction age for pinned manager sessions; 0 disables.
     manager_reset_days: int = DEFAULT_MANAGER_RESET_DAYS
+    # The dispatcher's standing instructions (one general-mgr per allowed
+    # owner is created and briefed from this file at startup).
+    general_mgr_instructions_file: Path = field(
+        default_factory=lambda: Path(__file__).parent / "general_mgr_prompt.md"
+    )
     log_level: str = "INFO"
     # Gateway-owned control endpoint (127.0.0.1 only); 0 disables it.
     control_port: int = DEFAULT_CONTROL_PORT
@@ -391,6 +401,10 @@ def load_config(
             or DEFAULT_SERVICE_STATE_JSON
         ).expanduser(),
         manager_reset_days=manager_reset_days,
+        general_mgr_instructions_file=Path(
+            (env.get("GENERAL_MGR_INSTRUCTIONS_FILE") or "").strip()
+            or (Path(__file__).parent / "general_mgr_prompt.md")
+        ).expanduser(),
         log_level=(env.get("TELEGRAM_GATEWAY_LOG_LEVEL") or "INFO").strip().upper(),
         control_port=control_port,
         idle_stop_s=idle_stop_s,
