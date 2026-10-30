@@ -127,12 +127,20 @@ class FakeOcClient:
 
 
 class FakeOc:
-    """Offline stand-in for `telegram_gateway.opencode_api` in bot_data."""
+    """Offline stand-in for `telegram_gateway.opencode_api` in bot_data.
 
-    def __init__(self, *, models=(), session=None, fail=None, fail_call=None):
+    ``fail`` breaks BOTH transports (child + shared service); ``fail_child``
+    or ``fail_service`` breaks just one, which is how the panel's
+    child-then-shared transport order is exercised offline.
+    """
+
+    def __init__(self, *, models=(), session=None, fail=None, fail_call=None,
+                 fail_child=None, fail_service=None):
         self.models = [dict(m) for m in models]
         self.session = json.loads(json.dumps(session or SESSION))
-        self.fail = fail  # raised by client_for: discovery/auth is broken
+        self.fail = fail  # raised by both entry points: nothing is reachable
+        self.fail_child = fail_child  # raised by client_for only
+        self.fail_service = fail_service  # raised by client_for_service only
         self.fail_call = dict(fail_call or {})  # method -> exception
         self.calls = []
         self.client = FakeOcClient(self)
@@ -141,6 +149,16 @@ class FakeOc:
         self.calls.append(("client_for", lane, pin))
         if self.fail is not None:
             raise self.fail
+        if self.fail_child is not None:
+            raise self.fail_child
+        return self.client
+
+    async def client_for_service(self, **kwargs):
+        self.calls.append(("client_for_service", kwargs))
+        if self.fail is not None:
+            raise self.fail
+        if self.fail_service is not None:
+            raise self.fail_service
         return self.client
 
 
@@ -834,6 +852,66 @@ def test_an_unpinned_opencode_lane_keeps_todays_refusal(tmp_path):
     assert "no effort switch" in texts(update)[-1]
 
 
+# ---- Milestone 10: the panel survives the private child going away ---------
+
+
+def test_a_lane_without_a_private_child_uses_the_shared_service(tmp_path):
+    """M4's world: no `serve --stdio` child (headless worker, stopped lane, or
+    a box where every `opencode` joins the ONE shared server). The session's
+    state lives in the shared `opencode.db`, so the SHARED service keeps every
+    dial working — model list, one-POST switch, the effort page — and the
+    registry path reaches the call (amux's `from_env` contract)."""
+    cfg = make_cfg(tmp_path)
+    state = GatewayState(tmp_path / "state.json")
+    amux = FakeAmux(rows=[panel_row()])
+    oc = FakeOc(models=CATALOG, fail_child=OcError(0, "no serve child"))
+    context = oc_context(cfg, state, amux, oc)
+    try:
+        listed = fake_callback("gw:ctlm:mgr-x")
+        run(botmod.on_callback(listed, context))
+        data = buttons(listed.callback_query.edits[0]["markup"])
+        assert "gw:ctlo:mgr-x:0" in data
+        # transport order: child asked first, shared second — with the
+        # registry path the config carries
+        assert oc.calls[0] == ("client_for", "mgr-x", PIN)
+        assert oc.calls[1][0] == "client_for_service"
+        assert oc.calls[1][1]["state_json"] == cfg.opencode_service_state
+
+        picked = fake_callback("gw:ctlo:mgr-x:0")
+        run(botmod.on_callback(picked, context))
+        assert ("set_model", PIN, "opencode-go", "kimi-k3.1-pro", "high") in oc.calls
+        assert amux.patches() == []  # hot, through the shared service
+
+        effort = fake_callback("gw:ctle:mgr-x")
+        run(botmod.on_callback(effort, context))
+        labels = [
+            b.text
+            for row in effort.callback_query.edits[0]["markup"].inline_keyboard
+            for b in row
+        ]
+        assert any("max" in label for label in labels)  # kimi's variants
+    finally:
+        run(amux.aclose())
+
+
+def test_both_transports_dead_keep_the_panel_on_the_amux_path(tmp_path):
+    """Child AND shared service unreachable → every verb keeps today's
+    behavior and the owner is told why (one WARN per stretch)."""
+    cfg = make_cfg(tmp_path)
+    state = GatewayState(tmp_path / "state.json")
+    amux = FakeAmux(rows=[panel_row()])
+    oc = FakeOc(fail=OcError(0, "no opencode server anywhere"))
+    update = fake_callback("gw:ctle:mgr-x")
+    try:
+        run(botmod.on_callback(update, oc_context(cfg, state, amux, oc)))
+    finally:
+        run(amux.aclose())
+    assert oc.calls[0][0] == "client_for"
+    assert oc.calls[1][0] == "client_for_service"  # both were tried
+    assert amux.patches() == []  # effort never PATCHes an opencode lane
+    assert "unreachable right now" in texts(update)[-1]
+
+
 # ---- Task 1 (owner, 2026-10-28): the SHARED service the relay reads from ---
 
 
@@ -862,6 +940,7 @@ def test_service_endpoint_prefers_the_env_url_and_never_scans(tmp_path):
     base, pw = service_endpoint(
         url="http://127.0.0.1:49374/",
         service_json=file_pw,
+        state_json=tmp_path / "no-registry.json",
         proc_root=str(tmp_path / "no-such-proc"),
         ss_output="",  # would be parsed only if the URL branch did not win
     )
@@ -892,6 +971,7 @@ def test_service_endpoint_finds_the_shared_service_and_skips_lane_children(tmp_p
     )
     base, pw = service_endpoint(
         service_json=write_service_json(tmp_path, '{"password": "shared-pw"}'),
+        state_json=tmp_path / "no-registry.json",
         proc_root=str(root),
         ss_output=ss,
     )
@@ -899,18 +979,116 @@ def test_service_endpoint_finds_the_shared_service_and_skips_lane_children(tmp_p
     assert pw == "shared-pw"
 
 
+def test_service_endpoint_prefers_the_registry_over_a_socket_scan(tmp_path):
+    """The registry (url+password together) beats a scan — M4's contract.
+
+    MEASURED on this box (2026-10-30): opencode itself writes
+    `~/.local/state/opencode/service.json` with `{id, version, url, pid,
+    password}`, refreshed on every service start — so when it exists, no scan
+    runs and a restart that moved the port is picked up for free.
+    """
+    registry = write_service_json(
+        tmp_path,
+        '{"id": "x", "version": "2.2.3", "url": "http://127.0.0.1:5555", '
+        '"pid": 42, "password": "registry-pw"}',
+        name="state.json",
+    )
+    base, pw = service_endpoint(
+        service_json=tmp_path / "no-config.json",
+        state_json=registry,
+        proc_root=str(tmp_path / "no-such-proc"),
+        ss_output="",  # a scan would find nothing; the registry must not need it
+    )
+    assert base == "http://127.0.0.1:5555"
+    assert pw == "registry-pw"
+
+
+def test_env_url_and_password_still_beat_the_registry(tmp_path):
+    registry = write_service_json(
+        tmp_path,
+        '{"url": "http://127.0.0.1:5555", "password": "registry-pw"}',
+        name="state.json",
+    )
+    base, pw = service_endpoint(
+        url="http://127.0.0.1:6666",
+        password="env-pw",
+        service_json=tmp_path / "no-config.json",
+        state_json=registry,
+    )
+    assert base == "http://127.0.0.1:6666"
+    assert pw == "env-pw"
+
+
+def test_a_registry_without_url_or_password_is_no_registry(tmp_path):
+    """Half a credential is not a service: the malformed registry falls
+    through to the scan, which then owns the answer."""
+    root = tmp_path / "proc"
+    write_proc(root, 300, cmdline=b"/usr/bin/opencode\x00serve\x00--service")
+    ss = 'LISTEN 0 512 127.0.0.1:7777 0.0.0.0:* users:(("opencode",pid=300,fd=10))'
+    for text in (
+        '{"password": "pw-only"}',
+        '{"url": "http://127.0.0.1:5555"}',
+        '{"url": " ", "password": "pw"}',
+        "{ not json",
+    ):
+        registry = write_service_json(tmp_path, text, name="state.json")
+        base, pw = service_endpoint(
+            service_json=write_service_json(tmp_path, '{"password": "scan-pw"}'),
+            state_json=registry,
+            proc_root=str(root),
+            ss_output=ss,
+        )
+        assert base == "http://127.0.0.1:7777"  # the scan, not the registry
+        assert pw == "scan-pw"
+
+
 def test_service_endpoint_reports_what_is_actually_missing(tmp_path):
     """No password and no service are DIFFERENT failures — never conflated."""
     with pytest.raises(OcError, match="no password"):
         service_endpoint(
-            url="http://127.0.0.1:1", service_json=tmp_path / "absent.json"
+            url="http://127.0.0.1:1",
+            service_json=tmp_path / "absent.json",
+            state_json=tmp_path / "no-registry.json",
         )
     with pytest.raises(OcError, match="serve --service"):
         service_endpoint(
             service_json=write_service_json(tmp_path, '{"password": "pw"}'),
+            state_json=tmp_path / "no-registry.json",
             proc_root=str(tmp_path / "empty-proc"),
             ss_output="",
         )
+
+
+def test_client_for_service_reads_the_registry_and_authenticates(tmp_path):
+    """`client_for_service(state_json=…)` joins the registry's URL with the
+    registry's password — no env URL, no scan, no config file."""
+    registry = write_service_json(
+        tmp_path,
+        '{"url": "http://127.0.0.1:5555", "password": "registry-pw"}',
+        name="state.json",
+    )
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["port"] = request.url.port
+        seen["auth"] = request.headers.get("authorization", "")
+        return httpx.Response(200, json={"interrupted": False})
+
+    client = run(
+        client_for_service(
+            service_json=tmp_path / "absent.json",
+            state_json=registry,
+            transport=httpx.MockTransport(handler),
+        )
+    )
+    try:
+        run(client.interrupt("ses_x"))
+    finally:
+        run(client.aclose())
+    assert seen["port"] == 5555
+    scheme, _, token = seen["auth"].partition(" ")
+    assert scheme == "Basic"
+    assert base64.b64decode(token).decode() == "opencode:registry-pw"
 
 
 def test_client_for_service_builds_a_client_from_url_and_password():

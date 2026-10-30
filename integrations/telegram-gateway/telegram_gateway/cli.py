@@ -56,6 +56,22 @@ async def _check(cfg: Config) -> int:
         "  topic title sync   "
         + (f"{cfg.topic_sync_s:g}s" if cfg.topic_sync_s else "off")
     )
+    print(
+        "  manager reset      "
+        + (
+            f"{cfg.manager_reset_days}d (idle 1h+, never with cards)"
+            if cfg.manager_reset_days
+            else "off"
+        )
+    )
+    print(
+        "  oc service registry "
+        + (
+            f"{cfg.opencode_service_state} (present)"
+            if cfg.opencode_service_state.exists()
+            else f"{cfg.opencode_service_state} (absent → env URL or socket scan)"
+        )
+    )
 
     if not os.path.isdir(cfg.default_workdir):
         print(f"  ✗ default workdir does not exist: {cfg.default_workdir}")

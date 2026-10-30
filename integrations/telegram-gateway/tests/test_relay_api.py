@@ -130,7 +130,8 @@ class FakeOcService:
         self.handler = history_handler(self.history, status=status, error=request_error)
         self.discovery_error = discovery_error
 
-    async def client_for_service(self, *, url=None, password=None, service_json=None):
+    async def client_for_service(self, *, url=None, password=None, service_json=None,
+                                 state_json=None, **kwargs):
         self.calls += 1
         if self.discovery_error is not None:
             raise self.discovery_error

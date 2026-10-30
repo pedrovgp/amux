@@ -55,7 +55,11 @@ class NoOc:
         self.calls: list[tuple] = []
 
     async def client_for(self, lane=None, pin=None):
-        self.calls.append((lane, pin))
+        self.calls.append(("client_for", lane, pin))
+        raise self.exc
+
+    async def client_for_service(self, **kwargs):
+        self.calls.append(("client_for_service", kwargs))
         raise self.exc
 
 

@@ -7,6 +7,8 @@ import os
 import secrets
 import time
 
+import httpx
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Conflict, TelegramError
@@ -134,11 +136,20 @@ def _oc_fallback_ok(session: str) -> None:
 async def _oc_client(
     context: ContextTypes.DEFAULT_TYPE, row: dict, op: str
 ) -> tuple | None:
-    """``(client, pin)`` when this row is an opencode lane with a live serve.
+    """``(client, pin)`` when this row is an opencode session with a live serve.
 
     ``None`` means "run today's path" — not an opencode lane, no pin (an
-    unpinned lane has no conversation id to address), or discovery/auth
-    failed (WARNed here and, for the reason, by ``opencode_api``).
+    unpinned lane has no conversation id to address), or no server reachable
+    (WARNed here and, for the reason, by ``opencode_api``).
+
+    Transport order (Milestone 10, the M4 shared-server world): the lane's own
+    ``serve --stdio`` child first — it OWNS a TUI lane's executions, which is
+    what makes its ``/interrupt`` the real one — then the SHARED
+    ``opencode serve --service``. Session state lives in the shared
+    ``opencode.db`` (refs are portable, measured), so the shared service can
+    list models, read and hot-set model+effort for a session whose private
+    child does not exist at all: a headless worker, a stopped lane, or a box
+    where every ``opencode`` joins the one server.
     """
     if str(row.get("provider") or "").lower() != "opencode":
         return None
@@ -146,11 +157,24 @@ async def _oc_client(
     if not pin:
         return None
     name = str(row.get("name") or "?")
+    api = _oc_api(context)
     try:
-        client = await _oc_api(context).client_for(lane=name, pin=pin)
-    except AmuxError as exc:
-        _oc_fallback_warn(name, op, exc)
-        return None
+        client = await api.client_for(lane=name, pin=pin)
+    except AmuxError as child_exc:
+        cfg = _cfg(context)
+        try:
+            client = await api.client_for_service(
+                url=cfg.opencode_service_url,
+                password=cfg.opencode_service_password,
+                service_json=cfg.opencode_service_json,
+                state_json=cfg.opencode_service_state,
+            )
+        except AmuxError as exc:
+            log.debug(
+                "oc_child_unavailable session=%s detail=%s", name, child_exc.detail
+            )
+            _oc_fallback_warn(name, op, exc)
+            return None
     if client is None:
         return None  # an entry point that answered "nothing" is not a client
     return client, pin
@@ -1877,6 +1901,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _apply_effort(update, context, session, level)
     elif action == "ctli":
         await _interrupt(update, context, raw)
+    elif action == "ctln":
+        await _reset_session(update, context, raw)
     elif action in ("ctlr", "ctlc"):
         # The prompt conversation owns both as entry points, registered before
         # this handler: reaching here means that wiring broke. Log it (a button
@@ -2633,6 +2659,7 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
             url=cfg.opencode_service_url,
             password=cfg.opencode_service_password,
             service_json=cfg.opencode_service_json,
+            state_json=cfg.opencode_service_state,
         )
     except AmuxError as exc:
         _note_api_unavailable(chat_id, session, exc)
@@ -2867,6 +2894,7 @@ async def idle_sweep_once(app: Application) -> None:
                     # Something brought it back (amux's own bootstrap): track
                     # it again instead of fighting it over and over.
                     state.clear_idle_stopped(chat_id, session)
+                    _dispatch_paged.discard((chat_id, session))
                     log.info(
                         "idle_stop_undone chat_id=%s session=%s reason=running_again",
                         chat_id,
@@ -2886,7 +2914,14 @@ async def idle_sweep_once(app: Application) -> None:
                     chat_id,
                     session,
                 )
+                # The keeper half (Milestone 10): a tracked PINNED lane found
+                # stopped WITHOUT a sweep stamp (a swept one never reaches
+                # here) and without an owner stop (its topics would be
+                # released, so it would not be tracked) died unexpectedly —
+                # the owner hears about it, once per stretch.
+                await _page_dispatcher_down(app, chat_id, session)
                 continue
+            _dispatch_paged.discard((chat_id, session))
             last = state.last_activity(chat_id, session)
             if last is None:
                 continue  # no activity recorded: not ours to judge
@@ -3040,6 +3075,356 @@ async def sync_topic_titles_loop(app: Application) -> None:
             log.exception("topic_sync_failed")
 
 
+# ---------------------------------------------------------------------------
+# fresh sessions + the keeper page (Milestone 10, owner 2026-10-30)
+# ---------------------------------------------------------------------------
+
+COMPACTION_TICK_S = 3600.0
+# Never compact a session the owner was talking to recently — a reset that
+# lands mid-use would throw away the half-finished exchange it is typing into.
+COMPACT_MIN_IDLE_S = 3600.0
+# Once per stretch: a dead manager pages ONCE, until it is seen running again.
+_dispatch_paged: set[tuple[int, str]] = set()
+
+
+async def page_owner(
+    cfg: Config, chat_id: int, text: str, *, transport: httpx.AsyncBaseTransport | None = None
+) -> bool:
+    """A direct Bot API ``sendMessage`` — the measured 2026-10-27 bypass
+    (msg 81) that reaches the owner while this gateway's own handlers or relay
+    are down: sending needs no getUpdates. ``transport`` exists so tests never
+    touch the network; every failure is logged and returns False.
+    """
+    url = f"https://api.telegram.org/bot{cfg.bot_token}/sendMessage"
+    try:
+        async with httpx.AsyncClient(
+            verify=False,
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            transport=transport,
+        ) as http:
+            response = await http.post(url, json={"chat_id": chat_id, "text": text})
+    except httpx.HTTPError as exc:
+        log.warning("owner_page_failed chat_id=%s error=%s", chat_id, exc)
+        return False
+    if response.status_code >= 400:
+        log.warning(
+            "owner_page_failed chat_id=%s status=%s detail=%s",
+            chat_id,
+            response.status_code,
+            response.text[:200],
+        )
+        return False
+    return True
+
+
+async def _page_dispatcher_down(app: Application, chat_id: int, session: str) -> None:
+    """Tell the owner a tracked manager died — ONCE per (chat, session) stretch.
+
+    Only called from the idle sweep's ``reason=not_running`` branch, whose
+    guards make it the honest "died unexpectedly" signal: a deliberately
+    swept lane carries the idle stamp (it never reaches the branch) and an
+    owner-stopped one has released its topics (it is not tracked).
+    """
+    if (chat_id, session) in _dispatch_paged:
+        return
+    _dispatch_paged.add((chat_id, session))
+    log.warning(
+        "dispatcher_down chat_id=%s session=%s hint=tracked manager found stopped "
+        "without an idle sweep or an owner stop — send any message in its topic "
+        "to revive it",
+        chat_id,
+        session,
+    )
+    cfg: Config = app.bot_data["cfg"]
+    ok = await page_owner(
+        cfg,
+        chat_id,
+        f"⚠️ manager {session} stopped unexpectedly (not the idle sweep, not a "
+        "stop you asked for). Send any message in its topic to bring it back — "
+        "the same conversation resumes.",
+    )
+    if ok:
+        log.info(
+            "owner_paged chat_id=%s session=%s reason=dispatcher_down",
+            chat_id,
+            session,
+        )
+
+
+async def _compact_session(
+    bot_data: dict, chat_id: int, session: str, *, source: str
+) -> tuple[str, list[int]]:
+    """Start a FRESH conversation for this manager, keeping its topic.
+
+    The owner, 2026-10-30: *"I also need a way to reset/compact the global mgr
+    session, otherwise it will grow unboundedly"*. The principle that makes
+    this safe: durable state lives on the BOARD and the NOTES, never in the
+    conversation — so compaction is a handoff, not a loss. It is a RESPAWN,
+    not a PATCH (amux has no session setting to set): mint a new OpenCode
+    session id, spawn a new pinned lane from the same template
+    (``create_manager``: provider/cwd/standing instructions), migrate every
+    gateway map to it (the Milestone-8 rename cascade), move the topic
+    identity to the NEW pin (``set_pinned``), re-arm the topic for the fresh
+    conversation's title, and retire the old lane. The old session stays in
+    ``opencode.db`` — resumable, just no longer ours.
+
+    Returns ``(new_name, threads)``; raises :class:`AmuxError` (the caller
+    reports it) when the lane is gone or is not a pinned opencode session.
+    """
+    cfg: Config = bot_data["cfg"]
+    client: AmuxClient = bot_data["client"]
+    state: GatewayState = bot_data["state"]
+    row = await client.find(session)
+    pin = session_id_from_flags(row.get("flags"))
+    if str(row.get("provider") or "").lower() != "opencode" or not pin:
+        raise AmuxError(0, f"`{session}` is not a pinned opencode session")
+    new_pin = new_opencode_session_id()
+    new, _new_row = await create_manager(
+        client, cfg, flags=f"--session {new_pin}"
+    )
+    threads = state.rename_session(chat_id, session, new)
+    # The pin is the topic's identity; it now names the NEW conversation, and
+    # `set_topic` re-arms the title sync (created=True) so the topic follows
+    # the fresh session's own title once its first turn names it.
+    state.set_pinned(chat_id, new, new_pin)
+    for thread in threads:
+        state.set_topic(chat_id, thread, new, created=True)
+    # In-memory maps the cascade cannot reach (bot_data).
+    recent = bot_data.get(RECENT_STARTS)
+    if isinstance(recent, dict):
+        for key in [k for k, (value, _ts) in recent.items() if value == session]:
+            recent.pop(key, None)
+    _no_boundary_warned.discard((chat_id, session))
+    _cards_warned.discard((chat_id, session))
+    _oc_fallback_warned.discard(session)
+    _dispatch_paged.discard((chat_id, session))
+    # Retire the old lane: its session lives on in opencode.db, but a lane
+    # still running the old conversation would silently keep growing while
+    # nothing points at it.
+    try:
+        await client.stop(session)
+    except AmuxError as exc:
+        # Not fatal — the fresh session is already the topic's — but the old
+        # lane may keep running (amux restarts a stop that a waiting card
+        # undoes), so name it in the log instead of pretending.
+        log.warning(
+            "compact_old_stop_failed old=%s new=%s status=%s detail=%s",
+            session,
+            new,
+            exc.status,
+            exc.detail,
+        )
+    log.info(
+        "session_compacted chat_id=%s old=%s new=%s old_pin=%s new_pin=%s "
+        "source=%s topics=%s",
+        chat_id,
+        session,
+        new,
+        pin,
+        new_pin,
+        source,
+        len(threads),
+    )
+    return new, threads
+
+
+async def _reset_session(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: str
+) -> None:
+    """The owner-facing half: 🔄 Fresh session (button) and ``/reset``."""
+    chat_id = update.effective_chat.id
+    try:
+        new, _threads = await _compact_session(
+            context.application.bot_data, chat_id, session, source="reset_action"
+        )
+    except AmuxError as exc:
+        log.warning(
+            "session_compact_failed chat_id=%s session=%s status=%s detail=%s",
+            chat_id,
+            session,
+            exc.status,
+            exc.detail,
+        )
+        await _say(
+            update,
+            f"❌ cannot start a fresh session: {exc.detail}",
+            reply_markup=_back_keyboard(session),
+        )
+        return
+    await _show_control(
+        update,
+        context,
+        new,
+        note=f"🔄 fresh session started — `{new}` owns this topic now; the old "
+        "conversation retired (its session stays in OpenCode, no longer ours). "
+        "Durable state was never in the conversation — it lives on the board.",
+    )
+
+
+@allow_only
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/reset`` — the command half of 🔄 Fresh session."""
+    log.info(
+        "command reset user=%s chat=%s",
+        update.effective_user.id,
+        update.effective_chat.id,
+    )
+    session = await _target_session(update, context)
+    if not session:
+        await _say(update, "No session selected — /sessions")
+        return
+    await _reset_session(update, context, session)
+
+
+async def _session_created_ms(app: Application, pin: str) -> float | None:
+    """``time.created`` (ms) for a pinned session, via the SHARED service.
+
+    The service knows every conversation's birth regardless of which serve
+    instance (or lane) owns it; ``None`` on any failure — the age sweep must
+    never compact blind.
+    """
+    cfg: Config = app.bot_data["cfg"]
+    api = app.bot_data.get("oc_api") or opencode_api
+    client = None
+    try:
+        client = await api.client_for_service(
+            url=cfg.opencode_service_url,
+            password=cfg.opencode_service_password,
+            service_json=cfg.opencode_service_json,
+            state_json=cfg.opencode_service_state,
+        )
+        sess = await client.get_session(pin)
+    except AmuxError:
+        return None
+    finally:
+        if client is not None:
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                await close()
+    block = sess.get("time") if isinstance(sess, dict) else None
+    created = block.get("created") if isinstance(block, dict) else None
+    return float(created) if isinstance(created, (int, float)) else None
+
+
+async def compaction_once(app: Application) -> None:
+    """Auto-compact a pinned manager session past ``cfg.manager_reset_days``.
+
+    Owner, 2026-10-30: the dispatcher's session must be bounded *"without me
+    thinking about it"*. The guard rails, each with a reason:
+
+    - **age from the session itself** (``GET /api/session/<id>``'s
+      ``time.created`` through the shared service), not from first sighting;
+    - **never mid-use**: the agent must be idle AND no owner message/relayed
+      output for ``COMPACT_MIN_IDLE_S``;
+    - **never blind**: the service must answer (else skip), and a stopped
+      lane has nothing that grows (it revives on demand);
+    - **never while the lane owns cards** — its cards are assigned to its
+      NAME, and compaction retires that name, so the work would strand.
+      Deferred (logged), which is the owner's (c): queued work waits for a
+      decision, it is never force-moved.
+    - ``0`` disables the whole tick (``/reset`` still works).
+    """
+    cfg: Config = app.bot_data["cfg"]
+    if not cfg.manager_reset_days:
+        return
+    state: GatewayState = app.bot_data["state"]
+    client: AmuxClient = app.bot_data["client"]
+    threshold_s = cfg.manager_reset_days * 86400
+    now = time.time()
+    try:
+        rows = await client.list_sessions()
+    except AmuxError as exc:
+        log.debug("compaction_unreachable error=%s", exc)
+        return
+    live = {
+        str(row.get("name")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("name")
+    }
+    for chat_id, sessions in state.tracked_sessions().items():
+        for session in sessions:
+            pin = state.pinned(chat_id, session)
+            if not pin:
+                continue
+            row = live.get(session)
+            if not row or not row.get("running"):
+                continue
+            agent = str(row.get("agent_state") or "").lower()
+            if agent not in ("", "idle"):
+                log.debug(
+                    "manager_compact_deferred chat_id=%s session=%s reason=agent_%s",
+                    chat_id,
+                    session,
+                    agent or "unknown",
+                )
+                continue
+            last = state.last_activity(chat_id, session)
+            if last is not None and now - last < COMPACT_MIN_IDLE_S:
+                continue
+            cards = await client.todo_cards(session)
+            if cards:
+                log.info(
+                    "manager_compact_deferred chat_id=%s session=%s reason=cards "
+                    "cards=%s",
+                    chat_id,
+                    session,
+                    ",".join(str(card.get("id")) for card in cards),
+                )
+                continue
+            created = await _session_created_ms(app, pin)
+            if created is None:
+                continue
+            age_s = now - created / 1000.0
+            if age_s < threshold_s:
+                continue
+            try:
+                new, threads = await _compact_session(
+                    app.bot_data, chat_id, session, source="age"
+                )
+            except AmuxError as exc:
+                log.warning(
+                    "session_compact_failed chat_id=%s session=%s status=%s detail=%s",
+                    chat_id,
+                    session,
+                    exc.status,
+                    exc.detail,
+                )
+                continue
+            log.info(
+                "manager_compacted chat_id=%s old=%s new=%s age_days=%.1f "
+                "topics=%s source=age",
+                chat_id,
+                session,
+                new,
+                age_s / 86400.0,
+                len(threads),
+            )
+            try:
+                await _send_markdown(
+                    app.bot,
+                    chat_id,
+                    "🔄 this manager's session aged out — a fresh one now owns "
+                    "the topic. Durable state lives on the board and the notes, "
+                    "never in the conversation.",
+                    thread_id=state.session_topic(chat_id, new),
+                )
+            except TelegramError as exc:
+                log.warning(
+                    "compact_note_failed chat_id=%s new=%s error=%s", chat_id, new, exc
+                )
+
+
+async def compaction_loop(app: Application) -> None:
+    while True:
+        await asyncio.sleep(COMPACTION_TICK_S)
+        try:
+            await compaction_once(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never let one bad cycle kill the loop
+            log.exception("compaction_failed")
+
+
 async def post_init(app: Application) -> None:
     cfg: Config = app.bot_data["cfg"]
     client: AmuxClient = app.bot_data["client"]
@@ -3058,6 +3443,8 @@ async def post_init(app: Application) -> None:
     app.bot_data["relay_task"] = asyncio.create_task(relay_loop(app))
     app.bot_data["idle_task"] = asyncio.create_task(idle_sweep_loop(app))
     app.bot_data["title_task"] = asyncio.create_task(sync_topic_titles_loop(app))
+    if cfg.manager_reset_days:
+        app.bot_data["compaction_task"] = asyncio.create_task(compaction_loop(app))
     log.info(
         "gateway_started allowed_users=%d amux_url=%s voice=%s relay_interval_s=%s "
         "idle_stop_s=%s topic_sync_s=%s",
@@ -3205,6 +3592,7 @@ def build_application(
     app.add_handler(CommandHandler("ctl", ctl_command))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("effort", effort_command))
+    app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(conversation)
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^gw:"))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))

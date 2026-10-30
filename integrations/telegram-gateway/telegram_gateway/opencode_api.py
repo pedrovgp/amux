@@ -69,6 +69,10 @@ SS_TIMEOUT_S = 5.0
 # The shared `opencode serve --service` password file (amux's serve client
 # contract: crates/amux-server/src/opencode/serve.rs, password_from_service_json).
 DEFAULT_SERVICE_JSON = "~/.config/opencode/service.json"
+# The registry OPEncode itself writes for the box's ONE shared server — url and
+# password in the same file (amux's `ServeClient::from_env` reads this one;
+# `AMUX_OPENCODE_SERVICE_STATE` relocates it, for both).
+DEFAULT_SERVICE_STATE_JSON = "~/.local/state/opencode/service.json"
 # One read of `/api/session/<id>/message`: newest-first, so a long answer needs
 # no viewport. Paging stops at `since_id`; the ceiling only guards a runaway.
 MESSAGE_PAGE_LIMIT = 100
@@ -360,35 +364,88 @@ def service_password(
     return None
 
 
+def shared_service_registry(
+    *, path: str | Path = DEFAULT_SERVICE_STATE_JSON
+) -> dict | None:
+    """``{url, password}`` from the file opencode registers for its ONE
+    shared server — else ``None``.
+
+    MEASURED on this box (2026-10-30, opencode 2.2.3):
+    ``{"id", "version", "url": "http://127.0.0.1:49374", "pid", "password"}``
+    — url AND password in one file, which is what lets a client join the
+    box's single server with no hand-set variable. Both fields must be
+    non-blank: half a credential is not a service (the same rule amux's
+    `shared_service_from_state` applies, serve.rs). Pure: missing or
+    malformed is ``None``, never an exception.
+    """
+    try:
+        raw = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    url = value.get("url")
+    password = value.get("password")
+    if not (isinstance(url, str) and url.strip()):
+        return None
+    if not (isinstance(password, str) and password.strip()):
+        return None
+    return {"url": url.strip().rstrip("/"), "password": password.strip()}
+
+
 def service_endpoint(
     *,
     url: str | None = None,
     password: str | None = None,
     service_json: str | Path = DEFAULT_SERVICE_JSON,
+    state_json: str | Path = DEFAULT_SERVICE_STATE_JSON,
     proc_root: str = "/proc",
     ss_output: str | None = None,
 ) -> tuple[str, str]:
     """``(base_url, password)`` of the shared service, or :class:`OcError`.
 
-    Order (owner, 2026-10-28): ``AMUX_OPENCODE_SERVICE_URL`` if set → else the
-    listening socket of a process running ``opencode serve --service`` → else
-    a failure, which the relay turns into ``relay_api_unavailable`` and a pane
-    fallback. **The port is never hardcoded**: that service is a child of a
-    TUI (measured 2026-10-28: pid 2605614, 127.0.0.1:49374), it can die with
-    its parent, and the next one binds a new random port.
+    Order, mirroring amux's ``ServeClient::from_env`` (the contract this
+    gateway must not drift from — M4, 2026-10-30):
+
+    1. ``AMUX_OPENCODE_SERVICE_URL`` if set (password: the explicit value,
+       else ``~/.config/opencode/service.json``) — the explicit override;
+    2. **the registry opencode itself writes**,
+       ``~/.local/state/opencode/service.json`` — url and password together,
+       so the join needs no socket scan and no password hunting;
+    3. the listening socket of a process running ``opencode serve --service``
+       (today's fallback) with the config-file password.
+
+    **The port is never hardcoded**: that service can restart on a new random
+    port (measured 2026-10-28: pid 2605614, 127.0.0.1:49374), which is also
+    why the registry — refreshed on every service start — beats a scan.
 
     Deliberately silent on failure — the caller owns the one-WARN-per-stretch
     log line, so a dead service cannot double-report.
     """
-    pw = service_password(password=password, path=service_json)
+    env_pw = service_password(password=password, path=service_json)
+    registry = shared_service_registry(path=state_json)
+    pw = env_pw or (registry or {}).get("password")
+    if url:
+        if not pw:
+            raise OcError(
+                0,
+                "no password: AMUX_OPENCODE_SERVICE_PASSWORD unset, "
+                f"{service_json} has no password field, and no registry at "
+                f"{state_json}",
+            )
+        return url.rstrip("/"), pw
+    if registry:
+        return str(registry["url"]), pw
     if not pw:
         raise OcError(
             0,
             "no password: AMUX_OPENCODE_SERVICE_PASSWORD unset and "
-            f"{service_json} has no password field",
+            f"{service_json} has no password field (no registry at {state_json})",
         )
-    if url:
-        return url.rstrip("/"), pw
     if ss_output is None:
         ss_output = _run_ss()
     for port, pid in _ss_listeners(ss_output):
@@ -409,6 +466,7 @@ async def client_for_service(
     url: str | None = None,
     password: str | None = None,
     service_json: str | Path = DEFAULT_SERVICE_JSON,
+    state_json: str | Path = DEFAULT_SERVICE_STATE_JSON,
     proc_root: str = "/proc",
     ss_output: str | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
@@ -417,9 +475,10 @@ async def client_for_service(
 
     Unlike :func:`client_for` (one lane's own ``serve --stdio`` child, found
     through its pin) this addresses the one ``opencode serve --service`` that
-    answers ``/api/session/<id>/message`` for any conversation — the endpoint
-    the relay reads answers from. ``url``+``password`` short-circuit discovery
-    entirely (the offline rule: a test never runs ``ss`` or reads ``/proc``).
+    answers ``/api/session/<id>/message`` for any conversation — and, since
+    session state lives in the shared ``opencode.db``, model, effort and
+    interrupt too. ``url``+``password`` short-circuit discovery entirely (the
+    offline rule: a test never runs ``ss`` or reads ``/proc``).
     """
     try:
         if url and password:
@@ -430,6 +489,7 @@ async def client_for_service(
                 url=url,
                 password=password,
                 service_json=service_json,
+                state_json=state_json,
                 proc_root=proc_root,
                 ss_output=ss_output,
             )

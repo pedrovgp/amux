@@ -41,6 +41,17 @@ Optional
 ``AMUX_OPENCODE_SERVICE_PASSWORD`` overrides ``~/.config/opencode/service.json``
     (``password`` field) for that same service — the amux serve client's own
     contract (``crates/amux-server/src/opencode/serve.rs``).
+``AMUX_OPENCODE_SERVICE_STATE`` default ``~/.local/state/opencode/service.json``
+    — the registry opencode itself writes for the box's ONE shared server
+    (``{url, pid, password}``; amux reads the same file and the same variable).
+    It is the preferred discovery source: url and password travel together, so
+    a service restart on a new port is picked up without any scan.
+``TELEGRAM_GATEWAY_MANAGER_RESET_DAYS`` default ``14`` — a tracked pinned
+    manager session older than this, idle (no owner message, no relayed
+    output) for at least an hour, is compacted automatically: a fresh
+    conversation is started, the topic follows it, and the old lane retires.
+    The board and the notes hold the durable state, never the conversation;
+    ``0`` disables the automatic reset (`/reset` still works).
 ``TELEGRAM_GATEWAY_CONTROL_PORT`` default ``8834`` — the gateway's own
     localhost control endpoint (``POST /topic``), the one path managers may use
     to open a topic; ``0`` disables it
@@ -84,6 +95,12 @@ DEFAULT_PEEK_LINES = 2000
 MIN_PEEK_LINES = 50
 # The shared opencode service's password file (amux's serve client contract).
 DEFAULT_SERVICE_JSON = "~/.config/opencode/service.json"
+# The registry opencode writes for the shared service (same file+variable amux
+# reads: ServeClient::from_env).
+DEFAULT_SERVICE_STATE_JSON = "~/.local/state/opencode/service.json"
+# A pinned manager session older than this is compacted automatically — the
+# conversation is disposable, the board and the notes are not (0 = off).
+DEFAULT_MANAGER_RESET_DAYS = 14
 
 
 class ConfigError(RuntimeError):
@@ -118,6 +135,13 @@ class Config:
     opencode_service_json: Path = field(
         default_factory=lambda: Path(DEFAULT_SERVICE_JSON).expanduser()
     )
+    # The registry opencode itself writes for that service (url+password
+    # together): the preferred discovery source, before any socket scan.
+    opencode_service_state: Path = field(
+        default_factory=lambda: Path(DEFAULT_SERVICE_STATE_JSON).expanduser()
+    )
+    # Auto-compaction age for pinned manager sessions; 0 disables.
+    manager_reset_days: int = DEFAULT_MANAGER_RESET_DAYS
     log_level: str = "INFO"
     # Gateway-owned control endpoint (127.0.0.1 only); 0 disables it.
     control_port: int = DEFAULT_CONTROL_PORT
@@ -329,6 +353,20 @@ def load_config(
         problems.append("TELEGRAM_GATEWAY_TOPIC_SYNC_S must be 0 (disabled) or positive")
         topic_sync_s = DEFAULT_TOPIC_SYNC_S
 
+    reset_days_raw = (env.get("TELEGRAM_GATEWAY_MANAGER_RESET_DAYS") or "").strip()
+    try:
+        manager_reset_days = int(reset_days_raw) if reset_days_raw else DEFAULT_MANAGER_RESET_DAYS
+    except ValueError:
+        manager_reset_days = DEFAULT_MANAGER_RESET_DAYS
+        problems.append(
+            f"TELEGRAM_GATEWAY_MANAGER_RESET_DAYS is not a number; using {DEFAULT_MANAGER_RESET_DAYS}"
+        )
+    if manager_reset_days < 0:
+        problems.append(
+            "TELEGRAM_GATEWAY_MANAGER_RESET_DAYS must be 0 (disabled) or positive"
+        )
+        manager_reset_days = DEFAULT_MANAGER_RESET_DAYS
+
     if problems:
         raise ConfigError(problems)
 
@@ -348,6 +386,11 @@ def load_config(
         opencode_service_password=(env.get("AMUX_OPENCODE_SERVICE_PASSWORD") or "").strip()
         or None,
         opencode_service_json=Path(DEFAULT_SERVICE_JSON).expanduser(),
+        opencode_service_state=Path(
+            (env.get("AMUX_OPENCODE_SERVICE_STATE") or "").strip()
+            or DEFAULT_SERVICE_STATE_JSON
+        ).expanduser(),
+        manager_reset_days=manager_reset_days,
         log_level=(env.get("TELEGRAM_GATEWAY_LOG_LEVEL") or "INFO").strip().upper(),
         control_port=control_port,
         idle_stop_s=idle_stop_s,

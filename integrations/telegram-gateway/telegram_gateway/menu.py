@@ -30,6 +30,9 @@ Session control (Milestone 8 — the topic's own panel):
     gw:ctlr:<session>       ask for a new name (conversation)
     gw:ctli:<session>       interrupt the current turn (OpenCode API when it
                             is reachable, Escape in the pane otherwise)
+    gw:ctln:<session>       FRESH session (Milestone 10): mint a new ses_,
+                            respawn the lane, re-pin the topic, retire the
+                            old conversation (pinned opencode lanes only)
 
 Every payload is kept ≤ 64 bytes (Telegram's cap): ``gw:ctlp:`` (8) +
 :data:`MAX_CTL_KEY` (40) + ``:`` + ``xhigh`` (5) = 54.
@@ -260,6 +263,12 @@ def control_keyboard(session: str) -> InlineKeyboardMarkup:
                 ),
             ],
             [
+                # 🔄 (Milestone 10): a FRESH conversation on the same topic —
+                # mint a new ses_, respawn the lane, re-pin; the board and the
+                # notes hold the durable state, the conversation is disposable.
+                InlineKeyboardButton(
+                    "🔄 Fresh session", callback_data=f"{PREFIX}ctln:{key}"
+                ),
                 # Stop reuses the existing confirm (card warning + buttons)
                 # rather than growing a second one.
                 InlineKeyboardButton("🔴 Stop", callback_data=f"{PREFIX}stop:{key}"),

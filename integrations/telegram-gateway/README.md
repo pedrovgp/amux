@@ -152,6 +152,8 @@ GROQ_API_KEY=gsk_your_key_here
 # TELEGRAM_GATEWAY_RELAY_INTERVAL_S=20
 # TELEGRAM_GATEWAY_IDLE_STOP_S=1800   # 0 disables the idle stop
 # TELEGRAM_GATEWAY_TOPIC_SYNC_S=60     # topic titles follow OpenCode (0 = off)
+# TELEGRAM_GATEWAY_MANAGER_RESET_DAYS=14  # auto-compact old manager sessions (0 = off)
+# AMUX_OPENCODE_SERVICE_STATE=~/.local/state/opencode/service.json  # shared-serve registry
 ```
 
 New sessions are created with `POST /api/sessions` — a fleet lane (env file +
@@ -242,13 +244,21 @@ topic's own session; in General or a private chat the commands address the
 selected one. Each topic ack carries a **🎛 Session control** button, and
 `/ctl` opens the same panel anywhere.
 
-- **🤖 Model** — an **opencode** lane reads ITS OWN server: the lane's
-  `opencode serve` child is found (`ss -tlnp` → `/proc` → lane name + the
-  `--session` pin) and authenticated with its `OPENCODE_PASSWORD`, and
-  `GET /api/model` lists its catalog — 74 models across `opencode` and
+- **🤖 Model** — an **opencode** session reads ITS OWN server: the lane's
+  `opencode serve` child first (`ss -tlnp` → `/proc` → lane name + the
+  `--session` pin, authenticated with its `OPENCODE_PASSWORD`), and when no
+  private child exists — a headless worker, a stopped lane, or a box where
+  every `opencode` joins the one shared server (amux's M4 default) — the
+  **shared `opencode serve --service`** speaks for it, discovered the way
+  amux does: `AMUX_OPENCODE_SERVICE_URL` override → the registry
+  `~/.local/state/opencode/service.json` (url + password together,
+  `AMUX_OPENCODE_SERVICE_STATE` relocates it) → the listening socket.
+  `GET /api/model` lists the catalog — 74 models across `opencode` and
   `opencode-go` (measured), current one marked by provider *and* id, paged 10
   at a time. Picking one POSTs `{"model": {providerID, id, variant}}` to
-  `/api/session/<id>/model`: model AND effort in **one call, no restart**.
+  `/api/session/<id>/model`: model AND effort in **one call, no restart** —
+  which also means it works on a **stopped** lane (the session state lives in
+  the shared `opencode.db`).
   Every other lane — and any discovery/auth/API failure — keeps amux's
   `GET /api/models` + config PATCH (a restart that resumes the conversation),
   where an uncatalogued provider still offers **⌨️ Custom model id…** (type
@@ -263,18 +273,37 @@ selected one. Each topic ack carries a **🎛 Session control** button, and
   to the lane's next launch, so an amux effort PATCH is never the fallback).
   `/effort <level>` applies one directly.
 - **⚡ Interrupt** — prefers OpenCode's own `POST /api/session/<id>/interrupt`
-  (the TUI's own interrupt) and otherwise presses Escape in the pane: both
-  stop the current turn and leave the lane, its topic and its conversation
-  alone. Logged `session_interrupted … path=oc_api|keys`; every API failure
-  falls back to the Escape path with one `oc_api_fallback` WARN per stretch,
-  so a button is never left dead.
+  (the TUI's own interrupt; the lane's private child owns a TUI lane's
+  execution, so it is asked first, then the shared service) and otherwise
+  presses Escape in the pane: both stop the current turn and leave the lane,
+  its topic and its conversation alone. Logged
+  `session_interrupted … path=oc_api|keys`; every API failure falls back to
+  the Escape path with one `oc_api_fallback` WARN per stretch, so a button is
+  never left dead.
 - **✏️ Rename** — asks for the new name, PATCHes the lane's config, then moves
   the session through **every** gateway map (topic, pin, anchors, activity,
   dedupe, quote map, selection) and retitles the Telegram topic. The topic is
   bound to the OpenCode conversation id, so a rename made in the dashboard
   keeps the topic attached too — the next message in it follows the lane to its
   new name. `/name <new>` renames directly.
+- **🔄 Fresh session** (or `/reset`) — compaction for a conversation that has
+  outgrown itself: mint a NEW OpenCode session id, respawn the lane pinned to
+  it (same provider, cwd, standing instructions), migrate every gateway map,
+  move the topic's identity to the new pin, and retire the old lane. The
+  topic follows the fresh conversation (its own title once it earns one).
+  Durable state was never in the conversation — it lives on the board and the
+  notes — which is what makes this a handoff, not a loss. Pinned opencode
+  sessions only; a pinned session older than
+  `TELEGRAM_GATEWAY_MANAGER_RESET_DAYS` (default 14) and idle for an hour is
+  compacted automatically, unless it owns cards (its cards are assigned to its
+  name, so they would strand — deferred instead).
 - **🔴 Stop** — the existing confirm, with the board-card warning.
+
+If a tracked manager dies unexpectedly (not the idle sweep, not a stop you
+asked for), the idle sweep pages you directly over the Bot API — a
+`sendMessage` needs no `getUpdates`, so it reaches you even while this
+gateway's own relay is down — once per stretch, until it is seen running
+again (`dispatcher_down` / `owner_paged` in the log).
 
 Replies from the session are relayed automatically: the gateway finds the last
 `[from Telegram @…]` marker in the pane and sends everything after it, stripping
