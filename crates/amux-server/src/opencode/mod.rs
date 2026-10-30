@@ -10,8 +10,10 @@
 //! against the RR-0028e spike's coverage matrix.
 
 pub mod acp;
+pub mod boundary_policy;
 pub mod events;
 pub mod mock;
+pub mod serve;
 pub mod structured;
 
 /// The model an OpenCode worker runs when neither the worker nor the fleet
@@ -93,6 +95,17 @@ pub trait AgentProtocol: Send + Sync {
     async fn pause(&self, worker: &WorkerId) -> Result<()>;
     async fn resume(&self, worker: &WorkerId) -> Result<()>;
     async fn state(&self, worker: &WorkerId) -> Result<AgentState>;
+    /// Switch the model used by SUBSEQUENT turns, without ending the session.
+    ///
+    /// Default: unsupported, and it says so — a silent `Ok` would look like a
+    /// model change that never happened. Providers that can answer it override
+    /// this; OpenCode does on both structured transports.
+    async fn set_model(&self, worker: &WorkerId, model: &str) -> Result<()> {
+        let _ = (worker, model);
+        Err(ProtocolError::Rejected(
+            "this protocol cannot switch a model on a live worker".to_string(),
+        ))
+    }
     /// Subscribe to this worker's event stream. Events arrive in order;
     /// a lagged subscriber is told so (broadcast semantics match the SSE
     /// contract — Invariant 26).
