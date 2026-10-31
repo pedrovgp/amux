@@ -301,7 +301,11 @@ def test_control_server_refuses_to_start_on_a_busy_port(tmp_path, caplog):
 
 
 def _prepared_app(tmp_path, control_port):
-    cfg = make_cfg(tmp_path, control_port=control_port)
+    # `state_dir` isolated on purpose: post_init spawns the pinned-menu task,
+    # and against the LIVE state it would find the real group and POST to
+    # Telegram with the test token (an InvalidToken network call from the
+    # suite — the offline rule).
+    cfg = make_cfg(tmp_path, control_port=control_port, state_dir=tmp_path / "gw")
     app = botmod.build_application(cfg)
     # never touch the live amux server from a unit test
     app.bot_data["client"] = AmuxClient(

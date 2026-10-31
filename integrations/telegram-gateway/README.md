@@ -300,7 +300,8 @@ tail -f ~/.amux/logs/telegram-gateway.log
 
 ## Usage
 
-- `/start` or `/menu` — the four-button menu.
+- `/start` or `/menu` — the menu (six actions; the SAME keyboard as the
+  pinned menu below).
 - **🚀 Start agent** — creates and starts a fleet lane named
   `tg-<MMDD-HHMM>-<hex>` in `AMUX_DEFAULT_WORKDIR` using
   `AMUX_DEFAULT_PROVIDER`. It waits for the spawn to settle and reports the real
@@ -319,6 +320,20 @@ tail -f ~/.amux/logs/telegram-gateway.log
   message's thread. **Quote its answer** (or the "started" ack) to keep talking
   to the same manager; every other message starts another one.
 - `/sessions` picks a session (for the menu actions); `/status` peeks it.
+- `/browse` — the session browser: every project directory with its
+  conversation count → a project's conversations (title · last update ·
+  ✅ already adopted) → tap one to adopt it into a pinned lane, open its
+  topic and post its last messages as the intro (the 🧩 button on relayed
+  dispatcher answers opens the same list).
+- **The permanent menu (`/gmmenu`)** — at startup (and on `/gmmenu`) the
+  gateway posts ONE menu message and **pins** it, so it is always visible at
+  the top of the group, opening in General where your dispatcher answers.
+  Later runs EDIT that same message (its id lives in `state.json`), never
+  stack a second one. Pinning needs the bot's **Pin messages** admin right
+  (separate from manage-topics); without it the menu is still posted and
+  `/gmmenu` says exactly which right to add. If you pin something else
+  yourself, Telegram replaces the menu's pin — the gateway yields on
+  purpose (it never fights your pin) and `/gmmenu` re-asserts it.
 - `/sessions` picks a session; `/status` peeks the selected one.
 
 ### Session control (the 🎛 panel)

@@ -17,7 +17,7 @@ def callbacks(markup):
     ]
 
 
-def test_main_menu_has_the_five_actions():
+def test_main_menu_has_the_six_actions():
     menu = main_menu()
     assert callbacks(menu) == [
         f"{PREFIX}new",
@@ -25,6 +25,7 @@ def test_main_menu_has_the_five_actions():
         f"{PREFIX}prompt",
         f"{PREFIX}stop",
         f"{PREFIX}mgr",
+        f"{PREFIX}prj",  # the session browser rides the ONE menu everywhere
     ]
     labels = [button.text for row in menu.inline_keyboard for button in row]
     assert any("Start" in label for label in labels)
@@ -32,6 +33,7 @@ def test_main_menu_has_the_five_actions():
     assert any("Send" in label for label in labels)
     assert any("Stop" in label for label in labels)
     assert any("Manager" in label for label in labels)
+    assert any("Sessions by project" in label for label in labels)
 
 
 def test_manager_keyboard_offers_providers_then_models():

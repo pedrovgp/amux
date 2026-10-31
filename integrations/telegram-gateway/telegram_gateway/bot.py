@@ -99,6 +99,14 @@ WELCOME = (
     "automatically."
 )
 
+# The pinned menu's body (owner, 2026-10-31: "permanent menu always shown in
+# the general manager topic"). Kept short and stable: the ensure EDITs this
+# exact message, so churn here is churn in the group.
+GM_MENU_TEXT = (
+    "🤖 *amux gateway* — your dispatcher's menu\n"
+    "Tap an action below, or just write here to talk to your general manager."
+)
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -2757,6 +2765,169 @@ async def browse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _show_projects(update, context)
 
 
+# ---------------------------------------------------------------------------
+# the permanent menu (owner, 2026-10-31): one message, pinned, always shown
+# ---------------------------------------------------------------------------
+
+
+def gm_menu_chat(state: GatewayState, uids) -> int | None:
+    """The chat the pinned menu belongs in: where a dispatcher ANSWERS.
+
+    Preference, most to least specific:
+
+    1. a chat where a `general-mgr-<uid>` has a turn AND bound topics — that
+       is the dispatcher's own thread (forum General under M11.5);
+    2. any chat the gateway has bound topics in (the forum group, even for a
+       dispatcher not written to yet);
+    3. a dispatcher turn chat without topics (a private DM fallback — the
+       menu still works there, it just cannot be a forum pin).
+    """
+    candidates: list[int] = []
+    for uid in sorted(uids):
+        chat = state.chat_for_session(general_manager_name(uid))
+        if chat is not None and chat not in candidates:
+            candidates.append(chat)
+    for chat in candidates:
+        if state.chat_has_topics(chat):
+            return chat
+    forum = state.chats_with_topics()
+    if forum:
+        return forum[0]
+    return candidates[0] if candidates else None
+
+
+async def _gm_menu_send(bot, chat_id: int):
+    """Post the menu fresh (markdown, plain fallback) — returns its id."""
+    try:
+        sent = await bot.send_message(
+            chat_id, GM_MENU_TEXT, reply_markup=main_menu(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except BadRequest:
+        sent = await bot.send_message(
+            chat_id, GM_MENU_TEXT, reply_markup=main_menu()
+        )
+    return getattr(sent, "message_id", None)
+
+
+async def ensure_gm_menu(app) -> dict:
+    """Post (or refresh) the gateway menu and PIN it — the owner's ask.
+
+    Idempotent, and every outcome is reportable:
+
+    - a STORED message id means this ran before → the message is EDITed
+      ("message is not modified" is a success; a deleted/uneditable message
+      clears the id so a fresh one replaces it), then PINNED again;
+    - no stored id → the menu is sent once and its id recorded in
+      `state.json` (the rebind rule: only this process writes it — which is
+      why the STARTUP task, not an external script, is the live probe);
+    - a refused pin is NOT a failed menu: the message exists either way,
+      `gm_menu_pin_failed` names the missing right (Pin messages, separate
+      from manage-topics), and `/gmmenu` tells the owner exactly that.
+
+    Deliberately not on the hourly tick: Telegram pins are chat-level, so
+    re-pinning on a loop would silently override whatever the OWNER pinned.
+    The gateway yields to the human's pin and re-asserts on demand.
+    """
+    cfg: Config = app.bot_data["cfg"]
+    state: GatewayState = app.bot_data["state"]
+    bot = app.bot
+    chat_id = gm_menu_chat(state, cfg.allowed_user_ids)
+    if chat_id is None:
+        log.info("gm_menu_skipped reason=no_chat")
+        return {"status": "skipped", "detail": "no chat has the dispatcher yet"}
+
+    message_id = state.menu_message(chat_id)
+    if message_id is not None:
+        try:
+            await bot.edit_message_text(
+                GM_MENU_TEXT,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=main_menu(),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except BadRequest as exc:
+            lowered = str(exc).lower()
+            if "not modified" in lowered:
+                pass  # content unchanged — the pin below re-asserts anyway
+            else:
+                # Deleted, or no longer editable: drop the id and re-send,
+                # so a dead reference never wedges the menu forever.
+                log.info(
+                    "gm_menu_edit_gone chat_id=%s msg_id=%s error=%s",
+                    chat_id,
+                    message_id,
+                    exc,
+                )
+                message_id = None
+        except TelegramError as exc:
+            # Transient (a timeout): keep the message, try the pin, and let
+            # the next ensure retry the content — never duplicate on a flake.
+            log.warning(
+                "gm_menu_edit_failed chat_id=%s msg_id=%s error=%s",
+                chat_id,
+                message_id,
+                exc,
+            )
+    if message_id is None:
+        message_id = await _gm_menu_send(bot, chat_id)
+        if message_id is None:
+            log.warning("gm_menu_post_failed chat_id=%s", chat_id)
+            return {
+                "status": "failed",
+                "chat_id": chat_id,
+                "detail": "telegram returned no message id",
+            }
+        state.set_menu_message(chat_id, message_id)
+    try:
+        await bot.pin_chat_message(chat_id, message_id, disable_notification=True)
+    except TelegramError as exc:
+        log.warning(
+            "gm_menu_pin_failed chat_id=%s msg_id=%s error=%s",
+            chat_id,
+            message_id,
+            exc,
+        )
+        return {
+            "status": "unpinned",
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "detail": str(exc),
+        }
+    log.info("gm_menu_pinned chat_id=%s msg_id=%s", chat_id, message_id)
+    return {"status": "pinned", "chat_id": chat_id, "message_id": message_id}
+
+
+@allow_only
+async def gmmenu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/gmmenu — (re)post the gateway menu and pin it in the GM's thread."""
+    log.info("gm_menu_opened user=%s source=command", update.effective_user.id)
+    result = await ensure_gm_menu(context.application)
+    status = result.get("status")
+    if status == "pinned":
+        await update.message.reply_text(
+            f"📌 Menu pinned in General (message {result['message_id']})."
+        )
+    elif status == "unpinned":
+        await update.message.reply_text(
+            "⚠️ The menu is in place (message "
+            f"{result.get('message_id')}) but I could NOT pin it: "
+            f"{result.get('detail')}\nGive @homuxBot the "
+            "**Pin messages** admin right (it is separate from manage "
+            "topics), then run /gmmenu again.",
+        )
+    elif status == "skipped":
+        await update.message.reply_text(
+            f"❌ No chat has your dispatcher yet — {result.get('detail')}. "
+            "Write to me in General once, then retry."
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ The menu could not be posted: {result.get('detail')}"
+        )
+
+
 @allow_only
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = _cfg(context)
@@ -4072,6 +4243,22 @@ async def ensure_general_managers_task(app: Application) -> None:
         log.exception("general_mgr_ensure_crashed")
 
 
+async def ensure_gm_menu_task(app: Application) -> None:
+    """Startup fire-and-forget: the pinned menu never blocks polling.
+
+    Also the feature's LIVE probe (the owner's ask, 2026-10-31): only this
+    process may write `state.json`, so the first post/record happens here —
+    an external script could not do it without being clobbered by the next
+    gateway save (the rebind rule).
+    """
+    try:
+        await ensure_gm_menu(app)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # a menu must never take the gateway down
+        log.exception("gm_menu_ensure_crashed")
+
+
 async def post_init(app: Application) -> None:
     cfg: Config = app.bot_data["cfg"]
     client: AmuxClient = app.bot_data["client"]
@@ -4097,6 +4284,10 @@ async def post_init(app: Application) -> None:
     app.bot_data["general_mgr_task"] = asyncio.create_task(
         ensure_general_managers_task(app)
     )
+    # The permanent menu (owner, 2026-10-31): one message, edited + re-pinned
+    # at boot so it is "always shown" in the dispatcher's thread. NOT on the
+    # hourly tick — a loop would override the owner's own pin.
+    app.bot_data["gm_menu_task"] = asyncio.create_task(ensure_gm_menu_task(app))
     log.info(
         "gateway_started allowed_users=%d amux_url=%s voice=%s relay_interval_s=%s "
         "idle_stop_s=%s topic_sync_s=%s",
@@ -4132,6 +4323,13 @@ async def post_shutdown(app: Application) -> None:
         title_task.cancel()
         try:
             await title_task
+        except asyncio.CancelledError:
+            pass
+    menu_task = app.bot_data.get("gm_menu_task")
+    if menu_task is not None:
+        menu_task.cancel()
+        try:
+            await menu_task
         except asyncio.CancelledError:
             pass
     client: AmuxClient = app.bot_data["client"]
@@ -4246,6 +4444,7 @@ def build_application(
     app.add_handler(CommandHandler("effort", effort_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("browse", browse_command))
+    app.add_handler(CommandHandler("gmmenu", gmmenu_command))
     app.add_handler(conversation)
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^gw:"))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))

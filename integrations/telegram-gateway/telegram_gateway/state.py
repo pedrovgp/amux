@@ -790,6 +790,39 @@ class GatewayState:
                     out.setdefault(cid, set()).add(session)
         return out
 
+    # ---- the gateway's own pinned menu (owner, 2026-10-31) ----------------
+
+    def menu_message(self, chat_id: int) -> int | None:
+        """The message id of the pinned gateway menu in this chat.
+
+        Persisted because the ensure EDITs that exact message after a
+        restart — a forgotten id would post a second menu on every boot,
+        and two "permanent" menus are not one.
+        """
+        value = self._chat(chat_id).get("menu_msg")
+        return int(value) if isinstance(value, int) else None
+
+    def set_menu_message(self, chat_id: int, message_id: int) -> None:
+        self._chat(chat_id)["menu_msg"] = int(message_id)
+        self._save()
+
+    def chats_with_topics(self) -> list[int]:
+        """Chats the gateway has BOUND topics in (the forum groups, ordered)."""
+        out: list[int] = []
+        for chat_id, chat in self._data.get("chats", {}).items():
+            topics = chat.get("topics") if isinstance(chat, dict) else None
+            if isinstance(topics, dict) and topics:
+                try:
+                    out.append(int(chat_id))
+                except ValueError:
+                    continue
+        return sorted(out)
+
+    def chat_has_topics(self, chat_id: int) -> bool:
+        chat = self._data.get("chats", {}).get(str(chat_id))
+        topics = chat.get("topics") if isinstance(chat, dict) else None
+        return isinstance(topics, dict) and bool(topics)
+
     # ---- manager agent choice -------------------------------------------
 
     def set_manager(self, chat_id: int, provider: str, model: str | None = None) -> None:

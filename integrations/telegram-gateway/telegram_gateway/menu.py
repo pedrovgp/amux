@@ -143,6 +143,11 @@ def format_worker_line(worker: dict) -> str:
 
 
 def main_menu() -> InlineKeyboardMarkup:
+    """The one menu everywhere: `/start`, `/menu` AND the pinned menu in the
+    dispatcher's thread (owner, 2026-10-31) — same rows, same paradigms, no
+    second keyboard to learn. 🧩 is the session browser (owner's ask that
+    made the menu worth pinning).
+    """
     return InlineKeyboardMarkup(
         [
             [
@@ -159,6 +164,11 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("🧠 Manager settings", callback_data=f"{PREFIX}mgr"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🧩 Sessions by project", callback_data=f"{PREFIX}prj"
+                ),
             ],
         ]
     )

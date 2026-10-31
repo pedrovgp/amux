@@ -149,10 +149,28 @@ class FakeBot:
         self.sent = []
         self.created = []  # (chat_id, name) per create_forum_topic call
         self.markups = []  # (message_id, keyboard) for sends that carried one
+        self.edited = []  # (chat_id, message_id, text) per edit_message_text
+        self.pins = []  # (chat_id, message_id) per pin_chat_message
+        self.pin_error = None  # set to a TelegramError to refuse the pin
+        self.edit_error = None  # set to a TelegramError to refuse the edit
 
     async def create_forum_topic(self, chat_id, name=None):
         self.created.append((chat_id, name))
         return SimpleNamespace(message_thread_id=1000 + len(self.created), name=name)
+
+    async def edit_message_text(
+        self, text, chat_id=None, message_id=None, parse_mode=None, reply_markup=None
+    ):
+        if self.edit_error is not None:
+            raise self.edit_error
+        self.edited.append((chat_id, message_id, text))
+        return SimpleNamespace(message_id=message_id, text=text)
+
+    async def pin_chat_message(self, chat_id, message_id, disable_notification=None, **kw):
+        if self.pin_error is not None:
+            raise self.pin_error
+        self.pins.append((chat_id, message_id))
+        return True
 
     async def send_message(
         self,
