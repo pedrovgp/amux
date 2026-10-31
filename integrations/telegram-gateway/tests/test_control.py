@@ -336,3 +336,63 @@ def test_post_init_skips_the_endpoint_when_disabled(tmp_path, caplog):
 
     assert run(scenario()) is False
     assert "control_disabled" in caplog.text
+
+
+def test_topic_bind_records_the_lanes_pin(tmp_path):
+    """Milestone 11.9: /topic on a PINNED lane records its conversation id at
+    BIND time. That pin is what switches the API relay on for the topic — the
+    only channel that carries outputs of turns driven from anywhere (the
+    owner's dashboard, the CLI, the dispatcher) — and it makes the binding
+    rename-proof (resolution goes pin-first). Without it `set_topic` POPS
+    topic_pins and the topic would relay through the pane sentinel only."""
+    state = GatewayState(tmp_path / "state.json")
+    bot = FakeBot()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/sessions":
+            return httpx.Response(200, json=[
+                {"name": "wk-adopted", "activity": "none", "status": "idle",
+                 "flags": "--session ses_adopted123"},
+            ])
+        return httpx.Response(200, json={})
+
+    client = AmuxClient(
+        "https://localhost:8824", transport=httpx.MockTransport(handler)
+    )
+    app = SimpleNamespace(bot=bot, bot_data={"state": state, "client": client})
+    try:
+        status, _payload = run(
+            dispatch(app, "POST", "/topic",
+                     json.dumps({"session": "wk-adopted", "chat_id": CHAT}).encode())
+        )
+    finally:
+        run(client.aclose())
+
+    assert status == 201
+    assert state.pinned(CHAT, "wk-adopted") == "ses_adopted123"
+    assert state.topic_pin(CHAT, 1001) == "ses_adopted123"  # the relay's key
+
+
+def test_topic_bind_still_works_for_a_name_only_session(tmp_path):
+    """A session amux cannot resolve (or no client at all) keeps the old
+    name-only bind — never a refusal."""
+    state = GatewayState(tmp_path / "state.json")
+    bot = FakeBot()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "session not found"})
+
+    client = AmuxClient(
+        "https://localhost:8824", transport=httpx.MockTransport(handler)
+    )
+    app = SimpleNamespace(bot=bot, bot_data={"state": state, "client": client})
+    try:
+        status, _payload = run(
+            dispatch(app, "POST", "/topic",
+                     json.dumps({"session": "ghost", "chat_id": CHAT}).encode())
+        )
+    finally:
+        run(client.aclose())
+    assert status == 201
+    assert state.topic_session(CHAT, 1001) == "ghost"
+    assert state.topic_pin(CHAT, 1001) is None

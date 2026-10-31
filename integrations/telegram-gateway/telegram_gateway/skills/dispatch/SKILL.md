@@ -35,7 +35,8 @@ in it starts a duplicate worker and the relay has no anchor.
 1. **Pick the project**: `~/Documents/pv/projetos/<…>` — confirm purpose from
    its README/AGENTS.md (`~/.amux/notes/worker/general-mgr/root-projects.md`
    is a snapshot, not the truth).
-2. **Spawn the worker** — `POST $AMUX_URL/api/sessions` with a name that says
+2. **Spawn the worker** — or reuse/adopt one (§5 for adopting an EXISTING
+   conversation into a lane) — `POST $AMUX_URL/api/sessions` with a name that says
    the task, `dir` set to the project, `start:true`, the task as its first
    prompt/instructions, and **PINNED**: mint a conversation id
    (`ses_disp<MMDDHHMM><6 hex>`) as `flags="--session <id>"`. Pinning is what
@@ -76,7 +77,37 @@ Suggest once, name the topic, give the reason — never nag:
 Bots cannot delete topics: your reply names what is safe to remove; the owner
 deletes it in Telegram.
 
-## 5. Staying free
+## 5. Connect a topic to an EXISTING conversation
+
+When the work already has a conversation (a retired lane, a session started
+elsewhere), do NOT spawn a fresh one — adopt it:
+
+1. **Find the id** (every project, with titles):
+
+   ```bash
+   python3 - <<'PY'
+   import json, os, base64, urllib.request
+   d = json.load(open(os.path.expanduser("~/.local/state/opencode/service.json")))
+   req = urllib.request.Request(d["url"] + "/api/session", headers={
+       "Authorization": "Basic " + base64.b64encode(b"opencode:" + d["password"].encode()).decode()})
+   for s in json.load(urllib.request.urlopen(req))["data"]:
+       print(s["id"], "|", s.get("title") or "(untitled)")
+   PY
+   ```
+
+   (`~/.config/opencode/service.json` holds the password alone; the state
+   file above holds url+password together — read it, never invent an id.)
+
+2. **Adopt** — `POST $AMUX_URL/api/sessions`:
+   `{"name": "<task-ish name>", "provider": "opencode", "dir": "<the project
+   that conversation belongs to>", "flags": "--session <ses_id>",
+   "start": true}`. `--session` RESUMES an existing conversation — the same
+   mechanism that revives idle managers — so it continues where it left off.
+   `dir` matters: a conversation belongs to the project it was made in.
+3. **Topic it** (§1, with `chat_id`; the pin is recorded automatically, so
+   answers relay — including turns driven from the dashboard or CLI).
+
+## 6. Staying free
 
 If answering would take longer than dispatching, dispatch. Your thread is a
 queue of decisions, not a workbench — the next customer demand must find you

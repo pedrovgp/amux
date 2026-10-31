@@ -99,6 +99,37 @@ gateway's relay delivers your worker's replies into its bound topic, as long
 as each reply starts with the `—— answer ——` line (put that line in the
 briefing you give the worker).
 
+### Connect a topic to an EXISTING conversation
+
+Work sometimes already has a conversation — a lane you retired, a session
+started elsewhere, a `ses_…` you know. To carry it in a topic:
+
+1. **Find its id** — the shared OpenCode server lists EVERY conversation on
+   this box with titles (a root `opencode session list` only sees one
+   project):
+   ```bash
+   python3 - <<'PY'
+   import json, os, base64, urllib.request
+   d = json.load(open(os.path.expanduser("~/.local/state/opencode/service.json")))
+   req = urllib.request.Request(d["url"] + "/api/session", headers={
+       "Authorization": "Basic " + base64.b64encode(b"opencode:" + d["password"].encode()).decode()})
+   for s in json.load(urllib.request.urlopen(req))["data"]:
+       print(s["id"], "|", s.get("title") or "(untitled)")
+   PY
+   ```
+2. **Adopt it into a lane**: `POST $AMUX_URL/api/sessions` with
+   `flags="--session <ses_id>"`, `dir` = the project that conversation
+   belongs to, `start:true`. `--session` RESUMES an existing conversation
+   (the same mechanism that revives idle managers) — it continues where it
+   left off, it is not a copy.
+3. **`POST /topic`** with that lane's name (plus `chat_id`; a one-line
+   `prompt` is fine as an orientation marker).
+
+After that it behaves exactly like a dispatched worker: the owner writes in
+the topic to continue it, and EVERY answer relays into the topic — including
+turns started from the dashboard or the CLI, because the gateway reads the
+conversation from the shared server, not the pane.
+
 ### If the group does not exist
 
 A `502` whose error mentions the chat, a missing group, or "not enough

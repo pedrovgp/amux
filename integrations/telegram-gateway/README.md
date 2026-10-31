@@ -72,6 +72,13 @@ of a per-conversation manager (owner, 2026-10-30):
 - **Notes**: `~/.amux/notes/worker/general-mgr/` — the root-projects map
   (a snapshot; `ls` is the truth) and the hard facts (group chat id
   `-1004274385104`, the `POST /topic` endpoint, never the Bot API).
+- **It can also CONNECT a topic to an existing conversation** (owner,
+  2026-10-31): find the `ses_…` id on the shared server (`GET /api/session`,
+  every project, with titles), adopt it into a lane pinned to that id
+  (`--session` resumes the conversation where it left off), and open its
+  topic — the pin is recorded at bind time, so the owner interacts in the
+  topic AND every answer relays there, including turns driven from the
+  dashboard or the CLI.
 - **Its brief covers the management contract**: dispatch fast or answer
   fast and stay free for the next demand; open a topic for a fresh worker
   through `POST /topic` (`chat_id` required for sessions no chat has seen);

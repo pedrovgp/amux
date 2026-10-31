@@ -30,6 +30,8 @@ import logging
 
 from telegram.error import TelegramError
 
+from .amux import session_id_from_flags
+
 log = logging.getLogger("telegram_gateway")
 
 MAX_BODY = 64 * 1024
@@ -139,6 +141,23 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
         )
         return 502, {"error": "telegram returned no thread id"}
 
+    # Record the lane's PIN if it has one (11.9): `/topic` used to bind by
+    # name only, which left `state.pinned` unset — and with it the API relay
+    # blind (`_relay_pin` reads it), so a bound session's outputs relayed
+    # only through the pane sentinel, never the structured channel that sees
+    # turns driven from a dashboard or the CLI. `set_pinned` BEFORE
+    # `set_topic`, so the binding writes `topic_pins` too.
+    if not state.pinned(chat_id, session):
+        client = app.bot_data.get("client")
+        if client is not None:
+            try:
+                row = await client.find(session)
+            except Exception:  # noqa: BLE001 — a name-only bind stays valid
+                log.debug("topic_pin_unknown session=%s", session)
+            else:
+                pin = session_id_from_flags(row.get("flags"))
+                if pin:
+                    state.set_pinned(chat_id, session, pin)
     # `created=True`: the OWNER's 11.8 ruling — this topic is ELIGIBLE for
     # the title sync. The task name is its BIRTH name; once OpenCode titles
     # the worker's conversation (seconds after the first turn), the topic is
