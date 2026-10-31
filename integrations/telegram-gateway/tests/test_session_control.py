@@ -938,19 +938,22 @@ def test_effort_command_validates_the_level(tmp_path):
 
 
 def test_topic_ack_carries_the_control_button(tmp_path):
+    """The 🎛 ack rides the START of an ADOPTED topic's manager. (M11.5 took
+    forum-General minting away — General now answers through the dispatcher,
+    so an ack-with-panel comes from an unmapped topic adopting a manager.)"""
     cfg = make_cfg(tmp_path)
     state = GatewayState(tmp_path / "state.json")
     sent, created = [], []
     client = make_manager_amux(sent, created)
     bot = CtlBot()
-    message = FakeMessage(message_id=100, text="start something", thread=None)
+    message = FakeMessage(message_id=100, text="start something", thread=777)
     try:
         run(botmod.on_text(fake_update(message), context_for(cfg, state, client, bot)))
     finally:
         run(client.aclose())
     markup = message.replies[0]["reply_markup"]
     assert buttons(markup) == [f"gw:ctl:{created[0]}"]
-    assert state.topic_session(CHAT, 1001) == created[0]
+    assert state.topic_session(CHAT, 777) == created[0]
 
 
 def test_message_in_an_unbound_topic_still_adopts_after_the_release(tmp_path):

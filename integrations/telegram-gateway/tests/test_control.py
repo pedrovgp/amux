@@ -78,6 +78,7 @@ def test_topic_is_created_bound_and_logged(tmp_path, caplog):
         "session": "mgr-x",
         "name": "mgr-x",
         "created": True,
+        "echoed": False,
     }
     # created in Telegram AND bound in the gateway's own state
     assert bot.created == [(CHAT, "mgr-x")]
@@ -90,6 +91,54 @@ def test_topic_is_created_bound_and_logged(tmp_path, caplog):
     assert created == [
         f"topic_created chat_id={CHAT} thread=1001 name=mgr-x source=control"
     ]
+
+
+def test_prompt_echo_becomes_the_topics_first_message_and_anchor(tmp_path, caplog):
+    """The dispatcher's spawn call carries the task: it lands as the topic's
+    FIRST message and becomes the turn anchor, so scrolling up shows what was
+    asked and the worker's first answer replies to it — the owner's
+    2026-10-29 ask, now carried through `POST /topic` (Milestone 11.6)."""
+    state = GatewayState(tmp_path / "state.json")
+    bot = FakeBot()
+    app = make_app(state, bot)
+    with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+        status, payload = post(
+            app,
+            {"session": "wk-x", "name": "fix-tests", "chat_id": CHAT,
+             "prompt": "Fix the red suite in django-k8s"},
+        )
+    assert status == 201 and payload["echoed"] is True
+    assert bot.sent == [
+        {"chat_id": CHAT, "text": "Fix the red suite in django-k8s",
+         "reply_to": None, "thread": 1001}
+    ]  # plain: no parse_mode, the task verbatim
+    # anchored: the first answer replies to the task inside the topic, and
+    # quoting the echo continues the worker (the same map every bind uses)
+    assert state.turn_message(CHAT, "wk-x") == 901
+    assert state.turn_thread(CHAT, "wk-x") == 1001
+    assert state.session_for_message(CHAT, 901) == "wk-x"
+    assert any("topic_prompt_echoed" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failed_echo_never_refuses_the_spawn(tmp_path, caplog):
+    class DeafBot(FakeBot):
+        async def send_message(self, *args, **kwargs):
+            raise TelegramError("telegram is having a day")
+
+    state = GatewayState(tmp_path / "state.json")
+    app = make_app(state, DeafBot())
+    with caplog.at_level(logging.WARNING, logger="telegram_gateway"):
+        status, payload = post(app, {"session": "wk-y", "chat_id": CHAT, "prompt": "task"})
+    assert status == 201 and payload["created"] is True
+    assert payload["echoed"] is False  # honest, and the topic still exists
+    assert state.topic_session(CHAT, 1001) == "wk-y"
+    assert any("topic_prompt_echo_failed" in r.getMessage() for r in caplog.records)
+
+
+def test_a_non_string_prompt_is_refused_and_prompt_stays_optional(tmp_path):
+    app = make_app(GatewayState(tmp_path / "state.json"))
+    assert post(app, {"session": "wk-z", "chat_id": CHAT, "prompt": 42})[0] == 400
+    assert post(app, {"session": "wk-z", "chat_id": CHAT})[0] == 201
 
 
 def test_explicit_chat_id_and_custom_name(tmp_path, caplog):

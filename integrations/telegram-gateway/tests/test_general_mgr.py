@@ -25,9 +25,18 @@ from telegram_gateway import bot as botmod
 from telegram_gateway.amux import AmuxClient
 from telegram_gateway.manager import general_manager_name
 
+from telegram_gateway.state import GatewayState
+
 from test_fresh_session import ResetAmux
-from test_session_control import lane
-from test_topics import make_cfg, run
+from test_session_control import CtlBot, lane
+from test_topics import (
+    CHAT,
+    FakeMessage,
+    fake_context,
+    fake_update,
+    make_cfg,
+    run,
+)
 
 
 def gm_app(cfg, client):
@@ -196,3 +205,112 @@ def test_config_default_points_at_the_packaged_prompt(tmp_path):
     cfg = make_cfg(tmp_path)
     assert cfg.general_mgr_instructions_file.name == "general_mgr_prompt.md"
     assert cfg.general_mgr_instructions_file.exists()
+
+
+# ---- 11.5: forum General routes to the dispatcher --------------------------
+
+
+def _dispatcher_row(**kw):
+    return lane("general-mgr-1", flags="--session ses_gm1", **kw)
+
+
+def test_forum_general_text_routes_to_the_dispatcher(tmp_path, caplog):
+    """The owner's ruling: a forum-General message mints NOTHING — it goes to
+    the sender's own dispatcher, anchored in General (`route=dispatcher`)."""
+    cfg = make_cfg(tmp_path)
+    state = GatewayState(tmp_path / "state.json")
+    amux = ResetAmux(rows=[_dispatcher_row()])
+    bot = CtlBot()
+    message = FakeMessage(message_id=100, text="dispatch this", thread=None)
+
+    try:
+        with caplog.at_level("INFO", logger="telegram_gateway"):
+            run(
+                botmod.on_text(
+                    fake_update(message),
+                    fake_context(cfg, amux.client, state, bot),
+                )
+            )
+    finally:
+        run(amux.aclose())
+
+    assert amux.created_bodies == []  # no lane minted
+    assert bot.created == []  # no topic minted
+    assert message.replies == []  # no ack: the answer is the reply
+    assert (
+        "POST",
+        "/api/sessions/general-mgr-1/send",
+        {"text": "[from Telegram @owner] dispatch this"},
+    ) in amux.calls
+    # a RUNNING dispatcher is never spuriously started (`is False` guard)
+    assert not any(c[0] == "POST" and c[1].endswith("/start") for c in amux.calls)
+    # anchored in General: thread None, on the dispatcher itself
+    assert state.turn_message(CHAT, "general-mgr-1") == 100
+    assert state.turn_thread(CHAT, "general-mgr-1") is None
+    assert any(
+        "prompt_text" in m and "route=dispatcher" in m for m in caplog.messages
+    )
+
+
+def test_forum_general_creates_the_dispatcher_on_first_message(tmp_path, caplog):
+    """Create-on-first-use: the gateway restarted while amux was down, the
+    hourly ensure has not run — the first message heals the ring itself."""
+    cfg = make_cfg(tmp_path)
+    state = GatewayState(tmp_path / "state.json")
+    amux = ResetAmux()  # no rows: the dispatcher does not exist yet
+    bot = CtlBot()
+    message = FakeMessage(message_id=100, text="hello", thread=None)
+
+    try:
+        with caplog.at_level("INFO", logger="telegram_gateway"):
+            run(
+                botmod.on_text(
+                    fake_update(message),
+                    fake_context(cfg, amux.client, state, bot),
+                )
+            )
+    finally:
+        run(amux.aclose())
+
+    (body,) = amux.created_bodies
+    assert body["name"] == "general-mgr-1"
+    assert body["flags"].startswith("--session ses_tg")  # pinned
+    assert any(
+        c[0] == "POST" and c[1] == "/api/sessions/general-mgr-1/instructions"
+        for c in amux.calls
+    )  # briefed before its first turn
+    assert any(
+        "POST" in c and c[1] == "/api/sessions/general-mgr-1/send"
+        for c in amux.calls
+    )
+    assert any(
+        "general_mgr_ensured" in m and "source=first_message" in m
+        for m in caplog.messages
+    )
+    assert bot.created == []  # still no topic
+
+
+def test_private_chats_keep_manager_mode(tmp_path):
+    """M11.5 is forum-scoped: a private chat has no dispatcher surface, so a
+    plain message still mints its own manager (the M6 contract)."""
+    cfg = make_cfg(tmp_path)
+    state = GatewayState(tmp_path / "state.json")
+    amux = ResetAmux()
+    bot = CtlBot()
+    message = FakeMessage(message_id=100, text="hello", thread=None)
+
+    try:
+        run(
+            botmod.on_text(
+                fake_update(message, forum=False),
+                fake_context(cfg, amux.client, state, bot),
+            )
+        )
+    finally:
+        run(amux.aclose())
+
+    assert amux.created_bodies and amux.created_bodies[0]["name"].startswith("mgr-")
+    assert not any(
+        "general-mgr" in str(c[1]) for c in amux.calls
+    )  # the dispatcher is never touched
+    assert message.replies  # the private "Starting … reply here" ack

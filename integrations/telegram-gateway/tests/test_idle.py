@@ -163,10 +163,13 @@ def test_opencode_manager_is_pinned_and_carries_the_session_flag(tmp_path, caplo
     bot = FakeBot()
     message = FakeMessage(message_id=100, text="hello", thread=None)
 
+    # M11.5: forum General routes to the dispatcher, so manager-choice
+    # creation (and its pinning/model rules) is exercised from a private chat.
     try:
         run(
             botmod.on_text(
-                fake_update(message), fake_context(cfg, fake.client, state, bot)
+                fake_update(message, forum=False),
+                fake_context(cfg, fake.client, state, bot),
             )
         )
     finally:
@@ -194,7 +197,8 @@ def test_other_provider_is_not_pinned_and_keeps_its_model(tmp_path, caplog):
     try:
         run(
             botmod.on_text(
-                fake_update(message), fake_context(cfg, fake.client, state, bot)
+                fake_update(message, forum=False),
+                fake_context(cfg, fake.client, state, bot),
             )
         )
     finally:

@@ -30,7 +30,9 @@ Telegram  ⇄  telegram-gateway (this module)  ⇄  amux server (https://localho
 
 ### Manager mode
 
-A message that is not a quote-reply starts a fresh **manager agent**: a fleet
+A message that is not a quote-reply starts a fresh **manager agent** — in a
+**private chat** (in forum General the plain message is the dispatcher's; see
+below): a fleet
 lane in `~/Documents/pv/projetos`, briefed with `manager_prompt.md` (override
 with `MANAGER_INSTRUCTIONS_FILE`). The role is deliberate: answer questions
 briefly, delegate real work to other lanes through the amux CLI/API
@@ -45,7 +47,8 @@ Which agent starts is yours to choose: **🧠 Manager settings** lists providers
 
 The thread rule is strict and Telegram-shaped: **quote any bot message — the
 answer, the "started" ack — to continue that session; any other message starts
-a new one.**
+a new one** (in forum General it goes to your general manager instead — see
+the forum section).
 
 ### The general manager (one dispatcher per allowed owner)
 
@@ -81,10 +84,13 @@ of a per-conversation manager (owner, 2026-10-30):
 
 In a forum group the **topic replaces the quote**:
 
-- **General** → a fresh manager; the gateway creates a topic named after the
-  session (`mgr-…`) and posts your message into it as its **first message**
-  (logged as `prompt_echoed`) — a topic always opens with the prompt that
-  created it, and the first answer replies to that copy, inside the topic.
+- **General** → your **general manager** (the dispatcher — one per allowed
+  owner): it answers right there in General. Nothing is minted: no manager,
+  no topic, no ack — the reply IS the answer. Dispatches happen when the
+  dispatcher opens a topic through `POST /topic`, carrying the task as
+  `"prompt"` so a dispatched topic still opens with the prompt that created
+  it (`topic_prompt_echoed`) and its worker's first answer replies to that
+  copy, inside the topic.
 - **Inside a topic** → the message continues that topic's session. No reply or
   quote needed — the topic *is* the session selector.
 - **An unmapped topic** (created by hand, or state loss) → a fresh manager
@@ -127,9 +133,11 @@ Logs to watch: `idle_stop`, `idle_stop_undone`, `idle_stop_skipped_cards`,
 
 ### Meaningful topic names
 
-A topic you start in General is born named after the lane (`mgr-1027-1536-8b4e`)
-— while OpenCode titles the same conversation from its content a few seconds
-after the first turn. `TELEGRAM_GATEWAY_TOPIC_SYNC_S` (default **60**, `0`
+Topics minted from General are gone (M11.5 routes General to the dispatcher),
+and `POST /topic` names are deliberate — the dispatcher names a topic after
+its task, which is already the meaningful name. For any gateway-minted topic
+for a PINNED session the sync remains: OpenCode titles the conversation from
+its content seconds after the first turn, and `TELEGRAM_GATEWAY_TOPIC_SYNC_S` (default **60**, `0`
 disables) makes the topic follow that title: every tick, a topic the gateway
 minted for a PINNED session whose recorded name is still the session name is
 renamed once to OpenCode's title (`editForumTopic`, clamped to Telegram's 128

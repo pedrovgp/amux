@@ -20,12 +20,20 @@ dispatching instead.
    `~/Documents/pv/projetos` (your map:
    `~/.amux/notes/worker/general-mgr/root-projects.md`; refresh it with `ls`
    and read a project's README/AGENTS.md before assuming what it is).
-2. Spawn a worker if nothing alive fits — `POST $AMUX_URL/api/workers` (or
-   `amux register …`), provider/model/dir chosen for THAT project, and brief
-   it with the task in its instructions/first prompt.
-3. Open a topic for the worker's session in the owner's Telegram group (the
-   `dispatch` skill and §Topics below have the exact call), then tell the
-   owner ONE line: what was dispatched, where it now lives, expected signal.
+2. Spawn a worker if nothing alive fits — `POST $AMUX_URL/api/sessions`
+   (lane; `amux register …` is the same call), provider/model/dir chosen for
+   THAT project, **PINNED**: mint your own conversation id (the
+   `ses_disp<MMDDHHMM><6 hex>` shape) and send it as
+   `flags="--session <id>"`, plus `start:true`. The pin is what makes the
+   worker's answers relay into its topic (the gateway reads them from the
+   shared OpenCode server); an unpinned worker's answers can only be scraped
+   from its pane and may arrive nowhere. Brief it with the task as its first
+   prompt/instructions — and put the task in the topic too (step 3).
+3. Open a topic for the worker's session in the owner's Telegram group —
+   pass the task VERBATIM as `"prompt"` so it lands as the topic's first
+   message (the `dispatch` skill and §Topics below have the exact call), then
+   tell the owner ONE line: what was dispatched, where it now lives,
+   expected signal.
 4. File a card (`POST $AMUX_URL/api/board`, `session` = the worker) whenever
    the work should outlive the conversation or be tracked — workers
    themselves delegate the same way (they create cards; you pick them up
@@ -62,7 +70,7 @@ you name, and logs `topic_created`):
 ```
 curl -sS -X POST http://127.0.0.1:8834/topic \
   -H 'content-type: application/json' \
-  -d '{"session":"<the session that should own the topic>","chat_id":-1004274385104,"name":"<short task name>"}'
+  -d '{"session":"<the session that should own the topic>","chat_id":-1004274385104,"name":"<short task name>","prompt":"<the task, verbatim>"}'
 ```
 
 - `session` (required): the session the topic belongs to — a worker you just
@@ -74,8 +82,15 @@ curl -sS -X POST http://127.0.0.1:8834/topic \
   in a chat.
 - `name` (optional): defaults to the session name; must be unique per group
   (`409 name_exists` → pick another name).
+- `prompt` (optional but do it for every dispatch): the task text, echoed
+  plain into the NEW topic as its first message AND set as the session's
+  turn anchor — the owner scrolls up to see what was asked, and the
+  worker's first answer replies to it inside the topic. The answer reports
+  `"echoed": true|false`; a false only means the echo failed (the topic
+  still exists — say so if it matters).
 - Answers: `201 {"thread":…}` created · `200 {"created":false}` it already
-  has one (calling twice is safe) · `502 {"error":…}` Telegram refused.
+  has one (calling twice is safe — the prompt echoes only on creation) ·
+  `502 {"error":…}` Telegram refused.
 
 After that, do nothing in the topic yourself: never post into it. The
 gateway's relay delivers your worker's replies into its bound topic, as long

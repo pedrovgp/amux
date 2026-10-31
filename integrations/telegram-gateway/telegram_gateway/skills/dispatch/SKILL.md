@@ -14,13 +14,14 @@ hold the current project map.
 ```bash
 curl -sS -X POST http://127.0.0.1:8834/topic \
   -H 'content-type: application/json' \
-  -d '{"session":"<session>","chat_id":-1004274385104,"name":"<name>"}'
+  -d '{"session":"<session>","chat_id":-1004274385104,"name":"<name>","prompt":"<the task, verbatim>"}'
 ```
 
 | answer | meaning | do |
 |---|---|---|
-| `201 {"thread":…}` | created | proceed; never post into it yourself |
-| `200 {"created":false}` | the session already has its topic | proceed (idempotent) |
+| `201 {"thread":…,"echoed":true}` | created, task echoed as its first message + anchor | proceed; never post into it yourself |
+| `201 {"thread":…,"echoed":false}` | created, echo failed | proceed; the topic has no context — mention the task in your owner summary |
+| `200 {"created":false}` | the session already has its topic | proceed (idempotent; prompt echoes only on creation) |
 | `409 name_exists` | another topic carries `name` | pick a distinct name, retry once |
 | `400 chat_id required` | the session is not bound to any chat yet | add `"chat_id":-1004274385104` |
 | `502 {"error":…}` | Telegram refused — group missing or bot not admin | §3 |
@@ -34,11 +35,16 @@ in it starts a duplicate worker and the relay has no anchor.
 1. **Pick the project**: `~/Documents/pv/projetos/<…>` — confirm purpose from
    its README/AGENTS.md (`~/.amux/notes/worker/general-mgr/root-projects.md`
    is a snapshot, not the truth).
-2. **Spawn the worker** — `POST $AMUX_URL/api/workers` with a name that says
-   the task, `dir` set to the project, and the task as its brief; `amux
-   register …` is the same call. Reuse a live worker when one already fits
+2. **Spawn the worker** — `POST $AMUX_URL/api/sessions` with a name that says
+   the task, `dir` set to the project, `start:true`, the task as its first
+   prompt/instructions, and **PINNED**: mint a conversation id
+   (`ses_disp<MMDDHHMM><6 hex>`) as `flags="--session <id>"`. Pinning is what
+   makes its answers relay into its topic (the gateway reads them from the
+   shared OpenCode server; an unpinned worker can only be pane-scraped, and
+   its answers may arrive nowhere). Reuse a live worker when one already fits
    (`amux sessions` — don't spawn a second of what exists).
-3. **Open its topic** (§1) with `chat_id`, name = short task name.
+3. **Open its topic** (§1) with `chat_id`, `name` = short task name, and the
+   task as `prompt` (echoed as the topic's first message + turn anchor).
 4. **Track it** — `POST $AMUX_URL/api/board` with `session` = the worker, so
    the work survives the conversation and your board sweep can see it.
 5. **Tell the owner one line**: what went, where it lives, what signal to

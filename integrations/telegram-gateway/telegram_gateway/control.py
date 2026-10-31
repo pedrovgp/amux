@@ -55,6 +55,12 @@ REASONS = {
 async def create_topic(app, payload: dict) -> tuple[int, dict]:
     """Create a forum topic, bind it to ``session``, log it. Idempotent.
 
+    Optional ``prompt`` (the dispatcher's spawn call): the task text is
+    echoed plain into the NEW topic and becomes the session's turn anchor, so
+    the owner can scroll up to what was asked and the first answer replies to
+    it. The ``201`` body reports ``echoed``; an echo failure WARNs but never
+    refuses the spawn.
+
     Returns ``(http status, json body)``; the body always says what happened
     so a manager can tell a real topic from a refused one without reading logs.
     """
@@ -64,6 +70,10 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     if not isinstance(session, str) or not session.strip():
         return 400, {"error": "session is required"}
     session = session.strip()
+
+    prompt = payload.get("prompt")
+    if prompt is not None and not isinstance(prompt, str):
+        return 400, {"error": "prompt must be a string"}
 
     name = payload.get("name")
     if name is None or name == "":
@@ -130,11 +140,46 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     log.info(
         "topic_created chat_id=%s thread=%s name=%s source=control", chat_id, thread, name
     )
+    echoed = False
+    if isinstance(prompt, str) and prompt.strip():
+        # The task that created the topic becomes its FIRST message and the
+        # session's turn anchor — scrolling up shows WHAT the worker was asked
+        # and its first answer replies to that (the contract the gateway's own
+        # minted topics had from the owner's 2026-10-29 ask, now carried by
+        # the dispatcher's spawn call). Plain, never parse_mode: the task text
+        # goes verbatim, the caller's own words.
+        body_text = prompt.strip()
+        try:
+            sent = await app.bot.send_message(
+                chat_id, body_text, message_thread_id=int(thread)
+            )
+            message_id = getattr(sent, "message_id", None)
+            if message_id is not None:
+                state.record_message(chat_id, int(message_id), session)
+                state.set_turn_message(chat_id, session, int(message_id), thread=int(thread))
+                echoed = True
+                log.info(
+                    "topic_prompt_echoed session=%s thread=%s msg_id=%s chars=%s",
+                    session,
+                    thread,
+                    message_id,
+                    len(body_text),
+                )
+        except TelegramError as exc:
+            # The topic exists and is bound either way: a failed echo is a
+            # WARN, never a refused spawn.
+            log.warning(
+                "topic_prompt_echo_failed session=%s thread=%s error=%s",
+                session,
+                thread,
+                exc,
+            )
     return 201, {
         "thread": int(thread),
         "session": session,
         "name": name,
         "created": True,
+        "echoed": echoed,
     }
 
 

@@ -72,9 +72,11 @@ PROMPT = 1
 ASK = 2  # the ✏️ rename / ⌨️ custom-model prompt conversation
 
 # A burst of identical messages in General (a client retry, a double tap, a
-# forwarded copy) would open one topic per copy: each General message starts a
-# fresh manager by design. An identical repeat inside DUP_WINDOW_S is merged
-# into the session the first copy started instead.
+# forwarded copy) is ONE intent: since Milestone 11.5 every copy routes to the
+# sender's dispatcher, and the record makes a repeat inside DUP_WINDOW_S show
+# up in the log as a merge into that same session instead of a second routing.
+# Recorded only after the first delivery landed (a failure must not swallow
+# the next identical message).
 DUP_WINDOW_S = 30.0
 RECENT_STARTS = "recent_starts"
 MAX_RECENT_STARTS = 100
@@ -2065,6 +2067,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await _continue_session(update, context, duplicate, text, "text")
         return
+    if getattr(update.effective_chat, "is_forum", False):
+        # FORUM GENERAL → the dispatcher (Milestone 11.5): the sender's own
+        # general-mgr answers HERE; no manager, no minted topic.
+        await _to_dispatcher(update, context, text, source="text")
+        return
+    # A private chat has no dispatcher surface: it keeps manager mode.
     await _start_manager(update, context, text, source="text")
 
 
@@ -2076,6 +2084,7 @@ async def _continue_session(
     source: str,
     *,
     anchor: int | None = None,
+    route: str = "reply",
 ) -> None:
     """Deliver a quote-reply to the session it quotes (the same session rule).
 
@@ -2084,6 +2093,10 @@ async def _continue_session(
     TRANSCRIPTION message, never to the audio bubble the owner cannot read
     back. The transcription is itself a reply to the audio, so the thread
     still opens at the voice note.
+
+    ``route`` names HOW the session was chosen — ``reply`` (a quote) or
+    ``dispatcher`` (forum General, Milestone 11) — so a sweep can tell the
+    two deliveries apart in the log.
     """
     chat_id = update.effective_chat.id
     state = _state(context)
@@ -2098,11 +2111,12 @@ async def _continue_session(
         # quoting any other bot message.
         state.record_message(chat_id, anchor, session)
     log.info(
-        "prompt_%s user=%s session=%s chars=%s route=reply",
+        "prompt_%s user=%s session=%s chars=%s route=%s",
         source,
         update.effective_user.id,
         session,
         len(text),
+        route,
     )
     try:
         await _deliver_prompt(context, chat_id, session, text, _username(update))
@@ -2113,80 +2127,100 @@ async def _continue_session(
     # is the confirmation. One extra line per turn would double the traffic.
 
 
-async def _create_forum_topic(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, name: str
-) -> int | None:
-    """Create the group topic a session will live in; ``None`` on failure.
-
-    Failure is never fatal: the session falls back to the plain General
-    behavior (today's pre-topic mode), and ``topic_create_failed`` is the
-    sweep signal for the fallback ever being taken.
-    """
-    chat_id = update.effective_chat.id
-    try:
-        topic = await context.application.bot.create_forum_topic(chat_id, name=name)
-    except TelegramError as exc:
-        log.warning(
-            "topic_create_failed chat_id=%s name=%s error=%s", chat_id, name, exc
-        )
-        return None
-    thread = getattr(topic, "message_thread_id", None)
-    if thread is None:
-        log.warning(
-            "topic_create_failed chat_id=%s name=%s detail=no thread id", chat_id, name
-        )
-        return None
-    log.info("topic_created chat_id=%s thread=%s name=%s", chat_id, thread, name)
-    return int(thread)
-
-
-async def _echo_prompt_into_topic(
+async def _to_dispatcher(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    *,
-    thread: int,
     text: str,
-    session: str,
-) -> int | None:
-    """Post the owner's prompt INSIDE the topic it just minted (Task 3).
+    *,
+    source: str,
+    anchor: int | None = None,
+) -> None:
+    """Forum General → THE dispatcher: the sender's own ``general-mgr-<uid>``.
 
-    Verbatim and plain — never ``parse_mode``, so quotes, underscores or a
-    code block in the prompt cannot make Telegram reject or reformat the one
-    message that is supposed to be the owner's own words. Returns its id, or
-    ``None`` on any failure, in which case the caller keeps today's anchor (the
-    owner's message in General) instead of inventing one.
+    Owner decision 2026-10-30 ("pointing General at the dispatcher is your
+    call → do it"): General stops minting a manager + topic per message and
+    becomes the ONE dispatcher's thread — the answer arrives right here as a
+    reply, and real work goes into topics the dispatcher opens through
+    ``POST /topic``. Private chats keep manager mode (this branch is
+    forum-only), a quote-reply keeps its old meaning (handled before this),
+    and unmapped topics still adopt.
 
-    Gateway code only: a manager never sends this — a second copy would fight
-    with the ``[from Telegram @…]`` marker the pane already carries. For a
-    voice note ``text`` is the TRANSCRIPTION (computed before the anchor is
-    set), never the audio: the audio bubble is unreadable, the transcript is
-    what the turn was about.
+    The dispatcher normally exists (startup ensure + hourly tick). If it does
+    not — the gateway restarted while amux was down — it is created ON DEMAND
+    with the same brief, so the ring heals on first use instead of at the next
+    deploy; a stopped one is started again (spawn-on-demand: the lane is just
+    the execution of a session that never went away). Any failure answers
+    honestly and is logged with the ``general_mgr_`` prefix a sweep greps.
     """
     chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    name = general_manager_name(uid)
+    client = _client(context)
     try:
-        sent = await context.application.bot.send_message(
-            chat_id, text, message_thread_id=thread
-        )
-    except TelegramError as exc:
-        log.warning(
-            "prompt_echo_failed chat_id=%s thread=%s session=%s error=%s",
-            chat_id,
-            thread,
-            session,
-            exc,
-        )
-        return None
-    message_id = getattr(sent, "message_id", None)
-    if message_id is None:
-        return None
-    log.info(
-        "prompt_echoed session=%s thread=%s msg_id=%s chars=%s",
-        session,
-        thread,
-        message_id,
-        len(text),
+        row = await client.find(name)
+    except AmuxError as exc:
+        if exc.status != 404:
+            # Unreachable: the send below carries its own retry and reports
+            # honestly — never guess a dispatcher into existence from a blip.
+            log.debug(
+                "dispatcher_probe_failed uid=%s status=%s detail=%s",
+                uid,
+                exc.status,
+                exc.detail,
+            )
+        else:
+            cfg = _cfg(context)
+            try:
+                await create_manager(
+                    client,
+                    cfg,
+                    name=name,
+                    flags=f"--session {new_opencode_session_id()}",
+                    instructions=load_instructions_file(
+                        cfg.general_mgr_instructions_file
+                    ),
+                )
+            except AmuxError as creation_exc:
+                log.warning(
+                    "general_mgr_ensure_failed uid=%s name=%s status=%s detail=%s "
+                    "source=first_message",
+                    uid,
+                    name,
+                    creation_exc.status,
+                    creation_exc.detail,
+                )
+                await update.message.reply_text(
+                    f"❌ the dispatcher `{name}` is unavailable right now "
+                    f"({creation_exc.detail}) — try again in a minute."
+                )
+                return
+            log.info(
+                "general_mgr_ensured uid=%s name=%s source=first_message", uid, name
+            )
+    else:
+        if row.get("running") is False:
+            # `is False` on purpose: a row that will not say (no `running`
+            # field) is never guessed into a revive — the fleet convention.
+            try:
+                await client.start(name)
+                await client.wait_until_started(name, timeout=25.0)
+                log.info("dispatcher_revived name=%s", name)
+            except AmuxError as start_exc:
+                # Not fatal: the send below reports the real state.
+                log.warning(
+                    "dispatcher_revive_failed name=%s status=%s detail=%s",
+                    name,
+                    start_exc.status,
+                    start_exc.detail,
+                )
+    await _continue_session(
+        update, context, name, text, source, anchor=anchor, route="dispatcher"
     )
-    return int(message_id)
+    if source == "text":
+        # The burst record keeps its old job with a new destination: an
+        # identical repeat inside DUP_WINDOW_S MERGES here (logged) instead
+        # of ever forking a second anything.
+        _record_general_start(context, chat_id, text, name)
 
 
 async def _start_manager(
@@ -2203,9 +2237,11 @@ async def _start_manager(
     ``anchor`` follows the same rule as in ``_continue_session``: a voice
     note's answer replies to the transcription message, not to the audio.
 
-    In a forum group the session gets its own topic named after it: ``topic``
-    is an existing topic to adopt (a message arrived inside one), ``None``
-    means create one (the message arrived in General).
+    In a forum group the topic is an EXISTING one to adopt (a message arrived
+    inside an unmapped topic) — since Milestone 11.5, forum General routes to
+    the sender's dispatcher and no longer mints topics here; minting happens
+    through ``POST /topic`` (the dispatcher's own spawn path), which carries
+    the prompt echo with it.
     """
     cfg = _cfg(context)
     state = _state(context)
@@ -2244,45 +2280,21 @@ async def _start_manager(
 
     # The topic is bound BEFORE the lane exists: an owner message arriving
     # while the lane is still being created must already route somewhere.
+    # Only adoption reaches this with a thread (M11.5: forum General routes to
+    # the dispatcher; gateway-minted topics are created through POST /topic,
+    # which carries the prompt echo with it).
     thread = topic if forum else None
-    fresh_topic = False
-    if forum and thread is None:
-        thread = await _create_forum_topic(update, context, name)
-        fresh_topic = thread is not None
-    if forum and thread is not None:
-        # `created` is what may later be renamed to OpenCode's session title:
-        # only a topic THIS gateway minted (General path), never one adopted
-        # from the owner's hand or opened through POST /topic.
-        state.set_topic(chat_id, thread, name, created=topic is None)
-
-    # Owner, 2026-10-29: "the topic must start with the prompt that created
-    # it" — a minted topic used to show only its ANSWER, so scrolling up never
-    # showed what started it. For the fresh-General case (and ONLY it — adoption,
-    # dedup/merge, quote-reply and non-forum chats must not echo), the owner's
-    # prompt becomes the topic's FIRST message and the turn's anchor: the first
-    # answer then replies to it inside the topic, which is exactly where the
-    # relay's cross-thread rule used to have to drop `reply_to`.
     anchor_thread = in_thread
-    if fresh_topic and thread is not None:
-        echoed = await _echo_prompt_into_topic(
-            update, context, thread=thread, text=text, session=name
-        )
-        if echoed is not None:
-            anchor_id = echoed
-            anchor_thread = thread
-            state.record_message(chat_id, echoed, name)
-
     if forum and thread is not None:
-        if thread == in_thread:
-            ack_text = (
-                f"🧠 Starting `{name}` ({choice['provider']}) — send messages in "
-                "this topic to continue it."
-            )
-        else:
-            ack_text = (
-                f"🧠 Starting `{name}` ({choice['provider']}) — continuing in "
-                f"its own topic."
-            )
+        # `created` stays False: an adopted topic is the owner's, never the
+        # gateway's — so the OpenCode title sync must not retitle it. (The
+        # `topic is None` arm is kept as the honest expression of the rule in
+        # case a mint path ever returns here.)
+        state.set_topic(chat_id, thread, name, created=topic is None)
+        ack_text = (
+            f"🧠 Starting `{name}` ({choice['provider']}) — send messages in "
+            "this topic to continue it."
+        )
     else:
         ack_text = f"🧠 Starting `{name}` ({choice['provider']}) — reply here to continue it."
 
@@ -2425,6 +2437,14 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = _session_from_reply(update, context)
     if session:
         await _continue_session(update, context, session, transcript, "voice", anchor=anchor)
+        return
+    if getattr(update.effective_chat, "is_forum", False):
+        # Same forum-General rule as text (Milestone 11.5): the transcription
+        # goes to the sender's dispatcher; its answer replies to the
+        # TRANSCRIPT (never the audio bubble), still here in General.
+        await _to_dispatcher(
+            update, context, transcript, source="voice", anchor=anchor
+        )
         return
     await _start_manager(update, context, transcript, source="voice", anchor=anchor)
 

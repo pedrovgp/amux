@@ -1,19 +1,18 @@
-"""Dedup: a burst of identical General messages is ONE session, not N.
+"""Dedup + General → the dispatcher (Milestone 7 contract → 11.5).
 
-The owner's client can hand the gateway the same sentence twice within a few
-seconds (the 2026-10-27 09:29 incident: 3 messages in 7 s). Each General
-message starts a fresh manager and its own topic by design, so an unguarded
-burst opened 3 topics for one intent.
+Old contract (M7): each forum-General message started a fresh manager AND its
+own topic by design, so a burst (the 2026-10-27 09:29 incident: 3 messages in
+7 s) opened 3 topics for one intent — dedup merged a repeat into the session
+the first copy started.
 
-The contract asserted here:
-
-1. identical text inside ``DUP_WINDOW_S`` (30 s) -> the second message is
-   delivered to the session the first one started, and logs
-   ``duplicate_general_merged`` — no second topic, no second lane;
-2. different text -> still a new session/topic (dedup is exact-match);
-3. outside the window -> new session/topic;
-4. a session that failed to start or has been stopped -> falls through to the
-   normal new-session path instead of vanishing into a dead lane.
+New contract (M11.5, owner 2026-10-30): forum General mints NOTHING. Every
+copy routes to the sender's own `general-mgr-<uid>` — so the burst record's
+surviving job is visibility: a repeat inside ``DUP_WINDOW_S`` logs
+``duplicate_general_merged`` as a merge into the SAME dispatcher instead of a
+second routing, and different text (or an expired window) simply routes
+normally. A dispatcher found STOPPED is revived before its prompt is
+delivered — spawn-on-demand — and is never replaced by a second session; a
+dispatcher that cannot be created answers honestly instead of silently.
 """
 import json
 import logging
@@ -35,37 +34,52 @@ from test_topics import (
 )
 
 TEXT = "Create a topic and answer me there any answer will do"
+DISPATCHER = "general-mgr-1"  # fake_update's sender is user id 1
 
 
-def amux(sent, created, statuses=None):
+def amux(sent, created, statuses=None, starts=None):
     """A client that records ``(session, prompt)`` and can mark lanes dead.
 
-    ``statuses`` maps session name -> status, so a test can stop the session
-    the first message started before the duplicate arrives.
+    ``statuses`` maps session name -> status (a ``stopped`` status also flips
+    the row's ``running`` to False — the fact a revive keys on), and
+    ``starts`` records every ``…/start`` call by session name.
     """
     statuses = statuses if statuses is not None else {}
+    starts = starts if starts is not None else []
 
     def handler(request):
         path = request.url.path
         if request.method == "POST" and path == "/api/sessions":
-            if request.url.params.get("force") == "fail":
-                return httpx.Response(500, json={"error": "boom"})
             created.append(json.loads(request.content)["name"])
             return httpx.Response(201, json={"ok": True})
         if request.method == "GET" and path == "/api/sessions":
             rows = [
-                {"name": name, "activity": "none", "status": statuses.get(name, "idle")}
+                {
+                    "name": name,
+                    "activity": "none",
+                    "status": statuses.get(name, "idle"),
+                    "running": statuses.get(name, "idle") != "stopped",
+                }
                 for name in created
             ]
             return httpx.Response(200, json=rows)
         if request.method == "POST" and path.endswith("/send"):
             sent.append((path.split("/")[-2], json.loads(request.content)["text"]))
             return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and path.endswith("/start"):
+            starts.append(path.split("/")[-2])
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST":
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(200, json={})
 
     return AmuxClient("https://localhost:8824", transport=httpx.MockTransport(handler))
+
+
+def seeded_amux(sent, created, statuses=None, starts=None):
+    """The fleet as a running gateway finds it: the dispatcher already exists."""
+    created.append(DISPATCHER)
+    return amux(sent, created, statuses, starts)
 
 
 def failing_amux():
@@ -84,13 +98,11 @@ def failing_amux():
 # ---- the four contracts ---------------------------------------------------
 
 
-def test_identical_general_messages_open_one_topic_and_one_session(
-    tmp_path, caplog
-):
+def test_identical_general_messages_all_reach_the_dispatcher(tmp_path, caplog):
     cfg = make_cfg(tmp_path)
     state = GatewayState(tmp_path / "state.json")
     sent, created = [], []
-    client = amux(sent, created)
+    client = seeded_amux(sent, created)
     bot = FakeBot()
     context = fake_context(cfg, client, state, bot)
 
@@ -104,44 +116,34 @@ def test_identical_general_messages_open_one_topic_and_one_session(
         finally:
             run(client.aclose())
 
-    # one topic, one lane, two prompts — both to the same session
-    assert len(bot.created) == 1
-    assert len(created) == 1
-    session = created[0]
+    # General minted NOTHING: no lane, no topic, no ack — and both copies of
+    # the burst went to the one dispatcher.
+    assert created == [DISPATCHER]
+    assert bot.created == []
+    assert first.replies == [] and second.replies == []
     assert sent == [
-        (session, f"[from Telegram @owner] {TEXT}"),
-        (session, f"[from Telegram @owner] {TEXT}"),
+        (DISPATCHER, f"[from Telegram @owner] {TEXT}"),
+        (DISPATCHER, f"[from Telegram @owner] {TEXT}"),
     ]
-    assert state.topic_session(CHAT, 1001) == session
 
-    # the signal a sweep can catch, exactly once
+    # the signal a sweep can catch, exactly once: a MERGE, not a routing
     merged = [
         r for r in caplog.records if r.getMessage().startswith("duplicate_general_merged")
     ]
     assert len(merged) == 1
-    assert f"session={session}" in merged[0].getMessage()
+    assert f"session={DISPATCHER}" in merged[0].getMessage()
     assert "msg=101" in merged[0].getMessage()
     assert f"chat_id={CHAT}" in merged[0].getMessage()
 
-    # only the first message got the "Starting" ack; the merged one is silent
-    assert len(first.replies) == 1
-    assert second.replies == []
-
-    # …and only the FRESH message was echoed into the topic (Task 3): the
-    # merged duplicate continues an existing session, so it must not post a
-    # second copy of the same sentence into the topic the first one opened.
-    assert len(bot.sent) == 1
-    assert bot.sent[0]["text"] == TEXT and bot.sent[0]["thread"] == 1001
-
-    # the merged turn anchors on the duplicate, so its answer is relayed too
-    assert state.turn_message(CHAT, session) == 101
+    # the merged turn re-anchors on the duplicate, so its answer replies there
+    assert state.turn_message(CHAT, DISPATCHER) == 101
 
 
-def test_different_text_still_starts_a_new_session(tmp_path):
+def test_different_text_goes_to_the_same_dispatcher_without_a_merge_log(tmp_path):
     cfg = make_cfg(tmp_path)
     state = GatewayState(tmp_path / "state.json")
     sent, created = [], []
-    client = amux(sent, created)
+    client = seeded_amux(sent, created)
     bot = FakeBot()
     context = fake_context(cfg, client, state, bot)
 
@@ -156,18 +158,21 @@ def test_different_text_still_starts_a_new_session(tmp_path):
     finally:
         run(client.aclose())
 
-    assert len(created) == 2
-    assert len(bot.created) == 2  # a topic each
-    assert [s for s, _ in sent] == created
+    # exact-match dedup: different text is two independent turns of ONE
+    # dispatcher — never a second session or topic (M7's contract is gone)
+    assert created == [DISPATCHER]
+    assert bot.created == []
+    assert [s for s, _ in sent] == [DISPATCHER, DISPATCHER]
+    assert all(s == DISPATCHER for s, _ in sent)
 
 
-def test_identical_message_past_the_window_starts_a_new_session(
+def test_a_repeat_outside_the_window_is_not_logged_as_a_merge(
     tmp_path, monkeypatch, caplog
 ):
     cfg = make_cfg(tmp_path)
     state = GatewayState(tmp_path / "state.json")
     sent, created = [], []
-    client = amux(sent, created)
+    client = seeded_amux(sent, created)
     bot = FakeBot()
     context = fake_context(cfg, client, state, bot)
 
@@ -182,50 +187,75 @@ def test_identical_message_past_the_window_starts_a_new_session(
         finally:
             run(client.aclose())
 
-    assert len(created) == 2
-    assert len(bot.created) == 2
+    assert created == [DISPATCHER]  # still nothing minted
+    assert bot.created == []
     assert "duplicate_general_merged" not in caplog.text
+    assert len(sent) == 2
 
 
-def test_stopped_session_falls_through_to_a_new_one(tmp_path, caplog):
-    """A dead lane must not swallow the repeat: the burst gets a fresh session."""
+def test_a_stopped_dispatcher_is_revived_not_replaced(tmp_path, caplog):
+    """Spawn-on-demand: a dispatcher that is down gets STARTED again —
+    its conversation is a session that never went away — and the fleet never
+    grows a second session for the same owner."""
     cfg = make_cfg(tmp_path)
     state = GatewayState(tmp_path / "state.json")
-    sent, created, statuses = [], [], {}
-    client = amux(sent, created, statuses)
+    sent, created, statuses, starts = [], [], {}, []
+    client = seeded_amux(sent, created, statuses, starts)
     bot = FakeBot()
     context = fake_context(cfg, client, state, bot)
 
     with caplog.at_level(logging.INFO, logger="telegram_gateway"):
         try:
             run(botmod.on_text(fake_update(FakeMessage(100, text=TEXT, thread=None)), context))
-            statuses[created[0]] = "stopped"  # the first session dies
+            statuses[DISPATCHER] = "stopped"  # the dispatcher dies mid-day
             run(botmod.on_text(fake_update(FakeMessage(101, text=TEXT, thread=None)), context))
         finally:
             run(client.aclose())
 
-    assert len(created) == 2
-    assert len(bot.created) == 2
+    assert created == [DISPATCHER]  # NEVER replaced
+    assert bot.created == []
+    assert starts == [DISPATCHER]  # revived, not re-created
+    assert any(
+        r.getMessage().startswith("dispatcher_revived") for r in caplog.records
+    )
+    assert sent and sent[-1][0] == DISPATCHER  # the prompt landed after revival
+    # the stale record was dropped (the session was dead), so no merge claim
     assert "duplicate_general_merged" not in caplog.text
-    # the second prompt went to the NEW session, not the stopped one
-    assert sent[-1][0] == created[1]
 
 
-def test_failed_start_is_not_recorded_as_a_merge_target(tmp_path, caplog):
-    """A manager that never came up cannot be a merge target."""
+def test_a_dispatcher_that_cannot_be_created_is_reported_not_silent(
+    tmp_path, caplog
+):
+    """No dispatcher and no way to make one (amux refuses): the owner gets an
+    honest line, and NOTHING is delivered as if it had been."""
     cfg = make_cfg(tmp_path)
     state = GatewayState(tmp_path / "state.json")
     bot = FakeBot()
     client = failing_amux()
     context = fake_context(cfg, client, state, bot)
+    first = FakeMessage(message_id=100, text=TEXT, thread=None)
+    second = FakeMessage(message_id=101, text=TEXT, thread=None)
 
     with caplog.at_level(logging.INFO, logger="telegram_gateway"):
         try:
-            run(botmod.on_text(fake_update(FakeMessage(100, text=TEXT, thread=None)), context))
-            run(botmod.on_text(fake_update(FakeMessage(101, text=TEXT, thread=None)), context))
+            run(botmod.on_text(fake_update(first), context))
+            run(botmod.on_text(fake_update(second), context))
         finally:
             run(client.aclose())
 
-    assert len(bot.created) == 2  # both attempts opened (and released) a topic
-    assert "duplicate_general_merged" not in caplog.text
-    assert "manager_create_failed" in caplog.text
+    # no prompt was ever "delivered"
+    assert not [
+        r for r in caplog.records if r.getMessage().startswith("prompt_text")
+    ]
+    # the failure is named for a sweep, once per attempt …
+    warns = [
+        r
+        for r in caplog.records
+        if "general_mgr_ensure_failed" in r.getMessage()
+        and "source=first_message" in r.getMessage()
+    ]
+    assert len(warns) == 2
+    # … and BOTH attempts answered the owner instead of vanishing
+    for message in (first, second):
+        assert message.replies
+        assert "unavailable right now" in message.replies[0]["text"]

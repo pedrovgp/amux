@@ -256,73 +256,38 @@ def fake_transcriber(monkeypatch, text="assunto falado"):
 # ---- routing: General / mapped topic / unmapped topic ---------------------
 
 
-def test_general_message_creates_manager_and_its_topic(tmp_path):
+def test_general_message_routes_to_the_dispatcher(tmp_path, caplog):
+    """M11.5: forum General mints NOTHING — the sender's own general-mgr
+    answers right here; its prompt is one send, anchored in General."""
     cfg = make_cfg(tmp_path)
     state = GatewayState(tmp_path / "state.json")
     sent, created = [], []
-    client = make_manager_amux(sent, created)
+    client = make_manager_amux(sent, created, names=("general-mgr-1",))
     bot = FakeBot()
     message = FakeMessage(message_id=100, text="start a research task", thread=None)
     update = fake_update(message)
 
     try:
-        run(botmod.on_text(update, fake_context(cfg, client, state, bot)))
+        with caplog.at_level("INFO", logger="telegram_gateway"):
+            run(botmod.on_text(update, fake_context(cfg, client, state, bot)))
     finally:
         run(client.aclose())
 
-    # exactly one topic, named after the session that was created
-    # (FakeBot's first topic id is 1000 + len(created) == 1001)
-    assert bot.created == [(CHAT, created[0])]
-    session = created[0]
-    assert session.startswith("mgr-")
-    assert state.topic_session(CHAT, 1001) == session
-    assert state.session_topic(CHAT, session) == 1001
-
-    # the ack went back in General (a reply) and points at the topic
-    assert message.replies and "own topic" in message.replies[0]["text"]
-
-    # Task 3 (owner, 2026-10-29): the topic STARTS with the prompt that created
-    # it — posted plain, verbatim, into the new thread — and that posted copy
-    # becomes the turn anchor, so the first answer replies to it INSIDE the
-    # topic instead of to a General anchor the relay had to drop.
-    assert bot.sent == [
-        {"chat_id": CHAT, "text": "start a research task", "reply_to": None,
-         "thread": 1001}
-    ]
-    assert state.turn_message(CHAT, session) == 901  # FakeBot's first send id
-    assert state.turn_thread(CHAT, session) == 1001
-    assert state.session_for_message(CHAT, 901) == session  # quoting it continues
-
-    # the prompt reached the lane
-    assert sent and sent[0]["text"] == "[from Telegram @owner] start a research task"
-
-
-def test_the_prompt_echo_is_logged_for_a_sweep(tmp_path, caplog):
-    """`prompt_echoed session=… thread=… msg_id=…` — the Task-3 sweep line."""
-    cfg = make_cfg(tmp_path)
-    state = GatewayState(tmp_path / "state.json")
-    sent, created = [], []
-    client = make_manager_amux(sent, created)
-    bot = FakeBot()
-    message = FakeMessage(message_id=105, text="open a topic for this", thread=None)
-
-    try:
-        with caplog.at_level(logging.INFO, logger="telegram_gateway"):
-            run(
-                botmod.on_text(
-                    fake_update(message), fake_context(cfg, client, state, bot)
-                )
-            )
-    finally:
-        run(client.aclose())
-
-    session = created[0]
-    echoes = [r.getMessage() for r in caplog.records if "prompt_echoed" in r.getMessage()]
-    assert len(echoes) == 1, echoes
-    assert f"session={session}" in echoes[0]
-    assert "thread=1001" in echoes[0] and "msg_id=901" in echoes[0]
-    # …and the message it names is the one sitting in the topic
-    assert bot.sent[0]["thread"] == 1001
+    assert created == []  # no manager lane minted
+    assert bot.created == []  # no topic minted
+    assert message.replies == []  # no ack: the answer IS the reply
+    # `sent` carries the stamped prompt; the target is proven three ways:
+    # nothing else was created, no error/ack reply appeared, and the anchor
+    # (below) is on the dispatcher itself.
+    assert sent == [{"text": "[from Telegram @owner] start a research task"}]
+    # anchored in GENERAL: the dispatcher's answer replies to the owner's
+    # message right here (thread None = General)
+    assert state.turn_message(CHAT, "general-mgr-1") == 100
+    assert state.turn_thread(CHAT, "general-mgr-1") is None
+    assert any(
+        "prompt_text" in r.getMessage() and "route=dispatcher" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_message_in_a_mapped_topic_continues_that_session(tmp_path):
@@ -399,38 +364,14 @@ def test_non_forum_chat_never_touches_topics(tmp_path):
     assert bot.sent == []  # Task 3: no topic, no echo — the ack is the only reply
 
 
-def test_topic_creation_failure_falls_back_to_general(tmp_path):
-    cfg = make_cfg(tmp_path)
-    state = GatewayState(tmp_path / "state.json")
-    sent, created = [], []
-    client = make_manager_amux(sent, created)
-    bot = FakeBot()
-
-    async def failing_topic(chat_id, name=None):
-        raise TelegramError("forum not available")
-
-    bot.create_forum_topic = failing_topic
-    message = FakeMessage(message_id=110, text="anyway continue", thread=None)
-    update = fake_update(message)
-
-    try:
-        run(botmod.on_text(update, fake_context(cfg, client, state, bot)))
-    finally:
-        run(client.aclose())
-
-    # the session survives with today's General behavior: no topic bound,
-    # ack answers in-thread, prompt delivered.
-    assert created and state.session_topic(CHAT, created[0]) is None
-    assert message.replies and "reply here" in message.replies[0]["text"]
-    assert sent and sent[0]["text"] == "[from Telegram @owner] anyway continue"
-
-
-def test_manager_create_failure_releases_the_topic(tmp_path):
+def test_manager_create_failure_releases_the_adopted_topic(tmp_path):
+    """An unmapped topic adopted the lane; creation failing must give the
+    topic back (adoptable), with the failure edited into the ack."""
     cfg = make_cfg(tmp_path)
     state = GatewayState(tmp_path / "state.json")
     client = make_manager_amux(status=500)
     bot = FakeBot()
-    message = FakeMessage(message_id=120, text="do it", thread=None)
+    message = FakeMessage(message_id=120, text="do it", thread=777)
     update = fake_update(message)
 
     try:
@@ -438,12 +379,10 @@ def test_manager_create_failure_releases_the_topic(tmp_path):
     finally:
         run(client.aclose())
 
-    # topic created (first thread id is 1001), lane creation failed
-    # -> the topic is adoptable again
-    assert len(bot.created) == 1 and bot.created[0][0] == CHAT
-    assert bot.created[0][1].startswith("mgr-")
-    assert state.topic_session(CHAT, 1001) is None
-    assert state.session_topic(CHAT, "nobody") is None
+    # adoption never mints a topic …
+    assert bot.created == []
+    # … and the one it BOUND is released when the lane never came up
+    assert state.topic_session(CHAT, 777) is None
     # the failure was edited into the ack, not swallowed
     ack = message.replies[0]["obj"]
     assert ack.edits and "Could not start a manager" in ack.edits[-1]
@@ -452,13 +391,13 @@ def test_manager_create_failure_releases_the_topic(tmp_path):
 # ---- voice in the forum ---------------------------------------------------
 
 
-def test_voice_in_general_opens_the_topic_for_the_transcript_session(
-    tmp_path, monkeypatch
-):
+def test_voice_in_general_goes_to_the_dispatcher(tmp_path, monkeypatch):
+    """M11.5 for voice: the TRANSCRIPT (never the audio) goes to the sender's
+    dispatcher, and its answer replies to the transcript here in General."""
     cfg = make_cfg(tmp_path)
     state = GatewayState(tmp_path / "state.json")
     sent, created = [], []
-    client = make_manager_amux(sent, created)
+    client = make_manager_amux(sent, created, names=("general-mgr-1",))
     bot = FakeBot()
     fake_transcriber(monkeypatch)
     message = FakeMessage(message_id=400, thread=None, voice=True)
@@ -472,21 +411,15 @@ def test_voice_in_general_opens_the_topic_for_the_transcript_session(
     # transcription echoed in General (readable where the voice was sent)...
     assert message.replies[0]["text"] == "🗣️ Transcribed: assunto falado"
     transcription_id = message.replies[0]["message_id"]
-    # ...the session gets a topic, and the TRANSCRIPT — never the audio — is
-    # posted into it as the turn anchor (Task 3): the first answer replies to
-    # that copy inside the topic.
-    session = created[0]
-    assert bot.created == [(CHAT, session)]
-    assert state.topic_session(CHAT, 1001) == session
-    assert bot.sent == [
-        {"chat_id": CHAT, "text": "assunto falado", "reply_to": None, "thread": 1001}
-    ]
-    assert state.turn_message(CHAT, session) == 901
-    assert state.turn_thread(CHAT, session) == 1001
-    # quoting the General transcription still continues the same session
-    assert state.session_for_message(CHAT, transcription_id) == session
-    assert state.session_for_message(CHAT, 901) == session
-    assert sent and sent[0]["text"] == "[from Telegram @owner] assunto falado"
+    # ...and delivered to the dispatcher: no topic, no manager, one send
+    assert created == []
+    assert bot.created == []
+    assert sent == [{"text": "[from Telegram @owner] assunto falado"}]
+    # the ANCHOR is the transcript (M4's voice rule), here in General
+    assert state.turn_message(CHAT, "general-mgr-1") == transcription_id
+    assert state.turn_thread(CHAT, "general-mgr-1") is None
+    # quoting the General transcription still continues the dispatcher
+    assert state.session_for_message(CHAT, transcription_id) == "general-mgr-1"
 
 
 def test_voice_inside_a_mapped_topic_continues_it(tmp_path, monkeypatch):
