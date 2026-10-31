@@ -59,7 +59,10 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     echoed plain into the NEW topic and becomes the session's turn anchor, so
     the owner can scroll up to what was asked and the first answer replies to
     it. The ``201`` body reports ``echoed``; an echo failure WARNs but never
-    refuses the spawn.
+    refuses the spawn. The topic is marked eligible for the title sync: born
+    with the ``name`` you gave it, renamed ONCE to the session's OpenCode
+    title when that title lands (owner, "I want", 2026-10-30) — and never
+    again.
 
     Returns ``(http status, json body)``; the body always says what happened
     so a manager can tell a real topic from a refused one without reading logs.
@@ -136,7 +139,12 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
         )
         return 502, {"error": "telegram returned no thread id"}
 
-    state.set_topic(chat_id, int(thread), session, name)
+    # `created=True`: the OWNER's 11.8 ruling — this topic is ELIGIBLE for
+    # the title sync. The task name is its BIRTH name; once OpenCode titles
+    # the worker's conversation (seconds after the first turn), the topic is
+    # renamed ONCE to that title (`topic_renamed … source=opencode_title`).
+    # Hand-made (adopted) topics still pass False and are never touched.
+    state.set_topic(chat_id, int(thread), session, name, created=True)
     log.info(
         "topic_created chat_id=%s thread=%s name=%s source=control", chat_id, thread, name
     )

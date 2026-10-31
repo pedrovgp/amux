@@ -125,6 +125,11 @@ class FakeOcClient:
         self._maybe_fail("interrupt")
         return {"interrupted": True}
 
+    async def sessions(self):
+        self.owner.calls.append(("sessions",))
+        self._maybe_fail("sessions")
+        return [dict(r) for r in self.owner.sessions_list]
+
 
 class FakeOc:
     """Offline stand-in for `telegram_gateway.opencode_api` in bot_data.
@@ -134,9 +139,10 @@ class FakeOc:
     child-then-shared transport order is exercised offline.
     """
 
-    def __init__(self, *, models=(), session=None, fail=None, fail_call=None,
-                 fail_child=None, fail_service=None):
+    def __init__(self, *, models=(), session=None, sessions=(), fail=None,
+                 fail_call=None, fail_child=None, fail_service=None):
         self.models = [dict(m) for m in models]
+        self.sessions_list = [dict(r) for r in sessions]  # GET /api/session rows
         self.session = json.loads(json.dumps(session or SESSION))
         self.fail = fail  # raised by both entry points: nothing is reachable
         self.fail_child = fail_child  # raised by client_for only

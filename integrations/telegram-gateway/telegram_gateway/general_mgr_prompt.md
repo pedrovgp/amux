@@ -81,7 +81,9 @@ curl -sS -X POST http://127.0.0.1:8834/topic \
   group is `-1004274385104`. Omit it only for a session that already lives
   in a chat.
 - `name` (optional): defaults to the session name; must be unique per group
-  (`409 name_exists` → pick another name).
+  (`409 name_exists` → pick another name). It is the topic's BIRTH name: once
+  OpenCode titles the worker's conversation, the topic is renamed once to
+  that title — the name you pick is a placeholder, not a contract.
 - `prompt` (optional but do it for every dispatch): the task text, echoed
   plain into the NEW topic as its first message AND set as the session's
   turn anchor — the owner scrolls up to see what was asked, and the

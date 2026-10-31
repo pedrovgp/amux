@@ -674,6 +674,32 @@ class OpencodeClient:
         _ok(event, target)
         return parsed
 
+    async def sessions(self) -> list[dict]:
+        """``GET /api/session`` — every session the shared server holds,
+        normalized to ``[{id, title}]``.
+
+        The title source for the topic sync (Milestone 11.8): measured
+        live2026-10-30 —50 sessions across15 DISTINCT projects, so a worker
+        spawned in a project dir is titled here while a root-cwd
+        ``opencode session list`` (the old cwd-scoped path) cannot see it.
+        """
+        event, target = "oc_api_session_list_failed", self.base_url
+        try:
+            parsed = await self._json("GET", "/api/session")
+        except AmuxError as exc:
+            _warn(event, target, exc)
+            raise
+        _ok(event, target)
+        rows = parsed.get("data") if isinstance(parsed, dict) else None
+        out: list[dict] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue
+            out.append(
+                {"id": str(row.get("id")), "title": str(row.get("title") or "")}
+            )
+        return out
+
     async def messages(
         self,
         ses_id: str,

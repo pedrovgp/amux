@@ -80,10 +80,13 @@ def test_topic_is_created_bound_and_logged(tmp_path, caplog):
         "created": True,
         "echoed": False,
     }
-    # created in Telegram AND bound in the gateway's own state
+    # created in Telegram AND bound in the gateway's own state — flagged for
+    # the title sync (11.8: the birth name follows the session's OpenCode
+    # title, once)
     assert bot.created == [(CHAT, "mgr-x")]
     assert state.topic_session(CHAT, 1001) == "mgr-x"
     assert state.session_topic(CHAT, "mgr-x") == 1001
+    assert state.topic_created(CHAT, 1001) is True
     # the sweep signal
     created = [
         r.getMessage() for r in caplog.records if "topic_created" in r.getMessage()

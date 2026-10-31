@@ -19,7 +19,7 @@ curl -sS -X POST http://127.0.0.1:8834/topic \
 
 | answer | meaning | do |
 |---|---|---|
-| `201 {"thread":…,"echoed":true}` | created, task echoed as its first message + anchor | proceed; never post into it yourself |
+| `201 {"thread":…,"echoed":true}` | created, task echoed as its first message + anchor; the topic follows the worker's OpenCode title once it lands | proceed; never post into it yourself |
 | `201 {"thread":…,"echoed":false}` | created, echo failed | proceed; the topic has no context — mention the task in your owner summary |
 | `200 {"created":false}` | the session already has its topic | proceed (idempotent; prompt echoes only on creation) |
 | `409 name_exists` | another topic carries `name` | pick a distinct name, retry once |

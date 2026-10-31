@@ -3011,28 +3011,70 @@ async def idle_sweep_loop(app: Application) -> None:
 _rename_warned: set[tuple[int, int]] = set()
 
 
+async def _session_titles(app, cfg) -> tuple[dict, str]:
+    """``(session id -> title, source)`` for the topic sync: the SHARED
+    service first, the measured cwd path as the fallback.
+
+    Milestone 11.8: the title source had to outgrow the root cwd — a worker
+    spawned in a project dir is titled in a project ``opencode session list``
+    run from the root cannot see (measured live: the serve's
+    ``GET /api/session`` answers50 sessions across15 distinct projects, and
+    the dispatcher's own session is among them). The service failing for any
+    reason falls back to ``read_titles(cwd)`` — titles are a nicety, so the
+    fallback must be quiet and a total failure is ``( {}, … )``: topics wait.
+    """
+    api = app.bot_data.get("oc_api") or opencode_api
+    try:
+        client = await api.client_for_service(
+            url=cfg.opencode_service_url,
+            password=cfg.opencode_service_password,
+            service_json=cfg.opencode_service_json,
+            state_json=cfg.opencode_service_state,
+        )
+    except AmuxError:
+        return await read_titles(cfg.manager_cwd), "cwd"
+    try:
+        rows = await client.sessions()
+        titles = {
+            row["id"]: row["title"] for row in rows if isinstance(row, dict) and row.get("id")
+        }
+        return titles, "api"
+    except AmuxError:
+        return await read_titles(cfg.manager_cwd), "cwd"
+    finally:
+        close = getattr(client, "aclose", None)
+        if close is not None:
+            await close()
+
+
 async def sync_topic_titles_once(app: Application) -> None:
-    """Rename a gateway-made topic to its OpenCode session's title.
+    """Rename an eligible topic to its OpenCode session's title — ONCE.
 
     Owner, 2026-10-27: "use meaningful names for topics — it should match the
-    session name in opencode". A topic is born `mgr-…` (the lane name) while
-    OpenCode titles the same conversation from its content seconds after the
-    first turn; the topic follows that title.
+    session name in opencode"; reaffirmed 2026-10-30 ("I want") for
+    DISPATCHER-spawned topics: the task name is the birth name, the worker's
+    OpenCode title takes over seconds after its first turn.
 
-    Eligibility is deliberately narrow, and each guard has a reason:
+    Eligibility and each guard's reason:
 
-    - **pinned session** — only an opencode lane has the id that selects its
-      title (legacy/other-provider lanes are never touched).
-    - **topic the GATEWAY minted** — a topic you made by hand, or one a manager
-      opened through ``POST /topic``, keeps the name it was given.
-    - **recorded name still == the session name** — a renamed topic drops out
-      of the sweep here, which is what makes this ONE rename per topic (no
-      churn, no process spawned when nothing is pending) rather than a follower
-      of every later retitle.
+    - **pinned session** — only an opencode conversation has the id that
+      selects its title (legacy/other-provider lanes are never touched, and
+      an unpinned worker keeps its birth name).
+    - **``topic_created`` now means "the sync may retitle this, once"** —
+      set by the pre-11.5 mint path, by ``POST /topic`` (the dispatcher's
+      spawn), and re-armed by a fresh session. A topic you made by hand
+      (adoption) passes False and is never touched; an owner rename releases
+      it (``release_topic_title``).
+    - **``recorded != title``** replaces the old "recorded == session name"
+      gate: the title is the goal, so equality IS the done state (this also
+      kills the old same-name edit edge). A successful rename RELEASES the
+      flag — the flag is exactly "not yet titled", which is what keeps this
+      ONE rename per topic (later retitles are not tracked, and nothing is
+      read when no topic is pending).
 
-    The Bot API cannot read a topic's title back, so `state.topic_names` is the
-    only record of what a topic is called: the rename writes it, and the same
-    field is the dedupe.
+    The Bot API cannot read a topic's title back, so `state.topic_names` is
+    the only record of what a topic is called: the rename writes it, it is
+    the dedupe, and the source (`via=api|cwd`) says which path named it.
     """
     cfg: Config = app.bot_data["cfg"]
     state: GatewayState = app.bot_data["state"]
@@ -3048,19 +3090,24 @@ async def sync_topic_titles_once(app: Application) -> None:
             if not pin:
                 continue
             if not state.topic_created(chat_id, thread):
-                continue
-            if (state.topic_name(chat_id, thread) or session) != session:
-                continue  # already renamed, or named deliberately elsewhere
+                continue  # hand-made, or already titled (flag released)
             candidates.append((chat_id, thread, session, pin))
     if not candidates:
         return
-    titles = await read_titles(cfg.manager_cwd)
+    titles, via = await _session_titles(app, cfg)
     bot = app.bot
     for chat_id, thread, session, pin in candidates:
         title = clean_title(titles.get(pin))
         if title is None:
             # No title yet (OpenCode's title job still running) or a stub:
             # wait for the real one — a topic is renamed only once.
+            continue
+        recorded = state.topic_name(chat_id, thread) or session
+        if recorded == title:
+            # Already there — including the birth-name-equals-title case:
+            # release so this topic stops being re-read every tick (and never
+            # attempts a same-name edit Telegram would reject).
+            state.release_topic_title(chat_id, thread)
             continue
         try:
             await bot.edit_forum_topic(chat_id, message_thread_id=thread, name=title)
@@ -3080,14 +3127,18 @@ async def sync_topic_titles_once(app: Application) -> None:
         _rename_warned.discard((chat_id, thread))
         previous = state.topic_name(chat_id, thread) or session
         state.set_topic_name(chat_id, thread, title)
+        # One rename per topic: the flag is spent, so no later retitle is
+        # tracked and an owner rename afterwards sticks without a release.
+        state.release_topic_title(chat_id, thread)
         log.info(
             "topic_renamed chat_id=%s thread=%s session=%s from=%s to=%s "
-            "source=opencode_title",
+            "source=opencode_title via=%s",
             chat_id,
             thread,
             session,
             previous,
             title,
+            via,
         )
 
 

@@ -217,13 +217,15 @@ class GatewayState:
         (the gateway's own convention) and is remembered separately because
         Telegram lets two topics share a name while this map may not.
 
-        ``created`` says the GATEWAY minted this topic (the General path), as
-        opposed to adopting one the owner made by hand or a manager opened
-        through ``POST /topic``. Only a created topic may later be renamed to
-        match its OpenCode session title: an adopted topic's recorded name
-        falls back to the session name, so without this flag "recorded name ==
-        session name" would be true for the owner's own topics too and the
-        sync would overwrite names he chose.
+        ``created`` says the TITLE SYNC may retitle this topic — exactly once:
+        a topic minted from General (pre-11.5), one opened through
+        ``POST /topic`` (its birth name follows the worker's OpenCode title
+        once — the owner's "I want", 2026-10-30), or one re-armed after a
+        fresh session. An adopted topic (the owner's own) passes False and is
+        never touched, and an owner rename RELEASES the flag (see
+        ``release_topic_title``) — because the Bot API cannot read a title
+        back, so this flag plus ``topic_names`` are the only truth about who
+        owns the name.
 
         When the session already has a pin, ``topic_pins`` records it beside
         the name — that id is what a later rename resolves through.
@@ -309,14 +311,15 @@ class GatewayState:
         self._save()
 
     def release_topic_title(self, chat_id: int, thread_id: int) -> None:
-        """Hand a topic's title over to whoever just named it (the owner).
+        """Hand a topic's title over to whoever just named it.
 
-        The OpenCode title sync only edits a topic it MINTED (`topic_created`),
-        and dedupes on "recorded name == session name". A session rename
-        satisfies that identity again — so without this release the sync would
-        retitle the topic back to OpenCode's session title on its next tick and
-        silently undo the owner's rename. Popping the flag says: this title now
-        belongs to the human, stop following.
+        The OpenCode title sync only edits a topic whose ``topic_created``
+        flag is set, and SPENDS that flag after its own one rename (11.8: the
+        flag now means "not yet titled"). An owner rename pops it too: a
+        rename leaves an eligible-looking topic, and without this release the
+        sync would retitle it back to OpenCode's session title on its next
+        tick and silently undo the owner's choice. Popping says: this title
+        now belongs to whoever just named it, stop following.
         """
         chat = self._chat(chat_id)
         made = chat.get("topic_created")

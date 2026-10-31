@@ -90,7 +90,10 @@ In a forum group the **topic replaces the quote**:
   dispatcher opens a topic through `POST /topic`, carrying the task as
   `"prompt"` so a dispatched topic still opens with the prompt that created
   it (`topic_prompt_echoed`) and its worker's first answer replies to that
-  copy, inside the topic.
+  copy, inside the topic. The topic is BORN with the task name and renamed
+  **once** to the worker's own OpenCode session title when that title lands
+  (`topic_renamed … source=opencode_title via=api`) — owner's call,
+  2026-10-30.
 - **Inside a topic** → the message continues that topic's session. No reply or
   quote needed — the topic *is* the session selector.
 - **An unmapped topic** (created by hand, or state loss) → a fresh manager
@@ -133,15 +136,20 @@ Logs to watch: `idle_stop`, `idle_stop_undone`, `idle_stop_skipped_cards`,
 
 ### Meaningful topic names
 
-Topics minted from General are gone (M11.5 routes General to the dispatcher),
-and `POST /topic` names are deliberate — the dispatcher names a topic after
-its task, which is already the meaningful name. For any gateway-minted topic
-for a PINNED session the sync remains: OpenCode titles the conversation from
-its content seconds after the first turn, and `TELEGRAM_GATEWAY_TOPIC_SYNC_S` (default **60**, `0`
+Topics are no longer minted from General (M11.5 routes it to the
+dispatcher); the two eligible sources are `POST /topic` (the dispatcher's
+spawn — born with the task name) and a re-armed fresh session. OpenCode
+titles the conversation from its content seconds after the first turn, and `TELEGRAM_GATEWAY_TOPIC_SYNC_S` (default **60**, `0`
 disables) makes the topic follow that title: every tick, a topic the gateway
 minted for a PINNED session whose recorded name is still the session name is
 renamed once to OpenCode's title (`editForumTopic`, clamped to Telegram's 128
-characters) and recorded in `state.json`.
+characters) and recorded in `state.json` — and the flag is spent there, so a
+topic is renamed **once** (later retitles are not tracked, and an owner
+rename still sticks). The title comes from the shared serve's
+`GET /api/session` first (one call across ALL projects — measured 50
+sessions/15 projects, because a worker lives in its project's directory,
+where a root-cwd `opencode session list` cannot see it), falling back to
+`opencode session list` in the root when the service cannot answer.
 
 - **Topics you created by hand are never renamed** (only gateway-minted ones are
   eligible — the `topic_created` flag in state), and neither are topics opened
