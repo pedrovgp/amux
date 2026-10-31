@@ -60,11 +60,13 @@ of a per-conversation manager (owner, 2026-10-30):
   task — provisioning never blocks polling) and on the hourly lifecycle
   tick, a missing dispatcher is created (pinned, root projects dir, fleet
   provider), briefed from the packaged `general_mgr_prompt.md` and started.
-  An existing one is left alone (create-only — re-briefing would disturb a
-  live conversation). Every outcome is sweepable: `general_mgr_ensured`,
-  `general_mgr_present` (once per process), `general_mgr_ensure_failed`
-  (uid + status + detail, retried hourly). Override the brief with
-  `GENERAL_MGR_INSTRUCTIONS_FILE`.
+  An existing one is never re-created (create-only) but is **brief-healed**:
+  when the packaged prompt changed since it was provisioned, the saved
+  instructions are re-saved (`general_mgr_rebriefed` — save-only, it cannot
+  disturb a live conversation; an unreadable read never rewrites). Every
+  outcome is sweepable: `general_mgr_ensured`, `general_mgr_present` (once
+  per process), `general_mgr_ensure_failed` (uid + status + detail, retried
+  hourly). Override the brief with `GENERAL_MGR_INSTRUCTIONS_FILE`.
 - **Skill**: its `dispatch` skill ships in the package
   (`telegram_gateway/skills/dispatch/SKILL.md`) and is installed
   content-idempotently into `~/.config/opencode/skill/dispatch/` — the
@@ -82,10 +84,39 @@ of a per-conversation manager (owner, 2026-10-30):
 - **Its brief covers the management contract**: dispatch fast or answer
   fast and stay free for the next demand; open a topic for a fresh worker
   through `POST /topic` (`chat_id` required for sessions no chat has seen);
-  when the group is missing or the bot lacks admin, ask the owner to create
-  the group and invite @homuxBot with **manage topics**; suggest deleting a
-  topic when its task is closed, superseded or stale (bots cannot delete
-  topics); reply with `—— answer ——` so the relay can deliver.
+  **post the dispatch report into that topic** through the gateway's second
+  route, `POST /message` (`{"session","text"}` → `201 {"thread":…}` posted,
+  `409 no_topic` = open the topic first — the caller never names a thread,
+  the gateway resolves it from its own binding); when the group is missing
+  or the bot lacks admin, ask the owner to create the group and invite
+  @homuxBot with **manage topics**; suggest deleting a topic when its task
+  is closed, superseded or stale (bots cannot delete topics); reply with
+  `—— answer ——` so the relay can deliver.
+
+### Session browser (resume an existing conversation)
+
+The dispatcher's surface carries a **🧩 Sessions by project** button (it
+rides on every relayed dispatcher answer; `/browse` opens it anywhere):
+
+1. every project directory — grouped from the shared OpenCode server's
+   `GET /api/session` (`location.directory`), with each project's
+   conversation count;
+2. tapping a project lists its conversations: **title · last update · ✅ if
+   a lane already adopts it**;
+3. tapping a conversation adopts it: a lane pinned to that exact `ses_…` in
+   the conversation's project dir (`POST /api/sessions`, `--session`
+   **resumes** — it never copies; an already-pinned lane is **reused**, one
+   conversation ever gets one lane), its topic opened through the same
+   `POST /topic` path the dispatcher uses, and the conversation's **last
+   messages posted as the topic intro** (`topic_prompt_echoed`) so the owner
+   picks up where it was left.
+
+Buttons carry the `ses_…` id itself (never an index into a list that may
+have moved); project rows carry an index into the list AS RENDERED, and a
+stale tap re-renders the current list instead of guessing. Sweep signals:
+`browse_opened`, `browse_adopted`, `browse_topic_bound`, and one WARN per
+stretch (`oc_api_fallback`, `browse_adopt_failed`, `browse_topic_failed`)
+when the OpenCode service or amux cannot answer.
 
 ### Forum topics (groups with Topics enabled)
 

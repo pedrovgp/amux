@@ -204,6 +204,26 @@ class AmuxClient:
             body={"instructions": instructions},
         )
 
+    async def instructions(self, name: str) -> str | None:
+        """The saved standing instructions of a lane, or ``None``: UNREADABLE.
+
+        Shape measured live 2026-10-31: ``{"instructions": "…"}``. ``None``
+        is deliberately distinct from ``""`` — it means "could not tell", and
+        a reader that cannot prove drift must never rewrite a brief (the
+        dispatcher's self-heal keys on exactly this distinction).
+        """
+        try:
+            data = await self._json(
+                "GET", f"/api/sessions/{self._key(name)}/instructions"
+            )
+        except AmuxError:
+            return None
+        if isinstance(data, dict):
+            value = data.get("instructions")
+            if isinstance(value, str) and value.strip():
+                return value
+        return None
+
     async def config(self, name: str, **fields) -> dict:
         """One config PATCH: ``PATCH /api/sessions/<n>/config`` (lanes) or
         ``PATCH /api/workers/<n>/config`` (rows), chosen by ``_base()`` like

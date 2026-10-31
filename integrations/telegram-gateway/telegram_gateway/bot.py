@@ -26,28 +26,37 @@ from telegram.ext import (
 from . import opencode_api
 from .amux import AmuxClient, AmuxError, session_id_from_flags
 from .config import Config
-from .control import ControlServer
+from .control import ControlServer, create_topic
 from .guard import Guard, allow_only
 from .manager import (
     PROVIDERS,
     create_manager,
     general_manager_name,
     load_instructions_file,
+    new_adopted_lane_name,
     new_manager_name,
     new_opencode_session_id,
 )
 from .menu import (
     EFFORTS,
+    INTRO_MAX_CHARS,
+    INTRO_MAX_MESSAGES,
+    NO_DIRECTORY,
     PREFIX,
+    browse_button,
     control_button,
     control_keyboard,
     ctl_key,
+    dir_label,
     effort_keyboard,
     effort_supported,
     format_worker_line,
     main_menu,
     manager_keyboard,
     model_keyboard,
+    project_sessions_keyboard,
+    projects_from_rows,
+    projects_keyboard,
     session_effort,
     session_model,
     sessions_keyboard,
@@ -56,6 +65,7 @@ from .menu import (
 )
 from .pollwatch import PollWatch, default_watch
 from .relay import (
+    assistant_texts,
     chunk_text,
     delta_since,
     extract_reply,
@@ -250,6 +260,7 @@ async def _send_markdown(
     code_block: bool = False,
     reply_to: int | None = None,
     thread_id: int | None = None,
+    reply_markup=None,
 ) -> list:
     """Send text as Markdown, falling back to plain text on a parse error.
 
@@ -257,10 +268,14 @@ async def _send_markdown(
     session (that map is what a quote-reply is resolved against).
     ``thread_id`` posts into a forum topic; ``reply_to`` must be a message of
     that same thread — the relay enforces this, never across threads.
+    ``reply_markup`` rides the LAST chunk only: a multi-chunk answer would
+    otherwise stack one identical button row per chunk.
     """
     sent = []
-    for chunk in chunk_text(text):
+    chunks = chunk_text(text)
+    for i, chunk in enumerate(chunks):
         payload = f"```\n{chunk}\n```" if code_block else chunk
+        markup = reply_markup if i == len(chunks) - 1 else None
         try:
             message = await bot.send_message(
                 chat_id,
@@ -268,6 +283,7 @@ async def _send_markdown(
                 parse_mode=ParseMode.MARKDOWN,
                 reply_to_message_id=reply_to,
                 message_thread_id=thread_id,
+                reply_markup=markup,
             )
         except BadRequest:
             message = await bot.send_message(
@@ -275,6 +291,7 @@ async def _send_markdown(
                 chunk,
                 reply_to_message_id=reply_to,
                 message_thread_id=thread_id,
+                reply_markup=markup,
             )
         sent.append(message)
     return sent
@@ -1913,6 +1930,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _interrupt(update, context, raw)
     elif action == "ctln":
         await _reset_session(update, context, raw)
+    elif action == "prj":
+        log.info("browse_opened user=%s source=button", update.effective_user.id)
+        if raw:
+            await _show_project_sessions(update, context, raw)
+        else:
+            await _show_projects(update, context)
+    elif action == "adopt":
+        await _adopt_session(update, context, raw)
     elif action in ("ctlr", "ctlc"):
         # The prompt conversation owns both as entry points, registered before
         # this handler: reaching here means that wiring broke. Log it (a button
@@ -2387,6 +2412,351 @@ async def _edit_or_send(message, text: str) -> None:
         await message.reply_text(text)
 
 
+# ---------------------------------------------------------------------------
+# session browser (owner, 2026-10-31): projects -> sessions -> adopt
+# ---------------------------------------------------------------------------
+
+BROWSE_KEY = "browse_projects"  # bot_data: the project list AS RENDERED
+
+
+def _browse_markup(session: str):
+    """The 🧩 button on relayed dispatcher answers — the GM's own surface.
+
+    Only a general-mgr session carries it: the browser is the dispatcher's
+    UI (the owner taps it in the thread where they talk to the GM), and a
+    worker's topic keeps its own panel instead.
+    """
+    if session.startswith("general-mgr-"):
+        return browse_button()
+    return None
+
+
+async def _oc_service(context: ContextTypes.DEFAULT_TYPE, op: str):
+    """A client for the SHARED opencode service, or ``None`` (WARNed once).
+
+    The same transport order contract as everywhere else, minus the lane
+    child: the browser addresses CONVERSATIONS, and the shared service is the
+    one server that holds every project's sessions (M11.8's measured 50
+    sessions across 15 projects).
+    """
+    cfg = _cfg(context)
+    api = _oc_api(context)
+    try:
+        return await api.client_for_service(
+            url=cfg.opencode_service_url,
+            password=cfg.opencode_service_password,
+            service_json=cfg.opencode_service_json,
+            state_json=cfg.opencode_service_state,
+        )
+    except AmuxError as exc:
+        _oc_fallback_warn("session_browser", op, exc)
+        return None
+
+
+async def _pinned_lanes(context: ContextTypes.DEFAULT_TYPE) -> dict[str, str]:
+    """``ses_id -> lane name`` for every lane pinned to a conversation.
+
+    The browser's "already adopted" marker AND its no-duplicate rule: a tap
+    on a conversation a lane already pins REUSES that lane (the fleet rule
+    behind the dispatcher's own playbook — never spawn a second of what
+    exists).
+    """
+    out: dict[str, str] = {}
+    try:
+        rows = await _client(context).list_sessions()
+    except AmuxError as exc:
+        # The marker degrades to "nothing adopted"; adoption still checks
+        # per-id below by re-reading the list, and a create that collides is
+        # answered honestly by amux itself.
+        log.warning(
+            "browse_lane_list_failed status=%s detail=%s", exc.status, exc.detail
+        )
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pin = session_id_from_flags(row.get("flags"))
+        name = str(row.get("name") or "")
+        if pin and name:
+            out[pin] = name
+    return out
+
+
+async def _show_projects(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, note: str | None = None
+) -> None:
+    """Every project directory with its conversation count (the entry list)."""
+    oc = await _oc_service(context, "projects")
+    if oc is None:
+        await _say(
+            update,
+            "❌ the OpenCode service is unreachable — the project list cannot "
+            "be read right now (one WARN per stretch is in the log).",
+        )
+        return
+    try:
+        rows = await oc.sessions()
+    except AmuxError as exc:
+        await _say(update, f"❌ the session list failed: {exc.detail}")
+        return
+    finally:
+        close = getattr(oc, "aclose", None)
+        if close is not None:
+            await close()
+    projects = projects_from_rows(rows)
+    # The list AS RENDERED is what a tap's index resolves against (the M9
+    # rule): a re-derivation could silently shift every index under the
+    # owner's finger.
+    context.application.bot_data[BROWSE_KEY] = projects
+    if not projects:
+        await _say(update, "No OpenCode conversations on this box.")
+        return
+    header = f"📁 Projects — {len(rows)} conversations in {len(projects)} directories"
+    lines = [note, header] if note else [header]
+    for i, project in enumerate(projects[:20]):
+        count = len(project.get("sessions") or [])
+        lines.append(f"`{i}` {dir_label(project.get('directory'))} — {count}")
+    await _say(
+        update,
+        "\n".join(lines),
+        reply_markup=projects_keyboard(projects),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _show_project_sessions(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str
+) -> None:
+    """One project's conversations: title · last update, adopted marked."""
+    try:
+        index = int(str(raw))
+    except (TypeError, ValueError):
+        index = -1
+    projects: list[dict] = context.application.bot_data.get(BROWSE_KEY) or []
+    if index < 0 or index >= len(projects):
+        # A stale tap (gateway restart, or a button from an older render):
+        # re-render the real list instead of guessing an index.
+        log.info("browse_stale_index target=%s rendered=%s", raw, len(projects))
+        await _show_projects(update, context, note="ℹ️ the list moved — current:")
+        return
+    project = projects[index]
+    directory = str(project.get("directory") or "")
+    sessions = list(project.get("sessions") or [])
+    # The rows refresh from the service (ages and titles are live), matched
+    # by directory; the id-carrying buttons make the staled rows harmless —
+    # a resume always re-resolves the id itself.
+    oc = await _oc_service(context, "project_sessions")
+    if oc is not None:
+        try:
+            fresh = projects_from_rows(await oc.sessions())
+            for group in fresh:
+                if str(group.get("directory") or "") == directory:
+                    sessions = list(group.get("sessions") or [])
+                    break
+        except AmuxError as exc:
+            log.debug("browse_refresh_failed dir=%s detail=%s", directory, exc.detail)
+        finally:
+            close = getattr(oc, "aclose", None)
+            if close is not None:
+                await close()
+    pins = await _pinned_lanes(context)
+    entries = [dict(row, adopted_by=pins.get(row.get("id"))) for row in sessions]
+    header = f"💬 {dir_label(directory)} — {len(entries)} conversation(s)\n`{directory or NO_DIRECTORY}`"
+    await _say(
+        update,
+        header,
+        reply_markup=project_sessions_keyboard(index, entries),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _resume_intro(client, ses_id: str, title: str) -> str:
+    """The topic's opening message: the conversation's last answers, in order.
+
+    Carried as ``POST /topic``'s ``prompt`` — the echo machinery (11.6)
+    sends it plain, makes it the turn anchor and records it, so the topic
+    opens with "where it left off" and the next answer replies inside it. A
+    history failure is NOT a failed adopt: the intro degrades to a one-line
+    orientation marker (the topic and the lane are what matter).
+    """
+    try:
+        messages = await client.messages(ses_id, max_pages=1)
+    except AmuxError as exc:
+        log.warning(
+            "browse_intro_failed ses=%s status=%s detail=%s",
+            ses_id,
+            exc.status,
+            exc.detail,
+        )
+        return f"Resumed conversation: {title}"
+    texts = assistant_texts(messages, limit=INTRO_MAX_MESSAGES)
+    if not texts:
+        return f"Resumed conversation: {title}"
+    body = "\n\n".join(texts)[:INTRO_MAX_CHARS]
+    return f"📂 {title} — last messages before the pause:\n\n{body}"
+
+
+async def _adopt_session(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, ses_id: str
+) -> None:
+    """Tap a conversation → adopt it into a pinned lane, topic it, intro it.
+
+    The three calls the owner's ask names, in order, all through the
+    sanctioned surfaces: ``POST /api/sessions`` (a lane pinned to the
+    ``ses_…`` in the conversation's own project dir — ``--session`` RESUMES,
+    it never copies), the gateway's own topic route IN-PROCESS (same binding
+    and logs as the dispatcher's ``POST /topic``), and the shared service's
+    ``GET /api/session/<id>/message`` for the intro. A lane already pinning
+    this conversation is REUSED — one conversation, one lane, ever.
+    """
+    ses_id = (ses_id or "").strip()
+    chat_id = update.effective_chat.id
+    if not ses_id:
+        await _say(
+            update,
+            "❌ that button carries no session id — tap again from the project list.",
+        )
+        return
+
+    oc = await _oc_service(context, "adopt")
+    if oc is None:
+        await _say(
+            update,
+            "❌ the OpenCode service is unreachable — that conversation "
+            "cannot be read right now.",
+        )
+        return
+    try:
+        rows = await oc.sessions()
+    except AmuxError as exc:
+        close = getattr(oc, "aclose", None)
+        if close is not None:
+            await close()
+        await _say(update, f"❌ the session list failed: {exc.detail}")
+        return
+    row = next((r for r in rows if r.get("id") == ses_id), None)
+    if row is None:
+        close = getattr(oc, "aclose", None)
+        if close is not None:
+            await close()
+        await _say(
+            update,
+            f"❌ `{ses_id}` is gone from the service — the list moved; tap "
+            "🧩 again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    title = str(row.get("title") or ses_id)
+    directory = str(row.get("directory") or "") or None
+
+    pins = await _pinned_lanes(context)
+    lane = pins.get(ses_id)
+    reused = lane is not None
+    if lane is None:
+        lane = new_adopted_lane_name()
+        try:
+            await _client(context).create_session(
+                lane,
+                cwd=directory,
+                provider="opencode",
+                flags=f"--session {ses_id}",
+                start=True,
+            )
+        except AmuxError as exc:
+            log.warning(
+                "browse_adopt_failed ses=%s lane=%s dir=%s status=%s detail=%s",
+                ses_id,
+                lane,
+                directory,
+                exc.status,
+                exc.detail,
+            )
+            await _say(update, f"❌ could not adopt into a lane: {exc.detail}")
+            return
+        log.info(
+            "browse_adopted ses=%s lane=%s dir=%s title=%s",
+            ses_id,
+            lane,
+            directory,
+            title,
+        )
+
+    intro = await _resume_intro(oc, ses_id, title)
+    close = getattr(oc, "aclose", None)
+    if close is not None:
+        await close()
+    topic_name = title if title.strip() else ses_id
+    status, payload = await create_topic(
+        context.application,
+        {"session": lane, "chat_id": chat_id, "name": topic_name, "prompt": intro},
+    )
+    if status == 409:
+        # A title collision with an existing topic (two conversations can
+        # share a title): retry ONCE with the conversation id as the tiebreak.
+        status, payload = await create_topic(
+            context.application,
+            {
+                "session": lane,
+                "chat_id": chat_id,
+                "name": f"{topic_name} ({ses_id[-6:]})",
+                "prompt": intro,
+            },
+        )
+    if status >= 400:
+        detail = payload.get("error") or payload.get("detail") or "unknown"
+        log.warning(
+            "browse_topic_failed ses=%s lane=%s status=%s detail=%s",
+            ses_id,
+            lane,
+            status,
+            detail,
+        )
+        # The lane is the resume vehicle and it EXISTS now (a reuse or a
+        # create above): a failed topic must not read as a failed adopt —
+        # a re-tap takes the reuse path and retries exactly this step.
+        await _say(
+            update,
+            f"⚠️ `{lane}` is ready, but the topic could not be opened: "
+            f"{detail}\nTap the conversation again to retry the topic.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    thread = int(payload.get("thread") or 0)
+    if payload.get("created"):
+        # Record the title THIS flow named the topic with, so the title sync
+        # finds recorded == title and releases its flag without attempting a
+        # same-name edit Telegram would reject on every tick.
+        _state(context).set_topic_name(chat_id, thread, topic_name)
+    log.info(
+        "browse_topic_bound ses=%s lane=%s thread=%s created=%s echoed=%s",
+        ses_id,
+        lane,
+        thread,
+        payload.get("created"),
+        payload.get("echoed"),
+    )
+    verb = "Reused lane" if reused else "Adopted"
+    intro_note = (
+        "its last messages are the topic's intro above"
+        if payload.get("echoed")
+        else "the topic is open, but the intro could not be posted"
+    )
+    await _say(
+        update,
+        f"✅ {verb} `{lane}` → topic {thread}: *{title}*\n"
+        f"Write in the topic to continue it — {intro_note}.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=control_button(lane),
+    )
+
+
+@allow_only
+async def browse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/browse — the session browser: projects → conversations → adopt."""
+    log.info("browse_opened user=%s source=command", update.effective_user.id)
+    await _show_projects(update, context)
+
+
 @allow_only
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = _cfg(context)
@@ -2713,10 +3083,18 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
     if thread_id is not None and state.turn_thread(chat_id, session) != thread_id:
         reply_to = None
     stored = since
+    # The GM's own surface: a relayed dispatcher answer carries the session
+    # browser button (the owner taps it where they talk to the dispatcher).
+    markup = _browse_markup(session)
     for message_id, text in plan.items:
         try:
             sent = await _send_markdown(
-                app.bot, chat_id, text, reply_to=reply_to, thread_id=thread_id
+                app.bot,
+                chat_id,
+                text,
+                reply_to=reply_to,
+                thread_id=thread_id,
+                reply_markup=markup,
             )
         except TelegramError as exc:
             log.warning(
@@ -2832,7 +3210,12 @@ async def relay_once(app: Application) -> None:
                 reply_to = None
             try:
                 sent = await _send_markdown(
-                    app.bot, chat_id, new_text, reply_to=reply_to, thread_id=thread_id
+                    app.bot,
+                    chat_id,
+                    new_text,
+                    reply_to=reply_to,
+                    thread_id=thread_id,
+                    reply_markup=_browse_markup(session),
                 )
             except TelegramError as exc:
                 log.warning("relay_send_failed chat_id=%s session=%s error=%s", chat_id, session, exc)
@@ -3553,23 +3936,67 @@ def install_general_mgr_skill(
         return f"failed: {exc}"
 
 
+async def _heal_dispatcher_brief(
+    client: AmuxClient, cfg: Config, name: str
+) -> None:
+    """Re-save the packaged brief onto an existing dispatcher when it drifted.
+
+    Root-cause companion to the prompt/skill updates (owner, 2026-10-31):
+    create-only provisioning meant a NEW packaged brief never reached the
+    dispatcher already running on the machine — a procedure shipped in the
+    package would exist in the repo and not on the box. ``set_instructions``
+    only SAVES (the replay happens on start), so this cannot disturb a live
+    conversation; and only a PROVEN difference rewrites — an unreadable
+    answer (``None``) or a missing packaged file never does.
+    """
+    path = cfg.general_mgr_instructions_file
+    try:
+        if not path.exists():
+            return
+    except OSError:
+        return
+    packaged = load_instructions_file(path)
+    current = await client.instructions(name)
+    if current is None or current.strip() == packaged.strip():
+        return
+    try:
+        await client.set_instructions(name, packaged)
+    except AmuxError as exc:
+        log.warning(
+            "general_mgr_rebrief_failed name=%s status=%s detail=%s",
+            name,
+            exc.status,
+            exc.detail,
+        )
+        return
+    log.info(
+        "general_mgr_rebriefed name=%s chars=%s reason=packaged_prompt_drifted",
+        name,
+        len(packaged),
+    )
+
+
 async def ensure_general_managers(
     app: Application, *, skill_root: str | Path | None = None
 ) -> list[str]:
     """The owner's invariant (Milestone 11): one briefed ``general-mgr-<uid>``
     per allowed Telegram owner.
 
-    **Create-only** — an existing dispatcher is left alone (re-briefing would
-    disturb a live conversation, and ``start_session_as`` replays the
-    instructions on start, so a create IS the brief). The skill is installed
-    first, so the very first turn can use it. Runs as a startup task (never
-    blocking polling) and on the hourly lifecycle tick, so one transient
-    amux outage heals on the next pass instead of waiting for a redeploy.
+    **Create-only for creation** — an existing dispatcher is never re-created
+    (``start_session_as`` replays the instructions on start, so a create IS
+    the brief). It is BRIEF-HEALED though: when the packaged prompt changed
+    since the lane was provisioned, the saved instructions are re-saved
+    (``_heal_dispatcher_brief`` — save-only, no disturb), so every procedure
+    shipped in the package reaches the dispatcher already on the machine. The
+    skill is installed first, so the very first turn can use it. Runs as a
+    startup task (never blocking polling) and on the hourly lifecycle tick,
+    so one transient amux outage heals on the next pass instead of waiting
+    for a redeploy.
 
     Every outcome is logged for a sweep: ``general_mgr_ensured`` (with the
     pin and the skill state), ``general_mgr_present`` (once per process),
-    ``general_mgr_ensure_failed`` (uid + status + detail). Returns the names
-    created this pass.
+    ``general_mgr_rebriefed`` (drift healed), ``general_mgr_ensure_failed``
+    (uid + status + detail). Returns the names created this pass.
     """
     cfg: Config = app.bot_data["cfg"]
     client: AmuxClient = app.bot_data["client"]
@@ -3594,6 +4021,15 @@ async def ensure_general_managers(
             if name not in _general_mgr_seen:
                 _general_mgr_seen.add(name)
                 log.info("general_mgr_present uid=%s name=%s", uid, name)
+            try:
+                await _heal_dispatcher_brief(client, cfg, name)
+            except AmuxError as exc:  # the heal must never fail the ensure
+                log.warning(
+                    "general_mgr_rebrief_failed name=%s status=%s detail=%s",
+                    name,
+                    exc.status,
+                    exc.detail,
+                )
             continue
         try:
             _name, row = await create_manager(
@@ -3809,6 +4245,7 @@ def build_application(
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("effort", effort_command))
     app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CommandHandler("browse", browse_command))
     app.add_handler(conversation)
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^gw:"))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))

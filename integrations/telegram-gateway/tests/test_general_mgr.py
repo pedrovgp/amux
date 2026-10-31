@@ -19,6 +19,7 @@ The contract under test:
 from types import SimpleNamespace
 
 import httpx
+import json
 import pytest
 
 from telegram_gateway import bot as botmod
@@ -314,3 +315,106 @@ def test_private_chats_keep_manager_mode(tmp_path):
         "general-mgr" in str(c[1]) for c in amux.calls
     )  # the dispatcher is never touched
     assert message.replies  # the private "Starting … reply here" ack
+
+
+# ---- brief self-heal: the packaged prompt must reach the LIVE dispatcher ----
+
+
+class DriftAmux(ResetAmux):
+    """ResetAmux that remembers the dispatcher's SAVED instructions.
+
+    The heal reads `GET /api/sessions/<n>/instructions` (live shape:
+    `{"instructions": "…"}`) and re-saves only on a PROVEN difference — so
+    this fake can prove each of the three outcomes: drifted, equal,
+    unreadable.
+    """
+
+    def __init__(self, *args, saved="", read_status=200, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.saved = saved
+        self.read_status = read_status
+        self.saved_posts = []  # bodies of POST .../instructions
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.endswith("/instructions"):
+            if self.read_status >= 400:
+                return httpx.Response(self.read_status, json={"error": "boom"})
+            return httpx.Response(200, json={"instructions": self.saved})
+        if request.method == "POST" and path.endswith("/instructions"):
+            body = json.loads(request.content.decode())
+            self.saved_posts.append(body)
+            self.saved = body["instructions"]
+            return httpx.Response(200, json={"ok": True})
+        return super()._handle(request)
+
+
+def _packaged_brief(cfg):
+    return cfg.general_mgr_instructions_file.read_text(encoding="utf-8").strip()
+
+
+def test_a_drifted_dispatcher_brief_is_healed_from_the_package(tmp_path, caplog):
+    """The root-cause fix for 'a new procedure ships and the live GM never
+    learns it': ensure re-saves the packaged brief when it differs — but
+    only when the drift is PROVEN by a successful read."""
+    cfg = make_cfg(tmp_path)
+    amux = DriftAmux(rows=[lane("general-mgr-1")], saved="the OLD brief")
+    app = gm_app(cfg, amux.client)
+    try:
+        with caplog.at_level("INFO", logger="telegram_gateway"):
+            assert run(botmod.ensure_general_managers(app, skill_root=tmp_path / "s")) == []
+    finally:
+        run(amux.aclose())
+
+    assert amux.saved_posts == [{"instructions": _packaged_brief(cfg)}]
+    assert any("general_mgr_rebriefed" in m for m in caplog.messages)
+    # the lane itself was NOT re-created
+    assert amux.created_bodies == []
+
+
+def test_an_equal_or_unreadable_brief_is_never_rewritten(tmp_path):
+    cfg = make_cfg(tmp_path)
+    packaged = _packaged_brief(cfg)
+
+    # equal → nothing written
+    same = DriftAmux(rows=[lane("general-mgr-1")], saved=packaged)
+    try:
+        run(botmod.ensure_general_managers(gm_app(cfg, same.client),
+                                           skill_root=tmp_path / "s"))
+    finally:
+        run(same.aclose())
+    assert same.saved_posts == []
+
+    # unreadable (500) → can't prove drift → never rewrite a brief blind
+    blind = DriftAmux(rows=[lane("general-mgr-1")], read_status=500)
+    try:
+        run(botmod.ensure_general_managers(gm_app(cfg, blind.client),
+                                           skill_root=tmp_path / "s"))
+    finally:
+        run(blind.aclose())
+    assert blind.saved_posts == []
+
+
+def test_a_refused_rebrief_warns_but_never_fails_the_ensure(tmp_path, caplog):
+    cfg = make_cfg(tmp_path)
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/instructions"):
+            return httpx.Response(200, json={"instructions": "stale"})
+        if request.method == "POST" and request.url.path.endswith("/instructions"):
+            return httpx.Response(500, json={"error": "nope"})
+        return httpx.Response(200, json=[{"name": "general-mgr-1"}])
+
+    client = AmuxClient("https://localhost:8824",
+                        transport=httpx.MockTransport(refuse))
+    try:
+        with caplog.at_level("WARNING", logger="telegram_gateway"):
+            # the ensure still completes (returns no creations) and the
+            # refusal is a greppable WARN, never an exception
+            assert run(
+                botmod.ensure_general_managers(gm_app(cfg, client),
+                                               skill_root=tmp_path / "s")
+            ) == []
+    finally:
+        run(client.aclose())
+    assert any("general_mgr_rebrief_failed" in m for m in caplog.messages)

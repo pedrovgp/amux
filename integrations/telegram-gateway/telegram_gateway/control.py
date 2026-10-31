@@ -12,10 +12,15 @@ This module is the sanctioned replacement. One localhost endpoint does the
 three things in the right order:
 
 1. create the topic (Bot API, same call the gateway makes for General),
-2. bind it in the gateway's **own** ``GatewayState`` — the only writer of
+2. bind it in the gateway's own ``GatewayState`` — the only writer of
    ``state.json`` while the gateway runs, because its in-memory copy clobbers
    any hand edit on the next save,
 3. log ``topic_created … source=control``.
+
+A second route, ``POST /message``, delivers a caller-authored message into
+the topic BOUND to a session (owner, 2026-10-31): the dispatcher's report on
+a dispatch lands in the worker's own topic, looked up from the gateway's
+binding — the caller never names a thread.
 
 Transport: a tiny asyncio HTTP/1.1 server on ``127.0.0.1`` inside the running
 gateway process — no framework, no second process, no shared file. It is
@@ -210,15 +215,112 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     }
 
 
+async def post_message(app, payload: dict) -> tuple[int, dict]:
+    """Deliver a caller-authored message into a session's BOUND topic.
+
+    The dispatcher's half of the dispatch contract (owner, 2026-10-31): when
+    it opens a worker's topic and reports on the dispatch, that report must
+    land IN the topic — not only in the GM home thread. The dispatcher cannot
+    touch the Bot API (that is the whole point of this endpoint), so it
+    POSTs the report here and the gateway sends it into the topic bound to
+    ``session``.
+
+    The caller never names a thread: the topic is looked up from the
+    gateway's own binding (``state.session_topic``), so a stale or foreign
+    thread id cannot route a message into the wrong topic. The text goes
+    plain (never ``parse_mode`` — the caller's own words, verbatim), the
+    sent message id is recorded against the session (quoting the report
+    continues that session, the same map every bind uses), and the outcome
+    is logged ``topic_message_posted`` for sweeps.
+
+    Returns ``(http status, json body)``; ``409 no_topic`` means the session
+    has no topic yet (open one with ``POST /topic`` first) — an honest
+    refusal, never a silent drop.
+    """
+    state = app.bot_data["state"]
+
+    session = payload.get("session")
+    if not isinstance(session, str) or not session.strip():
+        return 400, {"error": "session is required"}
+    session = session.strip()
+
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return 400, {"error": "text is required"}
+    text = text.strip()
+
+    chat_id = payload.get("chat_id")
+    if chat_id is None:
+        chat_id = state.chat_for_session(session)
+        if chat_id is None:
+            return 400, {
+                "error": "chat_id required: no chat has this session yet",
+                "session": session,
+            }
+    else:
+        try:
+            chat_id = int(chat_id)
+        except (TypeError, ValueError):
+            return 400, {"error": "chat_id must be an integer"}
+
+    thread = state.session_topic(chat_id, session)
+    if thread is None:
+        return 409, {
+            "error": "no_topic",
+            "session": session,
+            "detail": "session has no topic bound yet — POST /topic first",
+        }
+
+    try:
+        sent = await app.bot.send_message(chat_id, text, message_thread_id=thread)
+    except TelegramError as exc:
+        log.warning(
+            "topic_message_failed session=%s thread=%s error=%s", session, thread, exc
+        )
+        released = False
+        if "thread not found" in str(exc).lower():
+            # The topic is GONE (measured live 2026-10-31: thread 191 had
+            # been deleted, the send answered "Message thread not found").
+            # Same lifecycle as the relay's 404-send path: release the
+            # binding so the stale name/thread stop holding the map.
+            for freed in state.drop_session_topics(chat_id, session):
+                released = True
+                log.info(
+                    "topic_released chat_id=%s thread=%s session=%s "
+                    "reason=thread_missing source=message",
+                    chat_id,
+                    freed,
+                    session,
+                )
+        return 502, {"error": str(exc), **({"released": True} if released else {})}
+
+    message_id = getattr(sent, "message_id", None)
+    if message_id is not None:
+        state.record_message(chat_id, int(message_id), session)
+    log.info(
+        "topic_message_posted session=%s thread=%s msg_id=%s chars=%s",
+        session,
+        thread,
+        message_id,
+        len(text),
+    )
+    return 201, {
+        "thread": int(thread),
+        "session": session,
+        "msg_id": message_id,
+        "chars": len(text),
+    }
+
+
 async def dispatch(app, method: str, path: str, body: bytes) -> tuple[int, dict]:
     """Route one request. Kept separate from the socket so tests can call it."""
     if path in ("/health", "/"):
         if method != "GET":
             return 405, {"error": "method not allowed"}
         return 200, {"status": "ok", "service": "telegram-gateway"}
-    if path == "/topic":
+    if path in ("/topic", "/message"):
         if method != "POST":
-            return 405, {"error": "method not allowed, use POST /topic"}
+            return 405, {"error": f"method not allowed, use POST {path}"}
         if not body.strip():
             payload: object = {}
         else:
@@ -228,7 +330,9 @@ async def dispatch(app, method: str, path: str, body: bytes) -> tuple[int, dict]
                 return 400, {"error": "body is not valid JSON"}
         if not isinstance(payload, dict):
             return 400, {"error": "body must be a JSON object"}
-        return await create_topic(app, payload)
+        if path == "/topic":
+            return await create_topic(app, payload)
+        return await post_message(app, payload)
     return 404, {"error": f"no such route: {method} {path}"}
 
 
@@ -261,7 +365,8 @@ class ControlServer:
             return
         self.port = int(self._server.sockets[0].getsockname()[1])
         log.info(
-            "control_started host=127.0.0.1 port=%s routes=POST /topic,GET /health",
+            "control_started host=127.0.0.1 port=%s "
+            "routes=POST /topic,POST /message,GET /health",
             self.port,
         )
 

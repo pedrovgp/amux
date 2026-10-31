@@ -179,6 +179,25 @@ def _assistant_text(message: dict) -> str | None:
     return text or None
 
 
+def assistant_texts(messages: list[dict], limit: int | None = None) -> list[str]:
+    """Completed assistant texts from a NEWEST-FIRST page, OLDEST FIRST.
+
+    The resume UI's intro source (owner, 2026-10-31): the last answers of a
+    conversation, in reading order, so a topic opened on an existing session
+    starts with "where it left off". ``limit`` keeps the newest N (applied
+    before the reversal, so it is the N most recent answers).
+    """
+    out: list[str] = []
+    for message in messages or []:
+        text = _assistant_text(message)
+        if text:
+            out.append(text)
+        if limit is not None and len(out) >= limit:
+            break
+    out.reverse()
+    return out
+
+
 def plan_opencode_relay(
     messages: list[dict],
     *,

@@ -31,10 +31,27 @@ dispatching instead.
    prompt/instructions — and put the task in the topic too (step 3).
 3. Open a topic for the worker's session in the owner's Telegram group —
    pass the task VERBATIM as `"prompt"` so it lands as the topic's first
-   message (the `dispatch` skill and §Topics below have the exact call), then
-   tell the owner ONE line: what was dispatched, where it now lives,
-   expected signal.
-4. File a card (`POST $AMUX_URL/api/board`, `session` = the worker) whenever
+   message (the `dispatch` skill and §Topics below have the exact call).
+4. **Post your dispatch report INTO that topic** — the owner reads the
+   worker's thread, and a report that only lands in their home thread with
+   you is a report they never see where the work lives:
+
+   ```
+   curl -sS -X POST http://127.0.0.1:8834/message \
+     -H 'content-type: application/json' \
+     -d '{"session":"<the worker session>","text":"<the report, verbatim>"}'
+   ```
+
+   `201 {"thread":…}` = it is in the topic · `409 no_topic` = the session
+   has no topic yet (open it first) · `400` = fix the payload · `502` =
+   Telegram refused (the group/bot state, §Topics); a `502` carrying
+   `"released": true` means that topic no longer exists in Telegram — the
+   gateway released the stale binding, and `POST /topic` reopens one when
+   the work resumes. One report, one POST —
+   then tell the owner ONE line in their thread: what was dispatched, where
+   it now lives, expected signal. Your answer to them still starts with
+   `—— answer ——` as always.
+5. File a card (`POST $AMUX_URL/api/board`, `session` = the worker) whenever
    the work should outlive the conversation or be tracked — workers
    themselves delegate the same way (they create cards; you pick them up
    when you sweep the board).
@@ -94,10 +111,29 @@ curl -sS -X POST http://127.0.0.1:8834/topic \
   has one (calling twice is safe — the prompt echoes only on creation) ·
   `502 {"error":…}` Telegram refused.
 
-After that, do nothing in the topic yourself: never post into it. The
+After that, never touch the Bot API — but your REPORTS into the topic go
+through the gateway's second route, `POST /message`
+(`{"session":"<the bound session>","text":"<your report>"}`): the gateway
+sends it into the topic bound to that session and records it, so quoting the
+report continues that session. `409 no_topic` means the session has no topic
+bound yet — open one with `POST /topic` first. You never name a thread; the
+gateway resolves it from its own binding.
+
+You still never post into the topic BY YOURSELF beyond `POST /message`: the
 gateway's relay delivers your worker's replies into its bound topic, as long
 as each reply starts with the `—— answer ——` line (put that line in the
 briefing you give the worker).
+
+### The session browser (owner's buttons)
+
+The owner can resume an existing conversation from Telegram without asking
+you: the 🧩 **Sessions by project** button rides on your answers (or
+`/browse`) lists every project directory with its conversation count → a
+project shows its conversations (title · last update · ✅ already adopted) →
+tapping one adopts it into a pinned lane, opens its topic and posts the
+conversation's last messages as the intro. If they ask you to "connect an
+existing conversation", you may simply point at that button — and §5 below
+is still your manual path when you need to do it yourself.
 
 ### Connect a topic to an EXISTING conversation
 

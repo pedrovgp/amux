@@ -34,10 +34,22 @@ Session control (Milestone 8 — the topic's own panel):
                             respawn the lane, re-pin the topic, retire the
                             old conversation (pinned opencode lanes only)
 
+Session browser (owner, 2026-10-31 — resume an existing conversation):
+
+    gw:prj                  project list (session directories + counts)
+    gw:prj:<i>              the sessions of project index i (title · age,
+                            ✅ = already adopted by a lane)
+    gw:adopt:<ses_id>       adopt that conversation: reuse/create its pinned
+                            lane in the project dir, open its topic with the
+                            last messages as the intro
+
 Every payload is kept ≤ 64 bytes (Telegram's cap): ``gw:ctlp:`` (8) +
-:data:`MAX_CTL_KEY` (40) + ``:`` + ``xhigh`` (5) = 54.
+:data:`MAX_CTL_KEY` (40) + ``:`` + ``xhigh`` (5) = 54; the browser's session
+verb carries a measured-22-char ``ses_…`` id (``gw:adopt:`` 9 + 22 = 31).
 """
 from __future__ import annotations
+
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -397,4 +409,130 @@ def effort_keyboard(
         ]
     )
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"{PREFIX}ctl:{key}")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------------------------------------------------------------------------
+# session browser (owner, 2026-10-31): projects -> sessions -> adopt
+# ---------------------------------------------------------------------------
+
+NO_DIRECTORY = "(no directory)"
+# The intro is the topic's first content; keep it phone-sized.
+INTRO_MAX_MESSAGES = 3
+INTRO_MAX_CHARS = 3000
+
+
+def dir_label(directory: str) -> str:
+    """The short name of a project directory (its basename)."""
+    text = str(directory or "").rstrip("/")
+    return text.rsplit("/", 1)[-1] if text else NO_DIRECTORY
+
+
+def ago(updated, now: float | None = None) -> str:
+    """``time.updated`` (ms epoch) as a phone-sized age: ``4m`` ``3h`` ``2d``.
+
+    ``None`` (a row without a time) is ``""`` — the label just loses its age,
+    it never guesses one.
+    """
+    if not isinstance(updated, (int, float)) or updated <= 0:
+        return ""
+    now_ms = (now if now is not None else time.time()) * 1000.0
+    seconds = max(0.0, (now_ms - float(updated)) / 1000.0)
+    if seconds < 60:
+        return "now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    if seconds < 86400 * 28:
+        return f"{int(seconds // 86400)}d"
+    return f"{int(seconds // (86400 * 30))}mo"
+
+
+def projects_from_rows(rows: list[dict]) -> list[dict]:
+    """Group ``GET /api/session`` rows by project directory, sorted.
+
+    Returns ``[{"directory": str, "sessions": [row, …]}]``, directories
+    ascending (a stable order the callback indexes resolve against — the
+    same render/tap re-derivation rule the model lists follow) and each
+    project's sessions newest-``updated`` first.
+    """
+    groups: dict[str, list[dict]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        directory = str(row.get("directory") or "")
+        groups.setdefault(directory, []).append(row)
+    out = []
+    for directory in sorted(groups):
+        sessions = sorted(
+            groups[directory],
+            key=lambda r: -r["updated"]
+            if isinstance(r.get("updated"), (int, float))
+            else 0,
+        )
+        out.append({"directory": directory, "sessions": sessions})
+    return out
+
+
+def browse_button() -> InlineKeyboardMarkup:
+    """The persistent entry point riding on relayed dispatcher answers."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🧩 Sessions by project", callback_data=f"{PREFIX}prj"
+                )
+            ]
+        ]
+    )
+
+
+def projects_keyboard(projects: list[dict]) -> InlineKeyboardMarkup:
+    """One button per project directory with its session count.
+
+    Rows carry an INDEX into ``projects`` (directories run far past the
+    64-byte callback cap); the tap re-derives the same sorted list and
+    refuses an out-of-range index with an honest re-render — an index is
+    never resolved against a list the owner did not see.
+    """
+    rows = []
+    for i, project in enumerate(projects[:20]):
+        label = f"📁 {dir_label(project.get('directory'))} ({len(project.get('sessions') or [])})"
+        rows.append(
+            [InlineKeyboardButton(label[:64], callback_data=f"{PREFIX}prj:{i}")]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Menu", callback_data=f"{PREFIX}menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def project_sessions_keyboard(
+    dir_index: int, entries: list[dict]
+) -> InlineKeyboardMarkup:
+    """One button per session of a project: title · age, adopted marked.
+
+    A session button carries the ``ses_…`` id itself (measured 22 chars —
+    ``gw:adopt:`` + id stays under the 64-byte cap): a RESUME must address
+    the exact conversation the owner saw, never an index into a list that
+    may have shifted since it was rendered. ``✅`` marks a conversation a
+    lane already pins (adopting it reuses that lane — never a second one).
+    """
+    rows = []
+    for entry in entries[:20]:
+        title = str(entry.get("title") or entry.get("id") or "?")
+        age = ago(entry.get("updated"))
+        marker = "✅" if entry.get("adopted_by") else "○"
+        label = f"{marker} {title}" + (f" · {age}" if age else "")
+        key = str(entry.get("id") or "")[:MAX_KEY]
+        rows.append(
+            [InlineKeyboardButton(label[:64], callback_data=f"{PREFIX}adopt:{key}")]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Projects", callback_data=f"{PREFIX}prj"
+            ),
+            InlineKeyboardButton(" Menu", callback_data=f"{PREFIX}menu"),
+        ]
+    )
     return InlineKeyboardMarkup(rows)

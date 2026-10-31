@@ -676,12 +676,19 @@ class OpencodeClient:
 
     async def sessions(self) -> list[dict]:
         """``GET /api/session`` — every session the shared server holds,
-        normalized to ``[{id, title}]``.
+        normalized to ``[{id, title, directory, updated}]``.
 
         The title source for the topic sync (Milestone 11.8): measured
         live2026-10-30 —50 sessions across15 DISTINCT projects, so a worker
         spawned in a project dir is titled here while a root-cwd
         ``opencode session list`` (the old cwd-scoped path) cannot see it.
+
+        ``directory`` (``location.directory``) and ``updated``
+        (``time.updated``, ms epoch) carry the session-browser UI (owner,
+        2026-10-31): projects are this field grouped, "last update" is that
+        one rendered as an age. Missing fields read as ``""``/``None``, never
+        an exception — a row without a location groups under the honest
+        "(no directory)" bucket instead of vanishing.
         """
         event, target = "oc_api_session_list_failed", self.base_url
         try:
@@ -695,8 +702,21 @@ class OpencodeClient:
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict) or not row.get("id"):
                 continue
+            location = row.get("location")
+            directory = (
+                str(location.get("directory") or "")
+                if isinstance(location, dict)
+                else ""
+            )
+            times = row.get("time")
+            updated = times.get("updated") if isinstance(times, dict) else None
             out.append(
-                {"id": str(row.get("id")), "title": str(row.get("title") or "")}
+                {
+                    "id": str(row.get("id")),
+                    "title": str(row.get("title") or ""),
+                    "directory": directory,
+                    "updated": updated if isinstance(updated, (int, float)) else None,
+                }
             )
         return out
 

@@ -48,6 +48,20 @@ def new_opencode_session_id(now: time.struct_time | None = None) -> str:
     return f"ses_tg{time.strftime('%m%d%H%M', t)}{secrets.token_hex(3)}"
 
 
+def new_adopted_lane_name(now: time.struct_time | None = None) -> str:
+    """The lane name for the session browser's adopt flow (owner, 2026-10-31).
+
+    Tapping an EXISTING conversation in Telegram adopts it into a lane pinned
+    to that ``ses_…``; the lane name is a minted, log-readable handle (the
+    conversation's title is the topic's name, not the lane's — two
+    conversations can share a title, two lane names never may). 20 chars,
+    under the panel's ``MAX_CTL_KEY`` (40) so the adopted lane stays
+    addressable from every button.
+    """
+    t = now or time.localtime()
+    return f"adopt-{time.strftime('%m%d-%H%M', t)}-{secrets.token_hex(2)}"
+
+
 def general_manager_name(uid: int) -> str:
     """The dispatcher lane for ONE allowed Telegram owner.
 

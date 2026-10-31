@@ -256,16 +256,25 @@ def test_control_server_over_a_real_socket(tmp_path, caplog):
                 health = await client.get(f"{base}/health")
                 answer = await client.post(f"{base}/topic", json={"session": "mgr-s"})
                 again = await client.post(f"{base}/topic", json={"session": "mgr-s"})
+                report = await client.post(
+                    f"{base}/message",
+                    json={"session": "mgr-s", "text": "dispatch report"},
+                )
             await server.stop()
-        return health, answer, again
+        return health, answer, again, report
 
-    health, answer, again = run(scenario())
+    health, answer, again, report = run(scenario())
 
     assert health.json()["status"] == "ok"
     assert answer.status_code == 201 and answer.json()["thread"] == 1001
     assert again.status_code == 200 and again.json()["created"] is False
+    # the report rode the SAME socket into the SAME bound topic
+    assert report.status_code == 201 and report.json()["thread"] == 1001
     assert state.topic_session(CHAT, 1001) == "mgr-s"
     assert bot.created == [(CHAT, "mgr-s")]
+    assert bot.sent[-1]["text"] == "dispatch report"
+    assert bot.sent[-1]["thread"] == 1001
+    assert "topic_message_posted" in caplog.text
     assert "control_started" in caplog.text
     assert "topic_created" in caplog.text and "source=control" in caplog.text
     assert "control_stopped" in caplog.text
@@ -396,3 +405,122 @@ def test_topic_bind_still_works_for_a_name_only_session(tmp_path):
     assert status == 201
     assert state.topic_session(CHAT, 1001) == "ghost"
     assert state.topic_pin(CHAT, 1001) is None
+
+
+# ---- POST /message: a dispatch report lands IN its topic (owner, 2026-10-31) ---
+
+
+def test_message_posts_into_the_sessions_bound_topic(tmp_path, caplog):
+    """The dispatch report is delivered into the topic BOUND to the session —
+    looked up by the gateway, never by a thread id the caller supplies."""
+    state = GatewayState(tmp_path / "state.json")
+    state.set_topic(CHAT, 191, "wk-demo")
+    bot = FakeBot()
+    app = make_app(state, bot)
+
+    with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+        status, payload = post(
+            app,
+            {"session": "wk-demo",
+             "text": "Dispatched: adoption demo → topic 191"},
+            path="/message",
+        )
+
+    assert status == 201
+    assert payload["thread"] == 191
+    assert payload["msg_id"] == 901
+    assert bot.sent == [
+        {"chat_id": CHAT, "text": "Dispatched: adoption demo → topic 191",
+         "reply_to": None, "thread": 191}
+    ]  # plain: no parse_mode, the report verbatim
+    # recorded against the session: quoting the report continues THAT session
+    assert state.session_for_message(CHAT, 901) == "wk-demo"
+    assert any("topic_message_posted" in r.getMessage() for r in caplog.records)
+
+
+def test_message_without_a_topic_is_refused_honestly(tmp_path):
+    """A session with no bound topic gets 409 — an honest refusal, never a
+    message dropped silently or posted to General by accident."""
+    state = GatewayState(tmp_path / "state.json")
+    state.set_turn_message(CHAT, "wk-loose", 5)  # lives in this chat, no topic
+    bot = FakeBot()
+    app = make_app(state, bot)
+
+    status, payload = post(app, {"session": "wk-loose", "text": "hi"}, path="/message")
+
+    assert status == 409
+    assert payload["error"] == "no_topic"
+    assert bot.sent == []
+
+
+def test_message_resolves_the_chat_for_a_session_it_was_not_told(tmp_path):
+    """The GM knows the session, not the chat id — the same contract as
+    POST /topic's optional chat_id."""
+    state = GatewayState(tmp_path / "state.json")
+    state.set_topic(CHAT, 77, "wk-x")  # binds chat AND thread
+    bot = FakeBot()
+    app = make_app(state, bot)
+
+    status, payload = post(app, {"session": "wk-x", "text": "note"}, path="/message")
+    assert (status, payload["thread"]) == (201, 77)
+
+    # an unseen session without chat_id → 400, same wording as /topic
+    status, payload = post(app, {"session": "ghost", "text": "n"}, path="/message")
+    assert status == 400 and "chat_id" in payload["error"]
+
+
+def test_message_validation_and_telegram_failure(tmp_path):
+    app = make_app(GatewayState(tmp_path / "state.json"))
+    state = app.bot_data["state"]
+    state.set_topic(CHAT, 5, "wk-y")
+    assert post(app, {"text": "x"}, path="/message")[0] == 400
+    assert post(app, {"session": "wk-y"}, path="/message")[0] == 400
+    assert post(app, {"session": "wk-y", "text": "   "}, path="/message")[0] == 400
+    assert post(
+        app, {"session": "wk-y", "text": "x", "chat_id": "nope"}, path="/message"
+    )[0] == 400
+
+    async def refuse(chat_id, text, message_thread_id=None):
+        raise TelegramError("not enough rights")
+
+    app.bot.send_message = refuse
+    status, payload = post(
+        app, {"session": "wk-y", "text": "x"}, path="/message"
+    )
+    assert status == 502 and "not enough rights" in payload["error"]
+    assert "released" not in payload  # a rights failure is NOT a dead topic
+
+
+def test_message_on_a_deleted_topic_releases_the_binding(tmp_path, caplog):
+    """Measured live 2026-10-31: thread 191 had been deleted and the send
+    answered "Message thread not found". Same lifecycle as the relay's
+    404-send path — the stale binding is released, not kept forever."""
+    state = GatewayState(tmp_path / "state.json")
+    state.set_topic(CHAT, 191, "wk-gone")
+    bot = FakeBot()
+
+    async def gone(chat_id, text, message_thread_id=None):
+        raise TelegramError("Message thread not found")
+
+    bot.send_message = gone
+    app = make_app(state, bot)
+
+    with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+        status, payload = post(
+            app, {"session": "wk-gone", "text": "x"}, path="/message"
+        )
+
+    assert status == 502
+    assert payload == {"error": "Message thread not found", "released": True}
+    assert state.topic_session(CHAT, 191) is None  # the map is clean again
+    assert state.session_topic(CHAT, "wk-gone") is None
+    assert "topic_released" in caplog.text
+    assert "reason=thread_missing" in caplog.text
+    assert "source=message" in caplog.text
+
+
+def test_message_route_table(tmp_path):
+    app = make_app(GatewayState(tmp_path / "state.json"))
+    assert post(app, method="GET", path="/message")[0] == 405
+    assert post(app, body=b"{not json", path="/message")[0] == 400
+    assert post(app, body=b"[1,2]", path="/message")[0] == 400

@@ -30,6 +30,27 @@ Never call the Bot API directly (no `createForumTopic`, no `sendMessage`, no
 bot token): a topic outside the gateway binds nothing, so the owner's message
 in it starts a duplicate worker and the relay has no anchor.
 
+### 1b. Post a report INTO a bound topic
+
+```bash
+curl -sS -X POST http://127.0.0.1:8834/message \
+  -H 'content-type: application/json' \
+  -d '{"session":"<the bound session>","text":"<the report, verbatim>"}'
+```
+
+| answer | meaning | do |
+|---|---|---|
+| `201 {"thread":…}` | posted into the topic bound to that session, recorded | done — the report is where the work lives |
+| `409 no_topic` | the session has no topic bound yet | open it with §1 first, retry once |
+| `400` | missing/blank `session` or `text`, or no chat has the session | fix the payload (add `"chat_id":-1004274385104` if the session is unseen) |
+| `502 {"error":…}` | Telegram refused | §3 |
+| `502 {"released":true}` | the topic no longer exists (deleted in Telegram) | the binding is released for you — open it again with §1 when the work resumes |
+
+You never name a thread — the gateway resolves the topic from its own
+binding, so a stale id can never route your report into the wrong topic.
+One report, one POST; then your `—— answer ——` reply to the owner stays the
+short version.
+
 ## 2. Dispatch a task end to end
 
 1. **Pick the project**: `~/Documents/pv/projetos/<…>` — confirm purpose from
@@ -48,8 +69,10 @@ in it starts a duplicate worker and the relay has no anchor.
    task as `prompt` (echoed as the topic's first message + turn anchor).
 4. **Track it** — `POST $AMUX_URL/api/board` with `session` = the worker, so
    the work survives the conversation and your board sweep can see it.
-5. **Tell the owner one line**: what went, where it lives, what signal to
-   expect. Then you are free.
+5. **Post the dispatch report into its topic** (§1b) — what went, where it
+   lives, what signal to expect — so the report is where the work lives.
+   Then tell the owner ONE line in their thread (same content, short). Then
+   you are free.
 
 Board sweep (you do this when idle): open cards with no live session, or a
 session that is stopped with cards assigned — that is a dispatch that needs
@@ -79,8 +102,12 @@ deletes it in Telegram.
 
 ## 5. Connect a topic to an EXISTING conversation
 
-When the work already has a conversation (a retired lane, a session started
-elsewhere), do NOT spawn a fresh one — adopt it:
+**First look at the owner's button**: 🧩 *Sessions by project* (it rides on
+your answers, or `/browse`) lists every project's conversations and, on a
+tap, does steps 2–3 below itself — adopt into a pinned lane, open the topic,
+post the last messages as the intro. Point them at it when they ask to
+"resume" or "connect" something. The manual path stays yours for when you
+must do it yourself (or the OpenCode service is unreachable for the button):
 
 1. **Find the id** (every project, with titles):
 
@@ -105,7 +132,8 @@ elsewhere), do NOT spawn a fresh one — adopt it:
    mechanism that revives idle managers — so it continues where it left off.
    `dir` matters: a conversation belongs to the project it was made in.
 3. **Topic it** (§1, with `chat_id`; the pin is recorded automatically, so
-   answers relay — including turns driven from the dashboard or CLI).
+   answers relay — including turns driven from the dashboard or CLI), and
+   leave your orientation note in it with §1b.
 
 ## 6. Staying free
 

@@ -148,6 +148,7 @@ class FakeBot:
     def __init__(self):
         self.sent = []
         self.created = []  # (chat_id, name) per create_forum_topic call
+        self.markups = []  # (message_id, keyboard) for sends that carried one
 
     async def create_forum_topic(self, chat_id, name=None):
         self.created.append((chat_id, name))
@@ -160,6 +161,7 @@ class FakeBot:
         parse_mode=None,
         reply_to_message_id=None,
         message_thread_id=None,
+        reply_markup=None,
     ):
         self.sent.append(
             {
@@ -169,7 +171,13 @@ class FakeBot:
                 "thread": message_thread_id,
             }
         )
-        return FakeSentMessage(900 + len(self.sent), text)
+        message_id = 900 + len(self.sent)
+        if reply_markup is not None:
+            # Recorded beside `sent` (never in it): the exact-dict assertions
+            # elsewhere pin this dict's shape, and only a few sends carry a
+            # keyboard (the 🧩 browser button, the 🎛 ack).
+            self.markups.append((message_id, reply_markup))
+        return FakeSentMessage(message_id, text)
 
 
 def fake_update(message, *, forum=True, chat_id=CHAT):
