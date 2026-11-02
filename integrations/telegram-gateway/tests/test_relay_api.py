@@ -54,6 +54,7 @@ def _clean_relay_dedupe():
         botmod._api_source,
         botmod._api_unavailable,
         botmod._api_window_missed,
+        botmod._answer_notified,
     ):
         leaked.clear()
     yield
@@ -63,6 +64,7 @@ def _clean_relay_dedupe():
         botmod._api_source,
         botmod._api_unavailable,
         botmod._api_window_missed,
+        botmod._answer_notified,
     ):
         leaked.clear()
 

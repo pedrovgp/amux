@@ -237,6 +237,10 @@ class FakeBot:
         self.sent = []
         self.created = []  # (chat_id, name) per create_forum_topic call
         self.markups = []  # (message_id, keyboard) for sends that carried one
+        # Whether each send raises a push (disable_notification=False / the
+        # Bot API default). Recorded BESIDE `sent` for the same reason as
+        # `markups`: the exact-dict assertions pin `sent`'s shape.
+        self.notified = []
 
     async def send_message(
         self,
@@ -246,6 +250,7 @@ class FakeBot:
         reply_to_message_id=None,
         message_thread_id=None,
         reply_markup=None,
+        disable_notification=None,
     ):
         self.sent.append(
             {
@@ -255,6 +260,7 @@ class FakeBot:
                 "thread": message_thread_id,
             }
         )
+        self.notified.append(disable_notification is not True)
         message_id = 900 + len(self.sent)
         if reply_markup is not None:
             self.markups.append((message_id, reply_markup))

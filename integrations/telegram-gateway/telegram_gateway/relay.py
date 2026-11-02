@@ -77,6 +77,20 @@ def _is_chrome(line: str) -> bool:
     return False
 
 
+def _boundary_index(lines: list[str]) -> int | None:
+    """Index of the reply boundary: the LAST prompt marker or sentinel line.
+
+    Shared by ``extract_reply`` (what to return) and ``pane_answer_start``
+    (what that return MEANS for the phone) so the two can never disagree
+    about where the boundary is.
+    """
+    boundary = None
+    for index, line in enumerate(lines):
+        if MARKER in line or line.strip() == SENTINEL:
+            boundary = index
+    return boundary
+
+
 def extract_reply(raw: str) -> str | None:
     """Return the agent's answer, or ``None`` when no boundary is in the pane.
 
@@ -85,10 +99,7 @@ def extract_reply(raw: str) -> str | None:
     replaced the prompt in the viewport is still found.
     """
     lines = strip_ansi(raw).splitlines()
-    boundary = None
-    for index, line in enumerate(lines):
-        if MARKER in line or line.strip() == SENTINEL:
-            boundary = index
+    boundary = _boundary_index(lines)
     if boundary is None:
         return None
     block = [line.rstrip() for line in lines[boundary + 1:]]
@@ -132,6 +143,55 @@ def delta_since(last: str | None, text: str) -> str:
     if last and text.startswith(last):
         return text[len(last):].lstrip("\n")
     return text
+
+
+# ---------------------------------------------------------------------------
+# what may BUZZ the phone (owner, 2026-11-02): progress is delivered silently
+# ---------------------------------------------------------------------------
+
+
+def carries_answer(text: str) -> bool:
+    """True when this relayed segment carries the agent's ``—— answer ——`` line.
+
+    That line is the owner's own boundary: text after it is THE answer, every
+    message before it is progress ("I'm investigating", thinking, tool lines).
+    A segment without the sentinel is still delivered — with
+    ``disable_notification``, so it arrives without a push.
+    """
+    return SENTINEL in text
+
+
+def pane_answer_start(raw: str) -> bool:
+    """True when the pane's reply boundary IS the sentinel line.
+
+    ``extract_reply`` then returns the answer BODY: the sentinel was the
+    boundary and was dropped, so ``carries_answer`` cannot see it in the text.
+    This is the other shape of "starts at the answer" — everything before the
+    sentinel (progress, thinking) was cut away with the boundary.
+    """
+    lines = strip_ansi(raw).splitlines()
+    boundary = _boundary_index(lines)
+    return boundary is not None and lines[boundary].strip() == SENTINEL
+
+
+def pane_notify(raw: str, *, text: str, last: str | None, segment: str) -> bool:
+    """True when this pane segment is the answer's OPENING send (it buzzes).
+
+    - the sentinel rode into the segment itself (it was inline after the
+      prompt marker, so the boundary stayed the marker);
+    - or the boundary flipped to the sentinel and this segment is not a TAIL
+      of the still-growing answer: while the answer grows, ``text`` starts
+      with what was already relayed (``last``) and every later segment is a
+      continuation — muted. The first body after the flip is the answer's
+      first send, and that is the one notification of the turn.
+
+    A reply with no sentinel yet is progress: muted until the answer lands.
+    """
+    if carries_answer(segment):
+        return True
+    if not pane_answer_start(raw):
+        return False
+    return not (last and text.startswith(last))
 
 
 # ---------------------------------------------------------------------------

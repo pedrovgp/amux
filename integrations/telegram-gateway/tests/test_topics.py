@@ -153,6 +153,9 @@ class FakeBot:
         self.pins = []  # (chat_id, message_id) per pin_chat_message
         self.pin_error = None  # set to a TelegramError to refuse the pin
         self.edit_error = None  # set to a TelegramError to refuse the edit
+        # Whether each send raises a push — recorded BESIDE `sent`, like
+        # `markups`, so the exact-dict assertions keep pinning `sent`'s shape.
+        self.notified = []
 
     async def create_forum_topic(self, chat_id, name=None):
         self.created.append((chat_id, name))
@@ -180,6 +183,7 @@ class FakeBot:
         reply_to_message_id=None,
         message_thread_id=None,
         reply_markup=None,
+        disable_notification=None,
     ):
         self.sent.append(
             {
@@ -189,6 +193,7 @@ class FakeBot:
                 "thread": message_thread_id,
             }
         )
+        self.notified.append(disable_notification is not True)
         message_id = 900 + len(self.sent)
         if reply_markup is not None:
             # Recorded beside `sent` (never in it): the exact-dict assertions

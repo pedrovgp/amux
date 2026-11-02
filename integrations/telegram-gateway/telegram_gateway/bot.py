@@ -66,9 +66,11 @@ from .menu import (
 from .pollwatch import PollWatch, default_watch
 from .relay import (
     assistant_texts,
+    carries_answer,
     chunk_text,
     delta_since,
     extract_reply,
+    pane_notify,
     plan_opencode_relay,
     strip_ansi,
 )
@@ -269,6 +271,7 @@ async def _send_markdown(
     reply_to: int | None = None,
     thread_id: int | None = None,
     reply_markup=None,
+    notify: bool = True,
 ) -> list:
     """Send text as Markdown, falling back to plain text on a parse error.
 
@@ -278,12 +281,18 @@ async def _send_markdown(
     that same thread — the relay enforces this, never across threads.
     ``reply_markup`` rides the LAST chunk only: a multi-chunk answer would
     otherwise stack one identical button row per chunk.
+
+    ``notify=False`` sends every chunk with ``disable_notification`` — the
+    message still arrives in the topic, the phone does not buzz (progress,
+    owner 2026-11-02). A notified send buzzes on its FIRST chunk only, so a
+    long answer split into chunks is ONE notification, not one per chunk.
     """
     sent = []
     chunks = chunk_text(text)
     for i, chunk in enumerate(chunks):
         payload = f"```\n{chunk}\n```" if code_block else chunk
         markup = reply_markup if i == len(chunks) - 1 else None
+        quiet = not (notify and i == 0)
         try:
             message = await bot.send_message(
                 chat_id,
@@ -292,6 +301,7 @@ async def _send_markdown(
                 reply_to_message_id=reply_to,
                 message_thread_id=thread_id,
                 reply_markup=markup,
+                disable_notification=quiet,
             )
         except BadRequest:
             message = await bot.send_message(
@@ -300,6 +310,7 @@ async def _send_markdown(
                 reply_to_message_id=reply_to,
                 message_thread_id=thread_id,
                 reply_markup=markup,
+                disable_notification=quiet,
             )
         sent.append(message)
     return sent
@@ -3137,6 +3148,28 @@ _api_unavailable: set[tuple[int, str]] = set()
 # quiet, healthy relay.
 _api_window_missed: set[tuple[int, str]] = set()
 
+# One buzz per ANSWER (owner, 2026-11-02): progress segments still land in the
+# topic, but with `disable_notification`, and only the answer's opening send
+# raises a push. The TURN ANCHOR scopes "this answer": a new prompt (new
+# anchor) may buzz again, and the same answer seen through BOTH paths — the
+# API delivered it, then a service failure handed the pane the same text —
+# can never buzz twice. Keyed (chat_id, session) -> turn anchor, so the map
+# holds one entry per relayed session (same bound as the other relay maps).
+_answer_notified: dict[tuple[int, str], int | None] = {}
+
+
+def _may_notify(chat_id: int, session: str, turn: int | None) -> bool:
+    """True while this turn's answer has NOT raised its notification yet."""
+    if turn is None:
+        return True  # no anchor to scope by: the segment rules bound it
+    return _answer_notified.get((chat_id, session)) != turn
+
+
+def _mark_notified(chat_id: int, session: str, turn: int | None) -> None:
+    """Record that this turn's answer buzzed — only AFTER the send landed."""
+    if turn is not None:
+        _answer_notified[(chat_id, session)] = turn
+
 
 def _relay_pin(state: GatewayState, chat_id: int, session: str) -> str | None:
     """The OpenCode conversation id to read for this session, else ``None``.
@@ -3249,15 +3282,27 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
     )
     # Same anchor rule as the pane path: INTO the topic, and only a reply to
     # an anchor that lives in that very topic (never across threads).
+    turn = state.turn_message(chat_id, session)
     thread_id = state.session_topic(chat_id, session)
-    reply_to = state.turn_message(chat_id, session)
+    reply_to = turn
     if thread_id is not None and state.turn_thread(chat_id, session) != thread_id:
         reply_to = None
     stored = since
     # The GM's own surface: a relayed dispatcher answer carries the session
     # browser button (the owner taps it where they talk to the dispatcher).
     markup = _browse_markup(session)
-    for message_id, text in plan.items:
+    # One notification per batch, on the NEWEST answer in it: a batch can hold
+    # more than one sentinel message (the relay was stalled across a turn, or a
+    # send failed mid-batch and the rest is retried), and the answer the owner
+    # is waiting on is the last one — the older ones are delivered muted.
+    sentinel_indexes = [
+        index
+        for index, (_, text) in enumerate(plan.items)
+        if carries_answer(text)
+    ]
+    answer_index = sentinel_indexes[-1] if sentinel_indexes else None
+    for index, (message_id, text) in enumerate(plan.items):
+        notify = index == answer_index and _may_notify(chat_id, session, turn)
         try:
             sent = await _send_markdown(
                 app.bot,
@@ -3266,6 +3311,7 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
                 reply_to=reply_to,
                 thread_id=thread_id,
                 reply_markup=markup,
+                notify=notify,
             )
         except TelegramError as exc:
             log.warning(
@@ -3276,17 +3322,20 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
             break
         for message in sent:
             _track(state, chat_id, session, message)
+        if notify:
+            _mark_notified(chat_id, session, turn)
         stored = message_id
         state.touch_activity(chat_id, session, "output")
         log.info(
             "relay_sent chat_id=%s session=%s chars=%s total=%s reply_to=%s "
-            "thread=%s source=api",
+            "thread=%s notify=%s source=api",
             chat_id,
             session,
             len(text),
             len(text),
             reply_to,
             thread_id,
+            notify,
         )
     if plan.reason == "since_id_not_in_window":
         _note_api_window(chat_id, session, since or "-", len(messages))
@@ -3370,13 +3419,18 @@ async def relay_once(app: Application) -> None:
             new_text = delta_since(last, text)
             if not new_text.strip():
                 continue
+            # Progress is delivered, not announced (owner, 2026-11-02): only
+            # the answer's opening send raises a push, and only once per turn.
+            turn = state.turn_message(chat_id, session)
+            notify = pane_notify(raw, text=text, last=last, segment=new_text)
+            notify = notify and _may_notify(chat_id, session, turn)
             # Reply to the message that started this turn, so the answer lands
             # in the thread the owner can quote to keep talking to this session.
             # In a forum topic the answer goes INTO the topic; the anchor is
             # only reused when it was posted inside that very topic — a turn 1
             # anchor in General must never become a cross-thread reply.
             thread_id = state.session_topic(chat_id, session)
-            reply_to = state.turn_message(chat_id, session)
+            reply_to = turn
             if thread_id is not None and state.turn_thread(chat_id, session) != thread_id:
                 reply_to = None
             try:
@@ -3387,24 +3441,29 @@ async def relay_once(app: Application) -> None:
                     reply_to=reply_to,
                     thread_id=thread_id,
                     reply_markup=_browse_markup(session),
+                    notify=notify,
                 )
             except TelegramError as exc:
                 log.warning("relay_send_failed chat_id=%s session=%s error=%s", chat_id, session, exc)
                 continue
             for message in sent:
                 _track(state, chat_id, session, message)
+            if notify:
+                _mark_notified(chat_id, session, turn)
             state.set_last_relayed(chat_id, session, text)
             # New agent output IS activity (owner, 2026-10-27): a session still
             # producing answers is never swept, however long the turn runs.
             state.touch_activity(chat_id, session, "output")
             log.info(
-                "relay_sent chat_id=%s session=%s chars=%s total=%s reply_to=%s thread=%s",
+                "relay_sent chat_id=%s session=%s chars=%s total=%s reply_to=%s "
+                "thread=%s notify=%s",
                 chat_id,
                 session,
                 len(new_text),
                 len(text),
                 reply_to,
                 thread_id,
+                notify,
             )
 
 
