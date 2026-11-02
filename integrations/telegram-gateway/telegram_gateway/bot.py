@@ -23,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import opencode_api
+from . import opencode_api, search
 from .amux import AmuxClient, AmuxError, session_id_from_flags
 from .config import Config
 from .control import ControlServer, create_topic
@@ -39,8 +39,6 @@ from .manager import (
 )
 from .menu import (
     EFFORTS,
-    INTRO_MAX_CHARS,
-    INTRO_MAX_MESSAGES,
     NO_DIRECTORY,
     PREFIX,
     browse_button,
@@ -57,6 +55,7 @@ from .menu import (
     project_sessions_keyboard,
     projects_from_rows,
     projects_keyboard,
+    search_results_keyboard,
     session_effort,
     session_model,
     sessions_keyboard,
@@ -65,7 +64,6 @@ from .menu import (
 )
 from .pollwatch import PollWatch, default_watch
 from .relay import (
-    assistant_texts,
     carries_answer,
     chunk_text,
     delta_since,
@@ -82,6 +80,7 @@ log = logging.getLogger("telegram_gateway")
 
 PROMPT = 1
 ASK = 2  # the ✏️ rename / ⌨️ custom-model prompt conversation
+FIND = 3  # the 🔍 search conversation (one input per entry, never a hijack)
 
 # A burst of identical messages in General (a client retry, a double tap, a
 # forwarded copy) is ONE intent: since Milestone 11.5 every copy routes to the
@@ -1957,6 +1956,45 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _show_projects(update, context)
     elif action == "adopt":
         await _adopt_session(update, context, raw)
+    elif action == "findf":
+        st = _find_state(context)
+        if "t_from" not in st:
+            await _find_stale(update)
+        else:
+            st["field"] = (
+                search.FIELD_CREATED
+                if st.get("field") == search.FIELD_UPDATED
+                else search.FIELD_UPDATED
+            )
+            st["page"] = 0
+            await _render_find(update, context)
+    elif action == "finds":
+        st = _find_state(context)
+        if "t_from" not in st:
+            await _find_stale(update)
+        else:
+            st["directory"] = None
+            st["page"] = 0
+            await _render_find(update, context)
+    elif action == "findpg":
+        st = _find_state(context)
+        if "t_from" not in st:
+            await _find_stale(update)
+        else:
+            try:
+                st["page"] = max(0, int(raw))
+            except (TypeError, ValueError):
+                st["page"] = 0
+            await _render_find(update, context)
+    elif action in ("find", "findd", "findprj"):
+        # These are ConversationHandler ENTRY points; landing here means
+        # another conversation owns this chat (a rename/prompt ask in
+        # flight). Say so — a tap that silently does nothing is the one
+        # thing a button must never be.
+        await _say(
+            update,
+            "⏳ Finish or /cancel the current prompt first, then tap again.",
+        )
     elif action in ("ctlr", "ctlc"):
         # The prompt conversation owns both as entry points, registered before
         # this handler: reaching here means that wiring broke. Log it (a button
@@ -2589,32 +2627,6 @@ async def _show_project_sessions(
     )
 
 
-async def _resume_intro(client, ses_id: str, title: str) -> str:
-    """The topic's opening message: the conversation's last answers, in order.
-
-    Carried as ``POST /topic``'s ``prompt`` — the echo machinery (11.6)
-    sends it plain, makes it the turn anchor and records it, so the topic
-    opens with "where it left off" and the next answer replies inside it. A
-    history failure is NOT a failed adopt: the intro degrades to a one-line
-    orientation marker (the topic and the lane are what matter).
-    """
-    try:
-        messages = await client.messages(ses_id, max_pages=1)
-    except AmuxError as exc:
-        log.warning(
-            "browse_intro_failed ses=%s status=%s detail=%s",
-            ses_id,
-            exc.status,
-            exc.detail,
-        )
-        return f"Resumed conversation: {title}"
-    texts = assistant_texts(messages, limit=INTRO_MAX_MESSAGES)
-    if not texts:
-        return f"Resumed conversation: {title}"
-    body = "\n\n".join(texts)[:INTRO_MAX_CHARS]
-    return f"📂 {title} — last messages before the pause:\n\n{body}"
-
-
 async def _adopt_session(
     update: Update, context: ContextTypes.DEFAULT_TYPE, ses_id: str
 ) -> None:
@@ -2623,10 +2635,11 @@ async def _adopt_session(
     The three calls the owner's ask names, in order, all through the
     sanctioned surfaces: ``POST /api/sessions`` (a lane pinned to the
     ``ses_…`` in the conversation's own project dir — ``--session`` RESUMES,
-    it never copies), the gateway's own topic route IN-PROCESS (same binding
-    and logs as the dispatcher's ``POST /topic``), and the shared service's
-    ``GET /api/session/<id>/message`` for the intro. A lane already pinning
-    this conversation is REUSED — one conversation, one lane, ever.
+    it never copies) and the gateway's own topic route IN-PROCESS with
+    ``intro``+``reconnect`` (the endpoint fetches the last messages and, if
+    the topic was deleted in Telegram, recreates it with that recap).
+    A lane already pinning this conversation is REUSED — one conversation,
+    one lane, ever.
     """
     ses_id = (ses_id or "").strip()
     chat_id = update.effective_chat.id
@@ -2667,6 +2680,9 @@ async def _adopt_session(
         return
     title = str(row.get("title") or ses_id)
     directory = str(row.get("directory") or "") or None
+    close = getattr(oc, "aclose", None)
+    if close is not None:
+        await close()
 
     pins = await _pinned_lanes(context)
     lane = pins.get(ses_id)
@@ -2700,14 +2716,21 @@ async def _adopt_session(
             title,
         )
 
-    intro = await _resume_intro(oc, ses_id, title)
-    close = getattr(oc, "aclose", None)
-    if close is not None:
-        await close()
+    # The intro is `POST /topic`'s job now (owner, 2026-11-02): one format,
+    # one fetch, one echo — and `reconnect` makes a DELETED topic recreate
+    # itself with the same recap instead of reporting a dead binding.
     topic_name = title if title.strip() else ses_id
+    context_text = "Resumed from the session browser."
     status, payload = await create_topic(
         context.application,
-        {"session": lane, "chat_id": chat_id, "name": topic_name, "prompt": intro},
+        {
+            "session": lane,
+            "chat_id": chat_id,
+            "name": topic_name,
+            "prompt": context_text,
+            "intro": True,
+            "reconnect": True,
+        },
     )
     if status == 409:
         # A title collision with an existing topic (two conversations can
@@ -2718,7 +2741,9 @@ async def _adopt_session(
                 "session": lane,
                 "chat_id": chat_id,
                 "name": f"{topic_name} ({ses_id[-6:]})",
-                "prompt": intro,
+                "prompt": context_text,
+                "intro": True,
+                "reconnect": True,
             },
         )
     if status >= 400:
@@ -2939,6 +2964,240 @@ async def gmmenu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+# ---------------------------------------------------------------------------
+# session search (owner, 2026-11-02): fuzzy by name, filter by a date range
+# ---------------------------------------------------------------------------
+
+FIND_STATE = "find_state"  # bot_data: the ONE active search (term + filters)
+FIND_PAGE = 10
+
+
+def _find_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.application.bot_data.setdefault(FIND_STATE, {})
+
+
+async def _find_stale(update: Update) -> None:
+    """A filter tap with no search behind it (a restart, an old message)."""
+    await _say(
+        update,
+        "🔍 No active search — tap 🔍 Find sessions (or send /find) to start one.",
+    )
+
+
+async def _ask_find(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    directory: str | None = None,
+) -> int:
+    """Enter the one-shot FIND conversation and ask for the term.
+
+    Field and range are STICKY (the owner sets them once, searches again);
+    the scope is per entry — global, or the project the list was opened
+    from. Every input ENDS the conversation after answering it, so the
+    dispatcher's thread is never hijacked by a half-finished search.
+    """
+    query = update.callback_query
+    if query is not None:
+        try:
+            await query.answer()
+        except TelegramError:
+            pass
+    st = _find_state(context)
+    default_from, default_to = search.default_range()
+    st.setdefault("field", search.FIELD_UPDATED)
+    st.setdefault("t_from", default_from)
+    st.setdefault("t_to", default_to)
+    st["directory"] = directory
+    st["mode"] = "term"
+    st["page"] = 0
+    scope = f" in {dir_label(directory)}" if directory else " (global)"
+    log.info(
+        "find_asked user=%s scope=%s",
+        update.effective_user.id,
+        directory or "global",
+    )
+    await _say(
+        update,
+        f"🔍 Send what to find{scope} — fuzzy, matches titles and `ses_…` "
+        "ids (or /cancel).",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return FIND
+
+
+@allow_only
+async def ask_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/find or the 🔍 button: a global fuzzy search."""
+    return await _ask_find(update, context, directory=None)
+
+
+@allow_only
+async def ask_find_project(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """/🔍 from a project's list: the SAME search, scoped to that dir."""
+    raw = (update.callback_query.data or "").removeprefix(PREFIX + "findprj:")
+    projects: list[dict] = context.application.bot_data.get(BROWSE_KEY) or []
+    try:
+        index = int(raw)
+    except (TypeError, ValueError):
+        index = -1
+    directory = None
+    if 0 <= index < len(projects):
+        directory = str(projects[index].get("directory") or "") or None
+    else:
+        # A stale scope (restart, list moved): honest fallback to global —
+        # never a wrong directory under the owner's finger.
+        log.info("find_scope_stale target=%s rendered=%s", raw, len(projects))
+    return await _ask_find(update, context, directory=directory)
+
+
+@allow_only
+async def ask_find_dates(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """/⏱ Range…: ask for the initial/final timestamps (defaults shown)."""
+    query = update.callback_query
+    if query is not None:
+        try:
+            await query.answer()
+        except TelegramError:
+            pass
+    st = _find_state(context)
+    default_from, default_to = search.default_range()
+    t_from = st.get("t_from", default_from)
+    t_to = st.get("t_to", default_to)
+    st["mode"] = "dates"
+    await _say(
+        update,
+        "⏱ Send the range: *initial, final*.\n"
+        f"Current: {search.format_date(t_from)} → {search.format_date(t_to)} "
+        "(defaults: five days ago → tomorrow)\n"
+        "Examples: `2026-10-28, 2026-11-03` · `2026-11-01 09:00, now` · "
+        "`2026-10-25 to 2026-11-05`\n"
+        "Comma, `to` or space between them; `HH:MM` optional; `now` allowed; "
+        "or /cancel.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return FIND
+
+
+async def _render_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the stored search's results: header states scope + ACTIVE field
+    + range; rows adopt through the existing flow."""
+    st = _find_state(context)
+    term = str(st.get("term") or "")
+    field = st.get("field") or search.FIELD_UPDATED
+    t_from = st.get("t_from")
+    t_to = st.get("t_to")
+    if t_from is None or t_to is None:
+        t_from, t_to = search.default_range()
+    directory = st.get("directory")
+    oc = await _oc_service(context, "find")
+    if oc is None:
+        await _say(
+            update,
+            "❌ the OpenCode service is unreachable — the conversation list "
+            "cannot be read right now.",
+        )
+        return
+    try:
+        rows = await oc.sessions()
+    except AmuxError as exc:
+        await _say(update, f"❌ the session list failed: {exc.detail}")
+        return
+    finally:
+        close = getattr(oc, "aclose", None)
+        if close is not None:
+            await close()
+    results = search.search_sessions(
+        rows, term=term, field=field, t_from=t_from, t_to=t_to,
+        directory=directory,
+    )
+    pages = max(1, (len(results) + FIND_PAGE - 1) // FIND_PAGE)
+    page = min(max(0, int(st.get("page") or 0)), pages - 1)
+    st["page"] = page
+    entries = [dict(row) for row in results[page * FIND_PAGE:(page + 1) * FIND_PAGE]]
+    if entries:
+        pins = await _pinned_lanes(context)
+        for entry in entries:
+            entry["adopted_by"] = pins.get(entry.get("id"))
+    scope = f"📁 {dir_label(directory)}" if directory else "🌍 global"
+    when = (
+        f"{search.format_date(t_from) or '?'} → {search.format_date(t_to) or '?'}"
+    )
+    quoted = term.replace("`", "'")
+    header = (
+        f"🔍 `{quoted}` — {len(results)} match(es)\n"
+        f"scope: {scope} · filter: {field} {when}"
+        + (f" · page {page + 1}/{pages}" if pages > 1 else "")
+    )
+    if not results:
+        header += (
+            "\n\nNothing matches — widen the range ⏱, toggle the date 📅, "
+            "or drop the scope 🌍."
+        )
+    await _say(
+        update,
+        header,
+        reply_markup=search_results_keyboard(
+            entries,
+            page=page,
+            pages=pages,
+            field=field,
+            t_from=t_from,
+            t_to=t_to,
+            scoped=directory is not None,
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@allow_only
+async def receive_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """One input, one answer, conversation over (term → results; dates →
+    re-render; a bad range → honest example and a RETRY, never a guess)."""
+    st = _find_state(context)
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Send something to search for (or /cancel).")
+        return FIND
+    if st.get("mode") == "dates":
+        parsed = search.parse_range(text)
+        if parsed is None:
+            await update.message.reply_text(
+                "❌ I couldn't read that range. Send two dates, e.g.\n"
+                "`2026-10-28, 2026-11-03` — comma, space or `to` between them; "
+                "`HH:MM` optional; `now` allowed; a single value spans that "
+                "whole day.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return FIND  # stay: the owner retries the range
+        st["t_from"], st["t_to"] = parsed
+        st["mode"] = None
+        st["page"] = 0
+        log.info(
+            "find_range user=%s from=%s to=%s",
+            update.effective_user.id,
+            search.format_date(parsed[0]),
+            search.format_date(parsed[1]),
+        )
+        await _render_find(update, context)
+        return ConversationHandler.END
+    st["term"] = text
+    st["mode"] = None
+    st["page"] = 0
+    log.info(
+        "find_searched user=%s term_chars=%s scope=%s",
+        update.effective_user.id,
+        len(text),
+        st.get("directory") or "global",
+    )
+    await _render_find(update, context)
+    return ConversationHandler.END
+
+
 @allow_only
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = _cfg(context)
@@ -3150,12 +3409,26 @@ _api_window_missed: set[tuple[int, str]] = set()
 
 # One buzz per ANSWER (owner, 2026-11-02): progress segments still land in the
 # topic, but with `disable_notification`, and only the answer's opening send
-# raises a push. The TURN ANCHOR scopes "this answer": a new prompt (new
-# anchor) may buzz again, and the same answer seen through BOTH paths — the
-# API delivered it, then a service failure handed the pane the same text —
-# can never buzz twice. Keyed (chat_id, session) -> turn anchor, so the map
-# holds one entry per relayed session (same bound as the other relay maps).
+# raises a push. Keyed (chat_id, session) -> one entry per relayed session
+# (same bound as the other relay maps).
+#
+# TWO scopes, because the TURN ANCHOR alone is not a turn: it only advances
+# when a prompt rides the GATEWAY's own machinery (`_continue_session`), and a
+# prompt the dispatcher forwards straight to the lane (`amux send`, the GM's
+# dispatch path) never touches it — measured live 2026-11-02: three answers
+# relayed `reply_to=401` (anchor stuck), the first buzzed and every later one
+# went out SILENT, which is exactly what the owner reported as "you stopped
+# sending me those all together". So:
+#
+# - `_answer_notified` (anchor) stays the PANE path's scope and the
+#   cross-path guard: an API-delivered answer records its anchor here, so a
+#   later pane fallback of the same answer can never buzz twice;
+# - `_answer_msg_notified` (the BUZZED assistant message id) is the API
+#   path's scope: the API sees the conversation itself, and a USER message
+#   newer than the last buzzed answer IS the next turn — whatever route the
+#   prompt took to get there (gateway, dispatcher, dashboard, CLI).
 _answer_notified: dict[tuple[int, str], int | None] = {}
+_answer_msg_notified: dict[tuple[int, str], str] = {}
 
 
 def _may_notify(chat_id: int, session: str, turn: int | None) -> bool:
@@ -3169,6 +3442,29 @@ def _mark_notified(chat_id: int, session: str, turn: int | None) -> None:
     """Record that this turn's answer buzzed — only AFTER the send landed."""
     if turn is not None:
         _answer_notified[(chat_id, session)] = turn
+
+
+def _api_turn_fresh(messages: list[dict], chat_id: int, session: str) -> bool:
+    """True when the conversation shows a NEW owner prompt since the last
+    answer this session buzzed — the API path's turn scope.
+
+    ``messages`` is the newest-first page the relay just read, so "newer
+    than the buzzed answer" is "earlier in the list". A missing buzzed id
+    (first buzz, or the id slid out of the window) fails OPEN: a missed
+    notification is the failure the owner feels, a possible double buzz in a
+    thousand-row window slide is not.
+    """
+    key = (chat_id, session)
+    buzzed = _answer_msg_notified.get(key)
+    if not buzzed:
+        return True
+    index = next(
+        (i for i, m in enumerate(messages) if str(m.get("id") or "") == buzzed),
+        None,
+    )
+    if index is None:
+        return True  # out of the fetched window: cannot prove it is the same turn
+    return any(str(m.get("type") or "") == "user" for m in messages[:index])
 
 
 def _relay_pin(state: GatewayState, chat_id: int, session: str) -> str | None:
@@ -3301,8 +3597,23 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
         if carries_answer(text)
     ]
     answer_index = sentinel_indexes[-1] if sentinel_indexes else None
+    # The API path's turn scope is the CONVERSATION, not the Telegram anchor
+    # (see `_api_turn_fresh`): computed once, before this batch's own buzz.
+    fresh_turn = _api_turn_fresh(messages, chat_id, session)
     for index, (message_id, text) in enumerate(plan.items):
-        notify = index == answer_index and _may_notify(chat_id, session, turn)
+        notify = index == answer_index and fresh_turn
+        if index == answer_index and not notify:
+            # This batch's ANSWER is going out silent. After the fix that
+            # means it already buzzed (a retry — correct); if a sweep ever
+            # greps this while the owner reports silence, the turn rule is
+            # refusing answers again — the defect signature of 2026-11-02.
+            log.info(
+                "relay_answer_quiet chat_id=%s session=%s msg_id=%s "
+                "reason=already_notified",
+                chat_id,
+                session,
+                message_id,
+            )
         try:
             sent = await _send_markdown(
                 app.bot,
@@ -3324,6 +3635,10 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
             _track(state, chat_id, session, message)
         if notify:
             _mark_notified(chat_id, session, turn)
+            # The API's own scope: the next buzz waits for a NEW user message
+            # after this one, so a dispatcher-forwarded prompt (which never
+            # moves the Telegram anchor) buzzes its answer too.
+            _answer_msg_notified[(chat_id, session)] = str(message_id)
         stored = message_id
         state.touch_activity(chat_id, session, "output")
         log.info(
@@ -3422,8 +3737,20 @@ async def relay_once(app: Application) -> None:
             # Progress is delivered, not announced (owner, 2026-11-02): only
             # the answer's opening send raises a push, and only once per turn.
             turn = state.turn_message(chat_id, session)
-            notify = pane_notify(raw, text=text, last=last, segment=new_text)
-            notify = notify and _may_notify(chat_id, session, turn)
+            wants = pane_notify(raw, text=text, last=last, segment=new_text)
+            notify = wants and _may_notify(chat_id, session, turn)
+            if wants and not notify:
+                # The pane says "this is the answer opening" but the anchor
+                # gate refuses: with a STUCK anchor (a prompt the dispatcher
+                # delivered straight to the lane never advances it) this is
+                # the "silent answer" signature — greppable, never silent.
+                log.info(
+                    "relay_answer_quiet chat_id=%s session=%s "
+                    "reason=anchor_held turn=%s",
+                    chat_id,
+                    session,
+                    turn,
+                )
             # Reply to the message that started this turn, so the answer lands
             # in the thread the owner can quote to keep talking to this session.
             # In a forum topic the answer goes INTO the topic; the anchor is
@@ -4473,6 +4800,12 @@ def build_application(
             CallbackQueryHandler(ask_rename, pattern=r"^gw:ctlr:"),
             CallbackQueryHandler(ask_model, pattern=r"^gw:ctlc:"),
             CommandHandler("name", name_command),
+            # 🔍 search (owner, 2026-11-02): one input per entry, then END —
+            # the dispatcher's thread is never hijacked by a live search.
+            CommandHandler("find", ask_find),
+            CallbackQueryHandler(ask_find, pattern=r"^gw:find$"),
+            CallbackQueryHandler(ask_find_project, pattern=r"^gw:findprj:"),
+            CallbackQueryHandler(ask_find_dates, pattern=r"^gw:findd$"),
         ],
         states={
             PROMPT: [
@@ -4481,6 +4814,9 @@ def build_application(
             ],
             ASK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ask),
+            ],
+            FIND: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_find),
             ],
         },
         fallbacks=[

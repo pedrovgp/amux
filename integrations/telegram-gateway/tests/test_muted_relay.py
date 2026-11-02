@@ -38,10 +38,12 @@ from test_relay_api import CHAT, PIN, FakeOcService, app_for, assistant, pane_cl
 
 @pytest.fixture(autouse=True)
 def _clean_notify_gate():
-    """`_answer_notified` is module state; every test starts with no claim."""
+    """Both notify scopes are module state; every test starts with no claim."""
     botmod._answer_notified.clear()
+    botmod._answer_msg_notified.clear()
     yield
     botmod._answer_notified.clear()
+    botmod._answer_msg_notified.clear()
 
 
 def state_for(tmp_path) -> GatewayState:
@@ -295,3 +297,134 @@ def test_relay_sent_logs_which_sends_notified(tmp_path, caplog):
     assert len(lines) == 2
     assert any("notify=False" in line for line in lines), lines
     assert any("notify=True" in line for line in lines), lines
+
+
+# ---- 5. the dispatcher-forwarded turn (the owner's 2026-11-02 report) ------
+
+
+def _user(msg_id, text="[from Telegram @owner] next task"):
+    return {
+        "id": msg_id,
+        "type": "user",
+        "time": {"created": 4, "streamed": 5, "completed": 6},
+        "content": [{"type": "text", "text": text}],
+    }
+
+
+def test_api_turn_fresh_reads_the_conversation_not_the_anchor():
+    """The API path's turn scope: a USER message newer than the last buzzed
+    answer IS the next turn — whatever route the prompt took to get there."""
+    chat, sess = 1, "s"
+    # never buzzed → the first answer may buzz
+    assert botmod._api_turn_fresh([assistant("a1")], chat, sess)
+    botmod._answer_msg_notified[(chat, sess)] = "a1"
+    # same turn: nothing user-authored after the buzzed answer → muted
+    assert not botmod._api_turn_fresh(
+        [assistant("a2"), assistant("a1"), _user("u1")], chat, sess
+    )
+    # a new prompt (even one the gateway never saw) → the next turn
+    assert botmod._api_turn_fresh(
+        [assistant("a2"), _user("u2"), assistant("a1"), _user("u1")], chat, sess
+    )
+    # the buzzed id slid out of the window → fail OPEN (a missed push is the
+    # failure the owner feels; a rare double buzz is not)
+    assert botmod._api_turn_fresh([assistant("a9")], chat, sess)
+
+
+def test_a_dispatcher_forwarded_prompt_buzzes_even_with_a_stuck_anchor(tmp_path):
+    """The live defect (2026-11-02): prompts the GM forwards straight to the
+    lane (`amux send`) never advance the Telegram anchor, so the anchor-scoped
+    gate muted EVERY answer after the first one — the owner saw silent
+    replies and asked whether sending had stopped altogether. The conversation
+    itself shows the new user message, so the second answer must buzz."""
+    state = state_for(tmp_path)  # anchor 55 — and it STAYS 55 all test
+    state.set_pinned(CHAT, "mgr-x", PIN)
+    oc = FakeOcService(
+        [assistant("msg_1", "—— answer ——\nfirst answer"), _user("msg_u1")]
+    )
+    bot = FakeBot()
+    client, _ = pane_client("no boundary in this pane at all\n")
+
+    try:
+        relay(state, bot, oc, client)  # cycle 1: the first answer buzzes
+        # a dispatcher-forwarded prompt + its answer land in the conversation
+        # without any gateway involvement:
+        oc.history[0:0] = [
+            assistant("msg_2", "—— answer ——\nsecond answer"),
+            _user("msg_u2"),
+        ]
+        assert state.turn_message(CHAT, "mgr-x") == 55  # the anchor is STUCK
+        relay(state, bot, oc, client)  # cycle 2
+    finally:
+        run(client.aclose())
+
+    assert bot.notified == [True, True], "a new prompt must buzz its answer"
+    assert botmod._answer_msg_notified[(CHAT, "mgr-x")] == "msg_2"
+
+
+def test_an_answer_with_no_new_prompt_stays_muted(tmp_path):
+    """The other half: a repeat/continuation with NO user message after the
+    buzzed answer is the SAME turn — no second buzz."""
+    state = state_for(tmp_path)
+    state.set_pinned(CHAT, "mgr-x", PIN)
+    oc = FakeOcService(
+        [assistant("msg_1", "—— answer ——\nfirst answer"), _user("msg_u1")]
+    )
+    bot = FakeBot()
+    client, _ = pane_client("no boundary in this pane at all\n")
+
+    try:
+        relay(state, bot, oc, client)
+        oc.history[0:0] = [assistant("msg_2", "—— answer ——\nsame turn again")]
+        relay(state, bot, oc, client)
+    finally:
+        run(client.aclose())
+
+    assert bot.notified == [True, False], "one push per PROMPT, not per send"
+
+
+def test_a_repeat_answer_logs_the_quiet_verdict(tmp_path, caplog):
+    """The two-fix log signal on the API path: an answer sent SILENT is in
+    the log either way (`relay_answer_quiet`), so 'the owner reports no
+    pushes' is always greppable."""
+    state = state_for(tmp_path)
+    state.set_pinned(CHAT, "mgr-x", PIN)
+    botmod._answer_msg_notified[(CHAT, "mgr-x")] = "msg_1"  # already buzzed
+    oc = FakeOcService([assistant("msg_1", "—— answer ——\nthe answer"), _user("u1")])
+    bot = FakeBot()
+    client, _ = pane_client("no boundary in this pane at all\n")
+
+    try:
+        with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+            relay(state, bot, oc, client)
+    finally:
+        run(client.aclose())
+
+    assert bot.notified == [False]
+    assert any(
+        "relay_answer_quiet" in m and "reason=already_notified" in m
+        for m in caplog.messages
+    )
+
+
+def test_a_held_anchor_logs_the_quiet_answer(tmp_path, caplog):
+    """The same signal on the PANE path: the pane says 'this is the answer'
+    but the anchor gate refuses — the exact silent-answer signature."""
+    state = state_for(tmp_path)  # anchor 55
+    botmod._answer_notified[(CHAT, "mgr-x")] = 55  # this anchor already buzzed
+    bot = FakeBot()
+    client, _ = pane_client(
+        "[from Telegram @owner] task\n—— answer ——\nthe answer"
+    )
+
+    try:
+        with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+            relay(state, bot, None, client)
+    finally:
+        run(client.aclose())
+
+    assert bot.notified == [False], "delivered, but silent"
+    assert any(
+        "relay_answer_quiet" in m and "reason=anchor_held" in m
+        for m in caplog.messages
+    )

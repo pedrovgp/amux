@@ -110,6 +110,13 @@ curl -sS -X POST http://127.0.0.1:8834/topic \
 - Answers: `201 {"thread":…}` created · `200 {"created":false}` it already
   has one (calling twice is safe — the prompt echoes only on creation) ·
   `502 {"error":…}` Telegram refused.
+- `reconnect` + `intro` — pass BOTH on any CONNECT (the owner's default
+  behavior since 2026-11-02): `{"reconnect": true, "intro": true}` makes
+  the gateway **verify** the topic (the send is the detector), **recreate**
+  it when it was deleted in Telegram (`"recreated":true` — you do nothing),
+  and open it with the conversation's **last messages** so the owner sees
+  where it stopped. On a live topic your context lands in it
+  (`"echoed":true`). A plain spawn needs neither flag.
 
 After that, never touch the Bot API — but your REPORTS into the topic go
 through the gateway's second route, `POST /message`
@@ -158,8 +165,12 @@ started elsewhere, a `ses_…` you know. To carry it in a topic:
    belongs to, `start:true`. `--session` RESUMES an existing conversation
    (the same mechanism that revives idle managers) — it continues where it
    left off, it is not a copy.
-3. **`POST /topic`** with that lane's name (plus `chat_id`; a one-line
-   `prompt` is fine as an orientation marker).
+3. **`POST /topic`** with that lane's name (plus `chat_id`) and
+   `"reconnect": true, "intro": true` — the owner's DEFAULT connect: the
+   gateway verifies the topic, recreates it (with the conversation's last
+   messages as its intro) when it was deleted in Telegram, and lands your
+   context in it when it is alive. `recreated:true` in the answer means
+   "rebuilt, say so in one line".
 
 After that it behaves exactly like a dispatched worker: the owner writes in
 the topic to continue it, and EVERY answer relays into the topic — including

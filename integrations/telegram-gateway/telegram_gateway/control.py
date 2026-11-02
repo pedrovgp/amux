@@ -22,6 +22,12 @@ the topic BOUND to a session (owner, 2026-10-31): the dispatcher's report on
 a dispatch lands in the worker's own topic, looked up from the gateway's
 binding — the caller never names a thread.
 
+``POST /topic`` also carries the owner's DEFAULT connect behavior
+(2026-11-02): ``reconnect`` verifies an existing binding by landing the
+context into it — a deleted topic is released and recreated — and ``intro``
+opens the topic with the conversation's last messages, so "where we stopped"
+is the first thing in it.
+
 Transport: a tiny asyncio HTTP/1.1 server on ``127.0.0.1`` inside the running
 gateway process — no framework, no second process, no shared file. It is
 unauthenticated and loopback-only (single-owner machine); ``control_port=0``
@@ -35,7 +41,10 @@ import logging
 
 from telegram.error import TelegramError
 
-from .amux import session_id_from_flags
+from . import opencode_api
+from .amux import AmuxError, session_id_from_flags
+from .menu import INTRO_MAX_CHARS, INTRO_MAX_MESSAGES
+from .relay import assistant_texts
 
 log = logging.getLogger("telegram_gateway")
 
@@ -59,6 +68,140 @@ REASONS = {
 # ---------------------------------------------------------------------------
 
 
+def _thread_missing(exc: BaseException) -> bool:
+    """True when Telegram says the TOPIC is gone (measured twice live).
+
+    The one error that proves death: a send into a deleted thread answers
+    "Message thread not found" (live 2026-10-31 on thread 191, and again on
+    the probes). Anything else — rights, flood limits — proves NOTHING about
+    the topic's existence and must never release a live binding.
+    """
+    return "thread not found" in str(exc).lower()
+
+
+async def _fetch_intro(app, pin: str, name: str) -> str | None:
+    """The conversation's last completed answers, as a topic's opening context.
+
+    The owner's default (2026-11-02): *"recreate the topic and fetch the
+    latest message so I know where we stopped."* Reads the SHARED serve
+    (``GET /api/session/<pin>/message``, newest-first) through the same
+    client the relay uses, takes the last :data:`INTRO_MAX_MESSAGES`
+    completed assistant texts oldest-first, bounded to
+    :data:`INTRO_MAX_CHARS`. Every failure is a WARN and ``None``: an intro
+    is a nicety, it never refuses a topic that must exist.
+    """
+    if not pin:
+        return None
+    cfg = app.bot_data.get("cfg")
+    if cfg is None:  # a test app without config skips the nicety
+        return None
+    api = app.bot_data.get("oc_api") or opencode_api
+    client = None
+    try:
+        client = await api.client_for_service(
+            url=cfg.opencode_service_url,
+            password=cfg.opencode_service_password,
+            service_json=cfg.opencode_service_json,
+            state_json=cfg.opencode_service_state,
+        )
+        messages = await client.messages(pin, max_pages=1)
+    except AmuxError as exc:
+        log.warning(
+            "topic_intro_failed pin=%s status=%s detail=%s",
+            pin,
+            exc.status,
+            exc.detail,
+        )
+        return None
+    except Exception as exc:  # a surprise must degrade, never explode
+        log.warning("topic_intro_failed pin=%s detail=%s", pin, exc)
+        return None
+    finally:
+        if client is not None:
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                await close()
+    texts = assistant_texts(messages, limit=INTRO_MAX_MESSAGES)
+    if not texts:
+        return None
+    body = "\n\n".join(texts)[:INTRO_MAX_CHARS]
+    return f"📂 {name} — last messages before the pause:\n\n{body}"
+
+
+# The verdicts of a ``reconnect`` attempt against an EXISTING binding.
+LANDED = "landed"  # context posted into the live topic
+DEAD = "dead"  # proven gone: release + recreate
+FAILED = "failed"  # Telegram refused for another reason: keep the binding
+SILENT = "silent"  # alive (or unproven), nothing to land
+
+
+async def _land_context(
+    app, chat_id: int, thread: int, session: str,
+    prompt, intro: bool, pin: str | None, name: str,
+) -> str:
+    """Land the caller's context into an existing topic — and classify it.
+
+    The SEND is the detector (there is no message-getter in the Bot API):
+    a content send into a dead thread raises "Message thread not found" and
+    delivered nothing, so the caller can release + recreate without any
+    duplicate risk. With no content to send, a ``sendChatAction`` probe
+    stands in (no message, no content) — if Telegram ever stops validating
+    the thread there, the caller degrades to today's behavior, never worse.
+    """
+    parts = []
+    if isinstance(prompt, str) and prompt.strip():
+        parts.append(prompt.strip())
+    if intro and pin:
+        intro_text = await _fetch_intro(app, pin, name)
+        if intro_text:
+            parts.append(intro_text)
+    content = "\n\n".join(parts) if parts else None
+    if content:
+        try:
+            sent = await app.bot.send_message(
+                chat_id, content, message_thread_id=thread
+            )
+        except TelegramError as exc:
+            if _thread_missing(exc):
+                return DEAD
+            log.warning(
+                "topic_prompt_echo_failed session=%s thread=%s error=%s",
+                session,
+                thread,
+                exc,
+            )
+            return FAILED
+        message_id = getattr(sent, "message_id", None)
+        if message_id is not None:
+            # Recorded so quoting the context continues the session — but
+            # deliberately NOT `set_turn_message`: a reconnect must never
+            # hijack the anchor of a turn that is already in flight.
+            state = app.bot_data["state"]
+            state.record_message(chat_id, int(message_id), session)
+        log.info(
+            "topic_prompt_echoed session=%s thread=%s msg_id=%s chars=%s mode=reconnect",
+            session,
+            thread,
+            message_id,
+            len(content),
+        )
+        return LANDED
+    try:
+        await app.bot.send_chat_action(
+            chat_id, action="typing", message_thread_id=thread
+        )
+    except TelegramError as exc:
+        if _thread_missing(exc):
+            return DEAD
+        log.debug(
+            "topic_probe_inconclusive session=%s thread=%s error=%s",
+            session,
+            thread,
+            exc,
+        )
+    return SILENT
+
+
 async def create_topic(app, payload: dict) -> tuple[int, dict]:
     """Create a forum topic, bind it to ``session``, log it. Idempotent.
 
@@ -70,6 +213,20 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     with the ``name`` you gave it, renamed ONCE to the session's OpenCode
     title when that title lands (owner, "I want", 2026-10-30) — and never
     again.
+
+    Two opt-in flags (owner, 2026-11-02 — the DEFAULT connect behavior):
+
+    - ``reconnect``: the session may already have a topic and that topic may
+      be DELETED in Telegram. The existing binding is verified by landing
+      the context into it (the send is the detector): alive → ``echoed:true``;
+      dead → the stale binding is released (``topic_released …
+      reason=thread_missing source=connect``) and a FRESH topic is created —
+      ``recreated:true`` in the ``201`` body. Only "thread not found" proves
+      death; any other error keeps the binding.
+    - ``intro``: fetch the pin's last messages from the shared serve and
+      open the topic with "where it stopped" — implied whenever a dead topic
+      is recreated (the owner's default). A failed fetch degrades to the
+      prompt alone (WARN), never a refusal.
 
     Returns ``(http status, json body)``; the body always says what happened
     so a manager can tell a real topic from a refused one without reading logs.
@@ -84,6 +241,9 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     prompt = payload.get("prompt")
     if prompt is not None and not isinstance(prompt, str):
         return 400, {"error": "prompt must be a string"}
+
+    reconnect = bool(payload.get("reconnect"))
+    intro = bool(payload.get("intro"))
 
     name = payload.get("name")
     if name is None or name == "":
@@ -107,18 +267,73 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
         except (TypeError, ValueError):
             return 400, {"error": "chat_id must be an integer"}
 
-    # Idempotent: the session already has its topic — report it, create nothing.
+    # The lane's PIN, looked up ONCE, early: the intro needs it BEFORE the
+    # echo, and the bind records it after the create (11.9a). A caller that
+    # spawns the lane first (every shipped flow does) finds it here; a
+    # name-only session stays exactly as bindable as before.
+    pin = None
+    client = app.bot_data.get("client")
+    if client is not None:
+        try:
+            row = await client.find(session)
+        except Exception:  # noqa: BLE001 — a name-only bind stays valid
+            log.debug("topic_pin_unknown session=%s", session)
+        else:
+            pin = session_id_from_flags(row.get("flags"))
+
+    # Idempotent: the session already has its topic — report it, create
+    # nothing. With `reconnect`/`intro` the existing topic is VERIFIED (and
+    # its context landed) before that report is trusted.
+    recreated = False
     existing = state.session_topic(chat_id, session)
     if existing is not None:
-        log.info(
-            "topic_exists chat_id=%s thread=%s session=%s", chat_id, existing, session
-        )
-        return 200, {
-            "thread": existing,
-            "session": session,
-            "name": name,
-            "created": False,
-        }
+        if reconnect or intro:
+            verdict = await _land_context(
+                app, chat_id, existing, session, prompt, intro, pin, name
+            )
+            if verdict == LANDED:
+                return 200, {
+                    "thread": existing,
+                    "session": session,
+                    "name": name,
+                    "created": False,
+                    "echoed": True,
+                    "recreated": False,
+                }
+            if verdict == FAILED:
+                return 200, {
+                    "thread": existing,
+                    "session": session,
+                    "name": name,
+                    "created": False,
+                    "echoed": False,
+                    "recreated": False,
+                }
+            if verdict == DEAD:
+                for freed in state.drop_session_topics(chat_id, session):
+                    log.info(
+                        "topic_released chat_id=%s thread=%s session=%s "
+                        "reason=thread_missing source=connect",
+                        chat_id,
+                        freed,
+                        session,
+                    )
+                recreated = True  # fall through to a fresh create
+        if not recreated:
+            log.info(
+                "topic_exists chat_id=%s thread=%s session=%s",
+                chat_id,
+                existing,
+                session,
+            )
+            return 200, {
+                "thread": existing,
+                "session": session,
+                "name": name,
+                "created": False,
+                "echoed": False,
+                "recreated": False,
+            }
 
     # Telegram happily allows two topics with one name; we do not, because the
     # gateway's map is keyed by name and could not tell them apart.
@@ -151,18 +366,10 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     # blind (`_relay_pin` reads it), so a bound session's outputs relayed
     # only through the pane sentinel, never the structured channel that sees
     # turns driven from a dashboard or the CLI. `set_pinned` BEFORE
-    # `set_topic`, so the binding writes `topic_pins` too.
-    if not state.pinned(chat_id, session):
-        client = app.bot_data.get("client")
-        if client is not None:
-            try:
-                row = await client.find(session)
-            except Exception:  # noqa: BLE001 — a name-only bind stays valid
-                log.debug("topic_pin_unknown session=%s", session)
-            else:
-                pin = session_id_from_flags(row.get("flags"))
-                if pin:
-                    state.set_pinned(chat_id, session, pin)
+    # `set_topic`, so the binding writes `topic_pins` too. The pin was
+    # resolved ONCE at the top (it also feeds the intro).
+    if pin and not state.pinned(chat_id, session):
+        state.set_pinned(chat_id, session, pin)
     # `created=True`: the OWNER's 11.8 ruling — this topic is ELIGIBLE for
     # the title sync. The task name is its BIRTH name; once OpenCode titles
     # the worker's conversation (seconds after the first turn), the topic is
@@ -172,15 +379,35 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     log.info(
         "topic_created chat_id=%s thread=%s name=%s source=control", chat_id, thread, name
     )
+    if recreated:
+        # The sweep signal for the owner's default (2026-11-02): a deleted
+        # topic was found, released and replaced — grep-able as the moment a
+        # dead binding healed itself.
+        log.info(
+            "topic_recreated chat_id=%s thread=%s session=%s reason=thread_missing",
+            chat_id,
+            thread,
+            session,
+        )
     echoed = False
+    # The echo: the caller's prompt, plus the conversation's last messages
+    # when the intro was asked for — or when a DEAD topic is being recreated
+    # (the owner's default: the recreated topic opens with "where we stopped").
+    parts = []
     if isinstance(prompt, str) and prompt.strip():
-        # The task that created the topic becomes its FIRST message and the
-        # session's turn anchor — scrolling up shows WHAT the worker was asked
-        # and its first answer replies to that (the contract the gateway's own
-        # minted topics had from the owner's 2026-10-29 ask, now carried by
-        # the dispatcher's spawn call). Plain, never parse_mode: the task text
-        # goes verbatim, the caller's own words.
-        body_text = prompt.strip()
+        parts.append(prompt.strip())
+    if (intro or recreated) and pin:
+        intro_text = await _fetch_intro(app, pin, name)
+        if intro_text:
+            parts.append(intro_text)
+    body_text = "\n\n".join(parts)[:4000] if parts else None
+    if body_text:
+        # The context becomes the topic's FIRST message and the session's
+        # turn anchor — scrolling up shows WHAT the worker was asked (and
+        # where the conversation stood) and its first answer replies to that
+        # (the contract the gateway's own minted topics had from the owner's
+        # 2026-10-29 ask, now carried by the dispatcher's spawn call and the
+        # connect flow). Plain, never parse_mode: the text goes verbatim.
         try:
             sent = await app.bot.send_message(
                 chat_id, body_text, message_thread_id=int(thread)
@@ -212,6 +439,7 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
         "name": name,
         "created": True,
         "echoed": echoed,
+        "recreated": recreated,
     }
 
 
@@ -278,7 +506,7 @@ async def post_message(app, payload: dict) -> tuple[int, dict]:
             "topic_message_failed session=%s thread=%s error=%s", session, thread, exc
         )
         released = False
-        if "thread not found" in str(exc).lower():
+        if _thread_missing(exc):
             # The topic is GONE (measured live 2026-10-31: thread 191 had
             # been deleted, the send answered "Message thread not found").
             # Same lifecycle as the relay's 404-send path: release the

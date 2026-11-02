@@ -683,12 +683,14 @@ class OpencodeClient:
         spawned in a project dir is titled here while a root-cwd
         ``opencode session list`` (the old cwd-scoped path) cannot see it.
 
-        ``directory`` (``location.directory``) and ``updated``
-        (``time.updated``, ms epoch) carry the session-browser UI (owner,
-        2026-10-31): projects are this field grouped, "last update" is that
-        one rendered as an age. Missing fields read as ``""``/``None``, never
-        an exception — a row without a location groups under the honest
-        "(no directory)" bucket instead of vanishing.
+        ``directory`` (``location.directory``) plus ``created`` and
+        ``updated`` (``time.created``/``time.updated``, ms epoch) carry the
+        session-browser and search UIs (owner, 2026-10-31/11-02): projects
+        are this field grouped, ages and the date-range filter read those
+        two. Missing fields read as ``""``/``None``, never an exception — a
+        row without a location groups under the honest "(no directory)"
+        bucket instead of vanishing, and a row without a date simply cannot
+        pass a filter on that date (it is excluded, not guessed).
         """
         event, target = "oc_api_session_list_failed", self.base_url
         try:
@@ -710,11 +712,13 @@ class OpencodeClient:
             )
             times = row.get("time")
             updated = times.get("updated") if isinstance(times, dict) else None
+            created = times.get("created") if isinstance(times, dict) else None
             out.append(
                 {
                     "id": str(row.get("id")),
                     "title": str(row.get("title") or ""),
                     "directory": directory,
+                    "created": created if isinstance(created, (int, float)) else None,
                     "updated": updated if isinstance(updated, (int, float)) else None,
                 }
             )

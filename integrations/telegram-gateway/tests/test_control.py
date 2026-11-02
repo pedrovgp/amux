@@ -79,6 +79,7 @@ def test_topic_is_created_bound_and_logged(tmp_path, caplog):
         "name": "mgr-x",
         "created": True,
         "echoed": False,
+        "recreated": False,
     }
     # created in Telegram AND bound in the gateway's own state — flagged for
     # the title sync (11.8: the birth name follows the session's OpenCode
@@ -528,3 +529,243 @@ def test_message_route_table(tmp_path):
     assert post(app, method="GET", path="/message")[0] == 405
     assert post(app, body=b"{not json", path="/message")[0] == 400
     assert post(app, body=b"[1,2]", path="/message")[0] == 400
+
+
+# ---- reconnect + intro: the owner's DEFAULT connect (2026-11-02) ------------
+
+
+class IntroOc:
+    """The injected `oc_api` for intro tests: a shared-serve reader stub."""
+
+    def __init__(self, rows=(), fail=None):
+        self.rows = [dict(r) for r in rows]
+        self.fail = fail
+
+    async def client_for_service(self, **kwargs):
+        if self.fail is not None:
+            raise self.fail
+        return self
+
+    async def messages(self, pin, **kwargs):
+        return [dict(r) for r in self.rows]
+
+    async def aclose(self):
+        pass
+
+
+def intro_rows(*texts):
+    return [
+        {
+            "id": f"m{i}",
+            "type": "assistant",
+            "time": {"completed": 1},
+            "content": [{"type": "text", "text": t}],
+        }
+        for i, t in enumerate(texts)
+    ]
+
+
+def intro_app(tmp_path, state, bot, *, rows=(), oc_fail=None,
+              flags="--session ses_intro1"):
+    """An app shaped like the running gateway's: state, cfg, oc_api, a lane."""
+    cfg = make_cfg(tmp_path)  # isolated cfg (state_dir defaults aside)
+    handler = lambda request: httpx.Response(  # noqa: E731 — the lane's pin
+        200,
+        json=[{"name": "wk-x", "activity": "none", "status": "idle",
+               "flags": flags}] if flags else [],
+    )
+    client = AmuxClient(
+        "https://localhost:8824", transport=httpx.MockTransport(handler)
+    )
+    return SimpleNamespace(
+        bot=bot,
+        bot_data={
+            "state": state,
+            "client": client,
+            "cfg": cfg,
+            "oc_api": IntroOc(rows, fail=oc_fail),
+        },
+    )
+
+
+def test_reconnect_lands_the_context_in_the_live_topic(tmp_path, caplog):
+    """Alive topic: the caller's orientation line lands there (echoed:true),
+    nothing is created, and the turn anchor of an in-flight turn is NOT
+    hijacked — record only."""
+    state = GatewayState(tmp_path / "state.json")
+    state.set_topic(CHAT, 191, "wk-x")
+    state.set_turn_message(CHAT, "wk-x", 55, thread=191)  # a live turn anchor
+    bot = FakeBot()
+    app = SimpleNamespace(
+        bot=bot, bot_data={"state": state, "client": None, "cfg": make_cfg(tmp_path)}
+    )
+
+    with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+        status, payload = post(
+            app,
+            {"session": "wk-x", "prompt": "Reconnecting — say hi",
+             "reconnect": True},
+        )
+
+    assert status == 200
+    assert payload == {"thread": 191, "session": "wk-x", "name": "wk-x",
+                       "created": False, "echoed": True, "recreated": False}
+    assert bot.created == []  # nothing new in Telegram
+    assert bot.sent[0]["thread"] == 191
+    assert bot.sent[0]["text"] == "Reconnecting — say hi"
+    # the live turn keeps its anchor (a reconnect must not steal reply_to)
+    assert state.turn_message(CHAT, "wk-x") == 55
+    # quoting the landed context continues the session
+    assert state.session_for_message(CHAT, 901) == "wk-x"
+
+
+class DeadThreadBot(FakeBot):
+    """A bot whose sends into GIVEN threads answer the measured
+    'Message thread not found' (live, thread 191, 2026-10-31)."""
+
+    def __init__(self, dead=()):
+        super().__init__()
+        self.dead = set(dead)
+
+    async def send_message(self, chat_id, text, **kw):
+        if kw.get("message_thread_id") in self.dead:
+            raise TelegramError("Message thread not found")
+        return await super().send_message(chat_id, text, **kw)
+
+
+def test_reconnect_on_a_deleted_topic_recreates_it_with_the_intro(
+    tmp_path, caplog
+):
+    """THE owner's default: the topic is gone → the stale binding is
+    released, a fresh topic is created, and it OPENS with the conversation's
+    last messages ("where we stopped")."""
+    state = GatewayState(tmp_path / "state.json")
+    state.set_topic(CHAT, 191, "wk-x")  # bound to a thread Telegram deleted
+    bot = DeadThreadBot(dead={191})
+    app = intro_app(
+        tmp_path, state, bot, rows=intro_rows("second answer", "first answer")
+    )
+
+    with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+        status, payload = post(
+            app,
+            {"session": "wk-x", "chat_id": CHAT, "name": "The Task",
+             "prompt": "Reconnecting", "reconnect": True, "intro": True},
+        )
+
+    assert status == 201
+    assert payload["recreated"] is True and payload["echoed"] is True
+    # the dead binding is gone, the fresh one is bound
+    assert state.topic_session(CHAT, 191) is None
+    assert state.topic_session(CHAT, 1001) == "wk-x"
+    assert bot.created == [(CHAT, "The Task")]
+    text = bot.sent[0]["text"]
+    assert bot.sent[0]["thread"] == 1001
+    assert text.startswith("Reconnecting")  # the caller's words first
+    assert "📂 The Task — last messages before the pause:" in text
+    assert "first answer" in text and "second answer" in text  # oldest first
+    # the sweep signals
+    assert any("topic_released" in m and "reason=thread_missing" in m
+               and "source=connect" in m for m in caplog.messages)
+    assert any("topic_recreated" in m for m in caplog.messages)
+
+
+def test_reconnect_keeps_the_binding_when_telegram_refuses_differently(
+    tmp_path, caplog
+):
+    """Only 'thread not found' proves death: a rights failure leaves the
+    binding exactly as it was."""
+    state = GatewayState(tmp_path / "state.json")
+    state.set_topic(CHAT, 191, "wk-x")
+    bot = FakeBot()
+
+    async def refuse(chat_id, text, **kw):
+        raise TelegramError("Not enough rights to send messages")
+
+    bot.send_message = refuse
+    app = SimpleNamespace(
+        bot=bot, bot_data={"state": state, "client": None, "cfg": make_cfg(tmp_path)}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="telegram_gateway"):
+        status, payload = post(
+            app, {"session": "wk-x", "prompt": "hi", "reconnect": True}
+        )
+
+    assert status == 200 and payload["echoed"] is False
+    assert state.session_topic(CHAT, "wk-x") == 191  # KEPT
+    assert bot.created == []
+    assert any("topic_prompt_echo_failed" in m for m in caplog.messages)
+
+
+def test_reconnect_without_content_probes_with_a_chat_action(tmp_path):
+    """No prompt, no intro: a sendChatAction stands in as the liveness
+    probe (no message, no content) — alive keeps the report honest."""
+    state = GatewayState(tmp_path / "state.json")
+    state.set_topic(CHAT, 191, "wk-x")
+    bot = FakeBot()
+    app = SimpleNamespace(
+        bot=bot, bot_data={"state": state, "client": None, "cfg": make_cfg(tmp_path)}
+    )
+
+    status, payload = post(app, {"session": "wk-x", "reconnect": True})
+
+    assert status == 200 and payload["echoed"] is False
+    assert bot.actions == [(CHAT, 191)]  # probed the bound thread
+    assert bot.created == [] and bot.sent == []
+
+
+def test_a_dead_thread_without_content_recreates_too(tmp_path, caplog):
+    state = GatewayState(tmp_path / "state.json")
+    state.set_topic(CHAT, 191, "wk-x")
+    bot = FakeBot()
+    bot.action_error = TelegramError("Message thread not found")
+    app = SimpleNamespace(
+        bot=bot, bot_data={"state": state, "client": None, "cfg": make_cfg(tmp_path)}
+    )
+
+    with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+        status, payload = post(app, {"session": "wk-x", "reconnect": True})
+
+    assert status == 201 and payload["recreated"] is True
+    assert state.session_topic(CHAT, "wk-x") == 1001  # rebound to the fresh topic
+    assert any("topic_recreated" in m for m in caplog.messages)
+
+
+def test_intro_on_a_fresh_create_carries_the_history(tmp_path):
+    """`intro:true` without reconnect (the 🧩 browser's adopt): the new
+    topic opens with the conversation's last messages."""
+    state = GatewayState(tmp_path / "state.json")
+    bot = FakeBot()
+    app = intro_app(tmp_path, state, bot, rows=intro_rows("the last answer"))
+
+    status, payload = post(
+        app, {"session": "wk-x", "chat_id": CHAT, "name": "Resumed",
+              "intro": True}
+    )
+
+    assert status == 201 and payload["echoed"] is True
+    text = bot.sent[0]["text"]
+    assert text.startswith("📂 Resumed — last messages before the pause:")
+    assert "the last answer" in text
+
+
+def test_a_failed_intro_fetch_never_refuses_the_create(tmp_path, caplog):
+    """The intro is a nicety: a dead OpenCode service degrades to a
+    prompt-only echo (or none), never a refused topic."""
+    from telegram_gateway.opencode_api import OcError
+
+    state = GatewayState(tmp_path / "state.json")
+    bot = FakeBot()
+    app = intro_app(tmp_path, state, bot, oc_fail=OcError(0, "no serve (test)"))
+
+    with caplog.at_level(logging.WARNING, logger="telegram_gateway"):
+        status, payload = post(
+            app, {"session": "wk-x", "chat_id": CHAT, "intro": True,
+                  "prompt": "task text"}
+        )
+
+    assert status == 201 and payload["created"] is True
+    assert payload["echoed"] is True  # the prompt still landed
+    assert bot.sent[0]["text"] == "task text"  # intro absent, no crash
+    assert any("topic_intro_failed" in m for m in caplog.messages)

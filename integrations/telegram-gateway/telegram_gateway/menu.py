@@ -43,6 +43,17 @@ Session browser (owner, 2026-10-31 — resume an existing conversation):
                             lane in the project dir, open its topic with the
                             last messages as the intro
 
+Search (owner, 2026-11-02 — fuzzy by name, filter by date):
+
+    gw:find                 ask for the term (global scope) — conversation
+    gw:findprj:<i>          ask for the term scoped to project index i —
+                            conversation entry too
+    gw:findd                ask for the initial/final timestamps (with
+                            defaults) — conversation entry
+    gw:findf                toggle the filtered date: created ⇄ updated
+    gw:finds                drop the project scope (back to global)
+    gw:findpg:<p>           results page p (re-render of the stored search)
+
 Every payload is kept ≤ 64 bytes (Telegram's cap): ``gw:ctlp:`` (8) +
 :data:`MAX_CTL_KEY` (40) + ``:`` + ``xhigh`` (5) = 54; the browser's session
 verb carries a measured-22-char ``ses_…`` id (``gw:adopt:`` 9 + 22 = 31).
@@ -50,10 +61,12 @@ verb carries a measured-22-char ``ses_…`` id (``gw:adopt:`` 9 + 22 = 31).
 from __future__ import annotations
 
 import time
+from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .manager import PROVIDERS
+from .search import FIELD_CREATED, FIELD_UPDATED, format_date
 
 PREFIX = "gw:"
 # Telegram caps callback_data at 64 bytes; leave room for the verb prefix.
@@ -168,6 +181,11 @@ def main_menu() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     "🧩 Sessions by project", callback_data=f"{PREFIX}prj"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔍 Find sessions", callback_data=f"{PREFIX}find"
                 ),
             ],
         ]
@@ -540,9 +558,104 @@ def project_sessions_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
+                "🔍 Search this project",
+                callback_data=f"{PREFIX}findprj:{dir_index}",
+            ),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
                 "⬅️ Projects", callback_data=f"{PREFIX}prj"
             ),
             InlineKeyboardButton(" Menu", callback_data=f"{PREFIX}menu"),
         ]
     )
+    return InlineKeyboardMarkup(rows)
+
+
+def _month_day(ms) -> str:
+    """``10-28`` for a range button (the full dates live in the header)."""
+    if not isinstance(ms, (int, float)) or ms <= 0:
+        return "?"
+    return datetime.fromtimestamp(float(ms) / 1000.0).strftime("%m-%d")
+
+
+def search_results_keyboard(
+    entries: list[dict],
+    *,
+    page: int,
+    pages: int,
+    field: str,
+    t_from: float,
+    t_to: float,
+    scoped: bool,
+) -> InlineKeyboardMarkup:
+    """One button per matching session (tap = the existing adopt flow),
+    plus the live filters the owner asked for (2026-11-02):
+
+    - **field toggle** — `created` ⇄ `updated`, the ACTIVE one marked, so
+      the header's range always says which date it filters;
+    - **range** — asks for the initial/final timestamps (defaults shown in
+      the label: the last five days → tomorrow);
+    - **scope** — only when the search entered from a project: jump back to
+      the global search;
+    - paging and the way out, both source-free (they only re-render the
+      stored search state).
+
+    Result rows carry the ``ses_…`` id itself — a resume must never resolve
+    against a list the owner did not see.
+    """
+    rows = []
+    for entry in entries[:10]:
+        title = str(entry.get("title") or entry.get("id") or "?")
+        marker = "✅" if entry.get("adopted_by") else "○"
+        when = format_date(entry.get("created" if field == FIELD_CREATED else "updated"))
+        label = f"{marker} {title}" + (f" · {when}" if when else "")
+        key = str(entry.get("id") or "")[:MAX_KEY]
+        rows.append(
+            [InlineKeyboardButton(label[:64], callback_data=f"{PREFIX}adopt:{key}")]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"{'✅' if field == FIELD_CREATED else '○'} 📅 Created",
+                callback_data=f"{PREFIX}findf",
+            ),
+            InlineKeyboardButton(
+                f"{'✅' if field == FIELD_UPDATED else '○'} 📅 Updated",
+                callback_data=f"{PREFIX}findf",
+            ),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"⏱ {_month_day(t_from)} → {_month_day(t_to)}",
+                callback_data=f"{PREFIX}findd",
+            ),
+            *(
+                [InlineKeyboardButton("🌍 All projects", callback_data=f"{PREFIX}finds")]
+                if scoped
+                else []
+            ),
+        ]
+    )
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton(
+                    "⬅️ prev", callback_data=f"{PREFIX}findpg:{page - 1}"
+                )
+            )
+        if page < pages - 1:
+            nav.append(
+                InlineKeyboardButton(
+                    "next ➡️", callback_data=f"{PREFIX}findpg:{page + 1}"
+                )
+            )
+        if nav:
+            rows.append(nav)
+    rows.append([InlineKeyboardButton("⬅️ Projects", callback_data=f"{PREFIX}prj")])
     return InlineKeyboardMarkup(rows)

@@ -20,11 +20,20 @@ curl -sS -X POST http://127.0.0.1:8834/topic \
 | answer | meaning | do |
 |---|---|---|
 | `201 {"thread":…,"echoed":true}` | created, task echoed as its first message + anchor; the topic follows the worker's OpenCode title once it lands | proceed; never post into it yourself |
+| `201 {"thread":…,"recreated":true}` | the old topic was DELETED in Telegram — released and recreated, intro included (owner's default, 2026-11-02) | proceed; tell the owner it was rebuilt |
 | `201 {"thread":…,"echoed":false}` | created, echo failed | proceed; the topic has no context — mention the task in your owner summary |
-| `200 {"created":false}` | the session already has its topic | proceed (idempotent; prompt echoes only on creation) |
+| `200 {"created":false}` | the session already has its topic (no `reconnect`) | proceed (idempotent; prompt echoes only on creation) |
+| `200 {"echoed":true}` | `reconnect`: your context landed in the LIVE topic | done — the topic is verified alive |
 | `409 name_exists` | another topic carries `name` | pick a distinct name, retry once |
 | `400 chat_id required` | the session is not bound to any chat yet | add `"chat_id":-1004274385104` |
 | `502 {"error":…}` | Telegram refused — group missing or bot not admin | §3 |
+
+Two flags for CONNECTING to a conversation that may already have a topic
+(the owner's default behavior, 2026-11-02): pass `"reconnect": true` and
+`"intro": true` — the gateway then verifies the existing topic (the send
+is the detector; Bot API has no message-getter), releases + recreates it
+when it was deleted, and opens it with the conversation's last messages so
+the owner sees where it stopped. A plain spawn needs neither flag.
 
 Never call the Bot API directly (no `createForumTopic`, no `sendMessage`, no
 bot token): a topic outside the gateway binds nothing, so the owner's message
@@ -131,9 +140,14 @@ must do it yourself (or the OpenCode service is unreachable for the button):
    "start": true}`. `--session` RESUMES an existing conversation — the same
    mechanism that revives idle managers — so it continues where it left off.
    `dir` matters: a conversation belongs to the project it was made in.
-3. **Topic it** (§1, with `chat_id`; the pin is recorded automatically, so
-   answers relay — including turns driven from the dashboard or CLI), and
-   leave your orientation note in it with §1b.
+3. **Topic it** (§1, with `chat_id`, and for a connect ALWAYS pass
+   `"reconnect": true, "intro": true`): the gateway verifies the topic —
+   a topic deleted in Telegram is released and RECREATED with the
+   conversation's last messages as its intro, a live one gets your context
+   landed in it, so "where we stopped" is what the owner opens to. The pin
+   is recorded automatically, so answers relay — including turns driven
+   from the dashboard or CLI — and leave your orientation note with §1b if
+   you have one.
 
 ## 6. Staying free
 

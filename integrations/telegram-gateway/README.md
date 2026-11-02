@@ -107,9 +107,10 @@ rides on every relayed dispatcher answer; `/browse` opens it anywhere):
    the conversation's project dir (`POST /api/sessions`, `--session`
    **resumes** — it never copies; an already-pinned lane is **reused**, one
    conversation ever gets one lane), its topic opened through the same
-   `POST /topic` path the dispatcher uses, and the conversation's **last
-   messages posted as the topic intro** (`topic_prompt_echoed`) so the owner
-   picks up where it was left.
+   `POST /topic` path the dispatcher uses — with `reconnect`+`intro`, so a
+   topic **deleted in Telegram is recreated with the conversation's last
+   messages as its intro** (the owner's default connect behavior,
+   2026-11-02; a live topic gets the context landed in it instead).
 
 Buttons carry the `ses_…` id itself (never an index into a list that may
 have moved); project rows carry an index into the list AS RENDERED, and a
@@ -117,6 +118,30 @@ stale tap re-renders the current list instead of guessing. Sweep signals:
 `browse_opened`, `browse_adopted`, `browse_topic_bound`, and one WARN per
 stretch (`oc_api_fallback`, `browse_adopt_failed`, `browse_topic_failed`)
 when the OpenCode service or amux cannot answer.
+
+### Session search (🔍 — fuzzy, date-filtered)
+
+`/find`, the **🔍 Find sessions** row on the menu (it rides the pinned
+menu too), or **🔍 Search this project** inside a project list:
+
+- **fuzzy match** on titles and `ses_…` ids: substring beats subsequence
+  beats a `difflib` ratio (≥ 0.5), best first — paste an id to find its own
+  conversation;
+- **filter while searching**: **📅 Created ⇄ Updated** toggles WHICH date
+  the range filters, and **⏱ Range…** asks for `initial, final`
+  (`YYYY-MM-DD[ HH:MM]`, comma / `to` / space, `now` allowed; an unreadable
+  range gets an example and a retry, never a guess). Defaults are the
+  owner's spec: **five days ago → tomorrow** ("a little bit in the future,
+  to get everything"), and the header always states the ACTIVE field,
+  range and scope;
+- **scope**: global by default; entering from a project scopes to that
+  directory (🌍 drops back to global); results page 10 at a time;
+- a result taps into the **same adopt flow** as 🧩 — and with `reconnect`,
+  adopting over a deleted topic rebuilds it with the recap.
+
+Every filter/page tap re-renders the STORED search (never resolved against
+a list the owner did not see); a tap with no search behind it says so.
+Sweep signals: `find_asked`, `find_searched`, `find_range`.
 
 ### Forum topics (groups with Topics enabled)
 
@@ -325,6 +350,10 @@ tail -f ~/.amux/logs/telegram-gateway.log
   ✅ already adopted) → tap one to adopt it into a pinned lane, open its
   topic and post its last messages as the intro (the 🧩 button on relayed
   dispatcher answers opens the same list).
+- `/find` — the session search: fuzzy by title or `ses_…` id, filtered by
+  **created** ⇄ **last updated** within a range you type (defaults: five
+  days ago → tomorrow), global or scoped to a project (see **Session
+  search** below).
 - **The permanent menu (`/gmmenu`)** — at startup (and on `/gmmenu`) the
   gateway posts ONE menu message and **pins** it, so it is always visible at
   the top of the group, opening in General where your dispatcher answers.

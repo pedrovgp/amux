@@ -93,11 +93,11 @@ def test_first_ensure_posts_the_menu_records_it_and_pins(tmp_path, caplog):
     (sent,) = bot.sent
     assert sent["chat_id"] == CHAT
     assert botmod.GM_MENU_TEXT.splitlines()[0] in sent["text"]
-    # ONE menu, and it is the SAME keyboard everywhere (main_menu + 🧩) —
-    # keyboards are recorded beside `sent`, never inside it
+    # ONE menu, and it is the SAME keyboard everywhere (main_menu + 🧩 + 🔍)
     (msg_id, markup) = bot.markups[0]
     keys = [b.callback_data for row in markup.inline_keyboard for b in row]
-    assert keys[-1] == "gw:prj"
+    assert "gw:prj" in keys
+    assert "gw:find" in keys
     assert "gw:new" in keys
     # recorded so the NEXT ensure edits this message instead of stacking one
     assert state.menu_message(CHAT) == 901

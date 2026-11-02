@@ -301,12 +301,14 @@ def test_adopt_creates_a_pinned_lane_topics_it_and_intros_it(tmp_path, caplog):
     assert body["flags"] == f"--session {SES_NEW}"
     assert body["start"] is True
 
-    # 2. the topic: through the gateway's own path, titled, echo carried
+    # 2. the topic: through the gateway's own path, titled, echo = the
+    # orientation + the intro (now POST /topic's own job, one format)
     assert bot.created == [(CHAT, TITLE)]
     echo = bot.sent[0]  # the echo is this flow's only SEND: FakeBot ids
     # start at 901, and the confirmation EDITS the tapped message
     assert echo["thread"] == 1001
-    assert echo["text"].startswith(f"📂 {TITLE} — last messages before the pause:")
+    assert echo["text"].startswith("Resumed from the session browser.")
+    assert f"📂 {TITLE} — last messages before the pause:" in echo["text"]
     assert "middle answer" in echo["text"] and "latest answer" in echo["text"]
     assert "half an answer" not in echo["text"]  # never an unfinished message
 
@@ -403,7 +405,8 @@ def test_a_title_collision_retries_once_with_the_session_id(tmp_path):
 
 
 def test_the_intro_degrades_to_a_marker_when_history_cannot_be_read(tmp_path):
-    """A history failure is NOT a failed adopt: the topic opens anyway."""
+    """A history failure is NOT a failed adopt: the topic opens anyway with
+    the orientation line (the intro fetch is POST /topic's, best-effort)."""
     cfg = make_cfg(tmp_path)
     state = GatewayState(tmp_path / "state.json")
     oc = BrowseOc(
@@ -420,7 +423,7 @@ def test_the_intro_degrades_to_a_marker_when_history_cannot_be_read(tmp_path):
         run(amux.aclose())
 
     assert amux.created_bodies and bot.created
-    assert bot.sent[0]["text"] == f"Resumed conversation: {TITLE}"
+    assert bot.sent[0]["text"] == "Resumed from the session browser."
 
 
 def test_a_failed_topic_keeps_the_lane_and_asks_for_a_retry(tmp_path, caplog):

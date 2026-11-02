@@ -153,6 +153,10 @@ class FakeBot:
         self.pins = []  # (chat_id, message_id) per pin_chat_message
         self.pin_error = None  # set to a TelegramError to refuse the pin
         self.edit_error = None  # set to a TelegramError to refuse the edit
+        # The liveness probe of a `reconnect` with nothing to land: recorded
+        # beside `sent`, and raisable to simulate a deleted thread.
+        self.actions = []  # (chat_id, message_thread_id)
+        self.action_error = None
         # Whether each send raises a push — recorded BESIDE `sent`, like
         # `markups`, so the exact-dict assertions keep pinning `sent`'s shape.
         self.notified = []
@@ -160,6 +164,14 @@ class FakeBot:
     async def create_forum_topic(self, chat_id, name=None):
         self.created.append((chat_id, name))
         return SimpleNamespace(message_thread_id=1000 + len(self.created), name=name)
+
+    async def send_chat_action(
+        self, chat_id, action=None, message_thread_id=None, **kw
+    ):
+        if self.action_error is not None:
+            raise self.action_error
+        self.actions.append((chat_id, message_thread_id))
+        return True
 
     async def edit_message_text(
         self, text, chat_id=None, message_id=None, parse_mode=None, reply_markup=None
