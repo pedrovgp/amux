@@ -57,6 +57,14 @@ async def _check(cfg: Config) -> int:
         + (f"{cfg.topic_sync_s:g}s" if cfg.topic_sync_s else "off")
     )
     print(
+        "  stall watch        "
+        + (
+            f"{cfg.stall_watch_s:g}s → {cfg.amux_server_log}"
+            if cfg.stall_watch_s
+            else "off"
+        )
+    )
+    print(
         "  manager reset      "
         + (
             f"{cfg.manager_reset_days}d (idle 1h+, never with cards)"

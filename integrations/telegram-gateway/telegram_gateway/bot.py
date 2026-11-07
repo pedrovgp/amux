@@ -73,6 +73,7 @@ from .relay import (
     strip_ansi,
 )
 from .state import GatewayState
+from .stallwatch import StallWatch
 from .topic_titles import clean_title, read_titles
 from .voice import groq_transcriber, transcribe_voice
 
@@ -487,12 +488,75 @@ async def _follow_topic_titles(
         )
 
 
+# ---------------------------------------------------------------------------
+# a PARKED prompt: amux took the text but did not submit it (2026-11-07)
+# ---------------------------------------------------------------------------
+
+# One owner-visible line per (chat, session) parked stretch, cleared by the next
+# CONFIRMED delivery — the `_cards_warned` / `_no_boundary_warned` shape, so a
+# lane that parks once does not nag and a lane that parks again is seen again.
+_parked_warned: set[tuple[int, str]] = set()
+
+# The owner's own words for the draft case (task, 2026-11-07). Both notices are
+# one line: they land in a busy topic where a paragraph reads as noise.
+DRAFT_PARKED_NOTICE = (
+    "⌛ Your message is parked behind a draft in the worker's input — "
+    "amux will submit it when idle."
+)
+QUEUE_PARKED_NOTICE = (
+    "⌛ Your message is queued — amux will deliver it to the worker at its "
+    "next turn boundary."
+)
+
+# amux's own markers, measured in `crates/amux-server/src/api/session_verbs.rs`
+# on 2026-11-07: a 409 body `{"message": "composer contains a draft; durable
+# message remains queued", "fix": …}` (no `error`/`detail` key, so the client's
+# `AmuxError.detail` is that raw JSON) and a 200 body `{"message": "queued
+# (steering) — delivers to …", "submission": "deferred", "queue_id": …}`.
+_DRAFT_MARKERS = (
+    "composer contains a draft",
+    "composer draft appeared before paste",
+    "already pasted in the composer",
+)
+_QUEUED_MARKERS = ("remains queued",)
+
+
+def parked_reason(message: str | None, submission: str | None = None) -> str | None:
+    """``"draft"`` / ``"queued"`` when amux accepted the text WITHOUT submitting it.
+
+    Both are holds, not failures: amux keeps the message and delivers it later
+    (behind text already in the composer, or from the steering queue at a turn
+    boundary). Returning the reason is what lets `_deliver_prompt` report that
+    truthfully instead of raising into `❌ amux refused` — the 409 the send
+    retry loop used to swallow and then report as a refusal, which is how the
+    owner's 09:37 message ended up with no signal at all.
+    """
+    text = message or ""
+    if any(marker in text for marker in _DRAFT_MARKERS):
+        return "draft"
+    if submission == "deferred" or text.lstrip().startswith("queued"):
+        return "queued"
+    if any(marker in text for marker in _QUEUED_MARKERS):
+        return "queued"
+    return None
+
+
 async def _deliver_prompt(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, session: str, text: str, username: str
-) -> None:
+) -> str | None:
+    """Deliver one owner prompt, starting the lane first if the sweeper stopped it.
+
+    Returns ``None`` when amux took the text for delivery, or ``"draft"`` /
+    ``"queued"`` when it PARKED it (see :func:`parked_reason`): a parked message
+    is not a refusal and must never be reported as one, but it is also not
+    delivered — the caller must not claim ``✅ Sent`` for it.
+    """
     stamp = f"[from Telegram @{username}] {text}"
     client = _client(context)
     state = _state(context)
+    cfg = _cfg(context)
+    revived = False
+    prev_idle: float | None = None
     if state.idle_stopped(chat_id, session) is not None:
         # The sweeper stopped this lane; the topic binding survived precisely
         # so this moment resumes it. The lane's CC_FLAGS carry its pinned
@@ -510,20 +574,101 @@ async def _deliver_prompt(
                 exc.detail,
             )
             raise
+        prev_idle = state.last_activity(chat_id, session)
         state.clear_idle_stopped(chat_id, session)
-        log.info("revive chat_id=%s session=%s", chat_id, session)
+        revived = True
     state.touch_activity(chat_id, session, "owner")
+    if revived:
+        # The PROOF that the clock moved (the two-fix rule), logged only after
+        # the stamp below really happened: without that stamp a revived lane
+        # was killed 60 s after start by a window still counting from the last
+        # prompt hours earlier (2026-11-07, idle_s 33015…34335).
+        log.info(
+            "revive chat_id=%s session=%s clock_reset=1 prev_idle_s=%s "
+            "idle_window_s=%.0f",
+            chat_id,
+            session,
+            "none" if prev_idle is None else f"{time.time() - prev_idle:.0f}",
+            cfg.idle_stop_s,
+        )
     # A session can be mid-restart (live row, backend not spawned yet); the
     # bootstrap pass finishes in seconds, so retry once before surfacing it.
     for attempt in (1, 2):
         try:
-            await client.send(session, stamp)
-            return
+            resp = await client.send(session, stamp)
         except AmuxError as exc:
+            reason = parked_reason(exc.detail)
+            if reason:
+                # PARKED, not failed: amux holds the text and delivers it later
+                # (409 + "… remains queued"). Checked BEFORE the 409 retry — a
+                # composer draft never clears by pasting the same text twice.
+                await _note_parked(context, chat_id, session, reason, exc.detail)
+                return reason
             if exc.status in (409, 503) and attempt == 1:
                 await asyncio.sleep(2.0)
                 continue
             raise
+        message = str(resp.get("message") or "") if isinstance(resp, dict) else ""
+        reason = parked_reason(message, str(resp.get("submission") or "") or None)
+        if reason:
+            await _note_parked(context, chat_id, session, reason, message)
+            return reason
+        # A confirmed delivery closes the parked stretch: the next park pages
+        # again (once per stretch, the `_cards_warned` shape).
+        _parked_warned.discard((chat_id, session))
+        return None
+    return None
+
+
+async def _note_parked(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    session: str,
+    reason: str,
+    detail: str | None,
+) -> None:
+    """Make a parked prompt loud: a WARN every time, ONE topic line per stretch.
+
+    The 2026-11-07 incident was a silent park: the owner's 09:37 voice message
+    sat behind a held draft, amux answered `queued`/409, and the gateway said
+    NOTHING — the owner waited on a message that was never going to arrive on
+    its own. The WARN is for the sweep; the topic line is for the owner, in the
+    one place they are already looking.
+    """
+    log.warning(
+        "send_parked chat_id=%s session=%s reason=%s detail=%s",
+        chat_id,
+        session,
+        reason,
+        (detail or "").replace("\n", " ")[:300],
+    )
+    if (chat_id, session) in _parked_warned:
+        return
+    bot = context.application.bot
+    state = _state(context)
+    thread = state.session_topic(chat_id, session)
+    notice = DRAFT_PARKED_NOTICE if reason == "draft" else QUEUE_PARKED_NOTICE
+    try:
+        await bot.send_message(chat_id, notice, message_thread_id=thread)
+    except TelegramError as exc:
+        # Deliberately NOT marked: a page that failed must not consume the
+        # stretch, so the next parked send tries the owner again.
+        log.warning(
+            "parked_notice_failed chat_id=%s session=%s thread=%s error=%s",
+            chat_id,
+            session,
+            thread,
+            exc,
+        )
+        return
+    _parked_warned.add((chat_id, session))
+    log.info(
+        "parked_notice_sent chat_id=%s session=%s thread=%s reason=%s",
+        chat_id,
+        session,
+        thread,
+        reason,
+    )
 
 
 async def _report_send_error(
@@ -3303,9 +3448,15 @@ async def receive_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             thread=_msg_thread(update),
         )
         try:
-            await _deliver_prompt(context, chat_id, session, text, _username(update))
+            parked = await _deliver_prompt(context, chat_id, session, text, _username(update))
         except AmuxError as exc:
             await _report_send_error(update, context, session, exc, "prompt")
+            return ConversationHandler.END
+        if parked:
+            # NOT "✅ Sent": `_note_parked` already told the owner, IN THE
+            # TOPIC, that the message is parked (2026-11-07: claiming delivery
+            # for text amux is still holding is the false belief that incident
+            # cost hours to correct).
             return ConversationHandler.END
         ack = await update.message.reply_text(
             f"✅ Sent to `{session}` — reply here to continue it.",
@@ -3363,11 +3514,15 @@ async def receive_prompt_voice(update: Update, context: ContextTypes.DEFAULT_TYP
     if anchor is not None:
         state.record_message(update.effective_chat.id, anchor, session)
     try:
-        await _deliver_prompt(
+        parked = await _deliver_prompt(
             context, update.effective_chat.id, session, transcript, _username(update)
         )
     except AmuxError as exc:
         await _report_send_error(update, context, session, exc, "voice")
+        return ConversationHandler.END
+    if parked:
+        # Same rule as the text path: the topic notice is the whole report of a
+        # parked message; an ack claiming "✅ Sent" would contradict it.
         return ConversationHandler.END
     ack = await update.message.reply_text(
         f"✅ Sent to `{session}` — reply here to continue it.",
@@ -3827,7 +3982,11 @@ async def idle_sweep_once(app: Application) -> None:
       session without one (created before this change, or another provider)
       is never stopped: owner decision 2026-10-27, "Leave them as today".
     - **Owner silence AND no new output.** Either stamp resets the clock, so a
-      long-running turn is never cut off mid-task.
+      long-running turn is never cut off mid-task. A REVIVE stamps it too
+      (``idle_clock_reset``): clearing the marker without a fresh stamp left
+      the window counting from the last prompt, and the very next tick killed
+      the lane it had just recognised as alive (2026-11-07, six kills in 22
+      minutes).
     - **Cards first.** amux's bootstrap auto-restarts a stopped worker that
       owns a waiting Todo/Doing card; stopping one anyway would be undone
       within a sweep (option B, declined). We skip and say so.
@@ -3860,13 +4019,30 @@ async def idle_sweep_once(app: Application) -> None:
             if marked is not None:
                 if row is not None and row.get("running"):
                     # Something brought it back (amux's own bootstrap): track
-                    # it again instead of fighting it over and over.
+                    # it again instead of fighting it over and over. THE CLOCK
+                    # COMES BACK WITH IT (2026-11-07): the marker is cleared
+                    # here, so without a fresh stamp the next tick measured
+                    # `idle = now - <the owner prompt nine hours ago>` and
+                    # stopped the lane it had just recognised as alive — six
+                    # kills in 22 minutes (18:47:51 … 19:09:52, idle_s
+                    # 33015…34335). A revive IS activity: it gets a full
+                    # idle window, and the log line proves which clock moved.
+                    prev = state.last_activity(chat_id, session)
                     state.clear_idle_stopped(chat_id, session)
+                    state.touch_activity(chat_id, session, "revive")
                     _dispatch_paged.discard((chat_id, session))
                     log.info(
                         "idle_stop_undone chat_id=%s session=%s reason=running_again",
                         chat_id,
                         session,
+                    )
+                    log.info(
+                        "idle_clock_reset chat_id=%s session=%s reason=running_again "
+                        "prev_idle_s=%s idle_window_s=%.0f",
+                        chat_id,
+                        session,
+                        "none" if prev is None else f"{now - prev:.0f}",
+                        cfg.idle_stop_s,
                     )
                 continue
             is_running = None if row is None else row.get("running")
@@ -3941,6 +4117,101 @@ async def idle_sweep_loop(app: Application) -> None:
         except Exception:  # never let one bad cycle kill the loop
             log.exception("idle_sweep_failed")
 
+
+# ---------------------------------------------------------------------------
+# stall watch: amux's `steering queue STALLED` reaches the affected topic
+# ---------------------------------------------------------------------------
+
+STALL_NOTICE = (
+    "⚠️ amux: messages are not reaching `{session}` — its steering queue is "
+    "STALLED, so prompts sent there wait instead of arriving. The worker's "
+    "terminal shows what it is blocked on."
+)
+
+
+def _stall_targets(state: GatewayState, session: str) -> list[tuple[int, int | None]]:
+    """Every ``(chat, thread)`` the stalled session is bound to — the topic the
+    owner reads. A session tracked without a topic (a private chat's selection)
+    answers ``thread=None`` and the notice lands at the chat root.
+    """
+    out: list[tuple[int, int | None]] = []
+    for chat_id, sessions in state.tracked_sessions().items():
+        if session in sessions:
+            out.append((chat_id, state.session_topic(chat_id, session)))
+    return out
+
+
+async def stall_watch_once(app: Application) -> None:
+    """Repeat each NEW amux stall WARN into the session's topic, once per line.
+
+    The gap this closes (2026-11-07): amux logged `steering queue STALLED —
+    messages are not reaching this lane` for `server-migration` while the
+    owner's messages sat undelivered, and that WARN reached nobody — the owner
+    lives in Telegram, and nothing in the topic said a word. amux already
+    dedupes its WARN per (session, condition, hour bucket), so a NEW line IS a
+    new stretch; the reader's EOF-on-first-sight rule is what keeps a gateway
+    restart from replaying old ones as new.
+    """
+    cfg: Config = app.bot_data["cfg"]
+    state: GatewayState = app.bot_data["state"]
+    watch: StallWatch = app.bot_data.get("stall_watch") or StallWatch(
+        cfg.amux_server_log
+    )
+    app.bot_data["stall_watch"] = watch
+    stalls = watch.read_new()
+    if not stalls:
+        return
+    seen: set[str] = set()
+    for stall in stalls:
+        if stall.session in seen:
+            continue  # several stretches in one read: one line to the owner
+        seen.add(stall.session)
+        targets = _stall_targets(state, stall.session)
+        if not targets:
+            # Countable, never guessed: with no topic binding there is nothing
+            # to post into, and inventing a destination would page the wrong
+            # place (the same rule `_page_dispatcher_down` follows).
+            log.warning(
+                "stall_notice_skipped session=%s reason=no_topic amux=%s",
+                stall.session,
+                stall.line[:200],
+            )
+            continue
+        for chat_id, thread in targets:
+            try:
+                await app.bot.send_message(
+                    chat_id,
+                    STALL_NOTICE.format(session=stall.session),
+                    message_thread_id=thread,
+                )
+            except TelegramError as exc:
+                log.warning(
+                    "stall_notice_failed chat_id=%s session=%s thread=%s error=%s",
+                    chat_id,
+                    stall.session,
+                    thread,
+                    exc,
+                )
+                continue
+            log.info(
+                "stall_notice_sent chat_id=%s session=%s thread=%s amux=%s",
+                chat_id,
+                stall.session,
+                thread,
+                stall.line[:200],
+            )
+
+
+async def stall_watch_loop(app: Application) -> None:
+    cfg: Config = app.bot_data["cfg"]
+    while True:
+        await asyncio.sleep(cfg.stall_watch_s)
+        try:
+            await stall_watch_once(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never let one bad cycle kill the loop
+            log.exception("stall_watch_failed")
 
 
 # ---------------------------------------------------------------------------
@@ -4663,6 +4934,16 @@ async def post_init(app: Application) -> None:
     app.bot_data["relay_task"] = asyncio.create_task(relay_loop(app))
     app.bot_data["idle_task"] = asyncio.create_task(idle_sweep_loop(app))
     app.bot_data["title_task"] = asyncio.create_task(sync_topic_titles_loop(app))
+    # amux's own `steering queue STALLED` WARN, repeated into the affected
+    # topic (2026-11-07: the owner's message waited in a stalled queue and no
+    # signal reached the one place they look). Constructed HERE so the reader's
+    # first sight is this file's END — lines written before this process
+    # existed are history, not an event.
+    app.bot_data["stall_watch"] = StallWatch(cfg.amux_server_log)
+    if cfg.stall_watch_s:
+        app.bot_data["stall_task"] = asyncio.create_task(stall_watch_loop(app))
+    else:
+        log.info("stall_watch_disabled reason=TELEGRAM_GATEWAY_STALL_WATCH_S=0")
     if cfg.manager_reset_days:
         app.bot_data["compaction_task"] = asyncio.create_task(compaction_loop(app))
     # The dispatcher ring: one general-mgr per allowed owner, briefed from the
@@ -4676,13 +4957,15 @@ async def post_init(app: Application) -> None:
     app.bot_data["gm_menu_task"] = asyncio.create_task(ensure_gm_menu_task(app))
     log.info(
         "gateway_started allowed_users=%d amux_url=%s voice=%s relay_interval_s=%s "
-        "idle_stop_s=%s topic_sync_s=%s",
+        "idle_stop_s=%s topic_sync_s=%s stall_watch_s=%s stall_log=%s",
         len(cfg.allowed_user_ids),
         cfg.amux_url,
         "on" if cfg.groq_api_key else "off",
         cfg.relay_interval_s,
         f"{cfg.idle_stop_s:g}" if cfg.idle_stop_s else "off",
         f"{cfg.topic_sync_s:g}" if cfg.topic_sync_s else "off",
+        f"{cfg.stall_watch_s:g}" if cfg.stall_watch_s else "off",
+        cfg.amux_server_log,
     )
 
 
@@ -4709,6 +4992,13 @@ async def post_shutdown(app: Application) -> None:
         title_task.cancel()
         try:
             await title_task
+        except asyncio.CancelledError:
+            pass
+    stall_task = app.bot_data.get("stall_task")
+    if stall_task is not None:
+        stall_task.cancel()
+        try:
+            await stall_task
         except asyncio.CancelledError:
             pass
     menu_task = app.bot_data.get("gm_menu_task")

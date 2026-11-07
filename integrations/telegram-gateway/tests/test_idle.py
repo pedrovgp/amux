@@ -322,6 +322,64 @@ def test_sweep_clears_the_marker_when_the_lane_is_running_again(tmp_path, caplog
     assert fake.verbs() == []  # it did not stop a live lane again
 
 
+def test_undo_resets_a_stale_clock_so_the_revived_lane_survives_the_next_sweep(
+    tmp_path, caplog
+):
+    """The 2026-11-07 specimen: a revived lane killed 60 seconds after start.
+
+    amux's bootstrap brought `server-migration` back and the sweep correctly
+    undid its marker — but `activity` still held the owner's 09:37 prompt, so
+    the NEXT tick measured `idle = now - 09:37` (33 015…34 335 s, six kills in
+    22 minutes: 18:47:51 … 19:09:52) and stopped the very lane it had just
+    recognised as alive. The undo must restart the clock, and the log must say
+    so (the two-fix rule).
+    """
+    caplog.set_level(logging.INFO, logger="telegram_gateway")
+    cfg, state, fake, app = swept(
+        tmp_path,
+        [{"name": "mgr-x", "activity": "x", "status": "idle", "running": True}],
+        last_idle=33_000.0,  # the measured 09:37 -> 18:47 span
+    )
+    state.mark_idle_stopped(CHAT, "mgr-x")  # it WAS stopped; amux restarted it
+    before = time.time()
+    try:
+        run(botmod.idle_sweep_once(app))  # the undo
+
+        assert state.idle_stopped(CHAT, "mgr-x") is None
+        assert state.last_activity(CHAT, "mgr-x") >= before, "the clock restarts"
+        assert "idle_clock_reset" in caplog.text
+        assert "prev_idle_s=33" in caplog.text
+        assert "idle_window_s=1800" in caplog.text
+        assert fake.verbs() == [], "the undo itself stops nothing"
+
+        run(botmod.idle_sweep_once(app))  # the tick that used to kill it
+        assert state.idle_stopped(CHAT, "mgr-x") is None, "a full idle window"
+        assert fake.verbs() == [], "no stop within a sweep of the revive"
+        assert "idle_stop " not in caplog.text
+    finally:
+        run(fake.aclose())
+
+
+def test_deliver_revive_stamps_the_clock_too(tmp_path, caplog):
+    """The other revive path (an owner prompt) proves the same reset."""
+    caplog.set_level(logging.INFO, logger="telegram_gateway")
+    cfg = make_cfg(tmp_path, idle_stop_s=1800.0)
+    state = GatewayState(tmp_path / "state.json")
+    state.mark_idle_stopped(CHAT, "mgr-x")
+    state.touch_activity(CHAT, "mgr-x", "owner", at=time.time() - 33_000.0)
+    before = time.time()
+    fake = FakeAmux(rows=[{"name": "mgr-x", "activity": "x", "status": "idle"}])
+    ctx = fake_context(cfg, fake.client, state, FakeBot())
+
+    run(botmod._deliver_prompt(ctx, CHAT, "mgr-x", "back again", "owner"))
+
+    assert state.idle_stopped(CHAT, "mgr-x") is None
+    assert state.last_activity(CHAT, "mgr-x") >= before
+    assert "clock_reset=1" in caplog.text
+    assert "prev_idle_s=33" in caplog.text
+    run(fake.aclose())
+
+
 def test_sweep_is_off_when_the_knob_is_zero(tmp_path):
     cfg, state, fake, app = swept(
         tmp_path,

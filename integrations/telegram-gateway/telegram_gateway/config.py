@@ -68,6 +68,13 @@ Optional
     topic's name is checked against its OpenCode session title (the title is
     generated from the conversation a few seconds after the first turn, then
     the topic is renamed ONCE to match); ``0`` disables
+``TELEGRAM_GATEWAY_STALL_WATCH_S`` default ``60`` — how often the gateway tails
+    amux's server log for a NEW ``steering queue STALLED`` WARN (amux's own
+    "messages are not reaching this lane") and repeats it into the topic that
+    session is bound to, once per new line; ``0`` disables
+``AMUX_SERVER_LOG`` default ``~/.amux/logs/server-rs.log`` — which file that
+    watch reads. The first read starts at the file's END, so a gateway restart
+    never replays old stalls into the owner's topics.
 
 Manager mode (a plain message starts a new agent)
 -------------------------------------------------
@@ -93,6 +100,11 @@ DEFAULT_CONTROL_PORT = 8834
 DEFAULT_IDLE_STOP_S = 1800.0
 # Owner, 2026-10-27: "meaningful names for topics". 0 disables the sync.
 DEFAULT_TOPIC_SYNC_S = 60.0
+# The amux server log the stall watch tails (CLAUDE.md: "Raw logs:
+# ~/.amux/logs/server-rs.log") and how often it looks for a NEW stall line.
+# The path is overridable (AMUX_SERVER_LOG); 0 disables the watch.
+DEFAULT_AMUX_SERVER_LOG = "~/.amux/logs/server-rs.log"
+DEFAULT_STALL_WATCH_S = 60.0
 # Relay fallback peek depth (owner, 2026-10-28, "peek substantially further
 # back … default well above 300"): tmux's own history limit is 2000 lines, so
 # this reaches the entire buffer a long answer can still be hiding in.
@@ -160,6 +172,13 @@ class Config:
     # Topic-title sync (gateway-made topics follow OpenCode's session title);
     # the loop tick AND the on/off switch — 0 disables.
     topic_sync_s: float = DEFAULT_TOPIC_SYNC_S
+    # amux's own server log, tailed for a NEW `steering queue STALLED` WARN so
+    # it reaches the stalled session's topic (see module docstring).
+    amux_server_log: Path = field(
+        default_factory=lambda: Path(DEFAULT_AMUX_SERVER_LOG).expanduser()
+    )
+    # The stall watch's tick; 0 disables it (see module docstring).
+    stall_watch_s: float = DEFAULT_STALL_WATCH_S
     # Manager mode: a plain message (not a quote-reply) starts a new agent here.
     manager_cwd: str = field(
         default_factory=lambda: os.path.expanduser("~/Documents/pv/projetos")
@@ -363,6 +382,26 @@ def load_config(
         problems.append("TELEGRAM_GATEWAY_TOPIC_SYNC_S must be 0 (disabled) or positive")
         topic_sync_s = DEFAULT_TOPIC_SYNC_S
 
+    try:
+        stall_watch_s = float(
+            (env.get("TELEGRAM_GATEWAY_STALL_WATCH_S") or "").strip()
+            or DEFAULT_STALL_WATCH_S
+        )
+    except ValueError:
+        stall_watch_s = DEFAULT_STALL_WATCH_S
+        problems.append(
+            f"TELEGRAM_GATEWAY_STALL_WATCH_S is not a number; using {DEFAULT_STALL_WATCH_S:g}"
+        )
+    if stall_watch_s < 0:
+        problems.append(
+            "TELEGRAM_GATEWAY_STALL_WATCH_S must be 0 (disabled) or positive"
+        )
+        stall_watch_s = DEFAULT_STALL_WATCH_S
+
+    amux_server_log = Path(
+        (env.get("AMUX_SERVER_LOG") or "").strip() or DEFAULT_AMUX_SERVER_LOG
+    ).expanduser()
+
     reset_days_raw = (env.get("TELEGRAM_GATEWAY_MANAGER_RESET_DAYS") or "").strip()
     try:
         manager_reset_days = int(reset_days_raw) if reset_days_raw else DEFAULT_MANAGER_RESET_DAYS
@@ -409,6 +448,8 @@ def load_config(
         control_port=control_port,
         idle_stop_s=idle_stop_s,
         topic_sync_s=topic_sync_s,
+        amux_server_log=amux_server_log,
+        stall_watch_s=stall_watch_s,
         manager_cwd=os.path.expanduser(
             (env.get("MANAGER_CWD") or "").strip() or "~/Documents/pv/projetos"
         ),

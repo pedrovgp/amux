@@ -191,11 +191,44 @@ a long task is never cut off mid-turn).
 - **Lanes that own a waiting board card are skipped** (`idle_stop_skipped_cards`
   in the log): amux's bootstrap would restart a stopped worker that owns a
   Todo/Doing card, so stopping one is a fight nobody wins.
+- **A revive restarts the idle clock.** Whether the lane came back because of
+  your message (`revive … clock_reset=1`) or because amux's own bootstrap
+  brought it back (`idle_stop_undone … reason=running_again` +
+  `idle_clock_reset`), it gets a FULL window from that moment. Before this, the
+  undo cleared the marker while the clock still counted from your last prompt:
+  the very next sweep (60 s later) measured hours of "silence" and killed the
+  lane it had just recognised as alive — six kills in 22 minutes on 2026-11-07.
 - ⏹️ Stop from the menu keeps its old meaning: it releases the topic, and the
   next message there starts a fresh manager.
 
-Logs to watch: `idle_stop`, `idle_stop_undone`, `idle_stop_skipped_cards`,
-`revive`, `manager_pinned`, `opencode_model_dropped`.
+Logs to watch: `idle_stop`, `idle_stop_undone`, `idle_clock_reset`, `revive`,
+`idle_stop_skipped_cards`, `manager_pinned`, `opencode_model_dropped`.
+
+### A message amux could not submit is loud, never silent
+
+amux sometimes ACCEPTS your prompt without submitting it — text already in the
+worker's composer (it will not overwrite what someone typed), or a message parked
+on the steering queue until the worker reaches a turn boundary. Both are holds,
+not failures, and both used to be invisible here: the gateway swallowed the
+`queued …` answer, and reported the 409 draft hold as `❌ amux refused` while
+amux was still keeping the message.
+
+Now every park logs a WARN naming the session and posts **one line into that
+topic** — *"Your message is parked behind a draft in the worker's input — amux
+will submit it when idle"* — once per stretch (the next confirmed delivery
+closes it), and the caller no longer claims `✅ Sent` for text that is still
+held.
+
+The other half of the same silence is amux's own
+`steering queue STALLED — messages are not reaching this lane` WARN, which
+lives in `~/.amux/logs/server-rs.log`. `TELEGRAM_GATEWAY_STALL_WATCH_S`
+(default **60**, `0` disables) tails that log (`AMUX_SERVER_LOG` overrides the
+path) and repeats each NEW stall line into the affected session's topic. The
+first read of the file starts at its END, so a gateway restart never replays
+old stalls as news.
+
+Logs to watch: `send_parked`, `parked_notice_sent`, `parked_notice_failed`,
+`stall_notice_sent`, `stall_notice_skipped`, `stall_log_unavailable`.
 
 ### Meaningful topic names
 
@@ -261,6 +294,8 @@ GROQ_API_KEY=gsk_your_key_here
 # TELEGRAM_GATEWAY_RELAY_INTERVAL_S=20
 # TELEGRAM_GATEWAY_IDLE_STOP_S=1800   # 0 disables the idle stop
 # TELEGRAM_GATEWAY_TOPIC_SYNC_S=60     # topic titles follow OpenCode (0 = off)
+# TELEGRAM_GATEWAY_STALL_WATCH_S=60    # amux stall WARN -> the topic (0 = off)
+# AMUX_SERVER_LOG=~/.amux/logs/server-rs.log  # the log that watch tails
 # TELEGRAM_GATEWAY_MANAGER_RESET_DAYS=14  # auto-compact old manager sessions (0 = off)
 # AMUX_OPENCODE_SERVICE_STATE=~/.local/state/opencode/service.json  # shared-serve registry
 ```

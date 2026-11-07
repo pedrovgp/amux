@@ -629,10 +629,16 @@ class GatewayState:
         self, chat_id: int, session: str, kind: str = "owner", at: float | None = None
     ) -> None:
         """Stamp the last time a session was ACTIVE: ``owner`` (a prompt we
-        delivered) or ``output`` (new text the relay sent).
+        delivered), ``output`` (new text the relay sent) or ``revive`` (a lane
+        that came back and is starting a FRESH idle window).
 
-        Both count, per the owner's call on 2026-10-27 ("Yes, agent output
+        All three count, per the owner's call on 2026-10-27 ("Yes, agent output
         counts as activity") — a lane still producing answers is never idle.
+        ``revive`` is its own kind rather than a silent ``owner`` stamp: the
+        2026-11-07 incident was a revived lane killed 60 s after start because
+        the clock still counted from the last prompt nine hours earlier, and a
+        ``state.json`` dump has to say WHO reset the clock for that to be
+        diagnosable without the log.
         """
         chat = self._chat(chat_id)
         activity = chat.get("activity")
@@ -641,7 +647,7 @@ class GatewayState:
         entry = activity.get(session)
         if not isinstance(entry, dict):
             entry = {}
-        entry[kind if kind in ("owner", "output") else "owner"] = float(
+        entry[kind if kind in ("owner", "output", "revive") else "owner"] = float(
             time.time() if at is None else at
         )
         activity[session] = entry
