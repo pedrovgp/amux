@@ -3564,39 +3564,38 @@ _api_window_missed: set[tuple[int, str]] = set()
 
 # One buzz per ANSWER (owner, 2026-11-02): progress segments still land in the
 # topic, but with `disable_notification`, and only the answer's opening send
-# raises a push. Keyed (chat_id, session) -> one entry per relayed session
-# (same bound as the other relay maps).
+# raises a push.
 #
-# TWO scopes, because the TURN ANCHOR alone is not a turn: it only advances
-# when a prompt rides the GATEWAY's own machinery (`_continue_session`), and a
-# prompt the dispatcher forwards straight to the lane (`amux send`, the GM's
-# dispatch path) never touches it — measured live 2026-11-02: three answers
-# relayed `reply_to=401` (anchor stuck), the first buzzed and every later one
-# went out SILENT, which is exactly what the owner reported as "you stopped
-# sending me those all together". So:
+# `_answer_msg_notified` (the BUZZED assistant message id) is the API path's
+# scope: the API sees the conversation itself, and a USER message newer than
+# the last buzzed answer IS the next turn — whatever route the prompt took to
+# get there (gateway, dispatcher, dashboard, CLI — a dispatcher-forwarded
+# prompt never moves the Telegram anchor, which is why anchor-scoped gating
+# muted answers on 2026-11-02 and again on 2026-11-07: Revision 3 dropped the
+# pane's anchor gate entirely, so `pane_notify` alone decides there. A gate
+# can only SUBTRACT a notification, and a silenced answer is the owner's
+# complaint).
 #
-# - `_answer_notified` (anchor) stays the PANE path's scope and the
-#   cross-path guard: an API-delivered answer records its anchor here, so a
-#   later pane fallback of the same answer can never buzz twice;
-# - `_answer_msg_notified` (the BUZZED assistant message id) is the API
-#   path's scope: the API sees the conversation itself, and a USER message
-#   newer than the last buzzed answer IS the next turn — whatever route the
-#   prompt took to get there (gateway, dispatcher, dashboard, CLI).
-_answer_notified: dict[tuple[int, str], int | None] = {}
+# `_turn_notify` per session = (newest user msg id, buzzed?, warned?) powers
+# `relay_turn_quiet`: a turn that relays content and never buzzes means the
+# worker never stamped `—— answer ——`, so by spec EVERY segment of it went out
+# muted and the owner heard nothing — one WARN per turn, which is what lets a
+# sweep tell that apart from correctly-muted progress.
 _answer_msg_notified: dict[tuple[int, str], str] = {}
+_turn_notify: dict[tuple[int, str], tuple[str, bool, bool]] = {}
 
 
-def _may_notify(chat_id: int, session: str, turn: int | None) -> bool:
-    """True while this turn's answer has NOT raised its notification yet."""
-    if turn is None:
-        return True  # no anchor to scope by: the segment rules bound it
-    return _answer_notified.get((chat_id, session)) != turn
+def _newest_user_id(messages: list[dict]) -> str:
+    """The id of the newest ``user`` row in a NEWEST-FIRST page (``""`` = none).
 
-
-def _mark_notified(chat_id: int, session: str, turn: int | None) -> None:
-    """Record that this turn's answer buzzed — only AFTER the send landed."""
-    if turn is not None:
-        _answer_notified[(chat_id, session)] = turn
+    That id is the turn: a prompt from any route (gateway, dispatcher,
+    dashboard, CLI) is a ``user`` row, so it changes when the owner speaks
+    again no matter how the prompt was delivered.
+    """
+    return next(
+        (str(m.get("id") or "") for m in messages if str(m.get("type") or "") == "user"),
+        "",
+    )
 
 
 def _api_turn_fresh(messages: list[dict], chat_id: int, session: str) -> bool:
@@ -3755,6 +3754,15 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
     # The API path's turn scope is the CONVERSATION, not the Telegram anchor
     # (see `_api_turn_fresh`): computed once, before this batch's own buzz.
     fresh_turn = _api_turn_fresh(messages, chat_id, session)
+    # The no-sentinel signal's turn bookkeeping (Revision 3): the newest USER
+    # row is the turn, so a prompt from any route starts a fresh one.
+    turn_key = (chat_id, session)
+    turn_uid = _newest_user_id(messages)
+    turn_state = _turn_notify.get(turn_key)
+    if turn_state is not None and turn_state[0] == turn_uid:
+        _, turn_buzzed, turn_warned = turn_state
+    else:
+        turn_buzzed, turn_warned = False, False  # a new prompt: fresh turn
     for index, (message_id, text) in enumerate(plan.items):
         notify = index == answer_index and fresh_turn
         if index == answer_index and not notify:
@@ -3789,11 +3797,11 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
         for message in sent:
             _track(state, chat_id, session, message)
         if notify:
-            _mark_notified(chat_id, session, turn)
             # The API's own scope: the next buzz waits for a NEW user message
             # after this one, so a dispatcher-forwarded prompt (which never
             # moves the Telegram anchor) buzzes its answer too.
             _answer_msg_notified[(chat_id, session)] = str(message_id)
+            _turn_notify[turn_key] = (turn_uid, True, turn_warned)
         stored = message_id
         state.touch_activity(chat_id, session, "output")
         log.info(
@@ -3806,6 +3814,28 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
             reply_to,
             thread_id,
             notify,
+        )
+    if (
+        plan.items
+        and answer_index is None
+        and turn_uid
+        and not turn_buzzed
+        and not turn_warned
+    ):
+        # This turn's content carried NO sentinel: by spec it is progress and
+        # went out muted, but if the worker never stamps `—— answer ——` the
+        # owner hears NOTHING from the session and nothing was logged about
+        # it (`answer_index is None` skips `relay_answer_quiet`). One WARN per
+        # turn is the sweep signal; the remedy is the worker's briefing.
+        _turn_notify[turn_key] = (turn_uid, False, True)
+        log.warning(
+            "relay_turn_quiet chat_id=%s session=%s user_msg=%s "
+            "reason=no_sentinel hint=no segment of this turn carried the "
+            "'—— answer ——' line, so every send went out muted and the owner "
+            "was never notified — check the worker's briefing for the line",
+            chat_id,
+            session,
+            turn_uid,
         )
     if plan.reason == "since_id_not_in_window":
         _note_api_window(chat_id, session, since or "-", len(messages))
@@ -3890,22 +3920,16 @@ async def relay_once(app: Application) -> None:
             if not new_text.strip():
                 continue
             # Progress is delivered, not announced (owner, 2026-11-02): only
-            # the answer's opening send raises a push, and only once per turn.
+            # the answer's opening send raises a push.
             turn = state.turn_message(chat_id, session)
-            wants = pane_notify(raw, text=text, last=last, segment=new_text)
-            notify = wants and _may_notify(chat_id, session, turn)
-            if wants and not notify:
-                # The pane says "this is the answer opening" but the anchor
-                # gate refuses: with a STUCK anchor (a prompt the dispatcher
-                # delivered straight to the lane never advances it) this is
-                # the "silent answer" signature — greppable, never silent.
-                log.info(
-                    "relay_answer_quiet chat_id=%s session=%s "
-                    "reason=anchor_held turn=%s",
-                    chat_id,
-                    session,
-                    turn,
-                )
+            # No gate here (Revision 3, 2026-11-07): `pane_notify` alone says
+            # whether this is a NEW answer block or a growth tail. The anchor
+            # gate that sat between them refused 5 answers in 5 days (a
+            # dispatcher-forwarded prompt never moves the anchor) while the
+            # cross-path duplicate it guarded against never happened — a gate
+            # can only subtract a notification, and a silenced answer is the
+            # owner's complaint.
+            notify = pane_notify(raw, text=text, last=last, segment=new_text)
             # Reply to the message that started this turn, so the answer lands
             # in the thread the owner can quote to keep talking to this session.
             # In a forum topic the answer goes INTO the topic; the anchor is
@@ -3930,8 +3954,6 @@ async def relay_once(app: Application) -> None:
                 continue
             for message in sent:
                 _track(state, chat_id, session, message)
-            if notify:
-                _mark_notified(chat_id, session, turn)
             state.set_last_relayed(chat_id, session, text)
             # New agent output IS activity (owner, 2026-10-27): a session still
             # producing answers is never swept, however long the turn runs.

@@ -39,10 +39,10 @@ from test_relay_api import CHAT, PIN, FakeOcService, app_for, assistant, pane_cl
 @pytest.fixture(autouse=True)
 def _clean_notify_gate():
     """Both notify scopes are module state; every test starts with no claim."""
-    botmod._answer_notified.clear()
+    botmod._turn_notify.clear()
     botmod._answer_msg_notified.clear()
     yield
-    botmod._answer_notified.clear()
+    botmod._turn_notify.clear()
     botmod._answer_msg_notified.clear()
 
 
@@ -407,24 +407,79 @@ def test_a_repeat_answer_logs_the_quiet_verdict(tmp_path, caplog):
     )
 
 
-def test_a_held_anchor_logs_the_quiet_answer(tmp_path, caplog):
-    """The same signal on the PANE path: the pane says 'this is the answer'
-    but the anchor gate refuses — the exact silent-answer signature."""
-    state = state_for(tmp_path)  # anchor 55
-    botmod._answer_notified[(CHAT, "mgr-x")] = 55  # this anchor already buzzed
+def test_a_second_answer_block_in_the_same_turn_still_notifies(tmp_path, caplog):
+    """Revision 3 (2026-11-07): the pane used to gate on the turn anchor and
+    refused REAL answers — 19:50:16 a 1782-char block went out silent21 s
+    after a 517-char buzz on the same stuck anchor (a dispatcher-forwarded
+    prompt never moves it), and 5 refusals beat 4 lets-through in 5 days.
+
+    The segment rule alone decides now: a NEW answer block buzzes even when
+    the anchor never moved."""
+    state = state_for(tmp_path)  # anchor 55 — the same one for both answers
     bot = FakeBot()
-    client, _ = pane_client(
-        "[from Telegram @owner] task\n—— answer ——\nthe answer"
-    )
+    first = "[from Telegram @owner] task\n—— answer ——\nfirst answer"
+    second = "[from Telegram @owner] next\n—— answer ——\nsecond, longer answer"
+    client, _ = pane_client(first)
+    client2, _ = pane_client(second)
 
     try:
         with caplog.at_level(logging.INFO, logger="telegram_gateway"):
             relay(state, bot, None, client)
+            relay(state, bot, None, client2)
+    finally:
+        run(client.aclose())
+        run(client2.aclose())
+
+    assert bot.notified == [True, True], "both answers buzz on one held anchor"
+    assert not any("relay_answer_quiet" in m for m in caplog.messages)
+
+
+# ---- 6. the no-sentinel turn (Revision 3, 2026-11-07) --------------------
+
+
+def test_a_turn_that_never_carries_the_sentinel_logs_once_per_turn(tmp_path, caplog):
+    """A worker that never stamps `—— answer ——` gets every segment muted by
+    spec — `adopt-1103-0926-5208` answered 1998/2778/2373/2256-char replies
+    on Nov 6, all silent, with ZERO log lines, so a sweep could not tell that
+    from correctly-muted progress. `relay_turn_quiet reason=no_sentinel` is
+    the signal: once per user turn, only for turns that never buzzed."""
+    state = state_for(tmp_path)
+    state.set_pinned(CHAT, "mgr-x", PIN)
+    oc = FakeOcService([assistant("msg_2", "Short answer: it works"), _user("u1")])
+    bot = FakeBot()
+    client, _ = pane_client("no boundary in this pane at all\n")
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="telegram_gateway"):
+            relay(state, bot, oc, client)   # turn u1: content, no stamp → WARN
+            oc.history.insert(0, assistant("msg_3", "more progress, unstamped"))
+            relay(state, bot, oc, client)   # same turn → no second WARN
+            oc.history.insert(0, _user("u2"))  # the owner speaks again
+            oc.history.insert(0, assistant("msg_4", "progress under u2"))
+            relay(state, bot, oc, client)   # a NEW turn → WARN again
     finally:
         run(client.aclose())
 
-    assert bot.notified == [False], "delivered, but silent"
-    assert any(
-        "relay_answer_quiet" in m and "reason=anchor_held" in m
-        for m in caplog.messages
-    )
+    assert bot.notified == [False, False, False], "spec: no sentinel → muted"
+    quiet = [m for m in caplog.messages if "relay_turn_quiet" in m]
+    assert len(quiet) == 2, quiet          # once per turn, never twice
+    assert all("reason=no_sentinel" in m for m in quiet)
+
+
+def test_a_turn_that_buzzes_never_logs_the_quiet_signal(tmp_path, caplog):
+    """The control for the test above: a stamped answer must not leave a
+    `relay_turn_quiet` line behind, or the signal trains sweeps to ignore it."""
+    state = state_for(tmp_path)
+    state.set_pinned(CHAT, "mgr-x", PIN)
+    oc = FakeOcService([assistant("msg_1", "—— answer ——\nthe answer"), _user("u1")])
+    bot = FakeBot()
+    client, _ = pane_client("no boundary in this pane at all\n")
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="telegram_gateway"):
+            relay(state, bot, oc, client)
+    finally:
+        run(client.aclose())
+
+    assert bot.notified == [True]
+    assert not any("relay_turn_quiet" in m for m in caplog.messages)
