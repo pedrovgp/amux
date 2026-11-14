@@ -120,7 +120,17 @@ class FakeSentMessage:
 
 
 class FakeMessage:
-    def __init__(self, message_id, text=None, thread=None, reply_to=None, voice=False):
+    def __init__(
+        self,
+        message_id,
+        text=None,
+        thread=None,
+        reply_to=None,
+        voice=False,
+        photo=None,
+        caption=None,
+        document=None,
+    ):
         self.message_id = message_id
         self.text = text
         self.message_thread_id = thread
@@ -128,6 +138,9 @@ class FakeMessage:
             SimpleNamespace(message_id=reply_to) if reply_to is not None else None
         )
         self.voice = SimpleNamespace(mime_type="audio/ogg") if voice else None
+        self.photo = photo
+        self.caption = caption
+        self.document = document
         self.replies = []
 
     async def reply_text(self, text, reply_markup=None, parse_mode=None):

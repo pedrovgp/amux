@@ -23,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import opencode_api, search
+from . import media, opencode_api, search
 from .amux import AmuxClient, AmuxError, session_id_from_flags
 from .config import Config
 from .control import ControlServer, create_topic
@@ -3405,6 +3405,69 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _start_manager(update, context, transcript, source="voice", anchor=anchor)
 
 
+@allow_only
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A photo (or image document) rides the SAME routing as plain text.
+
+    No OCR happens here: the bytes are saved under the state dir and the
+    prompt carries the caption + ``[imagem salva em <path>]`` so the receiving
+    worker's model reads the image itself. Silence is never an option (owner
+    incident 2026-11-14: a dropped photo answered nothing) — a failed save
+    replies with a visible ❌ and a ``photo_save_failed`` WARN.
+    """
+    message = update.message
+    photo = None
+    if getattr(message, "photo", None):
+        photo = max(message.photo, key=lambda size: getattr(size, "file_size", 0) or 0)
+    else:
+        document = getattr(message, "document", None)
+        mime = getattr(document, "mime_type", "") or ""
+        if document is not None and mime.startswith("image/"):
+            photo = document
+    if photo is None:
+        return
+
+    chat_id = update.effective_chat.id
+    cfg = _cfg(context)
+    unique = f"{chat_id}_{message.message_id}"
+    try:
+        path = await media.save_photo(photo, cfg.state_dir / "photos", unique=unique)
+    except Exception as exc:
+        log.warning(
+            "photo_save_failed user=%s msg=%s error=%s",
+            update.effective_user.id,
+            message.message_id,
+            exc,
+        )
+        await message.reply_text(f"❌ Could not save that image: {exc}")
+        return
+    text = media.photo_prompt(path, getattr(message, "caption", "") or "")
+    log.info(
+        "photo user=%s path=%s chars=%s",
+        update.effective_user.id,
+        path,
+        len(text),
+    )
+
+    thread = _msg_thread(update)
+    if thread is not None:
+        # Same topic rule as text: the topic picks the session, no quote.
+        session = await _resolve_topic_session(context, chat_id, thread)
+        if session:
+            await _continue_session(update, context, session, text, "photo")
+            return
+        await _start_manager(update, context, text, source="photo", topic=thread)
+        return
+    session = _session_from_reply(update, context)
+    if session:
+        await _continue_session(update, context, session, text, "photo")
+        return
+    if getattr(update.effective_chat, "is_forum", False):
+        await _to_dispatcher(update, context, text, source="photo")
+        return
+    await _start_manager(update, context, text, source="photo")
+
+
 # ---------------------------------------------------------------------------
 # send-prompt conversation
 # ---------------------------------------------------------------------------
@@ -5155,6 +5218,9 @@ def build_application(
     app.add_handler(conversation)
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^gw:"))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
+    app.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo),
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.post_init = post_init
