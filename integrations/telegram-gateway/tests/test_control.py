@@ -412,6 +412,79 @@ def test_topic_bind_still_works_for_a_name_only_session(tmp_path):
     assert state.topic_pin(CHAT, 1001) is None
 
 
+def test_topic_resolves_a_pin_passed_as_session(tmp_path, caplog):
+    """2026-11-14 (thread 1548): a dispatch caller passed the lane's OpenCode
+    id as ``session``. Stored raw, the binding had no pin beside it, the first
+    prompt 404'd and RELEASED the topic (send_failed → topic_released
+    session_gone) — the owner's photo went nowhere and the answer landed in
+    General. A ``ses_…`` resolves to the lane carrying its pin."""
+    state = GatewayState(tmp_path / "state.json")
+    bot = FakeBot()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/sessions":
+            return httpx.Response(200, json=[
+                {"name": "other-lane", "flags": "--session ses_somethingelse"},
+                {"name": "gnucash-expense", "activity": "none", "status": "idle",
+                 "flags": "--session ses_disp111411337c3026"},
+            ])
+        return httpx.Response(200, json={})
+
+    client = AmuxClient(
+        "https://localhost:8824", transport=httpx.MockTransport(handler)
+    )
+    app = SimpleNamespace(bot=bot, bot_data={"state": state, "client": client})
+    try:
+        with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+            status, payload = run(
+                dispatch(app, "POST", "/topic",
+                         json.dumps({"session": "ses_disp111411337c3026",
+                                     "chat_id": CHAT,
+                                     "name": "GnuCash despesas"}).encode())
+        )
+    finally:
+        run(client.aclose())
+
+    assert status == 201, payload
+    assert payload["session"] == "gnucash-expense"
+    assert state.topic_session(CHAT, 1001) == "gnucash-expense"
+    assert state.topic_pin(CHAT, 1001) == "ses_disp111411337c3026"
+    assert any(
+        "topic_session_remapped" in m and "ses_disp111411337c3026" in m
+        for m in caplog.messages
+    )
+
+
+def test_topic_refuses_a_pin_no_lane_carries(tmp_path):
+    """An unknown ses_… is a mistake worth a400 — binding it raw would only
+    defer the same 404-and-release to the owner's first message."""
+    state = GatewayState(tmp_path / "state.json")
+    bot = FakeBot()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/sessions":
+            return httpx.Response(200, json=[
+                {"name": "unrelated", "flags": "--session ses_other"},
+            ])
+        return httpx.Response(200, json={})
+
+    client = AmuxClient(
+        "https://localhost:8824", transport=httpx.MockTransport(handler)
+    )
+    app = SimpleNamespace(bot=bot, bot_data={"state": state, "client": client})
+    try:
+        status, payload = run(
+            dispatch(app, "POST", "/topic",
+                     json.dumps({"session": "ses_ghost123", "chat_id": CHAT}).encode())
+        )
+    finally:
+        run(client.aclose())
+
+    assert status == 400
+    assert "no lane carries" in payload["error"]
+    assert state.topic_session(CHAT, 1001) is None  # nothing was bound
+
+
 # ---- POST /message: a dispatch report lands IN its topic (owner, 2026-10-31) ---
 
 

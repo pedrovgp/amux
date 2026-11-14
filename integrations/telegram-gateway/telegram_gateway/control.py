@@ -238,6 +238,38 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
         return 400, {"error": "session is required"}
     session = session.strip()
 
+    # A dispatch caller may pass the lane's OpenCode PIN (``ses_…``) as
+    # ``session``. The binding's identity is the LANE NAME — a raw pin stored
+    # as the name has no pin beside it, so the first prompt resolves to it,
+    # 404s and RELEASES the topic (live 2026-11-14, thread 1548:
+    # send_failed status=404 → topic_released reason=session_gone, and the
+    # owner's answer landed in General). Resolve it to the lane that carries
+    # the pin now; a pin no lane carries is refused, never bound.
+    if session.startswith("ses_"):
+        pin_as_session = session
+        lane = None
+        lookup = app.bot_data.get("client")
+        if lookup is not None:
+            try:
+                rows = await lookup.list_sessions()
+            except Exception:  # noqa: BLE001 — unreachable amux → clear 400 below
+                rows = []
+            for row in rows:
+                if isinstance(row, dict) and session_id_from_flags(row.get("flags")) == pin_as_session:
+                    lane = row.get("name")
+                    break
+        if not lane:
+            return 400, {
+                "error": "session is an OpenCode id and no lane carries that pin",
+                "session": pin_as_session,
+            }
+        log.info(
+            "topic_session_remapped pin=%s session=%s",
+            pin_as_session,
+            lane,
+        )
+        session = lane
+
     prompt = payload.get("prompt")
     if prompt is not None and not isinstance(prompt, str):
         return 400, {"error": "prompt must be a string"}
