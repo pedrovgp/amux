@@ -228,6 +228,22 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
       is recreated (the owner's default). A failed fetch degrades to the
       prompt alone (WARN), never a refusal.
 
+    One behavioral flag (owner, 2026-11-14):
+
+    - ``transcribe_only`` (boolean, optional): the topic becomes a
+      TRANSCRIPTION-ONLY topic — voice notes answer with the
+      ``🗣️ Transcribed: …`` echo and nothing else, text/photos get one
+      visible refusal line, and no session is ever resolved or started there
+      (``bot.on_voice``/``on_text``/``on_photo`` check it before any routing).
+      ``session`` is still required by this endpoint's contract, so callers
+      pass a PLACEHOLDER name (``transcribe-only``) that carries no pin: no
+      idle stop, no revive, no title sync, no relay peek. The ``prompt`` is
+      still echoed into the topic as its visible description, but it is NOT
+      recorded as a turn anchor (a transcribe-only topic routes nothing, so
+      it must never enter the relay's turn map). Re-POSTing with the flag on
+      an existing binding (the ``reconnect``/``intro`` flows included)
+      re-applies it without landing context.
+
     Returns ``(http status, json body)``; the body always says what happened
     so a manager can tell a real topic from a refused one without reading logs.
     """
@@ -277,6 +293,11 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     reconnect = bool(payload.get("reconnect"))
     intro = bool(payload.get("intro"))
 
+    transcribe_only = payload.get("transcribe_only")
+    if transcribe_only is not None and not isinstance(transcribe_only, bool):
+        return 400, {"error": "transcribe_only must be a boolean"}
+    transcribe_only = bool(transcribe_only)
+
     name = payload.get("name")
     if name is None or name == "":
         name = session
@@ -318,10 +339,33 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     # its context landed) before that report is trusted.
     recreated = False
     existing = state.session_topic(chat_id, session)
+    if existing is not None and transcribe_only:
+        # The flag belongs to the TOPIC: a reconnect/intro flow must not drop
+        # it, and a topic flagged after the fact stops the title sync from
+        # ever touching it (release spends the "not yet titled" flag).
+        state.set_transcribe_only(chat_id, existing, True)
+        state.release_topic_title(chat_id, existing)
+        log.info(
+            "topic_transcribe_only chat_id=%s thread=%s session=%s",
+            chat_id,
+            existing,
+            session,
+        )
     if existing is not None:
         if reconnect or intro:
+            # A transcribe-only topic LANS nothing: with no prompt and no
+            # intro the call degenerates to the sendChatAction probe — the
+            # dead-thread detector still runs (and can still recreate), but
+            # no context is ever dropped into a topic that routes nothing.
             verdict = await _land_context(
-                app, chat_id, existing, session, prompt, intro, pin, name
+                app,
+                chat_id,
+                existing,
+                session,
+                None if transcribe_only else prompt,
+                intro and not transcribe_only,
+                pin,
+                name,
             )
             if verdict == LANDED:
                 return 200, {
@@ -331,6 +375,7 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
                     "created": False,
                     "echoed": True,
                     "recreated": False,
+                    "transcribe_only": transcribe_only,
                 }
             if verdict == FAILED:
                 return 200, {
@@ -340,6 +385,7 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
                     "created": False,
                     "echoed": False,
                     "recreated": False,
+                    "transcribe_only": transcribe_only,
                 }
             if verdict == DEAD:
                 for freed in state.drop_session_topics(chat_id, session):
@@ -365,6 +411,7 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
                 "created": False,
                 "echoed": False,
                 "recreated": False,
+                "transcribe_only": transcribe_only,
             }
 
     # Telegram happily allows two topics with one name; we do not, because the
@@ -407,10 +454,27 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     # the worker's conversation (seconds after the first turn), the topic is
     # renamed ONCE to that title (`topic_renamed … source=opencode_title`).
     # Hand-made (adopted) topics still pass False and are never touched.
-    state.set_topic(chat_id, int(thread), session, name, created=True)
+    # A TRANSCRIBE-ONLY topic is never title-synced either: its placeholder
+    # binding carries no pin, and `created=False` spends nothing on a rename
+    # that must never happen (the owner named it himself).
+    state.set_topic(
+        chat_id,
+        int(thread),
+        session,
+        name,
+        created=not transcribe_only,
+        transcribe_only=transcribe_only,
+    )
     log.info(
         "topic_created chat_id=%s thread=%s name=%s source=control", chat_id, thread, name
     )
+    if transcribe_only:
+        log.info(
+            "topic_transcribe_only chat_id=%s thread=%s session=%s",
+            chat_id,
+            thread,
+            session,
+        )
     if recreated:
         # The sweep signal for the owner's default (2026-11-02): a deleted
         # topic was found, released and replaced — grep-able as the moment a
@@ -428,7 +492,7 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
     parts = []
     if isinstance(prompt, str) and prompt.strip():
         parts.append(prompt.strip())
-    if (intro or recreated) and pin:
+    if (intro or recreated) and pin and not transcribe_only:
         intro_text = await _fetch_intro(app, pin, name)
         if intro_text:
             parts.append(intro_text)
@@ -446,16 +510,33 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
             )
             message_id = getattr(sent, "message_id", None)
             if message_id is not None:
-                state.record_message(chat_id, int(message_id), session)
-                state.set_turn_message(chat_id, session, int(message_id), thread=int(thread))
+                if transcribe_only:
+                    # Visible description ONLY: never an anchor and never a
+                    # quote-map entry — a transcribe-only topic routes
+                    # nothing, and `set_turn_message` here would put the
+                    # placeholder into `sessions_to_relay`, where the relay
+                    # would peek a session that does not exist every cycle.
+                    log.info(
+                        "topic_prompt_echoed session=%s thread=%s msg_id=%s "
+                        "chars=%s anchor=none transcribe_only=1",
+                        session,
+                        thread,
+                        message_id,
+                        len(body_text),
+                    )
+                else:
+                    state.record_message(chat_id, int(message_id), session)
+                    state.set_turn_message(
+                        chat_id, session, int(message_id), thread=int(thread)
+                    )
+                    log.info(
+                        "topic_prompt_echoed session=%s thread=%s msg_id=%s chars=%s",
+                        session,
+                        thread,
+                        message_id,
+                        len(body_text),
+                    )
                 echoed = True
-                log.info(
-                    "topic_prompt_echoed session=%s thread=%s msg_id=%s chars=%s",
-                    session,
-                    thread,
-                    message_id,
-                    len(body_text),
-                )
         except TelegramError as exc:
             # The topic exists and is bound either way: a failed echo is a
             # WARN, never a refused spawn.
@@ -472,6 +553,7 @@ async def create_topic(app, payload: dict) -> tuple[int, dict]:
         "created": True,
         "echoed": echoed,
         "recreated": recreated,
+        "transcribe_only": transcribe_only,
     }
 
 

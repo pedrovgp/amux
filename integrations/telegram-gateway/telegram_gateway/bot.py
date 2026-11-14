@@ -352,6 +352,28 @@ def _track(state: GatewayState, chat_id: int, session: str, message) -> None:
         state.record_message(chat_id, message_id, session)
 
 
+def _transcribe_only_here(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, thread: int | None
+) -> bool:
+    """Is this message inside a TRANSCRIBE-ONLY topic (owner, 2026-11-14)?
+
+    Audio there answers with the transcription and NOTHING else; text and
+    photos get one visible refusal line and route nowhere. The check runs
+    BEFORE the topic's session is resolved — that ordering IS the feature: a
+    flagged topic must never reach ``_resolve_topic_session`` (which wakes the
+    bound agent) or ``_start_manager`` (which spawns one), so no agent can be
+    woken from it, bound or not.
+    """
+    if thread is None:
+        return False
+    return _state(context).transcribe_only(update.effective_chat.id, thread)
+
+
+# ONE short visible line — the whole answer a non-voice message gets in a
+# transcribe-only topic (owner, 2026-11-14). Never routed anywhere.
+TRANSCRIBE_ONLY_NOTICE = "🎙️ Este tópico só transcreve áudios."
+
+
 # ---------------------------------------------------------------------------
 # session identity: topic -> pin -> CURRENT lane name
 # ---------------------------------------------------------------------------
@@ -2264,6 +2286,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
     thread = _msg_thread(update)
+    if _transcribe_only_here(update, context, thread):
+        # Transcribe-only topic: text routes NOWHERE — no session is resolved
+        # and nothing is started. One visible line is the whole answer.
+        log.info(
+            "transcribe_only_blocked user=%s thread=%s source=text",
+            update.effective_user.id,
+            thread,
+        )
+        await update.message.reply_text(TRANSCRIBE_ONLY_NOTICE)
+        return
     if thread is not None:
         # The topic identifies the session — no reply or quote needed. The
         # binding resolves through its pin, so a rename (ours or the
@@ -3380,6 +3412,19 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     thread = _msg_thread(update)
+    if _transcribe_only_here(update, context, thread):
+        # TRANSCRIBE-ONLY topic (owner, 2026-11-14): audio in, transcript out,
+        # DONE. The echo above IS the answer — checked BEFORE any session is
+        # resolved, so neither `_continue_session` (wakes the agent) nor
+        # `_start_manager` (spawns one) can ever run for this topic. The
+        # `topic=transcribe_only=1` tag is the sweep signal for the branch.
+        log.info(
+            "voice_transcribed user=%s thread=%s chars=%s topic=transcribe_only=1",
+            update.effective_user.id,
+            thread,
+            len(transcript),
+        )
+        return
     if thread is not None:
         # Same topic rule as text: the topic picks the session, no quote.
         session = await _resolve_topic_session(context, update.effective_chat.id, thread)
@@ -3428,6 +3473,18 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     chat_id = update.effective_chat.id
+    thread = _msg_thread(update)
+    if _transcribe_only_here(update, context, thread):
+        # Transcribe-only topic (same rule as text, owner 2026-11-14): a photo
+        # gets the one visible line and routes NOWHERE — checked before the
+        # save, so no file is even written for a topic that answers nothing.
+        log.info(
+            "transcribe_only_blocked user=%s thread=%s source=photo",
+            update.effective_user.id,
+            thread,
+        )
+        await message.reply_text(TRANSCRIBE_ONLY_NOTICE)
+        return
     cfg = _cfg(context)
     unique = f"{chat_id}_{message.message_id}"
     try:
@@ -3449,7 +3506,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         len(text),
     )
 
-    thread = _msg_thread(update)
     if thread is not None:
         # Same topic rule as text: the topic picks the session, no quote.
         session = await _resolve_topic_session(context, chat_id, thread)

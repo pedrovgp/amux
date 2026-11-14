@@ -172,6 +172,35 @@ was sent (readable there), and the **transcription — never the audio** — is
 what a new topic opens with, so its first message is always text you can
 read; the answer lands in the topic.
 
+### Transcribe-only topic (audio in, transcript out, nothing else)
+
+One topic where the ONLY thing that happens is transcription — owner,
+2026-11-14. Open it through the control endpoint:
+
+```json
+POST /topic
+{"chat_id": -1004274385104, "session": "transcribe-only",
+ "name": "Transcrição de áudios", "transcribe_only": true,
+ "prompt": "Áudios falados viram texto aqui; nada mais acontece."}
+```
+
+- `transcribe_only` is an optional **boolean** on `POST /topic` (anything
+  else → `400 transcribe_only must be a boolean`); it is stored per thread in
+  `state.json` (`chats.<id>.transcribe_only.<thread>`) and reported back in
+  the response body. Re-POSTing it on an existing binding (the
+  `reconnect`/`intro` flows included) re-applies the flag without landing
+  any context into the topic.
+- **Voice note** → the Groq transcription, echoed `🗣️ Transcribed: …` as a
+  reply to the audio, then **return**: no session is resolved, nothing is
+  delivered, no agent is woken (`voice_transcribed … topic=transcribe_only=1`).
+- **Text or photo** → one line, `🎙️ Este tópico só transcreve áudios.`,
+  routed nowhere (`transcribe_only_blocked … source=text|photo`).
+- `session` is still required by the endpoint, so the topic binds a
+  **placeholder** (`transcribe-only`) that carries no pin: no idle stop, no
+  revive, no title sync, no relay peek. The `prompt` is echoed as the
+  topic's visible description but is NOT recorded as a turn anchor. Commands
+  (`/menu`, `/ctl`, …) behave there exactly as in every other topic.
+
 ### Idle stop, same-session revive
 
 A topic must not cost RAM forever. `TELEGRAM_GATEWAY_IDLE_STOP_S` (default

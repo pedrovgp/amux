@@ -80,6 +80,7 @@ def test_topic_is_created_bound_and_logged(tmp_path, caplog):
         "created": True,
         "echoed": False,
         "recreated": False,
+        "transcribe_only": False,
     }
     # created in Telegram AND bound in the gateway's own state — flagged for
     # the title sync (11.8: the birth name follows the session's OpenCode
@@ -682,7 +683,8 @@ def test_reconnect_lands_the_context_in_the_live_topic(tmp_path, caplog):
 
     assert status == 200
     assert payload == {"thread": 191, "session": "wk-x", "name": "wk-x",
-                       "created": False, "echoed": True, "recreated": False}
+                       "created": False, "echoed": True, "recreated": False,
+                       "transcribe_only": False}
     assert bot.created == []  # nothing new in Telegram
     assert bot.sent[0]["thread"] == 191
     assert bot.sent[0]["text"] == "Reconnecting — say hi"

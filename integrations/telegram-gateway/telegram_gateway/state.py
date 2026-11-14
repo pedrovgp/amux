@@ -206,6 +206,7 @@ class GatewayState:
         name: str | None = None,
         *,
         created: bool = False,
+        transcribe_only: bool = False,
     ) -> None:
         """Bind a forum topic (``message_thread_id``) to ``session``.
 
@@ -226,6 +227,9 @@ class GatewayState:
         ``release_topic_title``) — because the Bot API cannot read a title
         back, so this flag plus ``topic_names`` are the only truth about who
         owns the name.
+
+        ``transcribe_only`` records the TRANSCRIBE-ONLY flag beside the
+        binding (owner, 2026-11-14) — set-only, see :meth:`set_transcribe_only`.
 
         When the session already has a pin, ``topic_pins`` records it beside
         the name — that id is what a later rename resolves through.
@@ -258,17 +262,61 @@ class GatewayState:
         else:
             pins_map.pop(thread, None)
         # Bound the file: keep the most recently touched topics only.
+        flags_map = chat.get("transcribe_only")
+        flags_map = flags_map if isinstance(flags_map, dict) else {}
+        if transcribe_only:
+            # Set-only: a plain re-bind never CLEARS the flag (only
+            # `set_transcribe_only(..., False)` does), so no future caller of
+            # `set_topic` can accidentally turn a transcribe-only topic back
+            # into an agent-waking one.
+            flags_map[thread] = True
         while len(topics) > MAX_TOPICS_PER_CHAT:
             old = next(iter(topics))
             topics.pop(old, None)
             names.pop(old, None)
             made.pop(old, None)
             pins_map.pop(old, None)
+            flags_map.pop(old, None)
         chat["topics"] = topics
         chat["topic_names"] = names
         chat["topic_created"] = made
         chat["topic_pins"] = pins_map
+        if isinstance(chat.get("transcribe_only"), dict) or flags_map:
+            chat["transcribe_only"] = flags_map
         self._save()
+
+    def set_transcribe_only(
+        self, chat_id: int, thread_id: int, value: bool = True
+    ) -> None:
+        """Mark (or unmark) a topic as TRANSCRIBE-ONLY — audio in, transcript
+        out, and NOTHING routed anywhere (owner, 2026-11-14).
+
+        The flag is keyed by THREAD (the topic, not its session) because the
+        routing decision must happen BEFORE the session is resolved — the
+        whole point is that no agent can be woken from this topic. The topic
+        still carries a binding (``POST /topic`` requires a ``session``): a
+        placeholder name with no pin, which every sweep, relay and title sync
+        skips (they all guard on ``pinned``/``turn_msg`` first).
+        """
+        chat = self._chat(chat_id)
+        flags = chat.get("transcribe_only")
+        flags = flags if isinstance(flags, dict) else {}
+        thread = str(int(thread_id))
+        if value:
+            flags[thread] = True
+        else:
+            flags.pop(thread, None)
+        chat["transcribe_only"] = flags
+        self._save()
+
+    def transcribe_only(self, chat_id: int, thread_id: int | None) -> bool:
+        """Is this thread a transcribe-only topic? Unknown/no thread → False."""
+        if thread_id is None:
+            return False
+        flags = self._chat(chat_id).get("transcribe_only")
+        if not isinstance(flags, dict):
+            return False
+        return flags.get(str(int(thread_id))) is True
 
     def topic_pin(self, chat_id: int, thread_id: int) -> str | None:
         """The opencode conversation id this topic is stably bound to.
