@@ -71,6 +71,7 @@ from .relay import (
     pane_notify,
     plan_opencode_relay,
     strip_ansi,
+    thread_missing,
 )
 from .state import GatewayState
 from .stallwatch import StallWatch
@@ -314,6 +315,128 @@ async def _send_markdown(
             )
         sent.append(message)
     return sent
+
+
+def _release_missing_thread(
+    state: GatewayState, chat_id: int, session: str, *, path: str
+) -> bool:
+    """Free a session's topic binding after Telegram proved the topic is GONE.
+
+    Measured live (owner, 2026-11-25 12:09–12:13): the owner deleted the GM's
+    dispatch-workflow topic; every relayed answer then failed
+    ``relay_send_failed … Message thread not found`` for four minutes and the
+    GM's reply sat in limbo until a human called ``POST /message``, whose own
+    release path freed the binding. The relay is the hands-off path — it must
+    heal itself, not depend on a control call.
+
+    Same lifecycle as ``control.py``'s ``/message`` and ``/topic`` reconnect
+    (one predicate, :func:`relay.thread_missing`), with the sweep's line:
+    ``topic_released … reason=thread_missing source=relay path=<api|pane>``.
+    """
+    freed = state.drop_session_topics(chat_id, session)
+    for thread in freed:
+        log.warning(
+            "topic_released chat_id=%s thread=%s session=%s "
+            "reason=thread_missing source=relay path=%s",
+            chat_id,
+            thread,
+            session,
+            path,
+        )
+    if not freed:
+        # Two paths can meet the same dead thread in one cycle (API first,
+        # pane right after): the second release finds nothing to free. Logged
+        # so a sweep can tell "healed" from "binding was already gone".
+        log.info(
+            "topic_released chat_id=%s thread=%s session=%s "
+            "reason=thread_missing source=relay path=%s released=0",
+            chat_id,
+            (state.session_topic(chat_id, session) or "-"),
+            session,
+            path,
+        )
+    return bool(freed)
+
+
+async def _send_relay_text(
+    bot,
+    state: GatewayState,
+    chat_id: int,
+    session: str,
+    text: str,
+    *,
+    reply_to: int | None,
+    thread_id: int | None,
+    reply_markup,
+    notify: bool,
+    path: str,
+) -> tuple[list, int | None, bool]:
+    """Send one relayed answer, healing a topic Telegram says no longer exists.
+
+    Returns ``(sent, thread_id, healed)``. On "Message thread not found" the
+    binding is released and the SAME text is retried ONCE with no thread and
+    no anchor, so it lands in General (the owner's stated expectation: the
+    answer must not wait for a human). Nothing was delivered by the failed
+    attempt — a dead thread accepts no message — so the retry cannot duplicate.
+
+    ``reply_to`` is dropped on the retry on purpose: the anchor was a message
+    INSIDE the deleted topic, and replying to it would fail with a second
+    error class. Every other failure keeps today's behavior: one WARN
+    ``relay_send_failed`` and the caller leaves the message pending.
+    """
+    try:
+        sent = await _send_markdown(
+            bot,
+            chat_id,
+            text,
+            reply_to=reply_to,
+            thread_id=thread_id,
+            reply_markup=reply_markup,
+            notify=notify,
+        )
+        return sent, thread_id, False
+    except TelegramError as exc:
+        if thread_id is None or not thread_missing(exc):
+            log.warning(
+                "relay_send_failed chat_id=%s session=%s error=%s path=%s",
+                chat_id,
+                session,
+                exc,
+                path,
+            )
+            raise
+        dead_thread = thread_id
+    _release_missing_thread(state, chat_id, session, path=path)
+    try:
+        sent = await _send_markdown(
+            bot,
+            chat_id,
+            text,
+            reply_to=None,
+            thread_id=None,
+            reply_markup=reply_markup,
+            notify=notify,
+        )
+    except TelegramError as retry_exc:
+        log.warning(
+            "relay_send_failed chat_id=%s session=%s error=%s path=%s "
+            "retried_without_thread=true",
+            chat_id,
+            session,
+            retry_exc,
+            path,
+        )
+        raise
+    log.info(
+        "relay_sent_without_thread chat_id=%s session=%s dead_thread=%s "
+        "chars=%s path=%s reason=thread_missing",
+        chat_id,
+        session,
+        dead_thread,
+        len(text),
+        path,
+    )
+    return sent, None, True
 
 
 def _session_from_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
@@ -3897,22 +4020,26 @@ async def _relay_api(app, oc, cfg, state, chat_id, session, pin: str) -> bool:
                 message_id,
             )
         try:
-            sent = await _send_markdown(
+            sent, thread_id, healed = await _send_relay_text(
                 app.bot,
+                state,
                 chat_id,
+                session,
                 text,
                 reply_to=reply_to,
                 thread_id=thread_id,
                 reply_markup=markup,
                 notify=notify,
+                path="api",
             )
-        except TelegramError as exc:
-            log.warning(
-                "relay_send_failed chat_id=%s session=%s error=%s", chat_id, session, exc
-            )
+        except TelegramError:
             # `stored` stops at the last message that DID go out, so the rest
             # is retried on the next cycle instead of skipped forever.
             break
+        if healed:
+            # The topic is gone: the anchor lived in it, so the REST of this
+            # batch goes to General unanchored too (never reply across threads).
+            reply_to = None
         for message in sent:
             _track(state, chat_id, session, message)
         if notify:
@@ -4059,17 +4186,19 @@ async def relay_once(app: Application) -> None:
             if thread_id is not None and state.turn_thread(chat_id, session) != thread_id:
                 reply_to = None
             try:
-                sent = await _send_markdown(
+                sent, thread_id, _healed = await _send_relay_text(
                     app.bot,
+                    state,
                     chat_id,
+                    session,
                     new_text,
                     reply_to=reply_to,
                     thread_id=thread_id,
                     reply_markup=_browse_markup(session),
                     notify=notify,
+                    path="pane",
                 )
-            except TelegramError as exc:
-                log.warning("relay_send_failed chat_id=%s session=%s error=%s", chat_id, session, exc)
+            except TelegramError:
                 continue
             for message in sent:
                 _track(state, chat_id, session, message)

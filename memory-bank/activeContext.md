@@ -7,29 +7,29 @@
 
 ## Current task
 
-**DONE (this session) — STEERING STALL ROOT CAUSE (detail →
-`progress/tg-steering-stall-root-cause.md`).** GM/owner: "All steering skills
-seem to be stalled. The steel is not working." Reproduced read-only:
-`ocusage`/`tg-fix-steering-stall` each had one queued boot-delivery row from
-19:48 -03 25/11, composer held `[fromTelegram@whoamiPV]Eaí,resolveu?` — the
-whitespace-squashed twin of `meta.last_send_text`, i.e. amux's own stale paste.
-Three links: (1) `submit_own_steering_draft` matched only the CURRENT delivery
-and `clear_delivered_duplicate_draft` is Claude-only, so opencode lanes never
-self-healed → `send-refused: composer` forever; (2) gateway `idle_sweep_once`
-stopped a lane with a pending message → `not-running` (no deadline reaps it);
-(3) the topic stall notice hid `last_skip`. Fixed at all three: own-paste
-provenance + verified clear with new verdicts; queue-aware idle guard that
-refuses to stop on an unmeasured/unreadable queue; reason in the stall notice.
-**Verified:** gateway 408 passed (from 402), Rust `session_verbs` 535 passed,
-clippy/check clean. **OPEN:** commit; not pushed/deployed — Rust needs main/CI,
-gateway needs a service restart; the two queued rows were NOT touched.
+**DONE + LIVE (this session) — RELAY RELEASES A DELETED TOPIC (detail →
+`progress/tg-relay-thread-missing-release.md`).** Owner deleted the GM's topic
+544; every relayed answer logged `relay_send_failed … Message thread not found`
+for 4 min and only a manual `POST /message` freed the binding — the relay never
+did. Root cause: the release rule lived in `control.py` only. Fix: one predicate
+(`relay.thread_missing`) shared by control + relay; both relay send sites now
+release the binding (`topic_released … reason=thread_missing source=relay
+path=api|pane`) and retry the SAME answer once with no thread/anchor, so it
+lands in General. **Verified:** gateway 413 passed (408 + 5 new), service
+restarted (`active/running`), `/health` ok, `--check` OK. No live dead topic
+existed to reproduce on, so end-to-end proof is the tests (no owner topic
+polluted).
 
 **Older (one line each — full detail in the linked progress file):**
 - **2026-11-14** transcribe-only topic (`db5a1c925`, deployed 18:33:46) → `progress/tg-transcribe-only-topic.md`. Owner verify still open: one audio in thread 1711; pre-existing topic 1701 still wakes a lane.
 - **2026-11-14** photo input rides the text path (`86b291895`, deployed 11:59:02) → `progress/tg-photo-input.md`. Owner verify open: resend the photo in topic 1548.
 
 - **2026-11-07** muted-relay Revision 3 (`38b07ee16`, deployed 21:10:58) → `progress/muted-relay.md` §Revision 3. 5-day check: 320 relays → 38 notified / 282 muted, zero `anchor_held`; `relay_turn_quiet reason=no_sentinel` fires for workers that never stamp.
-- **OPEN FINDING (owner's call, out of scope):** this session's topic (thread 462) no longer exists — `relay_send_failed … Message thread not found` (68× on Nov 7); the RELAY path never releases a dead binding (only `POST /message` does). Replies reach Telegram only after the topic is recreated.
+- **FIXED 2026-11-26 (was OPEN, found 2026-11-07):** the RELAY path never
+  released a dead topic binding (`relay_send_failed … Message thread not found`
+  68× on Nov 7, again live on the owner's deleted GM topic 544 on Nov 25). Both
+  relay paths now release + deliver in General →
+  `progress/tg-relay-thread-missing-release.md`.
 - **2026-11-07** idle-clock reset + parked/stall observability (384 green, not pushed) → `progress/tg-idle-clock-and-parked-delivery.md`. Knobs `AMUX_SERVER_LOG`, `TELEGRAM_GATEWAY_STALL_WATCH_S`. Its deferred amux-side self-heal is now DONE in this session's progress file.
 
 **Older (one line each — full detail in the linked progress file):**

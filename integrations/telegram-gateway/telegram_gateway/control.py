@@ -44,7 +44,7 @@ from telegram.error import TelegramError
 from . import opencode_api
 from .amux import AmuxError, session_id_from_flags
 from .menu import INTRO_MAX_CHARS, INTRO_MAX_MESSAGES
-from .relay import assistant_texts
+from .relay import assistant_texts, thread_missing
 
 log = logging.getLogger("telegram_gateway")
 
@@ -66,17 +66,6 @@ REASONS = {
 # ---------------------------------------------------------------------------
 # routes
 # ---------------------------------------------------------------------------
-
-
-def _thread_missing(exc: BaseException) -> bool:
-    """True when Telegram says the TOPIC is gone (measured twice live).
-
-    The one error that proves death: a send into a deleted thread answers
-    "Message thread not found" (live 2026-10-31 on thread 191, and again on
-    the probes). Anything else — rights, flood limits — proves NOTHING about
-    the topic's existence and must never release a live binding.
-    """
-    return "thread not found" in str(exc).lower()
 
 
 async def _fetch_intro(app, pin: str, name: str) -> str | None:
@@ -162,7 +151,7 @@ async def _land_context(
                 chat_id, content, message_thread_id=thread
             )
         except TelegramError as exc:
-            if _thread_missing(exc):
+            if thread_missing(exc):
                 return DEAD
             log.warning(
                 "topic_prompt_echo_failed session=%s thread=%s error=%s",
@@ -191,7 +180,7 @@ async def _land_context(
             chat_id, action="typing", message_thread_id=thread
         )
     except TelegramError as exc:
-        if _thread_missing(exc):
+        if thread_missing(exc):
             return DEAD
         log.debug(
             "topic_probe_inconclusive session=%s thread=%s error=%s",
@@ -620,7 +609,7 @@ async def post_message(app, payload: dict) -> tuple[int, dict]:
             "topic_message_failed session=%s thread=%s error=%s", session, thread, exc
         )
         released = False
-        if _thread_missing(exc):
+        if thread_missing(exc):
             # The topic is GONE (measured live 2026-10-31: thread 191 had
             # been deleted, the send answered "Message thread not found").
             # Same lifecycle as the relay's 404-send path: release the

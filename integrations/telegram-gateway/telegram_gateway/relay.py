@@ -91,6 +91,23 @@ def _boundary_index(lines: list[str]) -> int | None:
     return boundary
 
 
+def thread_missing(exc: BaseException) -> bool:
+    """True when Telegram says the TOPIC is gone (measured live, twice).
+
+    The one error that proves death: a send into a deleted thread answers
+    "Message thread not found" (live 2026-10-31 on thread 191, again on the
+    probes, and again 2026-11-25 on the owner's deleted GM topic 544).
+    Anything else — rights, flood limits — proves NOTHING about the topic's
+    existence and must never release a live binding.
+
+    One copy of this rule, in the module both senders already share: the
+    control routes (``POST /topic``, ``POST /message``) and the relay
+    (``bot._send_relay_text``). Kept apart, they drifted — the control path
+    released a dead topic while the relay retried it forever.
+    """
+    return "thread not found" in str(exc).lower()
+
+
 def extract_reply(raw: str) -> str | None:
     """Return the agent's answer, or ``None`` when no boundary is in the pane.
 
