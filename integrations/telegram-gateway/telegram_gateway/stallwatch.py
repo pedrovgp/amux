@@ -44,14 +44,27 @@ STALL_MARKER = "steering queue STALLED"
 # The field after the message text. Anchored to the marker's own position so an
 # unrelated `session=` earlier in the line can never be mistaken for it.
 _SESSION_RE = re.compile(r"\bsession=(\S+)")
+# The REASON is the one fact the owner can act on. `last_skip` may itself
+# contain spaces (`send-refused: composer`), so stop at the next `key=` field
+# instead of grabbing a single token. Both searches start AFTER the marker.
+_LAST_SKIP_RE = re.compile(r"\blast_skip=(.*?)(?=\s+\w+=|$)")
+_BLOCKED_NOW_RE = re.compile(r"\bblocked_now=(\S+)")
 
 
 @dataclass(frozen=True)
 class Stall:
-    """One new stall line: the session it names, and the line verbatim."""
+    """One new stall line: its session, its reason fields, and the line itself.
+
+    The reason fields are optional: amux versions without them still produce a
+    valid stall, and a field that cannot be parsed is left empty rather than
+    guessed. An empty `last_skip` is honest — the WARN itself prints "unknown
+    (no skip recorded since this process started)" when amux has no memory.
+    """
 
     session: str
     line: str
+    last_skip: str = ""
+    blocked_now: str = ""
 
 
 class StallWatch:
@@ -128,5 +141,15 @@ class StallWatch:
                     line[:200],
                 )
                 continue
-            out.append(Stall(session=match.group(1), line=line))
+            tail = line[at:]
+            skip = _LAST_SKIP_RE.search(tail)
+            blocked = _BLOCKED_NOW_RE.search(tail)
+            out.append(
+                Stall(
+                    session=match.group(1),
+                    line=line,
+                    last_skip=(skip.group(1).strip() if skip else ""),
+                    blocked_now=(blocked.group(1).strip() if blocked else ""),
+                )
+            )
         return out

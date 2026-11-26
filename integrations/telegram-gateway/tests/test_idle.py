@@ -33,9 +33,11 @@ def _clean_warn_dedupe():
     """The sweep/relay keep one-WARN-per-stretch sets; they are module state."""
     botmod._cards_warned.clear()
     botmod._no_boundary_warned.clear()
+    botmod._pending_warned.clear()
     yield
     botmod._cards_warned.clear()
     botmod._no_boundary_warned.clear()
+    botmod._pending_warned.clear()
 
 
 def app_of(cfg, client, state, bot=None):
@@ -49,10 +51,14 @@ def app_of(cfg, client, state, bot=None):
 class FakeAmux:
     """One mock transport covering every verb the gateway uses."""
 
-    def __init__(self, rows=(), cards=(), peek=""):
+    def __init__(self, rows=(), cards=(), peek="", steering=(), steering_measured=True,
+                 steering_status=200):
         self.rows = [dict(row) for row in rows]
         self.cards = [dict(card) for card in cards]
         self.peek = peek
+        self.steering = [dict(row) for row in steering]
+        self.steering_measured = steering_measured
+        self.steering_status = steering_status
         self.calls: list[tuple[str, str, str]] = []
         self.created: dict | None = None
         self.client = AmuxClient(
@@ -67,6 +73,11 @@ class FakeAmux:
             return httpx.Response(200, json=self.rows)
         if request.method == "GET" and path.endswith("/peek"):
             return httpx.Response(200, json={"output": self.peek})
+        if request.method == "GET" and path == "/api/debug/steering":
+            return httpx.Response(
+                self.steering_status,
+                json={"measured": self.steering_measured, "lanes": self.steering},
+            )
         if request.method == "GET" and path == "/api/board":
             return httpx.Response(200, json=self.cards)
         if request.method == "POST" and path == "/api/sessions":
@@ -98,7 +109,8 @@ class FakeAmux:
         await self.client.aclose()
 
 
-def swept(tmp_path, rows, *, idle_s=1800.0, last_idle=10_000.0, cards=(), pin=True):
+def swept(tmp_path, rows, *, idle_s=1800.0, last_idle=10_000.0, cards=(), pin=True,
+          steering=(), steering_measured=True, steering_status=200):
     """cfg + state + fake client for one sweep, with the session pre-aged."""
     cfg = make_cfg(tmp_path, idle_stop_s=idle_s)
     state = GatewayState(tmp_path / "state.json")
@@ -107,7 +119,8 @@ def swept(tmp_path, rows, *, idle_s=1800.0, last_idle=10_000.0, cards=(), pin=Tr
     if pin:
         state.set_pinned(CHAT, "mgr-x", OC_PIN)
     state.touch_activity(CHAT, "mgr-x", "owner", at=time.time() - last_idle)
-    fake = FakeAmux(rows=rows, cards=cards)
+    fake = FakeAmux(rows=rows, cards=cards, steering=steering,
+                    steering_measured=steering_measured, steering_status=steering_status)
     return cfg, state, fake, app_of(cfg, fake.client, state)
 
 
@@ -286,6 +299,68 @@ def test_sweep_skips_a_lane_that_owns_a_waiting_card(tmp_path, caplog):
         fake.cards.clear()
         run(botmod.idle_sweep_once(app))
         assert fake.verbs() == ["stop"]
+    finally:
+        run(fake.aclose())
+
+
+def test_sweep_never_freezes_a_lane_with_a_queued_steering_message(tmp_path, caplog):
+    """2026-11-25: `not-running` has no deadline, so an idle-stop freezes it."""
+    caplog.set_level(logging.WARNING, logger="telegram_gateway")
+    cfg, state, fake, app = swept(
+        tmp_path,
+        [{"name": "mgr-x", "activity": "x", "status": "idle", "running": True}],
+        steering=[{"session": "mgr-x", "queued": 1, "oldest_age_s": 3600}],
+    )
+    try:
+        run(botmod.idle_sweep_once(app))
+        run(botmod.idle_sweep_once(app))  # once per stretch, not once per tick
+        assert fake.verbs() == [], "a queued message must survive the sweep"
+        assert state.idle_stopped(CHAT, "mgr-x") is None
+        assert caplog.text.count("idle_stop_skipped_pending") == 1
+        assert "idle_stop " not in caplog.text
+
+        # The message drains: the next sweep is free to stop the idle lane.
+        fake.steering.clear()
+        run(botmod.idle_sweep_once(app))
+        assert fake.verbs() == ["stop"]
+    finally:
+        run(fake.aclose())
+
+
+def test_an_unmeasured_or_unreadable_queue_refuses_every_stop(tmp_path, caplog):
+    """AF-320: `measured:false` is NOT an empty queue; neither is a 503."""
+    caplog.set_level(logging.WARNING, logger="telegram_gateway")
+    for measured, status, verdict in (
+        (False, 200, "idle_sweep_queue_unmeasured"),
+        (True, 503, "idle_sweep_queue_unreadable"),
+    ):
+        caplog.clear()
+        case_dir = tmp_path / f"case-{status}"
+        case_dir.mkdir()
+        cfg, state, fake, app = swept(
+            case_dir,
+            [{"name": "mgr-x", "activity": "x", "status": "idle", "running": True}],
+            steering_measured=measured,
+            steering_status=status,
+        )
+        try:
+            run(botmod.idle_sweep_once(app))
+            assert fake.verbs() == [], f"{verdict} must not authorize a stop"
+            assert state.idle_stopped(CHAT, "mgr-x") is None
+            assert verdict in caplog.text
+        finally:
+            run(fake.aclose())
+
+
+def test_the_client_distinguishes_empty_from_unmeasured(tmp_path):
+    cfg, state, fake, app = swept(tmp_path, [])
+    try:
+        assert run(fake.client.steering_queued_sessions()) == set()
+        fake.steering = [{"session": "mgr-x", "queued": 2}]
+        fake.steering_measured = False  # probe never ran: not an empty queue
+        assert run(fake.client.steering_queued_sessions()) is None
+        fake.steering_measured = True
+        assert run(fake.client.steering_queued_sessions()) == {"mgr-x"}
     finally:
         run(fake.aclose())
 

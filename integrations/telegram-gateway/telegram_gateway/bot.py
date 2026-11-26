@@ -4111,6 +4111,10 @@ IDLE_SWEEP_TICK_S = 60.0
 # one WARN per stretch (the shape `_no_boundary_warned` uses), so a sweep over
 # the log still shows WHY nothing was stopped.
 _cards_warned: set[tuple[int, str]] = set()
+# A lane with a queued steering message is never idle-stopped: amux cannot
+# deliver to a lane that is not running (`lane_block_reason=not-running`), and
+# no deadline reaps that hold. One WARN per stretch, like `_cards_warned`.
+_pending_warned: set[tuple[int, str]] = set()
 
 
 async def idle_sweep_once(app: Application) -> None:
@@ -4131,6 +4135,12 @@ async def idle_sweep_once(app: Application) -> None:
     - **Cards first.** amux's bootstrap auto-restarts a stopped worker that
       owns a waiting Todo/Doing card; stopping one anyway would be undone
       within a sweep (option B, declined). We skip and say so.
+    - **Pending steering first (2026-11-25).** A message already accepted into
+      amux's steering queue cannot be delivered to a stopped lane
+      (`not-running` is permanent; `steer_dead_letter_verdict` reaps only
+      `no-env-file`/`archived`). The idle sweep reads the queue BEFORE stopping
+      anything; an unmeasured/unreadable queue stops NO lane at all, rather
+      than turning the missing probe into a silent freeze.
     - **The topic binding is never touched.** That is the whole feature: the
       marker recorded here is what the next prompt finds, to start the lane
       again and resume its conversation.
@@ -4151,6 +4161,25 @@ async def idle_sweep_once(app: Application) -> None:
         for row in rows
         if isinstance(row, dict) and row.get("name")
     }
+    # Read the queue ONCE per sweep, before any stop. `None` means the probe
+    # never ran (AF-320); an exception means amux could not be asked. Both must
+    # refuse the stop: a queue we cannot see may hold the owner's last message.
+    try:
+        pending = await client.steering_queued_sessions()
+    except AmuxError as exc:
+        log.warning(
+            "idle_sweep_queue_unreadable status=%s detail=%s "
+            "hint=not stopping any lane while its steering queue cannot be read",
+            exc.status,
+            exc.detail,
+        )
+        return
+    if pending is None:
+        log.warning(
+            "idle_sweep_queue_unmeasured hint=not stopping any lane: "
+            "an unread steering queue is not an empty one"
+        )
+        return
     for chat_id, sessions in state.tracked_sessions().items():
         for session in sessions:
             if not state.pinned(chat_id, session):
@@ -4213,6 +4242,17 @@ async def idle_sweep_once(app: Application) -> None:
             idle = now - last
             if idle < cfg.idle_stop_s:
                 continue
+            if session in pending:
+                if (chat_id, session) not in _pending_warned:
+                    _pending_warned.add((chat_id, session))
+                    log.warning(
+                        "idle_stop_skipped_pending chat_id=%s session=%s "
+                        "hint=a steering message is queued; stopping this lane would freeze it",
+                        chat_id,
+                        session,
+                    )
+                continue
+            _pending_warned.discard((chat_id, session))
             cards = await client.todo_cards(session)
             if cards:
                 if (chat_id, session) not in _cards_warned:
@@ -4265,9 +4305,26 @@ async def idle_sweep_loop(app: Application) -> None:
 
 STALL_NOTICE = (
     "⚠️ amux: messages are not reaching `{session}` — its steering queue is "
-    "STALLED, so prompts sent there wait instead of arriving. The worker's "
-    "terminal shows what it is blocked on."
+    "STALLED, so prompts sent there wait instead of arriving.\n"
+    "Reason: {reason}. The worker's terminal shows what it is blocked on."
 )
+
+
+def stall_reason(stall) -> str:
+    """The reason a stall WARN actually printed, for the owner's topic.
+
+    Both halves matter and they are not the same tense: ``last_skip`` is what
+    the delivery loop last RECORDED, ``blocked_now`` is what the lane's state
+    says right now. Collapsing them to "queued" is what made the 2026-11-25
+    incident undiagnosable from the topic (the owner could not tell a composer
+    draft from a stopped lane). Missing fields are reported as unknown, never
+    invented.
+    """
+    parts = [
+        f"last_skip={stall.last_skip}" if stall.last_skip else "",
+        f"blocked_now={stall.blocked_now}" if stall.blocked_now else "",
+    ]
+    return ", ".join(part for part in parts if part) or "unknown (not logged)"
 
 
 def _stall_targets(state: GatewayState, session: str) -> list[tuple[int, int | None]]:
@@ -4318,11 +4375,12 @@ async def stall_watch_once(app: Application) -> None:
                 stall.line[:200],
             )
             continue
+        reason = stall_reason(stall)
         for chat_id, thread in targets:
             try:
                 await app.bot.send_message(
                     chat_id,
-                    STALL_NOTICE.format(session=stall.session),
+                    STALL_NOTICE.format(session=stall.session, reason=reason),
                     message_thread_id=thread,
                 )
             except TelegramError as exc:
@@ -4335,10 +4393,11 @@ async def stall_watch_once(app: Application) -> None:
                 )
                 continue
             log.info(
-                "stall_notice_sent chat_id=%s session=%s thread=%s amux=%s",
+                "stall_notice_sent chat_id=%s session=%s thread=%s reason=%s amux=%s",
                 chat_id,
                 stall.session,
                 thread,
+                reason,
                 stall.line[:200],
             )
 

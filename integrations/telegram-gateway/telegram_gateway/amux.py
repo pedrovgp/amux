@@ -371,6 +371,37 @@ class AmuxClient:
         output = data.get("output")
         return output if isinstance(output, str) else ""
 
+    async def steering_queued_sessions(self) -> set[str] | None:
+        """Sessions with at least one queued steering message, or ``None`` if
+        the probe did not run.
+
+        ``/api/debug/steering`` carries the AF-320 contract: ``measured:false``
+        means the queue was NEVER READ, so an empty ``lanes`` is not evidence
+        that nothing is waiting. A caller deciding whether to STOP a lane must
+        treat ``None`` as "do not stop" — a queue that could not be read may
+        still be full. Transport errors are raised, not swallowed into an empty
+        set, for exactly the same reason.
+        """
+        data = await self._json("GET", "/api/debug/steering")
+        if data.get("measured") is not True or not isinstance(
+            data.get("lanes"), list
+        ):
+            return None
+        out: set[str] = set()
+        for lane in data["lanes"]:
+            if not isinstance(lane, dict):
+                continue
+            session = lane.get("session")
+            queued = lane.get("queued")
+            if (
+                isinstance(session, str)
+                and isinstance(queued, (int, float))
+                and not isinstance(queued, bool)
+                and queued > 0
+            ):
+                out.add(session)
+        return out
+
     async def todo_cards(self, session: str) -> list[dict]:
         """Cards still assigned to a session that will restart it on stop.
 

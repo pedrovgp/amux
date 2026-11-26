@@ -151,6 +151,10 @@ class FakeAmux:
         self.calls.append((request.method, path, body))
         if request.method == "GET" and path == "/api/sessions":
             return httpx.Response(200, json=self.rows)
+        if request.method == "GET" and path == "/api/debug/steering":
+            # The idle sweep reads this before stopping anything; the control
+            # tests never queue a steering message.
+            return httpx.Response(200, json={"measured": True, "lanes": []})
         if request.method == "GET" and path == "/api/models":
             return httpx.Response(200, json={"models": self.models})
         if request.method == "PATCH" and path.endswith("/config"):

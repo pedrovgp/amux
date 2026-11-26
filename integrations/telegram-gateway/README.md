@@ -220,6 +220,12 @@ a long task is never cut off mid-turn).
 - **Lanes that own a waiting board card are skipped** (`idle_stop_skipped_cards`
   in the log): amux's bootstrap would restart a stopped worker that owns a
   Todo/Doing card, so stopping one is a fight nobody wins.
+- **A lane with a queued steering message is never stopped**
+  (`idle_stop_skipped_pending`): amux cannot deliver to a lane that is not
+  running, and `not-running` has no deadline. If the queue probe cannot be
+  read at all (`measured:false` or a 503), the sweep stops NO lane — an
+  unread queue is not an empty one. This froze two topics for 14 h on
+  2026-11-25.
 - **A revive restarts the idle clock.** Whether the lane came back because of
   your message (`revive … clock_reset=1`) or because amux's own bootstrap
   brought it back (`idle_stop_undone … reason=running_again` +
@@ -231,7 +237,9 @@ a long task is never cut off mid-turn).
   next message there starts a fresh manager.
 
 Logs to watch: `idle_stop`, `idle_stop_undone`, `idle_clock_reset`, `revive`,
-`idle_stop_skipped_cards`, `manager_pinned`, `opencode_model_dropped`.
+`idle_stop_skipped_cards`, `idle_stop_skipped_pending`,
+`idle_sweep_queue_unmeasured`, `idle_sweep_queue_unreadable`, `manager_pinned`,
+`opencode_model_dropped`.
 
 ### A message amux could not submit is loud, never silent
 
@@ -254,10 +262,19 @@ lives in `~/.amux/logs/server-rs.log`. `TELEGRAM_GATEWAY_STALL_WATCH_S`
 (default **60**, `0` disables) tails that log (`AMUX_SERVER_LOG` overrides the
 path) and repeats each NEW stall line into the affected session's topic. The
 first read of the file starts at its END, so a gateway restart never replays
-old stalls as news.
+old stalls as news. The topic notice now names amux's own `last_skip=` and
+`blocked_now=` fields too (e.g. `send-refused: composer` vs `not-running`),
+which are the difference between "clear the draft" and "start the lane".
+
+On the amux side, a composer draft that matches a text amux itself typed
+earlier is recognised as its own stuck paste and cleared (verdict
+`steering_own_stale_draft_cleared`, `direct_draft_own_stale_paste_cleared`) so
+the queued message can go through. A draft that matches nothing amux sent is
+still preserved (`steering_draft_preserved`) — no human text is overwritten.
 
 Logs to watch: `send_parked`, `parked_notice_sent`, `parked_notice_failed`,
-`stall_notice_sent`, `stall_notice_skipped`, `stall_log_unavailable`.
+`stall_notice_sent`, `stall_notice_skipped`, `stall_log_unavailable`,
+`steering_own_stale_draft_cleared`, `steering_draft_preserved`.
 
 ### Meaningful topic names
 

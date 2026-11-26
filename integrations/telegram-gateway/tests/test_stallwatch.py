@@ -75,6 +75,35 @@ def test_history_is_never_replayed(tmp_path):
     assert watch.read_new() == [], "one line, one read"
 
 
+def test_the_reason_fields_are_parsed_with_their_spaces(tmp_path):
+    """`last_skip=send-refused: composer` has a SPACE in its value."""
+    path = log_file(tmp_path)
+    watch = StallWatch(path)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(
+            "2026-11-25T23:00:03.440682Z  WARN amux_server::api::session_verbs: "
+            f"{STALL_MARKER} — messages are not reaching this lane session=ocusage "
+            "queued=1 oldest_min=11 last_skip=send-refused: composer "
+            "blocked_now=composer-draft\n"
+        )
+    (stall,) = watch.read_new()
+    assert stall.session == "ocusage"
+    assert stall.last_skip == "send-refused: composer"
+    assert stall.blocked_now == "composer-draft"
+
+
+def test_a_stall_without_reason_fields_is_still_a_stall(tmp_path):
+    path = log_file(tmp_path)
+    watch = StallWatch(path)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(
+            f"2026-11-07T22:20:00.000000Z  WARN x: {STALL_MARKER} "
+            "session=plain queued=1\n"
+        )
+    (stall,) = watch.read_new()
+    assert stall.last_skip == "" and stall.blocked_now == ""
+
+
 def test_a_torn_line_is_not_parsed_until_its_newline_arrives(tmp_path):
     path = log_file(tmp_path)
     watch = StallWatch(path)
@@ -154,6 +183,37 @@ def test_a_new_stall_reaches_the_topic_once(tmp_path, caplog):
 
     run(botmod.stall_watch_once(app))  # nothing new
     assert len(bot.sent) == 1, "one line per NEW stall line"
+
+
+def test_the_topic_notice_names_the_reason(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="telegram_gateway")
+    state = GatewayState(tmp_path / "state.json")
+    state.set_topic(CHAT, THREAD, SESSION)
+    bot = FakeBot()
+    app, path = app_for(tmp_path, state, bot)
+
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(line(SESSION).replace(
+            "last_skip=not-at-turn-boundary (within max age)",
+            "last_skip=send-refused: composer",
+        ).replace("blocked_now=busy-past-deadline", "blocked_now=not-running"))
+    run(botmod.stall_watch_once(app))
+
+    assert len(bot.sent) == 1
+    text = bot.sent[0]["text"]
+    assert "last_skip=send-refused: composer" in text
+    assert "blocked_now=not-running" in text
+    assert "reason=last_skip=send-refused: composer" in caplog.text
+
+    # A line with no reason fields still posts, honestly labelled unknown.
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(
+            f"2026-11-07T23:00:00.000000Z  WARN x: {STALL_MARKER} "
+            f"session={SESSION} queued=1\n"
+        )
+    run(botmod.stall_watch_once(app))
+    assert len(bot.sent) == 2
+    assert "Reason: unknown (not logged)" in bot.sent[1]["text"]
 
 
 def test_a_stall_for_an_unbound_session_is_skipped_and_logged(tmp_path, caplog):
