@@ -53,4 +53,31 @@ Repo: `/home/pv/Documents/pv/projetos/amux-telegram-gateway` (branch
 
 **Final answer**
 
-(see below, reproduced verbatim)
+—— answer ——
+
+**Feito: as duas coisas.**
+
+**1) `projectDecisions.md` corrigido e commitado** (`e2715d418`): agora diz a regra real — `memory-bank/` segue no `.gitignore`, mas plano/progresso/prompt-history entram no MESMO commit com `git add -f`, como já acontecia desde `f8cf229ad`.
+
+**2) O "stalled" repetido: causa achada, corrigida e no ar.**
+
+O que eu medi (não é palpite):
+- As linhas que chegavam são dos tópicos ligados a `ocusage` (thread 579) e `tg-fix-steering-stall` (thread 619); os nomes que o gateway guarda são "OCUsage custo por sessão" e "Fix steering stall" — se você renomeou algum para CCI/CUSED, é aí que apareciam.
+- Cada linha é UM aviso sobre UMA mensagem: `queued=1`, `oldest_min=911` (15h), `last_skip=not-running`, `blocked_now=not-running`.
+- E o `not-running` é verdade MEDIDA: dentro do pane do amux o opencode está suspenso (`[1]+ Stopped opencode --session …`) e o pane está no prompt do shell. Você está evoluindo no SEU terminal, mas o processo que o amux controla está parado — por isso a mensagem nunca chega por ali.
+
+O defeito era duplo: o amux repete o WARN a cada hora (de propósito, é o log) e o gateway tratava cada hora como caso novo → uma mensagem presa virava ~10 avisos. Correção (`7cc949690`):
+- a identidade agora é a LINHA (`last_skip_id`): mesma mensagem presa = 1 aviso, depois `stall_notice_suppressed`;
+- mensagem nova (linha nova) avisa de novo;
+- fila esvaziou → `stall_notice_cleared` no log e o próximo stall volta a avisar;
+- fila ilegível → 1 aviso por CONDIÇÃO, nunca por hora;
+- reinício/deploy não re-avisa o que você já viu: linha mais velha que o processo é "seedada" (`stall_notice_seeded`);
+- o texto parou de mentir: lane parada agora diz "a lane NÃO ESTÁ RODANDO … a mensagem espera a lane iniciar; nada se perde e nenhum deadline força", em vez de "o terminal do worker mostra onde travou".
+
+**Evidência ao vivo:** reiniciei só o gateway (11:08:58) → `ActiveState=active`, `running`, `/health` ok, e o log trouxe `stall_notice_seeded … session=ocusage … oldest_age_s=55249` e o mesmo para `tg-fix-steering-stall`. Ou seja: aquelas duas linhas não chegam mais. Suíte: **422 passed** (413 antes; 9 testes novos).
+
+**O que deixei de propósito:** as duas mensagens continuam na fila. Descartá-las é decisão sua, e o repo tem um contra-exemplo documentado de por que `not-running` não é dead-letter por idade (2026-08-19: 41 lanes caídas 6,5h, tudo entregue no restart). Se quiser: (a) apago as duas (são retomadas do GM, já obsoletas) ou (b) inicio as lanes para entregá-las — diga qual.
+
+**Pushed:** `1ba9a052b..e2715d418` → `origin/feat/telegram-gateway`.
+
+**Pendências honestas:** o WARN das 12:00 deve sair como `suppressed`; se o servidor do amux reiniciar antes, `last_skip_id` (que é em memória) some e pode sair UM aviso extra, uma vez. A metade Rust do fix de steering da sessão anterior segue não deployada (só entra via `origin/main` + CI).
