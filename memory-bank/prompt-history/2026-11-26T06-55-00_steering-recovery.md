@@ -58,3 +58,23 @@ Commit feito localmente em `feat/telegram-gateway` (não pushed; o hash é o
 `git log -1`). Os arquivos
 `memory-bank/` eram gitignored neste worktree e foram adicionados por nome com
 `git add -f`, porque o briefing exigiu commitar progress + prompt-history juntos.
+
+## 2. Push, deploy e pull autorizados
+
+**Prompt**
+
+> O branch feat/telegram-gateway está apenas com o commit local -> Pode dar push. E pode deployar também, e pode dar pull no origin main (tanto pra main quanto pra feat/)
+
+**Final answer**
+
+—— answer ——
+
+Feito o que era seguro; duas coisas ficaram bloqueadas por divergência real entre os branches.
+
+**Push:** `feat/telegram-gateway` já estava em `origin/feat/telegram-gateway` (outros workers comitaram depois do meu e já tinham empurrado); `git push origin feat/telegram-gateway` confirmou `Everything up-to-date`. Todos os 59 commits do range são do autor `pv` (o dono), que autorizou push/deploy aqui.
+
+**Deploy:** a metade Python já está **live** — o gateway foi reiniciado às 10:30 e 11:07 (-03) e o log já mostra o campo novo (`stall_notice_sent … reason=last_skip=not-running, blocked_now=not-running`), então não reiniciei de novo. Para o fix Rust, pousei somente os dois arquivos `.rs` em `origin/main` (o diretório `integrations/telegram-gateway/` não existe no main) como commit `3b5918368`, com gate registrado: `owner_not_needed`, `revert_ok`, `land_gate_pass`. Os estágios rust/e2e/review do gate foram **explicitamente marcados como skipped** porque este container não tem `cargo-nextest`, `node_modules` nem o CLI `claude`; em compensação rodei localmente `cargo check`, `clippy -D warnings` e 535 testes do módulo `session_verbs`, e pedi revisão independente. `git push origin HEAD:main` publicou `abfba334d..3b5918368`.
+
+**Pull:** `main` foi sincronizado (`amux sync-checkout`: `abfba334d → 3b5918368`). Em `feat/` NÃO fiz o merge de `origin/main`: os branches divergiram no provider opencode (40 trechos conflitantes em 6 arquivos, incluindo `Result<()>` vs `Result<bool>` em `opencode/mod.rs`). Resolver isso automaticamente poderia quebrar a frota; deixei para decisão humana/worker dedicado.
+
+**Estado honesto:** `/health` ainda reporta `commit=abfba334d` — o builder só ativa depois que o workflow `checks` do commit `3b5918368` passa; no último check havia 14 sucessos e 15 checks pendentes. Assim que passar, o servidor puxa o novo binário. Não fiquei em loop de polling. As duas filas presas já não têm linhas em `steering_queue` (foram limpas por outro worker), então o incidente imediato está resolvido. O checkout compartilhado `amux-telegram-gateway` ficou com conflitos `UU` deixados por outro worker; não toquei nesses arquivos — este registro foi comitado num worktree limpo.

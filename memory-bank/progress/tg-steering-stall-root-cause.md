@@ -295,3 +295,30 @@ grep -a 'steering_own_stale_draft_cleared\|idle_stop_skipped_pending' ~/.amux/lo
   fix is not in the running server (it is on branch `feat/telegram-gateway`,
   not on `origin/main`); the gateway fix needs `systemctl --user restart
   amux-telegram-gateway`. Deploy/push was not requested and is not claimed.
+
+## Follow-up (owner authorized push + deploy + pull, same day)
+
+- `feat/telegram-gateway` was ALREADY pushed at `d5fcfb26f` (other workers
+  committed after this fix and pushed the branch); `git push origin
+  feat/telegram-gateway` → `Everything up-to-date`. All 59 commits in
+  `origin/main..feat` are authored by `pv`, the owner who authorized the push.
+- **Python half is live**: gateway restarted at 10:30 and 11:07 -03; the log
+  now carries `stall_notice_sent … reason=last_skip=…, blocked_now=…` (new
+  code). No extra restart was needed.
+- **Rust half pushed to main** as `3b5918368` (only the two `.rs` files —
+  `integrations/telegram-gateway/` does not exist on main). Gate:
+  `owner_not_needed`, `revert_ok`, `land_gate_pass`; rust/e2e/review legs were
+  explicitly `--no-*` with recorded reasons (no `cargo-nextest`, no
+  `node_modules`, no `claude` CLI in this container). Equivalent local proof:
+  check + clippy + 535 `session_verbs` tests; independent reviewer engaged.
+  `git push origin HEAD:main` → `abfba334d..3b5918368 HEAD -> main`.
+- **Live verification pending**: `/health` still reported `commit=abfba334d`
+  at the last check (14 checks success, 15 pending); the builder activates only
+  after `checks` passes. Not polled in a loop.
+- **Pull**: local `main` advanced `abfba334d → 3b5918368` via `amux
+  sync-checkout`. `feat/` was NOT merged with `origin/main`: 40 conflicting
+  hunks across 6 opencode-provider files (incl. `Result<()>` vs `Result<bool>`).
+  Left for a deliberate merge; the shared checkout also has peer `UU` files,
+  which were not touched.
+- The two stuck `steering_queue` rows were gone at the final read-only check
+  (cleared by another worker), so the immediate incident is resolved.
