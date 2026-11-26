@@ -81,3 +81,32 @@ O defeito era duplo: o amux repete o WARN a cada hora (de propósito, é o log) 
 **Pushed:** `1ba9a052b..e2715d418` → `origin/feat/telegram-gateway`.
 
 **Pendências honestas:** o WARN das 12:00 deve sair como `suppressed`; se o servidor do amux reiniciar antes, `last_skip_id` (que é em memória) some e pode sair UM aviso extra, uma vez. A metade Rust do fix de steering da sessão anterior segue não deployada (só entra via `origin/main` + CI).
+
+## 3. Apagar as duas linhas presas
+
+**Prompt**
+
+> [from Telegram @whoamiPV] apaga
+
+**Final answer**
+
+—— answer ——
+
+**Apagadas — pelo caminho sancionado, não na mão.**
+
+- `DELETE /api/workers/ocusage/steer {"id": …}` → `{"cleared":1,"ok":true,"spared_system":0}`
+- `DELETE /api/workers/tg-fix-steering-stall/steer {"id": …}` → `{"cleared":1,"ok":true,"spared_system":0}`
+
+Verificação ao vivo:
+- `steering_queue` → **0** linhas;
+- `GET /api/debug/steering` → `{"lanes": [], "measured": true, "n_considered": 0}`;
+- o gateway fechou o ciclo sozinho às 13:26:33:
+  `stall_notice_cleared … session=ocusage … reason=queue_empty` e o mesmo para `tg-fix-steering-stall`.
+
+Ou seja: nada mais preso, nada vai repetir o aviso, e um stall NOVO volta a avisar uma vez (a dedupe foi limpa junto).
+
+**Evidência preservada antes do delete:** ids e texto das duas linhas (as "Retomada (general-mgr)" de 25/11 19:48) ficaram em `memory-bank/progress/tg-stall-notice-dedupe.md`.
+
+**Nada além disso foi tocado** — nenhum outro worker, nenhum tópico, e o único serviço reiniciado nesta sessão foi o próprio gateway (que já estava com o fix).
+
+**Commit + push:** `cbda44d40` (docs com a evidência) → `origin/feat/telegram-gateway`.
