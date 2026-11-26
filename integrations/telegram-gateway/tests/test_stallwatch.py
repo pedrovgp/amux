@@ -20,6 +20,8 @@ The contract:
 import logging
 from types import SimpleNamespace
 
+import pytest
+
 from telegram_gateway import bot as botmod
 from telegram_gateway.stallwatch import STALL_MARKER, StallWatch
 from telegram_gateway.state import GatewayState
@@ -28,6 +30,18 @@ from test_topics import CHAT, FakeBot, make_cfg, run
 
 SESSION = "server-migration"
 THREAD = 738
+
+
+@pytest.fixture(autouse=True)
+def _clean_stall_dedupe():
+    """The row-dedupe maps are module state; every test starts bare."""
+    botmod._stall_notified.clear()
+    botmod._stall_lanes_failed.clear()
+    botmod._stall_seeded = False
+    yield
+    botmod._stall_notified.clear()
+    botmod._stall_lanes_failed.clear()
+    botmod._stall_seeded = False
 
 
 def line(session, stamp="2026-11-07T22:18:15.514793Z"):

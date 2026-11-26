@@ -7,18 +7,24 @@
 
 ## Current task
 
-**DONE + LIVE (this session) — RELAY RELEASES A DELETED TOPIC (detail →
-`progress/tg-relay-thread-missing-release.md`).** Owner deleted the GM's topic
-544; every relayed answer logged `relay_send_failed … Message thread not found`
-for 4 min and only a manual `POST /message` freed the binding — the relay never
-did. Root cause: the release rule lived in `control.py` only. Fix: one predicate
-(`relay.thread_missing`) shared by control + relay; both relay send sites now
-release the binding (`topic_released … reason=thread_missing source=relay
-path=api|pane`) and retry the SAME answer once with no thread/anchor, so it
-lands in General. **Verified:** gateway 413 passed (408 + 5 new), service
-restarted (`active/running`), `/health` ok, `--check` OK. No live dead topic
-existed to reproduce on, so end-to-end proof is the tests (no owner topic
-polluted).
+**DONE + LIVE (this session) — STALL NOTICE PAGES ONCE PER MESSAGE (detail →
+`progress/tg-stall-notice-dedupe.md`).** Owner: "continuo recebendo mensagem de
+que está stalled e eu estou evoluindo no terminal". Cause: two GM boot-delivery
+rows (2026-11-25 19:48) on lanes whose opencode is *suspended* in the pane
+(`[1]+ Stopped` → `not-running`, measurably true), `steer_dead_letter_verdict`
+never reaps `not-running` by design, amux re-WARNs hourly and the gateway
+re-paged every hour (10 each). Fix: the ROW (`last_skip_id`) is the identity —
+same row suppressed (`stall_notice_suppressed`), new row pages, drained queue
+logs `stall_notice_cleared`; a row older than the process is seeded on deploy
+(`stall_notice_seeded`) so a restart never re-pages; the notice now says a
+stopped lane waits for a start instead of "its terminal shows what it is
+blocked on". **Verified:** suite 422 passed (413 + 9 new), restarted 11:08:58,
+`/health` ok, both rows seeded live (no new Telegram message). The two rows
+themselves stay queued — dropping them is the owner's call.
+
+**Older (one line each — full detail in the linked progress file):**
+- **2026-11-26** relay releases a deleted topic → `progress/tg-relay-thread-missing-release.md` (413 green, live).
+- **2026-11-26** steering stall root cause → `progress/tg-steering-stall-root-cause.md` (Rust half NOT deployed).
 
 **Older (one line each — full detail in the linked progress file):**
 - **2026-11-14** transcribe-only topic (`db5a1c925`, deployed 18:33:46) → `progress/tg-transcribe-only-topic.md`. Owner verify still open: one audio in thread 1711; pre-existing topic 1701 still wakes a lane.

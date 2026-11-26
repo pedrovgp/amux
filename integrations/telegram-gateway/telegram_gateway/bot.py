@@ -4435,8 +4435,122 @@ async def idle_sweep_loop(app: Application) -> None:
 STALL_NOTICE = (
     "⚠️ amux: messages are not reaching `{session}` — its steering queue is "
     "STALLED, so prompts sent there wait instead of arriving.\n"
-    "Reason: {reason}. The worker's terminal shows what it is blocked on."
+    "Reason: {reason}.\n{advice}"
 )
+
+# The advice has to name WHICH silence this is: "the worker's terminal shows
+# what it is blocked on" is false for a stopped lane (its pane shows a shell
+# prompt), and that sentence is exactly what made the owner's 2026-11-26 report
+# read as "something is strange — I am working in my terminal".
+STALL_ADVICE_STOPPED = (
+    "The lane is NOT RUNNING: its agent process is gone or suspended, so the "
+    "message waits until the lane starts again. Nothing is lost and no deadline "
+    "will force it through — start the lane to deliver it."
+)
+STALL_ADVICE_DEFAULT = (
+    "The worker's terminal shows what it is blocked on; the message is stored, "
+    "not lost."
+)
+
+# One notice per UNDELIVERED ROW, not per hourly amux WARN (owner, 2026-11-26:
+# "continuo recebendo mensagem de que está stalled" for the same stuck message).
+# Key: (chat_id, session) -> the row/condition the owner was last paged about.
+_stall_notified: dict[tuple[int, str], str] = {}
+# A queue probe that fails must be said ONCE, not every tick.
+_stall_lanes_failed: set[str] = set()
+# When this process started: a row OLDER than that was already paged by the run
+# this one replaced (see `_stall_seed_known`).
+_stall_process_started = time.monotonic()
+_stall_seeded = False
+# A row has to predate this process by more than the tick to count as "already
+# reported": the grace keeps a message that queued at the restart instant from
+# being swallowed by the seed.
+STALL_SEED_GRACE_S = 60.0
+
+
+def stall_advice(stall) -> str:
+    """The actionable half of a notice, for the reason this stall is about."""
+    blocked = (stall.blocked_now or stall.last_skip or "").strip()
+    if blocked == "not-running":
+        return STALL_ADVICE_STOPPED
+    return STALL_ADVICE_DEFAULT
+
+
+def stall_notice_text(stall) -> str:
+    return STALL_NOTICE.format(
+        session=stall.session, reason=stall_reason(stall), advice=stall_advice(stall)
+    )
+
+
+def _stall_notice_key_from_lane(lane: dict) -> str:
+    """The row identity a measured lane reports, when it reports one."""
+    row = lane.get("last_skip_id")
+    if isinstance(row, str) and row:
+        return row
+    return f"queued={lane.get('queued')};blocked={lane.get('blocked_reason')}"
+
+
+def _stall_notice_key(stall, lanes: dict[str, dict] | None) -> str:
+    """The identity of the UNDELIVERED WORK this stall line is about.
+
+    The row id is the truth (``last_skip_id``): ``oldest_age_s`` grows every
+    hour and ``queued`` may stay at 1, so neither can tell "the same stuck
+    message an hour later" from "a new one". Without a measured queue the
+    condition itself is the key — an unchanged condition pages once per
+    process, not once per hour bucket.
+    """
+    lane = (lanes or {}).get(stall.session)
+    if lane:
+        return _stall_notice_key_from_lane(lane)
+    return f"queue=unmeasured;skip={stall.last_skip};blocked={stall.blocked_now}"
+
+
+async def _stall_lanes(app: Application) -> dict[str, dict] | None:
+    """The measured queue view, or ``None`` (and one WARN) when it cannot be read."""
+    client = app.bot_data.get("client")
+    if client is None:
+        return None
+    try:
+        return await client.steering_lanes()
+    except Exception as exc:  # transport failure: never read as "empty"
+        if "probe" not in _stall_lanes_failed:
+            _stall_lanes_failed.add("probe")
+            log.warning(
+                "stall_queue_unreadable error=%s hint=stall notices keep their "
+                "per-condition dedupe until /api/debug/steering answers again",
+                exc,
+            )
+        return None
+
+
+async def _stall_clear_resolved(app: Application) -> None:
+    """Forget a row that is no longer queued, and say so in the log.
+
+    The loop only reaches a topic when a NEW stall line appears; without this,
+    a resolved stretch would keep suppressing the next, genuinely new one
+    (or, worse, keep a key nobody can ever clear). Log-only: the owner gets no
+    message for a recovery that needs nothing from them.
+    """
+    if not _stall_notified:
+        return
+    lanes = await _stall_lanes(app)
+    if lanes is None:
+        return  # unmeasured: decide nothing
+    _stall_lanes_failed.discard("probe")
+    for key in list(_stall_notified):
+        chat_id, session = key
+        lane = lanes.get(session) or {}
+        queued = lane.get("queued")
+        if isinstance(queued, (int, float)) and not isinstance(queued, bool) and queued > 0:
+            continue
+        row = _stall_notified.pop(key)
+        log.info(
+            "stall_notice_cleared chat_id=%s session=%s row=%s reason=queue_empty",
+            chat_id,
+            session,
+            row[:80],
+        )
+
 
 
 def stall_reason(stall) -> str:
@@ -4468,16 +4582,68 @@ def _stall_targets(state: GatewayState, session: str) -> list[tuple[int, int | N
     return out
 
 
+async def _stall_seed_known(app: Application) -> None:
+    """Remember rows that predate this process, so a restart does not re-page.
+
+    The dedupe is in memory, so a gateway restart used to forget that the owner
+    had already been told about a row that is still stuck — and the next hourly
+    amux WARN paged again. A row whose age is older than this process's uptime
+    (plus one tick of grace) was visible to the run being replaced; seeding it
+    keeps "one notice per stuck message" true across a deploy. A message that
+    queues AFTER the start keeps its normal first notice.
+    """
+    global _stall_seeded
+    if _stall_seeded:
+        return
+    lanes = await _stall_lanes(app)
+    if lanes is None:
+        return  # unmeasured: try again next tick, never guess
+    _stall_seeded = True
+    if not lanes:
+        return
+    state: GatewayState | None = app.bot_data.get("state")
+    if state is None:
+        return
+    uptime = time.monotonic() - _stall_process_started
+    for session, lane in lanes.items():
+        queued = lane.get("queued")
+        if not isinstance(queued, (int, float)) or isinstance(queued, bool) or queued <= 0:
+            continue
+        age = lane.get("oldest_age_s")
+        if not isinstance(age, (int, float)) or isinstance(age, bool):
+            continue
+        if age <= uptime + STALL_SEED_GRACE_S:
+            continue  # queued under this process: its first notice is due
+        key = _stall_notice_key_from_lane(lane)
+        for chat_id, _thread in _stall_targets(state, session):
+            _stall_notified[(chat_id, session)] = key
+            log.info(
+                "stall_notice_seeded chat_id=%s session=%s row=%s oldest_age_s=%s "
+                "hint=row predates this process; the run it replaced already paged",
+                chat_id,
+                session,
+                key[:80],
+                int(age),
+            )
+
+
 async def stall_watch_once(app: Application) -> None:
-    """Repeat each NEW amux stall WARN into the session's topic, once per line.
+    """Page the owner ONCE per undelivered steering row, in its topic.
 
     The gap this closes (2026-11-07): amux logged `steering queue STALLED —
     messages are not reaching this lane` for `server-migration` while the
     owner's messages sat undelivered, and that WARN reached nobody — the owner
-    lives in Telegram, and nothing in the topic said a word. amux already
-    dedupes its WARN per (session, condition, hour bucket), so a NEW line IS a
-    new stretch; the reader's EOF-on-first-sight rule is what keeps a gateway
-    restart from replaying old ones as new.
+    lives in Telegram, and nothing in the topic said a word.
+
+    The OTHER gap (owner, 2026-11-26: "continuo recebendo mensagem de que está
+    stalled" *while working in his terminal*): amux dedupes its WARN per hour,
+    and this loop treated every hour as a new stretch, so ONE stuck message
+    produced a notification per hour for as long as it stayed stuck (live: two
+    GM rows, 15h, ten notices each). The ROW is the identity now
+    (`_stall_notice_key`): the same row is reported once, a different one pages
+    again, and a drained queue logs `stall_notice_cleared` so the next genuine
+    stall is never suppressed. The reader's EOF-on-first-sight rule still keeps
+    a gateway restart from replaying old stalls as new.
     """
     cfg: Config = app.bot_data["cfg"]
     state: GatewayState = app.bot_data["state"]
@@ -4485,9 +4651,12 @@ async def stall_watch_once(app: Application) -> None:
         cfg.amux_server_log
     )
     app.bot_data["stall_watch"] = watch
+    await _stall_seed_known(app)
+    await _stall_clear_resolved(app)
     stalls = watch.read_new()
     if not stalls:
         return
+    lanes = await _stall_lanes(app)
     seen: set[str] = set()
     for stall in stalls:
         if stall.session in seen:
@@ -4505,11 +4674,23 @@ async def stall_watch_once(app: Application) -> None:
             )
             continue
         reason = stall_reason(stall)
+        row_key = _stall_notice_key(stall, lanes)
         for chat_id, thread in targets:
+            if _stall_notified.get((chat_id, stall.session)) == row_key:
+                # The same undelivered message, one hour (or one bucket) later.
+                log.info(
+                    "stall_notice_suppressed chat_id=%s session=%s thread=%s "
+                    "reason=same_row row=%s",
+                    chat_id,
+                    stall.session,
+                    thread,
+                    row_key[:80],
+                )
+                continue
             try:
                 await app.bot.send_message(
                     chat_id,
-                    STALL_NOTICE.format(session=stall.session, reason=reason),
+                    stall_notice_text(stall),
                     message_thread_id=thread,
                 )
             except TelegramError as exc:
@@ -4521,12 +4702,15 @@ async def stall_watch_once(app: Application) -> None:
                     exc,
                 )
                 continue
+            _stall_notified[(chat_id, stall.session)] = row_key
             log.info(
-                "stall_notice_sent chat_id=%s session=%s thread=%s reason=%s amux=%s",
+                "stall_notice_sent chat_id=%s session=%s thread=%s reason=%s "
+                "row=%s amux=%s",
                 chat_id,
                 stall.session,
                 thread,
                 reason,
+                row_key[:80],
                 stall.line[:200],
             )
 

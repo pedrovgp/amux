@@ -44,3 +44,13 @@ Repo: `/home/pv/Documents/pv/projetos/amux-telegram-gateway` (branch
 **Limitação documentada:** tópico deletado ENTRE dois chunks de uma resposta longa faz o retry reenviar o texto inteiro (duplica o chunk já entregue) — janela de ms; perder a resposta seria pior.
 
 **Commit:** `fix(telegram-gateway): relay releases a deleted topic and delivers in General` em `feat/telegram-gateway`, com `Progress: memory-bank/progress/tg-relay-thread-missing-release.md` e o prompt-history da sessão. Não pushei nada. Obs.: `memory-bank/` é gitignored mas force-added, como no commit anterior `f8cf229ad`; o `projectDecisions.md` §1 ainda diz para nunca stagear — está desatualizado em relação à prática de hoje (posso corrigir se quiser).
+
+## 2. Corrigir decisões/commit/push + o "stalled" que continua chegando
+
+**Prompt**
+
+> [from Telegram @whoamiPV] É, pode corrigir, comitada, puxe, mas no tópico CCI ou CUSED eu continuo recebendo mensagem de que está stalled e eu estou evoluindo no terminal do meu computador, então tem alguma coisa estranha ainda.
+
+**Final answer**
+
+(see below, reproduced verbatim)

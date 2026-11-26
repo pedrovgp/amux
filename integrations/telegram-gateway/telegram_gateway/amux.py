@@ -371,6 +371,29 @@ class AmuxClient:
         output = data.get("output")
         return output if isinstance(output, str) else ""
 
+    async def steering_lanes(self) -> dict[str, dict] | None:
+        """Per-lane queue state keyed by session, or ``None`` if unmeasured.
+
+        The same AF-320 contract as :meth:`steering_queued_sessions`, one step
+        richer: the caller needs the IDENTITY of the undelivered work
+        (``last_skip_id``) so a pager can tell "the same stuck message, an hour
+        later" from "a new one". ``measured:false`` or a malformed body is
+        ``None``, never an empty dict — an unread queue is not an empty queue.
+        """
+        data = await self._json("GET", "/api/debug/steering")
+        if data.get("measured") is not True or not isinstance(
+            data.get("lanes"), list
+        ):
+            return None
+        out: dict[str, dict] = {}
+        for lane in data["lanes"]:
+            if not isinstance(lane, dict):
+                continue
+            session = lane.get("session")
+            if isinstance(session, str) and session:
+                out[session] = lane
+        return out
+
     async def steering_queued_sessions(self) -> set[str] | None:
         """Sessions with at least one queued steering message, or ``None`` if
         the probe did not run.
@@ -382,20 +405,14 @@ class AmuxClient:
         still be full. Transport errors are raised, not swallowed into an empty
         set, for exactly the same reason.
         """
-        data = await self._json("GET", "/api/debug/steering")
-        if data.get("measured") is not True or not isinstance(
-            data.get("lanes"), list
-        ):
+        lanes = await self.steering_lanes()
+        if lanes is None:
             return None
         out: set[str] = set()
-        for lane in data["lanes"]:
-            if not isinstance(lane, dict):
-                continue
-            session = lane.get("session")
+        for session, lane in lanes.items():
             queued = lane.get("queued")
             if (
-                isinstance(session, str)
-                and isinstance(queued, (int, float))
+                isinstance(queued, (int, float))
                 and not isinstance(queued, bool)
                 and queued > 0
             ):
