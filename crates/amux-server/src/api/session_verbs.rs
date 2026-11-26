@@ -13939,8 +13939,55 @@ fn composer_holds_this_delivery(draft: &str, text: &str) -> bool {
     want.chars().count() >= 8 && draft == want
 }
 
+/// A draft that EXACTLY matches a text amux itself typed into this lane is
+/// amux's own stuck paste, not a human's unsaved thought (2026-11-25 incident:
+/// `ocusage` and `tg-fix-steering-stall` held
+/// `[fromTelegram@whoamiPV]Eaí,resolveu?` for 14h and refused every later
+/// message with `send-refused: composer`).
+///
+/// `composer_state(...).typed()` has already squashed whitespace and a pane can
+/// hard-wrap a long paste, so BOTH sides are squashed here. Exact equality and
+/// the 8-char floor are deliberate: a human who extends, prefixes or merely
+/// retypes a short "yes" keeps the preserve guard. `deliveries` are texts this
+/// layer knows amux wrote — the in-memory `pane_prompts` ring and the durable
+/// `meta.last_send_text` — never a guess from the draft's own wording.
+pub(crate) fn draft_matches_own_delivery(draft: &str, deliveries: &[String]) -> bool {
+    let want: String = draft.split_whitespace().collect();
+    want.chars().count() >= 8
+        && deliveries
+            .iter()
+            .any(|text| text.split_whitespace().collect::<String>() == want)
+}
+
+/// Every text amux is known to have typed into `name` recently.
+///
+/// The ring is in-memory and dies with the process; `meta.last_send_text` is
+/// written by the accepted api-send branch (`update_meta` below) and survives a
+/// restart — which is exactly what a lane that was idle-stopped and re-registered
+/// needs. `cmd_history` is included by `pane_prompts::own_delivery_texts` for
+/// the same reason.
+fn own_delivery_texts(state: &AppState, name: &str) -> Vec<String> {
+    let mut texts = super::pane_prompts::own_delivery_texts(state, name);
+    texts.extend(own_delivery_texts_no_store(name));
+    texts
+}
+
+/// The provenance sources available to a spawned watcher, which has no
+/// `AppState`: the in-memory ring plus the durable `meta.last_send_text`.
+fn own_delivery_texts_no_store(name: &str) -> Vec<String> {
+    let mut texts = super::pane_prompts::recent_own_delivery_texts(name);
+    let meta = load_meta(name);
+    let last = meta_str(&meta, "last_send_text");
+    if !last.trim().is_empty() {
+        texts.push(last.to_string());
+    }
+    texts
+}
+
 /// Submit the lane's own pasted steering message at an idle boundary. Returns
-/// None when the draft is not this delivery (the human-draft guard applies).
+/// None when the draft is not this delivery (the human-draft guard applies) OR
+/// when it was a *stale* own paste that this call cleared — the caller then
+/// re-reads the frame and delivers the message waiting in the queue.
 async fn submit_own_steering_draft(
     state: &AppState,
     name: &str,
@@ -13950,14 +13997,54 @@ async fn submit_own_steering_draft(
     let _guard = send_lock.lock().await;
     let raw = tmux_capture(name, 25).await;
     let draft = composer_state(&raw).typed()?.to_string();
-    if !composer_holds_this_delivery(&draft, text) {
+    let is_this_delivery = composer_holds_this_delivery(&draft, text);
+    let texts = own_delivery_texts(state, name);
+    let is_stale_own_paste = !is_this_delivery && draft_matches_own_delivery(&draft, &texts);
+    if !is_this_delivery && !is_stale_own_paste {
         return None;
     }
     if detect_claude_status(&raw) == "active" || pane_bar_says_generating(&raw) {
         return Some((
             false,
-            "this message is already pasted in the composer; the lane is mid-turn, so it is submitted at the next idle boundary".into(),
+            if is_this_delivery {
+                "this message is already pasted in the composer; the lane is mid-turn, so it is submitted at the next idle boundary".into()
+            } else {
+                "an earlier amux paste is still in the composer; the lane is mid-turn, so it is cleared at the next idle boundary".into()
+            },
         ));
+    }
+    if is_stale_own_paste {
+        // NOT our current delivery: submitting it would deliver the wrong text
+        // (and the queued one would still be waiting). It was already announced
+        // to the owner, so clear it and let the queued message go through.
+        // A human draft can never reach here: it would have to be an EXACT
+        // whitespace-squashed match of a text amux typed into this lane.
+        send_key(name, "C-u").await;
+        sleep_ms(200).await;
+        let cleared = composer_state(&tmux_capture(name, 25).await).typed().is_none();
+        let preview = chars_truncate(&draft, 120);
+        tracing::warn!(
+            session = %name,
+            preview = %preview,
+            cleared,
+            measured = true,
+            n_considered = texts.len(),
+            verdict = "steering_own_stale_draft_cleared",
+            "composer held amux's own earlier paste, not a human draft; cleared it so the queued message can be delivered"
+        );
+        emit_event(
+            state,
+            name,
+            "session.own_stale_draft_cleared",
+            Some(json!({"preview": preview, "cleared": cleared})),
+            None,
+            "steering",
+        )
+        .await;
+        // Returning None is deliberate: the caller re-captures the frame and
+        // either delivers the queued message or (if the clear failed and the
+        // text is still there) preserves it behind the human-draft guard.
+        return None;
     }
     let preview = chars_truncate(&draft, 120);
     tracing::warn!(
@@ -14232,7 +14319,11 @@ async fn send_text_inner_bound_body(
         if let Some(submitted) = submit_own_steering_draft(state, name, text).await {
             return submitted;
         }
-        if clear_delivered_duplicate_draft(state, name).await {
+        // That call may have CLEARED a stale paste of our own (verdict
+        // `steering_own_stale_draft_cleared`). Re-read before applying the
+        // human-draft guard, or a cleared composer would still look occupied.
+        out_st = tmux_capture(name, 15).await;
+        if composer_state(&out_st).typed().is_some() && clear_delivered_duplicate_draft(state, name).await {
             out_st = tmux_capture(name, 15).await;
         }
     }
@@ -15448,6 +15539,31 @@ fn spawn_direct_draft_idle_submit(name: &str, text: &str, sent_at: f64, grace_s:
             match composer_state(&raw) {
                 ComposerState::Typed(draft) => {
                     if !composer_holds_this_delivery(&draft, &text) {
+                        // An EXACT match to any text amux typed into this lane
+                        // is amux's own earlier paste, not a person's edit —
+                        // the same stale draft that blocks every steering
+                        // delivery. Clearing it (verified) stops this watcher
+                        // from leaving a poison draft behind when it gives up
+                        // or the lane is idle-stopped. A real human edit still
+                        // takes the untouched `changed_by_human` path.
+                        let texts = own_delivery_texts_no_store(&name);
+                        if draft_matches_own_delivery(&draft, &texts) {
+                            send_key(&name, "C-u").await;
+                            sleep_ms(200).await;
+                            let cleared =
+                                composer_state(&tmux_capture(&name, 25).await).typed().is_none();
+                            let preview = chars_truncate(&draft, 80);
+                            tracing::warn!(
+                                session = %name,
+                                preview = %preview,
+                                cleared,
+                                measured = true,
+                                n_considered = texts.len(),
+                                verdict = "direct_draft_own_stale_paste_cleared",
+                                "an idle watcher found amux's own earlier paste instead of the watched message; cleared it"
+                            );
+                            break "direct_draft_own_stale_paste_cleared";
+                        }
                         break "direct_draft_changed_by_human";
                     }
                 }
@@ -58024,6 +58140,53 @@ mod stale_draft_tests {
         let tool_result = user(json!([{"type": "tool_result", "content": SENT}]));
         assert!(!draft_matches_delivered_turn(DRAFT, &[tool_result]));
         assert!(!draft_matches_delivered_turn("yes", &[user(json!("yes"))]));
+    }
+
+    /// The 2026-11-25 specimen, verbatim from the lane meta and composer.
+    #[test]
+    fn a_stale_own_paste_is_recognized_while_a_human_edit_is_not() {
+        let draft = "[fromTelegram@whoamiPV]Eaí,resolveu?";
+        let sent = "[from Telegram @whoamiPV] E aí, resolveu?";
+        assert!(!composer_holds_this_delivery(
+            draft,
+            "Retomada (general-mgr). Continue a tarefa"
+        ));
+        assert!(draft_matches_own_delivery(draft, &[sent.to_string()]));
+        // Even the exact current-delivery test is merely a subset of the
+        // provenance rule: both sides are squashed identically.
+        assert!(draft_matches_own_delivery(draft, &[draft.to_string()]));
+        // Controls: a human extension, a prefix, and a short retype stay human.
+        assert!(!draft_matches_own_delivery(
+            &format!("{draft}e mais uma coisa"),
+            &[sent.to_string()]
+        ));
+        assert!(!draft_matches_own_delivery("resolveu", &[sent.to_string()]));
+        assert!(!draft_matches_own_delivery("yes", &["yes".to_string()]));
+        assert!(!draft_matches_own_delivery(draft, &[]));
+    }
+
+    /// The delivery path is async and needs a live pane, so pin the invariant
+    /// at the source: a stale own paste is CLEARED (never submitted as if it
+    /// were the queued message) and the guard still refuses unknown drafts.
+    #[test]
+    fn the_steering_draft_guard_clears_a_stale_own_paste_but_preserves_unknown_text() {
+        let src = include_str!("session_verbs.rs");
+        let at = src
+            .find("async fn submit_own_steering_draft(")
+            .expect("steering draft guard");
+        let body = &src[at..at + 3200];
+        assert!(body.contains("draft_matches_own_delivery("), "provenance check missing");
+        assert!(body.contains("is_stale_own_paste"), "stale branch missing");
+        assert!(body.contains("send_key(name, \"C-u\")"), "stale paste must be cleared");
+        assert!(body.contains("steering_own_stale_draft_cleared"), "no log verdict");
+        assert!(
+            body.contains("if !is_this_delivery && !is_stale_own_paste"),
+            "an unknown draft must still return before any key is sent"
+        );
+        assert!(
+            src.contains("verdict = \"steering_draft_preserved\""),
+            "the human-draft guard must stay in the delivery path"
+        );
     }
 }
 

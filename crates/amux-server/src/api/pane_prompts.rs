@@ -96,6 +96,27 @@ fn recent_deliveries(session: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Texts amux is known to have typed into `session` recently, from BOTH the
+/// in-memory ring and the durable `cmd_history`.
+///
+/// Used by the steering draft guard to tell amux's own stuck paste (which it
+/// may clear) from a human's unsaved thought (which it must preserve). The two
+/// sources overlap on purpose: the ring covers a raw API send that writes no
+/// history row, `cmd_history` covers a delivery followed by a server restart.
+pub(crate) fn recent_own_delivery_texts(session: &str) -> Vec<String> {
+    recent_deliveries(session)
+}
+
+pub(crate) fn own_delivery_texts(state: &AppState, session: &str) -> Vec<String> {
+    let mut texts = recent_deliveries(session);
+    for text in recent_history_texts(state, session) {
+        if !texts.contains(&text) {
+            texts.push(text);
+        }
+    }
+    texts
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaneVerdict {
     /// A person typed it: record it.
