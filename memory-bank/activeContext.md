@@ -19,8 +19,8 @@ logs `stall_notice_cleared`; a row older than the process is seeded on deploy
 (`stall_notice_seeded`) so a restart never re-pages; the notice now says a
 stopped lane waits for a start instead of "its terminal shows what it is
 blocked on". **Verified:** suite 422 passed (413 + 9 new), restarted 11:08:58,
-`/health` ok, both rows seeded live (no new Telegram message). The two rows
-themselves stay queued — dropping them is the owner's call.
+`/health` ok, both rows seeded live (no new Telegram message). The two rows were then dropped
+on the owner's "apaga" (`DELETE …/steer`, queue 0, `stall_notice_cleared` ×2).
 
 **Older (one line each — full detail in the linked progress file):**
 - **2026-11-26** relay releases a deleted topic → `progress/tg-relay-thread-missing-release.md` (413 green, live).

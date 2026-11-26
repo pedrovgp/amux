@@ -109,12 +109,34 @@ lanes carry `last_skip_id`.
 - `stall_watch_once` keeps amux's log as the TRIGGER; the API only supplies the
   identity. No new poller, no second source of truth.
 
+## Evidence preserved before the owner's drop (2026-11-26)
+
+Owner: "apaga" (drop the two obsolete rows). Recorded verbatim from
+`steering_queue` BEFORE deleting, so the evidence survives the delete:
+
+```
+boot-delivery:ocusage:1795635401:Owner:510292caf88dbbac7ac68d12a297602fbd81dbe1fea6a0de65ea26a9373dbe55
+  queued_at 1795646888 (2026-11-25 22:48 UTC / 19:48 -03)  guard=''  sender=''
+  "Retomada (general-mgr). Suas mensagens do Telegram das 15:33/15:38/16:00/16:36
+   ficaram presas no steering do amux (`send-refused: composer`) ... Continue a
+   tarefa OCUsage do ponto em que parou ..."
+
+boot-delivery:tg-fix-steering-stall:1795636378:Owner:2ef173b3edcc6920a6254146c6f469cd4d0460dd016c2efed4ed05aa032ceb8f
+  queued_at 1795646888  guard=''  sender=''
+  "Retomada (general-mgr). A sua mensagem das 17:43 ficou presa no steering ...
+   Retome a correção da causa raiz do `steering queue STALLED` ..."
+```
+
+Dropped through the SANCTIONED route (`DELETE /api/workers/<lane>/steer` with
+`{"id": …}`), not by hand-editing `amux.db`.
+
 ## Deferred Work
 
 - Auto-start (or dead-letter) a `not-running` hold: owner decision, unchanged
   semantics of `steer_dead_letter_verdict`.
-- The two obsolete GM rows (2026-11-25) are left in place on purpose; they are
-  the owner's calls to drop or deliver.
+- The two obsolete GM rows (2026-11-25) were DROPPED on the owner's "apaga"
+  (2026-11-26 13:26), through `DELETE /api/workers/<lane>/steer`; their text is
+  preserved above. Nothing else was touched.
 
 ## Execution Log
 
@@ -124,7 +146,8 @@ lanes carry `last_skip_id`.
 | 2 | dedupe + advice | row key, seed-on-deploy, cleared loop, NOT RUNNING advice | done | |
 | 3 | tests | 9 new; suite 422 passed (413 before) | done | |
 | 4 | suite + restart | `seeded … oldest_age_s=55249` for both rows, no new notice | done | |
-| 5 | commit + push | | pending | |
+| 5 | commit + push | `fix` `7cc949690` + `docs` `e2715d418`, pushed | done | |
+| 6 | owner drop of the two rows | `DELETE …/steer` ×2 → cleared 1+1; queue 0; `stall_notice_cleared` ×2 live | done | evidence in this file |
 
 ## Human Verification
 
