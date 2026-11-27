@@ -78,3 +78,25 @@ Feito o que era seguro; duas coisas ficaram bloqueadas por divergência real ent
 **Pull:** `main` foi sincronizado (`amux sync-checkout`: `abfba334d → 3b5918368`). Em `feat/` NÃO fiz o merge de `origin/main`: os branches divergiram no provider opencode (40 trechos conflitantes em 6 arquivos, incluindo `Result<()>` vs `Result<bool>` em `opencode/mod.rs`). Resolver isso automaticamente poderia quebrar a frota; deixei para decisão humana/worker dedicado.
 
 **Estado honesto:** `/health` ainda reporta `commit=abfba334d` — o builder só ativa depois que o workflow `checks` do commit `3b5918368` passa; no último check havia 14 sucessos e 15 checks pendentes. Assim que passar, o servidor puxa o novo binário. Não fiquei em loop de polling. As duas filas presas já não têm linhas em `steering_queue` (foram limpas por outro worker), então o incidente imediato está resolvido. O checkout compartilhado `amux-telegram-gateway` ficou com conflitos `UU` deixados por outro worker; não toquei nesses arquivos — este registro foi comitado num worktree limpo.
+
+## 3. Esperar o peer, confirmar e sincronizar / merge main → feat
+
+**Prompt**
+
+> espere o peer, ele terminou? se sim, pode fazer o sync
+
+**Final answer**
+
+—— answer ——
+
+O peer não tinha terminado — e já não está ativo: os workers `amux-tg-fix-steering-stall` e `amux-tg-fix-relay-topic-release` não existem mais (`amux peek` → worker not found). Os conflitos no checkout compartilhado (`UU` em `amux.py`/`bot.py`, `AA` em `activeContext.md`) eram um cherry-pick abandonado de `f8cf229ad`, commit que já é ancestral do tip do feat; em todos os três arquivos o lado `HEAD` era a versão mais nova e mais completa. Guardei os arquivos conflitados e o estado do índice em `/tmp/opencode/peer-conflict-evidence/2026-11-26T15-07/` e restaurei o `HEAD`. Nenhum trabalho do peer foi descartado.
+
+**Sync:** `amux sync-checkout` no checkout compartilhado avançou `d5fcfb26f → b404df409`, limpo. `main` já estava em `3b5918368` = `origin/main`.
+
+**Merge:** executei `git merge --no-edit origin/main` num worktree isolado a partir de `origin/feat/telegram-gateway`. Conflitaram exatamente os 6 arquivos previstos (40 trechos): `boundary_policy.rs`, `mod.rs`, `serve.rs`, `structured.rs`, `opencode-provider-plan.md`, `serve-spike-results.md`. Resolvi todos tomando a versão de `origin/main`, porque a versão do feat é a implementação anterior do provider, já integrada no main pelo PR #408 e depois melhorada (M9/M10/M11, `set_model → Result<bool>`, regras de fronteira por tipo de pergunta). Os dois testes que só existiam no lado feat testavam `PATH_DECIDABLE_TOOLS`, que o main removeu de propósito. Validei: zero marcadores, zero unmerged, os 6 arquivos idênticos ao `origin/main`, 59 arquivos do gateway e o fix de steering preservados no auto-merge, `git diff --check` limpo.
+
+**Verificação:** `cargo check -p amux-server --lib`, `cargo clippy -p amux-server --all-targets -- -D warnings`, gateway `pytest -q` (422 passed), suíte completa `amux-server --lib` via `scripts/test-contended.sh` (exit 0), módulos `opencode` (133 passed) e `session_verbs` (551 passed), zero falhas.
+
+**Deploy (achado separado, não alterado aqui):** `/health` ainda reporta `commit=abfba334d`. O workflow `gate` passou para `3b5918368`, mas o job `e2e` falhou; `/api/pull` responde `measured=false, repo=null, state=unmeasured` e o timer/serviço do builder está inativo nesta máquina, então não há como explicar ou disparar a ativação daqui. Não mexi nisso sem sua autorização.
+
+**Correção de fluxo (pedido do dono):** não foi `upstream/main` (mixpeek/amux). O merge usou `origin/main` = `3b5918368`; a `main` local já estava nesse mesmo commit, então nenhum dado passou por ela. O merge foi feito diretamente num worktree em `origin/feat/telegram-gateway` (`b404df409`) e publicado de volta em `origin/feat/telegram-gateway`. O amend autorizado acrescenta `Vision: A4, A6, A10` ao corpo do commit: A10 porque a cópia obsoleta e duplicada do provider no feat foi removida em favor da versão do main; A4 porque a evidência do peer e as verificações ficaram registradas; A6 porque `origin/main` é a fonte de verdade.

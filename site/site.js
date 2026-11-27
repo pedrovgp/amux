@@ -3,11 +3,14 @@
   // and keeps following it. Runs synchronously in <head>, before first paint.
   var KEY = 'amux-theme';
   var root = document.documentElement;
+  // <html data-theme-default="light"> starts a visitor who has not chosen in
+  // light, whatever the OS says. A choice from the theme menu always wins.
+  var DEFAULT_PREF = root.getAttribute('data-theme-default') === 'light' ? 'light' : 'system';
   var mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: light)') : null;
   function getPref() {
     var v = null;
     try { v = localStorage.getItem(KEY); } catch (e) {}
-    return v === 'light' || v === 'dark' ? v : 'system';
+    return v === 'light' || v === 'dark' || v === 'system' ? v : DEFAULT_PREF;
   }
   function resolve(pref) { return pref === 'system' ? (mq && mq.matches ? 'light' : 'dark') : pref; }
   function apply(pref) {
@@ -90,7 +93,7 @@
       items.forEach(function (it, i) {
         it.addEventListener('click', function () {
           var p = it.getAttribute('data-theme-set');
-          try { if (p === 'system') localStorage.removeItem(KEY); else localStorage.setItem(KEY, p); } catch (err) {}
+          try { localStorage.setItem(KEY, p); } catch (err) {}
           apply(p);
           if (window.posthog) posthog.capture('theme_set', { theme_pref: p, theme: resolve(p) });
           close(true);
@@ -104,23 +107,50 @@
       document.addEventListener('click', function (e) { if (!pick.contains(e.target)) close(false); });
       document.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(true); });
     });
+
+    // Solutions menu (<details class="nav-drop">): the browser opens and closes
+    // it; this keeps aria-expanded in step and closes it on Escape or a click
+    // anywhere else, like the theme menu.
+    document.querySelectorAll('.nav-drop').forEach(function (drop) {
+      var sum = drop.querySelector('summary');
+      if (!sum) return;
+      function sync() { sum.setAttribute('aria-expanded', drop.open ? 'true' : 'false'); }
+      sync();
+      drop.addEventListener('toggle', sync);
+      document.addEventListener('click', function (e) { if (drop.open && !drop.contains(e.target)) drop.open = false; });
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && drop.open) { drop.open = false; sum.focus(); }
+      });
+    });
   });
 
 
-  // GitHub star count for the header, cached an hour (the unauthenticated
-  // API allows 60 requests an hour per IP). Fills any count still empty.
+  // GitHub star count, every place a page shows it: the header's #gh-stars
+  // ("★ 555") and any .gh-stars (the homepage's header and buttons, number
+  // only). A cached count, else STARS_FALLBACK, shows at once; GitHub is asked
+  // at most once an hour (the unauthenticated API allows 60 requests an hour
+  // per IP) and its answer replaces whatever is shown. It used to fill only an
+  // EMPTY #gh-stars and the homepage kept a baked 539 when its own uncached
+  // fetch failed, so the counts read low or blank (2026-11-08: 539 shown, 555
+  // real). Bump STARS_FALLBACK with scripts/site-header.mjs's STARS.
+  var STARS_FALLBACK = 555;
   document.addEventListener('DOMContentLoaded', function () {
-    var el = document.getElementById('gh-stars');
-    if (!el) return;
-    function show(n) { if (n && !/\d/.test(el.textContent)) el.textContent = '\u2605 ' + n; }
+    var els = document.querySelectorAll('#gh-stars, .gh-stars');
+    if (!els.length) return;
+    function show(n) {
+      if (!n) return;
+      var txt = Number(n).toLocaleString('en-US');
+      els.forEach(function (el) { el.textContent = el.id === 'gh-stars' ? '\u2605 ' + txt : txt; });
+    }
     var cached = null;
-    try { cached = JSON.parse(localStorage.getItem('amux-gh-stars') || 'null'); } catch (e) {}
-    if (cached && Date.now() - cached.t < 3600000) { show(cached.n); return; }
+    try { cached = JSON.parse(localStorage.getItem('amux-gh-stars') || 'null'); } catch (e) { cached = null; }
+    show(cached && cached.n > STARS_FALLBACK ? cached.n : STARS_FALLBACK);
+    if (cached && Date.now() - cached.t < 3600000) return;
     fetch('https://api.github.com/repos/mixpeek/amux').then(function (r) { return r.json(); }).then(function (d) {
       if (!d.stargazers_count) return;
-      try { localStorage.setItem('amux-gh-stars', JSON.stringify({ n: d.stargazers_count, t: Date.now() })); } catch (e) {}
+      try { localStorage.setItem('amux-gh-stars', JSON.stringify({ n: d.stargazers_count, t: Date.now() })); } catch (e) { /* private mode: still shown */ }
       show(d.stargazers_count);
-    }).catch(function () { if (cached) show(cached.n); });
+    }).catch(function () { /* the cached or baked count stays */ });
   });
 
   // EXP-141: a copy button on the one-line install command (getting-started,
@@ -195,6 +225,8 @@
       if (/^\/start\/?$/.test(u.pathname)) return 'cloud';
       if (/^\/pricing\/?$/.test(u.pathname) || u.hash === '#get') return 'pricing';
       if (/^\/walkthrough\/?$/.test(u.pathname)) return 'walkthrough';
+      if (/^\/concierge\/?$/.test(u.pathname)) return 'concierge_page';
+      if (/^\/solutions\//.test(u.pathname) && a.closest('.nav-drop')) return 'solutions';
     }
     if (u.hostname === 'apps.apple.com') return 'ios';
     if (a.classList.contains('js-schedule') || u.hostname === 'calendly.com') return 'concierge';

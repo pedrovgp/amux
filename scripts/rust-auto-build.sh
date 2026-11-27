@@ -64,6 +64,48 @@ ids=[r.get("schedule_id","?") for r in rows if isinstance(r,dict) and r.get("sta
 print(",".join(sorted(set(ids))))' "$window" 2>/dev/null || true
 }
 
+# Wait for the server to report $1 live, for $2 seconds; sets $waited and
+# returns 0 once it does. The server holds adoption of a new binary while a
+# shell schedule run is in flight, for up to AMUX_ADOPT_SHELL_DEFER_MAX_S
+# (lib.rs SELF_ADOPT, default 900). Rolling back at $2 during that hold threw
+# away good builds: 6 rollbacks from 2026-10-30 to 11-02, c71df3ef9 among
+# them while SCHED-662 ran. So past $2 the wait goes on while a shell run is
+# in flight, up to $2 plus the hold, and says so once.
+wait_live_identity() {
+  local sha="$1" limit="$2" hold="${AMUX_ADOPT_SHELL_DEFER_MAX_S:-900}" said=0 runs="" released=0
+  local grace="${AMUX_ADOPT_POST_HOLD_GRACE_S:-120}"
+  case "$hold" in ''|*[!0-9]*) hold=900 ;; esac
+  case "$grace" in ''|*[!0-9]*) grace=120 ;; esac
+  waited=0
+  while :; do
+    if measure_live_identity && [ -n "$live" ]; then
+      case "$sha" in "$live"*) return 0 ;; esac
+    fi
+    if [ "$waited" -ge "$limit" ]; then
+      [ "$waited" -lt $((limit + hold)) ] || return 1
+      if [ "$released" = 0 ]; then
+        # Re-read the scheduler every 15s, not every second.
+        if [ $(( (waited - limit) % 15 )) = 0 ]; then runs=$(shell_runs_in_flight $((limit + hold))); fi
+        if [ -z "$runs" ]; then
+          [ "$said" = 1 ] || return 1
+          # THE RUN THAT HELD ADOPTION HAS JUST ENDED. The server adopts on its
+          # next tick, so judging health in the same second called a good build
+          # unhealthy: e5cc110cb on 2026-11-04 was rolled back at 405s, the
+          # moment SCHED-706 finished, and the hold that followed pinned deploys
+          # for 31 hours. Give the adoption its tick, then judge.
+          released=1; limit=$waited; hold=$grace
+          echo "== ACTIVATION HOLD RELEASED sha=$sha: no shell run in flight after ${waited}s; allowing ${grace}s for adoption verdict=activation_wait_post_hold"
+        fi
+      fi
+      if [ "$said" = 0 ]; then
+        said=1
+        echo "== ACTIVATION WAIT EXTENDED sha=$sha: not live after ${limit}s while shell run(s) $runs hold adoption; waiting up to $((limit + hold))s verdict=activation_wait_shell_hold"
+      fi
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+}
+
 # THE BASH CLI SHIPS WITH THE SERVER IT TALKS TO. This builder installs only
 # amux-server; the bash `amux` in ~/.local/bin and /usr/local/bin was copied
 # once by install.sh and then went stale. Measured 2026-09-27: the server
@@ -170,6 +212,42 @@ sync_observed_edits_hooks() {
   done
 }
 
+# The repo's own git hooks follow the activated commit too (AF-1129). A landed
+# change to scripts/git-hooks/ reached nothing until someone reran
+# install-hooks.sh: .git/hooks/pre-push sat at its Oct 29 bytes while main moved
+# on, so the pre-push script-tests leg ran only in fixtures. Only hooks already
+# installed are replaced, and a tracked core.hooksPath dir is the repo owner's.
+# ~/.amux/hooks stays with install-hooks.sh.
+sync_repo_git_hooks() {
+  local sha="$1" common dir name dest tmp
+  [ -z "$(git -C "$REPO" config core.hooksPath 2>/dev/null || true)" ] || return 0
+  common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  dir="$common/hooks"
+  for name in pre-commit pre-push post-commit prepare-commit-msg amux-staged-guard append-only-push-guard; do
+    dest="$dir/$name"
+    [ -f "$dest" ] && [ ! -L "$dest" ] && [ -w "$dir" ] || continue
+    tmp="$(mktemp "$dir/.repo-hook.XXXXXX")" || continue
+    if ! git -C "$REPO" show "${sha}:scripts/git-hooks/${name}" > "$tmp" 2>/dev/null; then
+      rm -f "$tmp"; continue
+    fi
+    if cmp -s "$tmp" "$dest"; then rm -f "$tmp"; continue; fi
+    if head -1 "$tmp" | grep -q python; then
+      python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$tmp" 2>/dev/null
+    else
+      bash -n "$tmp" 2>/dev/null
+    fi || {
+      echo "== REPO HOOK SYNC FAILED sha=$sha hook=$name verdict=repo_hook_source_invalid" >> "$LOG"
+      rm -f "$tmp"; continue
+    }
+    if chmod 0755 "$tmp" && mv -f "$tmp" "$dest"; then
+      echo "== REPO HOOK SYNCED sha=$sha hook=$name verdict=repo_hook_synced" >> "$LOG"
+    else
+      echo "== REPO HOOK SYNC FAILED sha=$sha hook=$name verdict=repo_hook_sync_failed" >> "$LOG"
+      rm -f "$tmp"
+    fi
+  done
+}
+
 # The sha that will actually be BUILT — the worktree below is created from
 # `rev-parse HEAD`. `$head` is a different thing: the last commit that touched
 # the build inputs, used as the rebuild stamp key. They differ routinely on a
@@ -249,6 +327,149 @@ except Exception:
 ' 2>/dev/null) || { identity_reason="invalid_commit"; return 1; }
 }
 
+# A COMMIT WITH NO COMPILE-INPUT CHANGE NEEDS NO COMPILE (2026-11-08).
+#
+# The server compiles its commit in, so a docs or scripts commit read as
+# "STAMP DRIFT" and rebuilt amux-server at the deploy profile: 80 to 185 s
+# measured, the largest share of push-to-live, for bytes identical to the ones
+# already running. 182 of 269 commits in the week to 2026-11-07 changed no
+# Rust source. The server now takes its commit from the receipt beside the
+# binary when the receipt names its own bytes (activation.rs `served`), and
+# re-executes when the receipt changes. So when nothing the compile reads has
+# changed since the installed bytes were compiled, write the receipt for the
+# new commit and let the server adopt it.
+#
+# "What the compile reads" is crates/, Cargo.*, the toolchain files and every
+# include_str!/include_bytes! target outside crates/ (scripts/ci-rust-key.mjs
+# lists them; the bash CLI and the hooks are among them). Any doubt compiles:
+# no receipt, a receipt for other bytes, a running server that does not read
+# receipts (no `build_commit` in /health) or runs other bytes, an unreadable
+# include list, or an earlier restamp of this commit that was not adopted.
+# AMUX_RS_RESTAMP=0 turns it off.
+#
+# The dashboard (crates/amux-dashboard/static/) is compiled in by rust-embed,
+# but nothing else the compile reads depends on it. When it is the only
+# compile input that changed, its files at this commit are copied to a
+# snapshot directory (AMUX_RS_DASHBOARD_SNAPSHOTS, one per git tree) and the
+# receipt names it as `dashboard_dir`; the server serves that directory
+# instead of its embedded copy. This needs a server that reports
+# `dashboard_source` in /health, and a server that cannot read the snapshot
+# reports its compiled commit, which reads here as not adopted: the receipt is
+# restored and the same run compiles.
+DASH_STATIC=crates/amux-dashboard/static
+# Keep the snapshot being served and the three newest others (a rollback
+# target); a snapshot is about 12 MB.
+prune_dashboard_snapshots() {
+  local keep="$1" d n=0
+  [ -d "$DASH_SNAPSHOTS" ] || return 0
+  for d in $(ls -1t "$DASH_SNAPSHOTS" 2>/dev/null); do
+    [ "$DASH_SNAPSHOTS/$d" = "$keep" ] && continue
+    n=$((n + 1))
+    [ "$n" -le 3 ] && continue
+    rm -rf "${DASH_SNAPSHOTS:?}/${d:?}"
+    echo "== DASHBOARD SNAPSHOT PRUNED $d verdict=dashboard_snapshot_pruned"
+  done
+}
+DASH_SNAPSHOTS="${AMUX_RS_DASHBOARD_SNAPSHOTS:-$HOME/.amux/dashboard-snapshots}"
+restamp_without_compile() {
+  local sha="$1" stamped body compiled dash_cap extra changed others dash_tree="" dash_dir="" tmp_snap
+  local paths=()
+  [ "${AMUX_RS_RESTAMP:-1}" = 1 ] || { echo "== RESTAMP OFF sha=$sha (AMUX_RS_RESTAMP=0) verdict=restamp_off"; return 1; }
+  if [ -f "${STAMP}.restamp_failed" ] && [ "$(cat "${STAMP}.restamp_failed" 2>/dev/null)" = "$sha" ]; then
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: an earlier restamp of it was not adopted; compiling verdict=restamp_retry_compiles"
+    return 1
+  fi
+  body=$(curl -sk --max-time 4 "${AMUX_RS_HEALTH_URL:-$(server_api_base)/api/health}" 2>/dev/null) || {
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: /health unreadable verdict=restamp_unmeasured"; return 1; }
+  compiled=$(python3 - "$INSTALL" "${INSTALL}.identity.json" "$body" <<'PYRESTAMP' 2>&1
+import hashlib,json,re,sys
+try:
+    d=json.load(open(sys.argv[2]))
+except (OSError,ValueError):
+    raise SystemExit('no readable receipt')
+with open(sys.argv[1],'rb') as f: build=hashlib.sha256(f.read()).hexdigest()[:16]
+if d.get('build')!=build: raise SystemExit('the receipt is not for the installed binary')
+try: h=json.loads(sys.argv[3])
+except ValueError: raise SystemExit('/health is not JSON')
+if 'build_commit' not in h: raise SystemExit('the running server does not read receipts')
+if h.get('build')!=build: raise SystemExit('the running server is not the installed binary')
+c=d.get('compiled_at') or d.get('sha','')
+if not re.fullmatch(r'[0-9a-f]{40}',c): raise SystemExit('the receipt names no compiled commit')
+print(c, 'dash' if 'dashboard_source' in h else 'nodash')
+PYRESTAMP
+) || { echo "== RESTAMP NOT APPLICABLE sha=$sha: $compiled verdict=restamp_not_applicable"; return 1; }
+  dash_cap=${compiled#* }; compiled=${compiled%% *}
+  extra=$(cd "$REPO" && node scripts/ci-rust-key.mjs --json --rustc none 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+if d.get("unresolved"): raise SystemExit(1)
+print("\n".join(sorted({i["path"] for i in d["includes"] if not i["path"].startswith("crates/")})))') || {
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: the include list is unreadable (scripts/ci-rust-key.mjs) verdict=restamp_includes_unmeasured"; return 1; }
+  while IFS= read -r p; do [ -n "$p" ] && paths+=("$p"); done <<EOF
+$extra
+EOF
+  git -C "$REPO" cat-file -e "${compiled}^{commit}" 2>/dev/null || {
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: compiled commit $compiled is not in $REPO verdict=restamp_not_applicable"; return 1; }
+  changed=$(git -C "$REPO" diff --name-only "$compiled" "$sha" -- crates Cargo.toml Cargo.lock rust-toolchain rust-toolchain.toml .cargo ${paths[@]+"${paths[@]}"} 2>&1) || {
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: diff failed verdict=restamp_not_applicable"; return 1; }
+  others=$(printf '%s\n' "$changed" | grep -v "^$DASH_STATIC/" | grep -v '^$' || true)
+  if [ -n "$others" ]; then
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: compile inputs changed since $compiled ($(printf '%s' "$others" | head -3 | tr '\n' ' ')) verdict=restamp_inputs_changed"
+    return 1
+  fi
+  # The dashboard at this commit, when it is not the one compiled in.
+  dash_tree=$(git -C "$REPO" rev-parse -q --verify "$sha:$DASH_STATIC" 2>/dev/null || true)
+  if [ -n "$dash_tree" ] && [ "$dash_tree" != "$(git -C "$REPO" rev-parse -q --verify "$compiled:$DASH_STATIC" 2>/dev/null)" ]; then
+    case "$dash_cap" in
+      dash) ;;
+      *) echo "== RESTAMP NOT APPLICABLE sha=$sha: the dashboard changed and the running server cannot serve a snapshot (no dashboard_source in /health) verdict=restamp_dashboard_unsupported"; return 1 ;;
+    esac
+    dash_dir="$DASH_SNAPSHOTS/$dash_tree"
+    if [ ! -d "$dash_dir" ]; then
+      tmp_snap="$DASH_SNAPSHOTS/.tmp.$$"
+      rm -rf "${tmp_snap:?}"; mkdir -p "$tmp_snap"
+      if ! git -C "$REPO" archive "$sha" "$DASH_STATIC" | tar -x -C "$tmp_snap" \
+         || ! mv "$tmp_snap/$DASH_STATIC" "$dash_dir"; then
+        rm -rf "${tmp_snap:?}"
+        echo "== RESTAMP NOT APPLICABLE sha=$sha: the dashboard snapshot could not be written to $dash_dir verdict=restamp_dashboard_unwritable"; return 1
+      fi
+      rm -rf "${tmp_snap:?}"
+    fi
+  fi
+  # Local until it is live: a re-stamp that is not adopted must not leave its
+  # fields (dashboard_dir, restamped) in the receipt the compile writes next.
+  stamped=$(python3 - "${INSTALL}.identity.json" "$PROV_JSON" "$head" "$compiled" "$dash_dir" <<'PYSTAMP'
+import json,sys
+old=json.load(open(sys.argv[1])); new=json.loads(sys.argv[2])
+new.update(build=old['build'], trigger=sys.argv[3], compiled_at=sys.argv[4], restamped=True)
+if sys.argv[5]: new['dashboard_dir']=sys.argv[5]
+print(json.dumps(new))
+PYSTAMP
+) || return 1
+  cp -p "${INSTALL}.identity.json" "${INSTALL}.identity.json.rollback"
+  printf '%s\n' "$stamped" > "${INSTALL}.identity.json.new.$$"
+  mv -f "${INSTALL}.identity.json.new.$$" "${INSTALL}.identity.json"
+  if [ -n "$dash_dir" ]; then
+    echo "== ACTIVATION RESTAMPED identity=$stamped: only the dashboard changed since $compiled; serving snapshot $dash_dir (${#paths[@]} includes outside crates/ checked) verdict=activation_restamped dashboard=snapshot"
+  else
+    echo "== ACTIVATION RESTAMPED identity=$stamped: no compile input changed since $compiled (${#paths[@]} includes outside crates/ checked) verdict=activation_restamped"
+  fi
+  if wait_live_identity "$sha" "${AMUX_ACTIVATION_HEALTH_S:-300}"; then
+    echo "$head" > "$STAMP"
+    date +%s > "${STAMP}.adopted_at"
+    PROV_JSON=$stamped
+    printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
+    rm -f "${INSTALL}.identity.json.rollback"
+    prune_dashboard_snapshots "$dash_dir"
+    echo "== ACTIVATION HEALTHY sha=$sha after ${waited}s push_to_live_s=$(( $(date +%s) - $(git -C "$REPO" log -1 --format=%ct "$sha" 2>/dev/null || date +%s) )) restamped=1 verdict=activation_healthy"
+    return 0
+  fi
+  mv -f "${INSTALL}.identity.json.rollback" "${INSTALL}.identity.json"
+  echo "$sha" > "${STAMP}.restamp_failed"
+  echo "== !! ACTIVATION RESTAMP UNADOPTED sha=$sha: not live after ${waited}s; the receipt is restored; compiling now verdict=activation_restamp_unadopted"
+  return 1
+}
+
 activation_authorized() {
   local authority
   authority=$(git -C "$REPO" rev-parse --verify -q "${ACTIVATION_REF}^{commit}" 2>/dev/null) || {
@@ -290,6 +511,19 @@ fi
 mkdir -p "$(dirname "$LOCK")"
 if ! mkdir "$LOCK" 2>/dev/null; then
   owner=$(cat "$LOCK/pid" 2>/dev/null || echo "")
+  # An EMPTY pid file is a holder between its mkdir and its pid write (the
+  # prebuild writes the pid one step after mkdir), not a dead one: breaking
+  # it there ran two builds and let the disk guard's rm race a live build
+  # (implicit state machines inventory 2026-10-31, #22). Empty counts as
+  # stale only once the lock is over a minute old.
+  # GNU form first (AF-1125): on Linux `stat -f` is filesystem mode, prints a
+  # "File: ..." block into lock_mtime, and the arithmetic below then aborts on
+  # `File: unbound variable`. BSD `stat -c` fails with nothing on stdout.
+  lock_mtime=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK" 2>/dev/null || echo 0)
+  if [ -z "$owner" ] && [ $(( $(date +%s) - lock_mtime )) -lt 60 ]; then
+    echo "== $(date '+%F %T') SKIP $built_sha — lock just taken, its pid not written yet verdict=build_lock_young" >> "$LOG"
+    exit 0
+  fi
   if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
     # Log the contention rather than exiting silently: a skip that leaves no
     # trace is indistinguishable from a cycle that found nothing to do, and
@@ -320,6 +554,7 @@ if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
   sync_bash_cli "$built_sha"
   sync_authority_launcher "$built_sha"
   sync_observed_edits_hooks "$built_sha"
+  sync_repo_git_hooks "$built_sha"
   # ADOPTION COOLDOWN: batch rapid commits from multiple lanes into fewer
   # rebuilds. Each self-adoption kills all SSE connections (6-12s of
   # "Worker updates unavailable" on every client). With 28 lanes committing
@@ -399,7 +634,8 @@ PYINSTALLED
           echo "== $(date '+%F %T') !! ACTIVATION AWAITING ADOPTION expected=$built_sha live=$live installed_match=true measured=true action=skip_rebuild" >> "$LOG"
           exit 0
         fi
-        echo "== $(date '+%F %T') !! ACTIVATION STAMP DRIFT $built_sha live=$live measured=true action=rebuild — measured foreign image" >> "$LOG" ;;
+        echo "== $(date '+%F %T') !! ACTIVATION STAMP DRIFT $built_sha live=$live measured=true action=rebuild — measured foreign image" >> "$LOG"
+        RESTAMP_CANDIDATE=1 ;;
     esac
   fi
 fi
@@ -512,6 +748,15 @@ if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
+# Every gate above has run (authority, cooldown, shell defer, overlap).
+# A crates/ commit can still be one that only changed the dashboard. A
+# disk-clear diagnostic run never installs anything, so it never re-stamps.
+[ "$head" != "$last" ] && RESTAMP_CANDIDATE=1
+[ "${AMUX_RS_DISK_CLEAR_ONLY:-}" = 1 ] && RESTAMP_CANDIDATE=0
+if [ "${RESTAMP_CANDIDATE:-0}" = 1 ] && restamp_without_compile "$built_sha" >> "$LOG" 2>&1; then
+  exit 0
+fi
+
 {
   # BUILT sha first, trigger second, and both LABELLED. This line printed `$head`
   # — the stamp key, i.e. the last commit that touched the build inputs — which
@@ -543,6 +788,16 @@ fi
   # down again every 15 minutes, so it is held until the build inputs move.
   rolled_head=''
   [ -r "${STAMP}.rolled_back" ] && read -r rolled_head _ < "${STAMP}.rolled_back" || true
+  # A hold whose commit has the SAME build inputs as the binary that was put
+  # back (the stamp names the inputs of what is installed) protects nothing:
+  # the restored binary is that code. Such a hold only clears when crates/ next
+  # changes, which held deploys from 2026-11-04 05:53Z for 31 hours while every
+  # newer main commit touched only scripts and docs. Clear it, and say so.
+  if [ -n "$rolled_head" ] && [ "$rolled_head" = "$head" ] && [ "$last" = "$head" ]; then
+    rm -f "${STAMP}.rolled_back"
+    echo "== WARN activation_rollback_hold_cleared trigger=$head: the restored binary was built from the same inputs, so holding this commit protects nothing verdict=activation_rollback_hold_same_inputs"
+    rolled_head=''
+  fi
   if [ "${AMUX_RS_DISK_CLEAR_ONLY:-0}" != 1 ] && [ -n "$rolled_head" ] && [ "$rolled_head" = "$head" ]; then
     echo "== activation_rollback_hold trigger=$head: rolled back as unhealthy; waiting for a newer commit verdict=activation_rollback_hold"
     exit 0
@@ -949,7 +1204,7 @@ fi
 import hashlib,json,sys
 with open(sys.argv[1], 'rb') as f:
     build=hashlib.file_digest(f, 'sha256').hexdigest()[:16] if hasattr(hashlib, 'file_digest') else hashlib.sha256(f.read()).hexdigest()[:16]
-d=json.loads(sys.argv[2]); d.update(build=build, trigger=sys.argv[3])
+d=json.loads(sys.argv[2]); d.update(build=build, trigger=sys.argv[3], compiled_at=d['sha'])
 print(json.dumps(d))
 PYIDENTITY
 )
@@ -998,23 +1253,30 @@ PYIDENTITY
     if [ "${AMUX_ACTIVATION_ROLLBACK:-1}" = 1 ] && [ "$install_action" = replaced ] && [ -f "${INSTALL}.rollback" ]; then
       limit="${AMUX_ACTIVATION_HEALTH_S:-300}"; waited=0; healthy=0
       case "$limit" in ''|*[!0-9]*) limit=300 ;; esac
-      while [ "$waited" -lt "$limit" ]; do
-        if measure_live_identity && [ -n "$live" ]; then
-          case "$built_sha" in "$live"*) healthy=1; break ;; esac
-        fi
-        sleep 5; waited=$((waited + 5))
-      done
+      if wait_live_identity "$built_sha" "$limit"; then healthy=1; fi
       if [ "$healthy" = 1 ]; then
-        echo "== ACTIVATION HEALTHY sha=$built_sha after ${waited}s verdict=activation_healthy"
+        echo "== ACTIVATION HEALTHY sha=$built_sha after ${waited}s push_to_live_s=$(( $(date +%s) - $(git -C "$WORK" log -1 --format=%ct "$built_sha" 2>/dev/null || date +%s) )) verdict=activation_healthy"
         rm -f "${INSTALL}.rollback" "${INSTALL}.identity.json.rollback" "${STAMP}.rolled_back"
       else
         # Identity before the executable, the same order as the install.
         if [ -f "${INSTALL}.identity.json.rollback" ]; then mv -f "${INSTALL}.identity.json.rollback" "${INSTALL}.identity.json"; else rm -f "${INSTALL}.identity.json"; fi
         mv -f "${INSTALL}.rollback" "$INSTALL"
         if [ -n "$last" ]; then echo "$last" > "$STAMP"; else rm -f "$STAMP"; fi
-        printf '%s %s\n' "$head" "$(date +%s)" > "${STAMP}.rolled_back"
-        echo "== !! ACTIVATION ROLLED BACK sha=$built_sha: the server did not report it healthy within ${limit}s" \
-             "(live: ${live:-unmeasured}); the previous binary is back and this commit is held until a newer one verdict=activation_rolled_back"
+        rb_next="this commit is held until a newer one"
+        if [ "$last" = "$head" ]; then
+          rb_next="this commit is retried after the ${retry_s}s build backoff, not held"
+          # Same build inputs as the binary just restored: the code is not what
+          # failed, so do not hold it until crates/ changes (see
+          # activation_rollback_hold_same_inputs). Retry on the bounded build
+          # backoff instead, so a server that never adopts is not rebuilt
+          # every tick.
+          printf '%s %s\n' "$head" "$(date +%s)" > "${STAMP}.failed"
+          echo "== WARN activation_unadopted_same_inputs sha=$built_sha trigger=$head: not held; retried after the ${retry_s}s backoff, since the restored binary is the same code verdict=activation_unadopted_same_inputs"
+        else
+          printf '%s %s\n' "$head" "$(date +%s)" > "${STAMP}.rolled_back"
+        fi
+        echo "== !! ACTIVATION ROLLED BACK sha=$built_sha: the server did not report it healthy within ${waited}s" \
+             "(live: ${live:-unmeasured}); the previous binary is back and $rb_next verdict=activation_rolled_back"
       fi
     fi
   else

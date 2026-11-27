@@ -189,4 +189,48 @@ class NativeStatus(unittest.TestCase):
             self.assertIn('PermissionRequest',second['hooks'])
             self.assertNotIn('SubagentStop',second['hooks'])
 
+    def test_a_run_killed_at_the_timeout_is_counted_by_the_next_run(self):
+        # AF-1054: the provider kills a hook at its timeout and a killed run
+        # writes nothing, so its lost Stop was invisible. A marker left by a
+        # process that is gone is reported as hook_killed; a live one is not.
+        import os, subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root/'status-events/worker/abc'
+            folder.mkdir(parents=True)
+            gone = subprocess.Popen(['true']); gone.wait()
+            (folder/('.hook.%d' % gone.pid)).write_text(json.dumps({'event':'Stop','at':1.0}))
+            (folder/('.hook.%d' % os.getpid())).write_text(json.dumps({'event':'PreToolUse','at':1.0}))
+            mine = observer.mark_running(root, 'worker', 'abc', 'PostToolUse')
+            errors=[json.loads(l) for l in (root/'status-observer-errors.jsonl').read_text().splitlines()]
+            self.assertEqual([(e['error_type'], e['event']) for e in errors], [('hook_killed','Stop')])
+            self.assertFalse((folder/('.hook.%d' % gone.pid)).exists(), 'a dead run is reported once')
+            self.assertTrue((folder/('.hook.%d' % os.getpid())).exists(), 'a live run is left alone')
+            self.assertEqual(mine, folder/('.hook.%d' % os.getpid()))
+            self.assertEqual(json.loads(mine.read_text())['event'], 'PostToolUse')
+
+    def test_installer_gives_the_hook_room_past_a_loaded_host(self):
+        # AF-1054: at 3 s an overloaded host's runs were killed mid-write.
+        data=installer.merge({}, 'claude', Path('/tmp/native-status.py'))
+        timeouts={h['timeout'] for gs in data['hooks'].values() for g in gs for h in g['hooks']}
+        self.assertEqual(timeouts, {installer.HOOK_TIMEOUT_S})
+        self.assertGreaterEqual(installer.HOOK_TIMEOUT_S, 10)
+
+    def test_cloud_install_wires_the_boundary_guard_once_with_the_canonical_matcher(self):
+        # 2026-11-06: cloud servers get hooks from this installer, not install.sh, so the
+        # boundary guard (and its scheduling boundary) never ran on them.
+        old={'hooks':{'PreToolUse':[{'matcher':'^Bash$','hooks':[{'type':'command','command':'python3 /old/boundary-guard.py'}]},
+                                    {'matcher':'.*','hooks':[{'type':'command','command':'python3 /x/mine.py'}]}]}}
+        data=installer.merge(old, 'claude', Path('/h/.amux/native-status.py'))
+        data=installer.wire_boundary_guard(data, Path('/h/.amux/hooks/boundary-guard.py'))
+        data=installer.wire_boundary_guard(data, Path('/h/.amux/hooks/boundary-guard.py'))
+        pre=data['hooks']['PreToolUse']
+        guards=[g for g in pre if any('boundary-guard.py' in h['command'] for h in g['hooks'])]
+        self.assertEqual(len(guards), 1, 'replaced, not stacked, on every run')
+        self.assertIn('/h/.amux/hooks/boundary-guard.py', guards[0]['hooks'][0]['command'])
+        for tool in ('ScheduleWakeup', 'CronCreate', 'Bash', 'AskUserQuestion'):
+            self.assertRegex(tool, guards[0]['matcher'])
+        self.assertNotRegex('Monitor', guards[0]['matcher'])
+        self.assertTrue(any('/x/mine.py' in h['command'] for g in pre for h in g['hooks']), 'other hooks kept')
+
 if __name__=='__main__': unittest.main()

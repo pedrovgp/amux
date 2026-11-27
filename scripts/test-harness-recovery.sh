@@ -19,7 +19,7 @@ AMUX_RESTART_BIN="$BINARY" scripts/test-contended.sh -p amux-server --test resta
 # shape that crashed the fleet's server on 2026-10-29 (sessions closing under the
 # client, the client SIGKILLed mid-command). The server must survive every round,
 # or the test names the crash. No TMUX: it must never see the fleet's server.
-env -u TMUX scripts/test-contended.sh -p amux-server --test tmux_control_chaos -- --nocapture 2>&1 | tee "$ARTIFACT_DIR/tmux-control-chaos.log"
+env -u TMUX scripts/test-contended.sh -p amux-server --test tmux_control_chaos -- --ignored --nocapture 2>&1 | tee "$ARTIFACT_DIR/tmux-control-chaos.log"
 # Each scenario owns its HOME, port and tmux socket (e2e/chaos/harness.mjs), so
 # they run side by side. Serially they took about 7 of this job's 13 minutes.
 # AMUX_CHAOS_JOBS caps concurrency (default: CPU count, at most 4).
@@ -36,7 +36,10 @@ CHAOS_SCENARIOS=(
   e2e/chaos/scheduler-dispatch-recovery.mjs scheduler-dispatch
   e2e/chaos/peer-receive-recovery.mjs peer-receive
   e2e/chaos/worker-group-boundary-recovery.mjs worker-group-boundary
+  e2e/chaos/directive-recovery.mjs directive
+  e2e/chaos/worker-identity-default.mjs worker-identity-default
   e2e/chaos/land-startup-recovery.mjs land-startup
+  e2e/chaos/land-red-recovery.mjs land-red
   e2e/chaos/sessions-snapshot-restart.mjs sessions-snapshot
 )
 CHAOS_JOBS="${AMUX_CHAOS_JOBS:-$(n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2); echo $(( n > 4 ? 4 : n )))}"

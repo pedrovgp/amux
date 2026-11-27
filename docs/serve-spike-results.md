@@ -133,6 +133,7 @@ serve, password captured from its spawn log, cleaned up afterwards.
 | 2026-10-29 | 2.2.1 | steer admitted mid-turn + `interrupt` acked `interrupted=true`; outcomes read from `/message` |
 | 2026-10-30 12:1x | 2.2.3 | transport, but the turn was refused: `provider.free-limit` (429) on the free default model |
 | **2026-10-30 13:2x** | **2.2.3** | **full pass** — see below |
+| **2026-10-30 20:3x** | **2.2.4** | **restart recovery** — server killed mid-turn on a dedicated serve and replaced on a new port: the turn ended in **1.8 s** with `failed: serve server unreachable` (not the 30-minute timeout), and the next turn **succeeded on the same `ses_`** |
 
 The 13:2x run, `AMUX_SMOKE_MODEL=opencode-go/deepseek-v4.1-flash` (paid credits, owner
 authorized):
@@ -175,6 +176,53 @@ untyped failure still panics. The full pass above is why that escape hatch is no
 load-bearing.
 
 ---
+
+### Restart recovery, measured (2026-10-30, 2.2.4)
+
+The behaviour that only exists because one server serves the whole fleet: it can
+be restarted underneath a running turn. Proven live against a dedicated serve
+(`OPENCODE_PASSWORD` pins the password, a chosen port pins the endpoint, and the
+registry file is rewritten — the same thing `opencode service restart` does):
+
+```
+smoke: server restarted on :49972 (was :49971)
+smoke: turn ended after 1.8s, outcome = "failed: serve server unreachable"
+smoke: post-restart outcome = "succeeded"
+smoke: RESUMED on ses_e70d99702ffeBa493cJUj7Ewkd
+```
+
+Two properties, and the second is the one worth keeping:
+
+- the turn **ends fast**. Polling a dead endpoint to the 30-minute turn timeout
+  would have reported "turn exceeded 30m" — a diagnosis blaming the model for a
+  dead process;
+- the next turn **resumes the same session**, because refs are portable between
+  serve instances. A restart costs one interrupted turn, not a forked
+  conversation.
+
+### What a permission ask actually carries (M9, 2026-11-03, 2.2.4)
+
+The question that decided whether `boundaries.toml` could ever be enforced for
+opencode: can a policy see the call's INPUT, or only its paths? Measured by
+creating real sessions with `permissions: [{action, resource: "*", effect: "ask"}`
+and reading the asks they produced:
+
+| ask `action` | fires for | carries |
+|---|---|---|
+| `shell` | bash / any command | **`resources[0]` = the full command** (`curl -s https://api.stripe.com/v1/charges -u k:`) plus `save: ["curl *"]` |
+| `edit` | write / edit | `resources[]` = file paths, and **`metadata.files[].patch` = the unified diff**, written content included (`+TOP-SECRET`) |
+| `external_directory` | a path outside the workspace | `resources[]` = a **path pattern** (`/home/pv/.amux/vault/*`) |
+
+Two corrections to what amux had assumed: the action vocabulary is opencode's
+(`shell`, `edit`, `external_directory` — **not** `bash`/`write`; `bash` as an
+action name matches nothing, so a ruleset written that way enforces nothing),
+and the `ask` effect on a session ruleset is what makes tools ask at all —
+without it opencode auto-approves and **no** policy is ever consulted.
+
+That is what made the 14 `match_all`/`match_none`/`content_any` rules decidable:
+commands come from `resources[0]`, written content from the patch. A
+plugin-side hook (the third option) is therefore not needed for boundary
+enforcement — recorded here so the idea is not re-derived.
 
 ## Measured error shapes
 

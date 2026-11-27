@@ -291,6 +291,10 @@ carries `tool`, `title`, `kind`, **`locations`** (paths) and the offered
 | `content_any` (written text) | **no** |
 | `tools` alone | **yes** — the tool is the whole rule |
 
+*(Superseded by M9's measurement below: a `shell`/`edit` ask does carry the
+command and the diff, and a `tools`-alone rule matches nothing — the guard
+requires a predicate. The kind table in M9 is the current rule.)*
+
 The design follows from that, and the two failure modes it refuses are both
 loud: a policy that denied anything naming the tool would brick every `Bash`
 call, and one that allowed silently would be theatre. So a path rule that
@@ -349,6 +353,82 @@ works; what is new is that any caller holding the protocol (a future route, the
 board, a script) can now switch a live worker without ending its session.
 Shipping a route was deliberately left out: it needs the dashboard's
 confirmation flow, and a route nobody calls is worse than a tested capability.
+
+### M9 — boundary asks become real, and decidable
+
+M6 built the enforcement seam and proved it with a fixture; measurement then
+showed it was **inert in production**: opencode auto-approves unless a session's
+permission ruleset says `ask`, so the policy never saw a call (zero asks in the
+log, ever). Two measurements fixed the input side of the same problem (see
+`docs/serve-spike-results.md`):
+
+- `POST /api/session` accepts **`permissions: [{action, resource, effect}]`** —
+  so amux polices a worker per session, without editing the owner's
+  `~/.config/opencode/opencode.jsonc` or dropping a file into a project.
+- An ask carries the predicate input: `shell` → the command in `resources[0]`,
+  `edit` → the diff in `metadata.files[].patch`, `external_directory` → a path
+  pattern. All 20 registry rules are decidable from that; **no plugin needed.**
+
+`boundary_policy::session_permission_ruleset()` derives the ruleset from the
+ENABLED registry (`shell` when a rule names Bash, `edit` when one names
+Write/Edit, `external_directory` when one has a `path` predicate), all `ask` —
+never `deny`, because a refusal must be logged with its reason and opencode's
+`deny` refuses before amux can say why. An empty ruleset logs
+`verdict=boundary_ruleset_empty`, since "asks nothing" is exactly how this gap
+looked before.
+
+**The rules are evaluated by KIND, exactly as `boundary-guard.py::rule_applies`
+does** (review, 2026-11-05 — the first version applied `path` to every kind,
+which refuses a `shell` ask whose COMMAND merely names a guarded path; five of
+the registry's own allow examples died that way):
+
+| ask kind | decided by |
+|---|---|
+| `shell` | `match_all` then `match_none`; `path`/`content_any` are not consulted |
+| file tools | `path` over `locations`, then `content_any` (a list; any match) |
+| `external_directory` | `path` — the one kind the hook never sees |
+| anything else | no rule applies |
+
+Two shapes the corpus pinned down: `Grep`/`Glob` paths are directories (the
+location is also tested with a trailing slash), and a rule stating no predicate
+refuses nothing. The evaluator compiles rules with **`fancy-regex`**, not
+`regex`, because the registry is Python `re`: three rules use lookbehind or
+lookahead, and with `regex` they compiled to nothing and were silently inert —
+`fleet-tmux`'s `tmux kill-server` boundary among them. **One rule is not
+decidable from an ask**: `requires_receipt` (`tenant-workload-gate`) is decided
+by the guard from a gate receipt, per command segment. The policy reports
+`boundary_not_decidable` for it rather than duplicating a receipt-shaped
+tokenizer — refusing every match would refuse the registry's own allow examples.
+
+### M11 — the scoped context rides the SESSION, not the process
+
+`OPENCODE_CONFIG_CONTENT` is a per-PROCESS launch env, which is why TUI lanes
+have always been forced onto `--standalone` (measured 2026-10-16: a TUI on the
+shared `--service` loaded its config before the worker existed, so the composed
+scoped context never reached the model). A shared serve is what D1 wants, so the
+context has to travel with the session.
+
+opencode exposes per-session instruction entries — `PUT
+/api/experimental/session/{id}/instructions/entries/{key} {"value": …}` — and a
+live probe on the shared server (2.2.5, 2026-11-08) settled the question: a
+session whose only instruction entry said `ZUCCHINI-7731` answered
+`ZUCCHINI-7731`. The serve transport now writes `compose_worker_context(worker,
+false)` into the session under ONE key (`amux-scoped`, so a recomposition
+replaces rather than accumulates), clears the entry when a scope is emptied, and
+logs `opencode_scoped_context_delivered|absent` either way. The `Put` answers
+204 with an empty body, so that path checks the status instead of parsing JSON.
+
+This is what makes one `opencode serve` usable by the whole fleet; the remaining
+step is a product one, not a protocol one — a serve worker has no tmux pane.
+
+### M10 — the model switch gets its door
+
+`AgentProtocol::set_model` had no caller. Rather than add a second way to change
+a model, `PATCH /api/sessions/<name>/config {"model": …}` — the door that already
+exists — now switches opencode live through the protocol and answers
+`{"mode": "hot", "live": true}`. When the live switch fails it answers 422 with
+`mode: "next_session"`: the durable config still changed, and the next session
+uses it, which is the honest half-apply rather than a claim.
 
 ---
 

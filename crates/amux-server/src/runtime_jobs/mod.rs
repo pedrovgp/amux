@@ -66,7 +66,10 @@ pub mod contract_watch;
 pub mod land_queue;
 pub mod deploy_wake;
 pub mod disk_watch;
+pub mod decision_digest;
+pub mod directive;
 pub mod email_approval_digest;
+pub mod email_scheduled_send;
 pub mod needs_input_auto;
 pub(crate) mod executor;
 pub mod gemini_ledger;
@@ -276,7 +279,7 @@ where
     // that were dead for hours with nothing visible anywhere.
     registry::register(&name, "periodic", Some(interval), None);
     let job_id = name.clone();
-    let handle = executor::spawn(async move {
+    let handle = executor::spawn_for(&name, async move {
         let mut tick = tokio::time::interval(interval);
         // Delay, not Burst: a run that overshoots must not be "paid back"
         // with a rapid-fire catch-up volley (the spin-catcher lesson — a

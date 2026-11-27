@@ -1016,6 +1016,21 @@ async fn mattermost_login(
     Ok((token, user_id))
 }
 
+/// Where a Google row's credential comes from. A stored sign-in answers a mint
+/// before the service account (connector_token), so it is named first: on
+/// 2026-11-08 the row read "service account" while hello@amux.io's grant did
+/// the work and the service account's delegation was failing.
+fn google_cred_source(home: &std::path::Path, category: &str) -> Option<Value> {
+    if category != "Google" {
+        return None;
+    }
+    let grants = store_accounts(home, "google");
+    if !grants.is_empty() {
+        return Some(json!(format!("Google sign-in ({})", grants.join(", "))));
+    }
+    super::google_sa::sa_config_in(home).map(|_| json!("service account (domain-wide delegation)"))
+}
+
 /// GET /api/connectors — the registry with per-provider status. `?worker=` is
 /// accepted for parity with the scope explain link but the status here is
 /// global (credential presence + token); per-scope enablement is the scope
@@ -1044,8 +1059,8 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
             // Where the credential came from, so the tab can say "reusing the
             // existing Google client" rather than looking un-configured (AMUX-3341).
             let in_server_env = keys.iter().all(|k| env_val(&file_env, k).is_some());
-            let cred_source = if p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some() {
-                json!("service account (domain-wide delegation)")
+            let cred_source = if let Some(google) = google_cred_source(&ctx.home, p.category) {
+                google
             } else if !all_creds_set {
                 Value::Null
             } else if in_server_env {
@@ -2248,6 +2263,11 @@ async fn complete_exchange(
             })
             .is_ok();
     }
+    supersede_tests_after_grant(&ctx.home, &family, &account);
+    // The accounts rollup caches for ROLLUP_TTL_S. Without this the Google
+    // card read "Connections (0)" for five minutes after hello@amux.io's grant
+    // (2026-11-08); gmail_auth and declared_oauth already drop it on a grant.
+    invalidate_rollup(&ctx.home);
     tracing::info!(
         "connector_oauth_callback: {} grant stored for {} (gmail_mirror={}, scopes=[{}])",
         family,
@@ -2320,6 +2340,47 @@ pub(crate) fn record_test(home: &std::path::Path, id: &str, result: &Value) {
             "a connector's live test failed; the list now reports it"
         );
     }
+}
+
+/// A new grant is a new credential, so a failed live test recorded before it
+/// no longer describes the connector. On 2026-11-08 Ethan connected hello@amux.io
+/// and Gmail still read "error" from an Oct 31 service-account test until someone
+/// re-ran the test by hand. Drop those receipts for every row the grant covers;
+/// the list then shows the computed status until the next live test.
+pub(crate) fn supersede_tests_after_grant(home: &std::path::Path, family: &str, account: &str) {
+    let ids: Vec<&str> = REGISTRY
+        .iter()
+        .filter(|p| family_of(p) == family)
+        .map(|p| p.id)
+        .chain(std::iter::once(family))
+        .collect();
+    let path = last_tests_path(home);
+    let mut cleared: Vec<String> = Vec::new();
+    let committed = (|| -> std::io::Result<()> {
+        let _lease = crate::integrations::secure_store::lock(&path)?;
+        let mut all: Map<String, Value> = crate::integrations::secure_store::read_json(&path)?;
+        all.retain(|id, t| {
+            let stale = ids.contains(&id.as_str()) && test_failed(t);
+            if stale {
+                cleared.push(id.clone());
+            }
+            !stale
+        });
+        if cleared.is_empty() {
+            return Ok(());
+        }
+        crate::integrations::secure_store::write(&path, Value::Object(all).to_string().as_bytes())
+    })();
+    tracing::info!(
+        family,
+        account,
+        cleared = ?cleared,
+        durable = committed.is_ok(),
+        measured = true,
+        n_considered = ids.len(),
+        verdict = "connector_status_refreshed_after_grant",
+        "a new grant superseded failed live tests recorded before it"
+    );
 }
 
 /// Whether a recorded test result is a failure the list reports. A "needs_*"
@@ -2874,6 +2935,32 @@ async fn mint_connector_token(
         }
         None => None,
     };
+    // A STORED GRANT ANSWERS ONLY FOR THE SCOPES IT HOLDS (amux-gtm, 2026-11-02).
+    // hello@amux.io's mailbox grant won every google-youtube mint, so the scopes
+    // delegated to the service account were never asked for and every YouTube
+    // read was a 403. When the grant lacks a requested scope and the service
+    // account can mint them all, the service account answers. If it cannot, the
+    // grant still does, and the log says what is missing.
+    let user_account = match user_account {
+        Some(a) if p.category == "Google" && super::google_sa::sa_usable_in(&ctx.home) => {
+            let missing = oauth_store::family_path(&ctx.home, family, &a)
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|grant| grant_missing_scopes(&grant, &scope))
+                .unwrap_or_default();
+            if missing.is_empty() {
+                Some(a)
+            } else {
+                let minted = super::google_sa::mint_token_as(&scope, &a).await;
+                tracing::warn!(connector = %p.id, account = %a, missing = ?missing, sa_minted = minted.is_ok(),
+                    sa_error = minted.as_ref().err().map(String::as_str).unwrap_or(""),
+                    measured = true, n_considered = 1, verdict = "connector_grant_lacks_scope",
+                    "connector_token: the stored grant lacks requested scopes");
+                if minted.is_ok() { None } else { Some(a) }
+            }
+        }
+        other => other,
+    };
     if user_account.is_none()
         && !(p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some())
     {
@@ -3221,9 +3308,58 @@ const ROLLUP_TTL_S: u64 = 300;
 /// `declared_oauth_connector_lifecycle_survives_sigkill`, 1 account of 2).
 static ROLLUP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Is `id` one of the builtin Google connectors (they share one grant)?
+pub(super) fn is_google_connector(id: &str) -> bool {
+    provider(id).is_some_and(|p| family_of(p) == "google")
+}
+
+/// Disconnect a Google account: revoke its token at Google, then delete the
+/// grant and its Gmail copy. Before this, the Connections tab's Disconnect
+/// answered every Google account with "use the provider's existing disconnect
+/// flow for builtins", and no such flow existed (sandbox, 2026-10-30: a
+/// mailbox connected by mistake could not be removed from the dashboard).
+/// The files are deleted even when Google's revoke fails, so amux stops using
+/// the grant either way; `provider_revoked` says which happened. Logs
+/// verdict=google_grant_disconnected.
+pub(super) async fn disconnect_google(ctx: &ConnectorsCtx, account: &str) -> Response {
+    if !crate::integrations::oauth_store::valid_account(account) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid account"}))).into_response();
+    }
+    let grant = ctx.home.join("connectors").join("google").join(format!("{account}.json"));
+    let mirror = ctx.home.join("gmail-tokens").join(format!("{account}.json"));
+    let token = [&grant, &mirror].iter().find_map(|p| {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()?;
+        ["refresh_token", "token", "access_token"].iter()
+            .find_map(|k| v[*k].as_str().filter(|t| !t.is_empty()).map(str::to_string))
+    });
+    let held = grant.exists() || mirror.exists();
+    if !held {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": format!("no Google grant for {account}")}))).into_response();
+    }
+    let revoked = match &token {
+        Some(t) => matches!(ctx.http.post_form("https://oauth2.googleapis.com/revoke", &[("token".to_string(), t.clone())]).await,
+            Ok((s, _)) if s < 300 || s == 400),
+        None => false,
+    };
+    let removed: Vec<&str> = [("grant", &grant), ("gmail", &mirror)].iter()
+        .filter(|(_, p)| std::fs::remove_file(p).is_ok()).map(|(k, _)| *k).collect();
+    invalidate_rollup(&ctx.home);
+    tracing::info!(account, provider_revoked = revoked, removed = ?removed, measured = true, n_considered = 1,
+        verdict = "google_grant_disconnected", "a Google account was disconnected; amux no longer holds its grant");
+    Json(json!({"ok": true, "account": account, "disconnected": true, "provider_revoked": revoked, "removed": removed})).into_response()
+}
+
+/// Which grant generation is current. Bumped by every grant change (connect,
+/// reconnect, disconnect, a refresh that rotated a token), so a cache of
+/// grant health from an older generation is stale whatever its age.
+pub(crate) fn grant_epoch() -> u64 {
+    ROLLUP_GEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Drop the cached rollup for `home` and stop any rollup already in flight
-/// from caching what it computed before this change.
-fn invalidate_rollup(home: &std::path::Path) {
+/// from caching what it computed before this change. Also voids every cached
+/// Gmail health verdict, which carries the epoch it was read in.
+pub(crate) fn invalidate_rollup(home: &std::path::Path) {
     ROLLUP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     ROLLUP_CACHE.lock().expect("rollup cache").remove(home);
 }
@@ -3671,13 +3807,53 @@ pub fn routes() -> Router<AppState> {
 /// spend the token and never return it (`api/social.rs`). `headers` carries the
 /// calling worker, so the same entitlement check applies; empty headers are the
 /// server itself. The error is the mint's JSON with any bearer removed.
+/// The requested scopes a stored grant (its JSON text) does not hold. A grant
+/// that names no scopes cannot be judged, so nothing reads as missing.
+fn grant_missing_scopes(grant: &str, requested: &str) -> Vec<String> {
+    let parsed: Value = serde_json::from_str(grant).unwrap_or_default();
+    let Some(held) = parsed["scopes"].as_str().filter(|h| !h.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let held: std::collections::HashSet<&str> = held.split_whitespace().collect();
+    requested.split_whitespace().filter(|s| !held.contains(s)).map(str::to_string).collect()
+}
+
+#[cfg(test)]
+mod grant_scope_tests {
+    use super::grant_missing_scopes as m;
+    #[test]
+    fn a_mailbox_grant_does_not_answer_for_youtube() {
+        let grant = r#"{"scopes":"openid https://x/gmail.send https://x/drive"}"#;
+        assert_eq!(m(grant, "https://x/youtube.readonly https://x/drive"), vec!["https://x/youtube.readonly"]);
+        assert!(m(grant, "https://x/drive openid").is_empty(), "a grant holding every scope still answers");
+        assert!(m(r#"{"token":"t"}"#, "https://x/drive").is_empty(), "no recorded scopes cannot be judged");
+        assert!(m("not json", "https://x/drive").is_empty());
+    }
+}
+
 pub(crate) async fn bearer_for(
     state: AppState,
     headers: HeaderMap,
     id: &str,
     account: &str,
 ) -> Result<String, Value> {
-    let q = std::collections::HashMap::from([("account".to_string(), account.to_string())]);
+    bearer_for_scopes(state, headers, id, account, None).await
+}
+
+/// `bearer_for`, asking only for `scopes` (space-separated) instead of all the
+/// connector's scopes. One scope the domain has not delegated fails a service
+/// account's whole request, so a caller that only reads should say so.
+pub(crate) async fn bearer_for_scopes(
+    state: AppState,
+    headers: HeaderMap,
+    id: &str,
+    account: &str,
+    scopes: Option<&str>,
+) -> Result<String, Value> {
+    let mut q = std::collections::HashMap::from([("account".to_string(), account.to_string())]);
+    if let Some(scopes) = scopes {
+        q.insert("scopes".to_string(), scopes.to_string());
+    }
     let resp = mint_connector_token(
         State(state),
         Extension(default_ctx()),
@@ -4000,6 +4176,48 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         record_test(home.path(), "google-gmail", &failed);
         assert_eq!(last_tests(home.path())["google-gmail"]["ok"], false);
+    }
+
+    #[test]
+    fn a_google_rows_source_names_the_sign_in_over_the_service_account() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("server.env"),
+            "GOOGLE_SA_KEY_FILE=/tmp/k.json\nGOOGLE_SA_SUBJECT=hello@amux.io\n").unwrap();
+        assert_eq!(google_cred_source(home.path(), "Google"),
+            Some(json!("service account (domain-wide delegation)")));
+        let dir = home.path().join("connectors").join("google");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hello@amux.io.json"), "{}").unwrap();
+        assert_eq!(google_cred_source(home.path(), "Google"),
+            Some(json!("Google sign-in (hello@amux.io)")),
+            "the grant answers mints first, so the row names it");
+        assert_eq!(google_cred_source(home.path(), "Chat"), None);
+    }
+
+    /// 2026-11-08: hello@amux.io was connected and working, and Gmail still
+    /// listed "error" from a service-account test recorded a week before the
+    /// grant. A grant drops failed receipts for the family it covers, and only
+    /// those: another family's failure and a passing receipt stay.
+    #[test]
+    fn a_new_grant_supersedes_failed_tests_recorded_before_it() {
+        let home = tempfile::tempdir().unwrap();
+        let failed = json!({"ok": false, "status": "needs_auth",
+            "detail": "service-account delegation failed"});
+        record_test(home.path(), "google-gmail", &failed);
+        record_test(home.path(), "google-calendar", &failed);
+        record_test(home.path(), "google-drive", &json!({"ok": true, "status": "connected"}));
+        record_test(home.path(), "slack", &failed);
+        supersede_tests_after_grant(home.path(), "google", "hello@amux.io");
+        let after = last_tests(home.path());
+        assert!(!after.contains_key("google-gmail"), "gmail's stale failure must go: {after:?}");
+        assert!(!after.contains_key("google-calendar"), "the grant covers the whole family");
+        assert_eq!(after["google-drive"]["ok"], true, "a passing receipt is kept");
+        assert_eq!(after["slack"]["ok"], false, "another family's failure is not this grant's to clear");
+        assert_eq!(
+            status_after_test("connected", after.get("google-gmail")),
+            ("connected".to_string(), None),
+            "the list now shows the computed status"
+        );
     }
 
     /// AMUX-3738: a delegation REFUSAL is 403 + needs_auth, a real fault stays
@@ -4577,6 +4795,11 @@ mod tests {
         let state = qparam(v["authorize_url"].as_str().unwrap(), "state")
             .unwrap()
             .to_string();
+        // A rollup cached before the grant (no accounts) must not outlive it.
+        ROLLUP_CACHE.lock().unwrap().insert(
+            home.path().to_path_buf(),
+            (Instant::now(), json!({"accounts": []})),
+        );
         let (st, page) = send(
             &app,
             "GET",
@@ -4586,6 +4809,10 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{page}");
         assert!(page.contains("connected"), "{page}");
         assert!(page.contains("email API included"), "{page}");
+        assert!(
+            !ROLLUP_CACHE.lock().unwrap().contains_key(home.path()),
+            "the grant must drop the pre-grant accounts rollup, or the card reads Connections (0) for the TTL"
+        );
 
         // The exchange carried the PKCE verifier and the SAME redirect URI the
         // auth request was issued with — the registered gmail one (AMUX-3427).
@@ -4732,6 +4959,33 @@ mod tests {
                 .join(format!("{ACCT}.json"))
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn disconnecting_a_google_account_revokes_it_and_removes_both_copies() {
+        // Sandbox, 2026-10-30: a mailbox connected by mistake could not be
+        // removed; Disconnect answered every builtin "use the provider's flow".
+        let home = tempfile::tempdir().unwrap();
+        let fam_dir = home.path().join("connectors").join("google");
+        let mirror_dir = home.path().join("gmail-tokens");
+        std::fs::create_dir_all(&fam_dir).unwrap();
+        std::fs::create_dir_all(&mirror_dir).unwrap();
+        let grant = json!({"token": "PLACEHOLDER_AT", "refresh_token": "PLACEHOLDER_RT", "scopes": "https://www.googleapis.com/auth/gmail.modify"});
+        std::fs::write(fam_dir.join("info@x.io.json"), grant.to_string()).unwrap();
+        std::fs::write(mirror_dir.join("info@x.io.json"), grant.to_string()).unwrap();
+        std::fs::write(fam_dir.join(format!("{ACCT}.json")), grant.to_string()).unwrap();
+        let http = MockHttp::new(vec![("FORM", "/revoke", 200, json!({}))]);
+        let (app, _d) = app_with(http.clone(), home.path());
+        let (st, v) = send_json(&app, "DELETE", "/api/connectors/google-gmail/accounts/info%40x.io").await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["provider_revoked"], json!(true), "{v}");
+        assert!(!fam_dir.join("info@x.io.json").exists() && !mirror_dir.join("info@x.io.json").exists(), "both copies removed");
+        assert!(fam_dir.join(format!("{ACCT}.json")).exists(), "another account is untouched");
+        let revoke = http.calls().into_iter().find(|c| c.1.contains("/revoke")).expect("revoked at Google");
+        assert_eq!(revoke.3.unwrap()["token"], json!("PLACEHOLDER_RT"), "the refresh token is the one revoked");
+        // Gone now, and an unknown account is a 404, not a fake success.
+        let (st, _) = send_json(&app, "DELETE", "/api/connectors/google-gmail/accounts/info%40x.io").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -4901,6 +5155,78 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["access_token"], json!("PLACEHOLDER_NEW"));
+    }
+
+    /// A grant that cannot refresh reaches the owner (2026-11-08: two Gmail
+    /// grants were dead for three weeks and only a board card said so): once
+    /// with a one-tap reconnect link, again after a day while it stays broken,
+    /// never on a stale report about an account that works, and again at once
+    /// when a healed account breaks a second time.
+    #[tokio::test]
+    async fn a_grant_that_cannot_refresh_alerts_the_owner_with_a_reconnect_link() {
+        use crate::api::alerts::AlertChannels;
+        type Sent = Arc<Mutex<Vec<(String, String, String)>>>;
+        struct Mail(Sent);
+        #[async_trait::async_trait]
+        impl AlertChannels for Mail {
+            async fn push(&self, _: &AppState, _: &str, _: &str) -> Result<(), String> { Err("mock".into()) }
+            async fn sms(&self, _: &str, _: &str) -> (bool, String) { panic!("a reauth alert never pages SMS") }
+            async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String) {
+                self.0.lock().unwrap().push((to.into(), subject.into(), body.into()));
+                (true, "mock".into())
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("server.env"),
+            "AMUX_OWNER_EMAIL=owner@x.io\nAMUX_PUBLIC_URL=https://mac.example.ts.net:8824\n").unwrap();
+        let gm = home.path().join("gmail-tokens");
+        std::fs::create_dir_all(&gm).unwrap();
+        std::fs::write(gm.join("broken@x.io.json"), json!({ "token": "PLACEHOLDER_DEAD", "refresh_token": "PLACEHOLDER_RT",
+            "token_uri": "https://oauth2.googleapis.com/token", "client_id": "CID", "client_secret": "CSEC" }).to_string()).unwrap();
+        let dead = || vec![("GET", "/profile", 401, json!({ "error": "unauthorized" })),
+            ("FORM", "oauth2.googleapis.com/token", 400, json!({ "error": "invalid_grant" }))];
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: Arc::new(crate::db::Store::open(&dir.path().join("c.db")).unwrap()),
+            started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let mail = Arc::new(Mutex::new(Vec::new()));
+        let channels = Mail(mail.clone());
+        let report = json!({"needs_reauth": [{"account": "broken@x.io",
+            "reconnect": "POST /api/connectors/google/auth?account=broken@x.io → open authorize_url, approve once"}]});
+        let run = |script: Vec<(&'static str, &'static str, u16, Value)>, now: f64| {
+            let ctx = ConnectorsCtx { home: home.path().to_path_buf(), http: MockHttp::new(script) };
+            let (state, channels, report) = (&state, &channels, &report);
+            async move { crate::runtime_jobs::connector_maintenance::reauth_alerts(channels, state, &ctx, report, now).await }
+        };
+        let t0 = now_ts();
+        let sent = |m: &Sent| m.lock().unwrap().len();
+
+        let out = run(dead(), t0).await;
+        assert_eq!(sent(&mail), 1, "{out}");
+        let (to, subject, body) = mail.lock().unwrap()[0].clone();
+        assert_eq!(to, "owner@x.io");
+        assert!(subject.contains("broken@x.io"), "{subject}");
+        assert!(body.contains("https://mac.example.ts.net:8824/#reconnect=google:broken@x.io"), "{body}");
+
+        // Within a day: not again.
+        run(dead(), t0 + 3600.0).await;
+        assert_eq!(sent(&mail), 1);
+        // A day later, still broken: a reminder that says how long.
+        run(dead(), t0 + 90_000.0).await;
+        assert_eq!(sent(&mail), 2);
+        assert!(mail.lock().unwrap()[1].2.contains("broken for 25 hours"), "{:?}", mail.lock().unwrap()[1]);
+
+        // The report still names it, but the account works now (a cached
+        // verdict from before a reconnect): no alert, and the record clears.
+        let out = run(vec![("GET", "/profile", 200, json!({ "emailAddress": "broken@x.io" }))], t0 + 90_100.0).await;
+        assert_eq!(sent(&mail), 2, "{out}");
+        assert_eq!(out["healed"], json!(["broken@x.io"]), "{out}");
+        // Broken again: told at once, not a day later.
+        run(dead(), t0 + 90_200.0).await;
+        assert_eq!(sent(&mail), 3);
+        assert!(!mail.lock().unwrap()[2].2.contains("broken for"), "a new break is not a reminder");
     }
 
     #[tokio::test]

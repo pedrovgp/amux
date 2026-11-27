@@ -769,6 +769,81 @@ const MIGRATIONS: &[Migration] = &[
         name: "0141_schedule_when",
         sql: include_str!("../../migrations/0141_schedule_when.sql"),
     },
+    Migration {
+        version: 142,
+        name: "0142_issues_source_ref_index",
+        sql: include_str!("../../migrations/0142_issues_source_ref_index.sql"),
+    },
+    Migration {
+        version: 143,
+        name: "0143_schedule_runs_running_index",
+        sql: include_str!("../../migrations/0143_schedule_runs_running_index.sql"),
+    },
+    Migration {
+        version: 144,
+        name: "0144_conversation_pins",
+        sql: include_str!("../../migrations/0144_conversation_pins.sql"),
+    },
+    Migration {
+        version: 145,
+        name: "0145_lease_generations",
+        sql: include_str!("../../migrations/0145_lease_generations.sql"),
+    },
+    Migration {
+        version: 146,
+        name: "0146_one_live_session",
+        sql: include_str!("../../migrations/0146_one_live_session.sql"),
+    },
+    Migration {
+        version: 147,
+        name: "0147_invariant_episode_occurrences",
+        sql: include_str!("../../migrations/0147_invariant_episode_occurrences.sql"),
+    },
+    Migration {
+        version: 148,
+        name: "0148_board_light_rows_covering",
+        sql: include_str!("../../migrations/0148_board_light_rows_covering.sql"),
+    },
+    Migration {
+        version: 149,
+        name: "0149_message_pins",
+        sql: include_str!("../../migrations/0149_message_pins.sql"),
+    },
+    Migration {
+        version: 150,
+        name: "0150_land_queue_composed_evidence",
+        sql: include_str!("../../migrations/0150_land_queue_composed_evidence.sql"),
+    },
+    Migration {
+        version: 151,
+        name: "0151_board_planning_covering",
+        sql: include_str!("../../migrations/0151_board_planning_covering.sql"),
+    },
+    Migration {
+        version: 152,
+        name: "0152_decision_digest",
+        sql: include_str!("../../migrations/0152_decision_digest.sql"),
+    },
+    Migration {
+        version: 153,
+        name: "0153_land_red",
+        sql: include_str!("../../migrations/0153_land_red.sql"),
+    },
+    Migration {
+        version: 154,
+        name: "0154_issues_session_status",
+        sql: include_str!("../../migrations/0154_issues_session_status.sql"),
+    },
+    Migration {
+        version: 155,
+        name: "0155_goal_samples",
+        sql: include_str!("../../migrations/0155_goal_samples.sql"),
+    },
+    Migration {
+        version: 156,
+        name: "0156_directives",
+        sql: include_str!("../../migrations/0156_directives.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
@@ -2253,6 +2328,22 @@ mod cost_tests {
         bad
     }
 
+    /// Correlated scans that are bounded by construction, as (migration, plan
+    /// detail, why). Each entry must still match a plan, or the test fails, so
+    /// a stale exemption cannot hide a new offender under its name.
+    ///
+    /// 0060: `org_teams` is created empty by 0060 itself and then holds one
+    /// row per distinct legacy scope grant, so each member row scans tens of
+    /// teams at most. SQLite 3.46 reported this as `SCAN t USING INDEX` (the
+    /// primary key's autoindex, chosen for `ORDER BY id`), which this check
+    /// counted as indexed though it read the whole table too; 3.53 and later
+    /// report a plain `SCAN t`. Migrations are append-only, so 0060 stays.
+    const BOUNDED_CORRELATED_SCANS: &[(&str, &str, &str)] = &[(
+        "0060_org_teams",
+        "SCAN t",
+        "org_teams is created by 0060 and holds one row per distinct legacy grant",
+    )];
+
     /// Every migration, applied in order, with each one's DML plan-checked
     /// against the schema THAT MIGRATION LEAVES BEHIND — previous migrations
     /// plus its own DDL, and nothing from later ones.
@@ -2273,6 +2364,7 @@ mod cost_tests {
         let mut offenders: Vec<String> = Vec::new();
         let mut explained = 0usize;
         let mut saw_the_0031_backfill = false;
+        let mut exemptions_used = vec![false; BOUNDED_CORRELATED_SCANS.len()];
 
         for m in MIGRATIONS {
             let tx = conn.transaction().unwrap();
@@ -2294,6 +2386,10 @@ mod cost_tests {
                     saw_the_0031_backfill = true;
                 }
                 for bad in unindexed_correlated_access(&rows) {
+                    if let Some(i) = BOUNDED_CORRELATED_SCANS.iter().position(|(n, d, _)| *n == m.name && *d == bad) {
+                        exemptions_used[i] = true;
+                        continue;
+                    }
                     offenders.push(format!(
                         "{}: `{}` runs once per outer row with no index\n    statement: {}",
                         m.name,
@@ -2320,6 +2416,9 @@ mod cost_tests {
              that held the database for 186 seconds, and this check exists to see it."
         );
 
+        for (used, (name, detail, why)) in exemptions_used.iter().zip(BOUNDED_CORRELATED_SCANS) {
+            assert!(*used, "exemption ({name}, `{detail}`: {why}) matched no plan; remove it rather than keep a name that hides nothing");
+        }
         assert!(
             offenders.is_empty(),
             "a migration would full-scan a table once per outer row, which is how 0031 held \

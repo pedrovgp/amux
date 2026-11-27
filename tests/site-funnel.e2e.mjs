@@ -30,10 +30,8 @@ ok(c.some(x => x[0] === 'register_for_session' && x[1].session_source === 'ai'),
 await p.click('.site-header a[href="https://github.com/mixpeek/amux"]');
 await p.click('.hero a[href="https://github.com/mixpeek/amux"]');
 await p.click('.hero a[href^="/start/"]');
-await p.click('#hero-watch');
 await p.click('#hero-ios');
 await p.click('#hero-mac');
-await p.click('.site-header a[href="#get"]');
 await p.click('a[href="/start/?plan=team"]');
 await p.click('.hero .copy-btn').catch(() => {});
 let cta = await evs(p, 'cta_click');
@@ -41,14 +39,16 @@ const has = (g, s) => cta.some(e => e.goal === g && e.spot === s);
 ok(has('github', 'header'), 'header star click -> goal github, spot header');
 ok(has('github', 'hero'), 'hero star click -> goal github, spot hero');
 ok(has('cloud', 'hero'), 'hero cloud click -> goal cloud, spot hero');
-ok(has('walkthrough', 'hero'), 'hero walkthrough -> goal walkthrough');
-ok(has('pricing', 'header'), 'Get started -> goal pricing, spot header');
+ok(cta.find(e => e.goal === 'cloud' && e.spot === 'hero')?.href === '/start/?source=home', 'hero cloud link carries source=home');
+ok(await p.evaluate(() => /\/home\/demo-desktop\.mp4$/.test(document.getElementById('demo-desk').currentSrc)), 'desktop hero loads the dashboard demo clip');
+ok(await p.evaluate(() => new Promise(r => { const v = document.getElementById('demo-desk'); const t0 = v.currentTime; setTimeout(() => r(v.currentTime > t0), 1500); })), 'the demo clip is playing');
+ok(await p.locator('.site-header a.nav-cta-primary').count() === 0, 'homepage header has no Get started: the hero holds the four calls to action');
 ok(has('ios', 'hero'), 'hero iPhone app -> goal ios');
 ok(has('mac', 'hero'), 'hero Mac app -> goal mac, not github');
 ok(cta.some(e => e.goal === 'cloud' && e.spot === 'get' && e.plan === 'team'), 'plan link -> goal cloud, spot get, plan team');
 const ic = await evs(p, 'install_copy');
 ok(ic.length === 1 && ic[0].spot === 'hero', 'hero copy -> install_copy spot hero (' + JSON.stringify(ic) + ')');
-await p.click('a[href="/docs/"] >> nth=0').catch(() => {});
+await p.click('.site-header nav > a[href="/docs/"]');
 ok((await evs(p, 'cta_click')).length === cta.length, 'non-goal link (docs) sends no cta_click');
 ok(p.errs.length === 0, 'no JS errors on homepage ' + p.errs.join('|'));
 
@@ -61,6 +61,9 @@ ok(c.find(x => x[0] === 'register_once')?.[1].first_source === 'search', 'google
 await p.click('.site-header a[href*="github.com/mixpeek/amux"]');
 cta = await evs(p, 'cta_click');
 ok(cta.length === 1 && cta[0].goal === 'github' && cta[0].spot === 'header', 'mobile guide header star -> github/header');
+await p.click('.site-header a[href="/#get"]');
+cta = await evs(p, 'cta_click');
+ok(cta.some(e => e.goal === 'pricing' && e.spot === 'header'), 'guide header Get started -> goal pricing, spot header');
 ok(p.errs.length === 0, 'no JS errors on guide');
 
 // Internal navigation does not overwrite first touch
@@ -96,6 +99,95 @@ const er = await evs(p, 'signup_error');
 ok(er.length === 1, 'failed checkout API -> signup_error ' + JSON.stringify(er));
 ok(checkoutBody && 'ph' in checkoutBody && 'ab' in checkoutBody && checkoutBody.plan === 'solo', 'checkout body carries ph and ab for server-side attribution ' + JSON.stringify(checkoutBody && { ph: checkoutBody.ph, ab: checkoutBody.ab }));
 ok(p.errs.length === 0, 'no JS errors on /start/ ' + p.errs.join('|'));
+// EXP-157: no exit above the form, and the IP-lock hint does not toggle the box.
+ok(await p.locator('.site-header a[href="/#get"]').count() === 0, '/start/ header has no Get started link away from the form');
+ok(await p.evaluate(() => { const f = document.getElementById('f'), n = document.querySelector('.free-note[data-cta-loc="start-selfhost"]'); return !!n && !!(f.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_FOLLOWING); }), 'self-host note sits below the form');
+await p.click('.field.lock .hint');
+ok(!(await p.isChecked('#iplock')), 'clicking the IP-lock hint leaves the box unchecked');
+await p.click('label[for="iplock"]');
+ok(await p.isChecked('#iplock'), 'clicking the IP-lock label checks the box');
+
+// Concierge links: /start/ (outside the form, so no form start), /pricing/ and a solutions page
+p = await page({ mobile: true });
+await p.goto(B + '/start/');
+await p.evaluate(() => document.addEventListener('click', e => e.preventDefault()));
+await p.click('[data-cta-loc="start-concierge"] a');
+cta = await evs(p, 'cta_click');
+ok(cta.length === 1 && cta[0].goal === 'concierge_page' && cta[0].spot === 'start-concierge' && cta[0].href === '/concierge/?source=start', '/start/ Concierge line -> goal concierge_page, spot start-concierge ' + JSON.stringify(cta));
+ok((await evs(p, 'signup_form_start')).length === 0, 'clicking the Concierge line sends no signup_form_start');
+ok(await p.evaluate(() => document.documentElement.scrollWidth <= innerWidth), '/start/ has no sideways overflow at 390');
+p = await page();
+await p.goto(B + '/pricing/');
+await p.evaluate(() => document.addEventListener('click', e => e.preventDefault()));
+await p.click('[data-cta-loc="pricing-concierge"] a.pricing-cta');
+cta = await evs(p, 'cta_click');
+ok(cta.length === 1 && cta[0].goal === 'concierge_page' && cta[0].spot === 'pricing-concierge', 'pricing Concierge card -> goal concierge_page ' + JSON.stringify(cta));
+p = await page();
+await p.goto(B + '/solutions/skilled-nursing-facilities/');
+await p.evaluate(() => document.addEventListener('click', e => e.preventDefault()));
+await p.click('[data-cta-loc="sol-top"] a');
+cta = await evs(p, 'cta_click');
+ok(cta.length === 1 && cta[0].goal === 'concierge_page' && cta[0].spot === 'sol-top' && cta[0].href === '/concierge/?source=solutions-skilled-nursing-facilities', 'solutions top button -> goal concierge_page ' + JSON.stringify(cta));
+ok(p.errs.length === 0, 'no JS errors on a solutions page ' + p.errs.join('|'));
+
+// Header Solutions menu: a <details> that opens by click, tap and keyboard on every page,
+// closes on Escape and outside click, and tags each industry link.
+for (const mobile of [false, true]) {
+  p = await page({ mobile });
+  await p.goto(B + '/guides/harness-engineering/');
+  await p.evaluate(() => document.addEventListener('click', e => { if (e.target.closest('.nav-drop-menu a')) e.preventDefault(); }));
+  const w = mobile ? '390' : '1440';
+  const sum = p.locator('.site-header .nav-drop > summary'), menu = p.locator('.nav-drop-menu');
+  ok(await sum.isVisible(), `${w}: Solutions menu button is in the header`);
+  await sum.click();
+  await p.waitForFunction(() => document.querySelector('.nav-drop > summary').getAttribute('aria-expanded') === 'true', null, { timeout: 2000 }).catch(() => {});
+  ok(await menu.isVisible() && await sum.getAttribute('aria-expanded') === 'true', `${w}: click opens it, aria-expanded true`);
+  ok(await p.evaluate(() => { const m = document.querySelector('.nav-drop-menu').getBoundingClientRect(); return m.left >= 0 && m.right <= innerWidth && document.documentElement.scrollWidth <= innerWidth; }), `${w}: open menu fits the screen`);
+  ok((await p.$$eval('.nav-drop-menu a[href^="/solutions/"]', a => a.length)) === 6, `${w}: five industries plus All solutions`);
+  await p.keyboard.press('Escape');
+  await p.waitForTimeout(50);
+  ok(!(await menu.isVisible()) && await sum.getAttribute('aria-expanded') === 'false', `${w}: Escape closes it`);
+  await sum.focus(); await p.keyboard.press('Enter');
+  ok(await menu.isVisible(), `${w}: Enter opens it`);
+  await p.mouse.click(10, 600);
+  ok(!(await menu.isVisible()), `${w}: a click elsewhere closes it`);
+  await sum.click();
+  await p.click('.nav-drop-menu a[href="/solutions/accounting-firms/"]');
+  cta = await evs(p, 'cta_click');
+  ok(cta.length === 1 && cta[0].goal === 'solutions' && cta[0].spot === 'nav-solutions-accounting-firms', `${w}: industry link -> goal solutions, spot nav-solutions-accounting-firms ` + JSON.stringify(cta));
+  if (mobile) ok(await p.locator('.nav-drop-menu .nd-more a[href="/pricing/"]').isVisible(), '390: the menu carries the links the phone header hides');
+  ok(p.errs.length === 0, `${w}: no JS errors with the menu ` + p.errs.join('|'));
+}
+// With an old cached site.js (or none), the menu still opens: <details> needs no script.
+p = await page();
+await p.route(/\/site\.js(\?|$)/, r => r.fulfill({ contentType: 'application/javascript', body: '' }));
+await p.goto(B + '/pricing/');
+await p.click('.site-header .nav-drop > summary');
+ok(await p.locator('.nav-drop-menu').isVisible(), 'Solutions menu opens with no site.js');
+
+// /concierge/ starts light for a visitor who has not chosen, even on a dark OS; the theme menu still rules.
+{
+  const ctx = await b.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'dark' });
+  const tp = await ctx.newPage();
+  await tp.route(/posthog\.com|cloud\.amux\.io/, r => r.abort());
+  const theme = () => tp.evaluate(() => document.documentElement.getAttribute('data-theme'));
+  const pick = async v => { await tp.click('.theme-btn'); await tp.click(`[data-theme-set="${v}"]`); };
+  await tp.goto(B + '/concierge/');
+  ok(await theme() === 'light', 'dark OS, no saved choice: /concierge/ is light');
+  await pick('dark');
+  ok(await theme() === 'dark', 'theme menu switches /concierge/ to dark');
+  ok(await tp.evaluate(() => [...document.querySelectorAll('#future, #how, .final')].every(e => { const m = getComputedStyle(e).backgroundColor.match(/[\d.]+/g).map(Number); return m[3] === 0 || m[0] < 60; })), 'dark mode reaches every band');
+  await tp.reload();
+  ok(await theme() === 'dark', 'the saved choice survives a reload');
+  await pick('system');
+  ok(await theme() === 'dark', 'choosing System follows the dark OS, on /concierge/ too');
+  await pick('light');
+  ok(await tp.evaluate(() => [...document.querySelectorAll('#future, #how, .final')].every(e => { const m = getComputedStyle(e).backgroundColor.match(/[\d.]+/g).map(Number); return m[3] === 0 || m[0] > 200; })), 'light mode has no dark bands');
+  await tp.evaluate(() => localStorage.clear());
+  await tp.goto(B + '/pricing/');
+  ok(await theme() === 'dark', 'other pages still follow the OS when nothing is saved');
+  await ctx.close();
+}
 
 // Welcome page: paid once per order
 p = await page();
@@ -112,7 +204,7 @@ ok(tp.length === 1 && tp[0].test === true, 'test checkout is flagged test:true')
 async function abPage(ctx) {
   const p = ctx ? await ctx.newPage() : await page();
   if (!ctx) await p.route(/posthog\.com|cloud\.amux\.io/, r => r.abort());
-  await p.route('**/site.js', async r => {
+  await p.route(/\/site\.js(\?|$)/, async r => {
     const body = (await (await r.fetch()).text()).replace('var AB_TESTS = {', "var AB_TESTS = { exptest: { variants: ['control', 'b'], pages: /^\\/$/ },");
     r.fulfill({ contentType: 'application/javascript', body });
   });
@@ -148,6 +240,65 @@ ok((await evs(p, 'ab_exposure')).length === 0, 'a page outside the test sends no
 const stale = await p.evaluate(() => { localStorage.setItem('amux-ab', JSON.stringify({ exptest: 'b', oldtest: 'x' })); return 1; });
 await p.reload();
 ok(await p.evaluate(() => !('oldtest' in JSON.parse(localStorage.getItem('amux-ab')))), 'ended tests are dropped from storage');
+
+// The featured video is one shared poster: no YouTube request until the visitor presses play.
+const videoSpots = [['/demos/', 'demos-featured-video'], ['/walkthrough/', 'walkthrough-featured-video']];
+for (const mobile of [false, true]) for (const [path, spot] of videoSpots) {
+  const where = `${path} ${mobile ? 'phone' : 'desktop'}`;
+  p = await page({ mobile });
+  const yt = []; p.on('request', r => { if (/youtube|ytimg/.test(r.url())) yt.push(r.url()); });
+  await p.route(/youtube/, r => r.fulfill({ status: 200, contentType: 'text/html', body: '<html></html>' }));
+  await p.goto(B + path);
+  await p.waitForLoadState('load');
+  ok(yt.length === 0, `no YouTube request before play (${where})`);
+  ok(await p.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `no sideways overflow (${where})`);
+  await p.focus('a.yt-frame');
+  await p.keyboard.press('Enter');
+  await p.waitForSelector('.yt-frame iframe');
+  ok(/youtube-nocookie\.com\/embed\/kn7Cw1bMBRQ\?autoplay=1/.test(await p.getAttribute('.yt-frame iframe', 'src')), `Enter on the poster loads the nocookie player (${where})`);
+  cta = await evs(p, 'cta_click');
+  ok(cta.filter(e => e.goal === 'video' && e.spot === spot).length === 1, `play records one cta_click, goal video, spot ${spot}`);
+  ok(p.errs.length === 0, `no JS errors (${where})`);
+  await p.context().close();
+}
+p = await page();
+await p.goto(B + '/');
+await p.evaluate(() => document.addEventListener('click', e => e.preventDefault()));
+await p.click('.hero-walk a[href="/walkthrough/"]');
+cta = await evs(p, 'cta_click');
+ok(cta.some(e => e.goal === 'walkthrough' && e.spot === 'home-walkthrough'), 'homepage walkthrough link -> goal walkthrough, spot home-walkthrough');
+await p.context().close();
+
+// /demos/ search: filters from the markup, says when nothing matches, loads no clip it does not show.
+for (const mobile of [false, true]) {
+  const where = mobile ? 'phone' : 'desktop';
+  p = await page({ mobile });
+  await p.goto(B + '/demos/');
+  await p.waitForLoadState('load');
+  const visible = () => p.evaluate(() => [...document.querySelectorAll('.demo-card')].filter(c => !c.classList.contains('hidden')).length);
+  const total = await p.evaluate(() => document.querySelectorAll('.demo-card').length);
+  ok(total > 20 && await visible() === total, `every demo shows before searching (${where})`);
+  ok(await p.evaluate(() => [...document.querySelectorAll('.demo-thumb video')].every(v => v.preload === 'none' && !v.autoplay)), `clips wait until they are on screen (${where})`);
+  ok(await p.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `no sideways overflow on /demos/ (${where})`);
+  await p.focus('#demo-search');
+  await p.keyboard.type('subscribe');
+  ok(await visible() === 1, `searching a tag finds the calendar demo (${where})`);
+  await p.keyboard.press('Escape');
+  ok(await visible() === total, `Escape clears the search (${where})`);
+  await p.keyboard.type('zzzz');
+  ok(await p.isVisible('#demo-empty') && await visible() === 0, `no match says so (${where})`);
+  await p.click('#demo-clear');
+  ok(await visible() === total && !await p.isVisible('#demo-empty'), `Clear search brings them back (${where})`);
+  await p.click('.filter-btn:text-is("Board")');
+  const board = await visible();
+  await p.fill('#demo-search', 'subscribe');
+  ok(board > 0 && board < total && await visible() >= 1 && await visible() <= board, `search and category filter combine (${where})`);
+  await p.waitForFunction(() => Array.from(window.posthog).some(c => Array.isArray(c) && c[1] === 'cta_click' && c[2] && c[2].goal === 'demo_search'), null, { timeout: 4000 });
+  cta = await evs(p, 'cta_click');
+  ok(cta.filter(e => e.goal === 'demo_search' && e.spot === 'demos-search' && e.label === 'subscribe').length === 1, `search records one cta_click, goal demo_search (${where})`);
+  ok(p.errs.length === 0, `no JS errors on /demos/ (${where})`);
+  await p.context().close();
+}
 
 await b.close();
 console.log(`\n${pass} passed, ${fail} failed`);

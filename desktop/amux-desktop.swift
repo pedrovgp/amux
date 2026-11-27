@@ -3,6 +3,7 @@ import WebKit
 import Carbon.HIToolbox
 import UserNotifications
 import AVFoundation
+import PDFKit
 
 // The native macOS app: dashboard windows and tabs on the system WebKit (no
 // bundled browser), pinned notes as floating panels, the menu bar readout, a
@@ -30,15 +31,20 @@ struct Connection: Codable {
 
 /// Which server a page is on, as a color for its tab (Ethan, 2026-10-25: "put
 /// a color code based on the location/connection (so if its localhost/desktop
-/// vs sandbox, etc.) in the tabs"). This Mac is green, amux cloud (a sandbox
-/// on *.amux.io) blue, and any other server keeps one color of its own, picked
-/// from its host so it never changes between launches.
+/// vs sandbox, etc.) in the tabs"). This Mac is green, and every other server has
+/// a color of its own (amux-tabcolors.swift), saved so it never changes between
+/// launches. 2026-10-31: every *.amux.io server was blue, so sandbox and
+/// mixpeek-dev tabs looked the same.
 struct ConnectionBadge {
     let color: NSColor
     let name: String
     let host: String
 
     private static var cache: [String: ConnectionBadge] = [:]
+    private static let tabColorsKey = "amux.tabColors"
+    /// tabColorNames' colors, in the same order.
+    private static let tabNSColors: [NSColor] = [.systemBlue, .systemOrange, .systemPurple, .systemPink, .systemTeal,
+                                                 .systemYellow, .systemIndigo, .systemRed, .systemBrown, .systemMint, .systemCyan]
 
     static func of(_ url: URL?) -> ConnectionBadge? {
         guard let url = url, let host = url.host, url.scheme == "https" || url.scheme == "http" else { return nil }
@@ -52,13 +58,12 @@ struct ConnectionBadge {
         let color: NSColor
         if local {
             color = .systemGreen
-        } else if host == "amux.io" || host.hasSuffix(".amux.io") {
-            color = .systemBlue
         } else {
-            let palette: [NSColor] = [.systemOrange, .systemPurple, .systemPink, .systemTeal, .systemYellow, .systemIndigo, .systemBrown]
-            var h: UInt32 = 5381
-            for b in host.utf8 { h = (h &* 33) ^ UInt32(b) }
-            color = palette[Int(h % UInt32(palette.count))]
+            let saved = (UserDefaults.standard.dictionary(forKey: tabColorsKey) as? [String: Int]) ?? [:]
+            let pick = tabColorIndex(for: key, assigned: saved)
+            if pick.assigned != saved { UserDefaults.standard.set(pick.assigned, forKey: tabColorsKey) }
+            color = tabNSColors[pick.index]
+            dlog("verdict=tab_color server=\(key) color=\(tabColorNames[pick.index]) servers_colored=\(pick.assigned.count)")
         }
         let badge = ConnectionBadge(color: color, name: named ?? (local ? "This Mac" : host), host: host)
         cache[key] = badge
@@ -130,6 +135,10 @@ struct Config: Codable {
     var cleanExit: Bool?
     // View > Zoom All Windows (2026-10-28). Unset means on.
     var zoomAllWindows: Bool?
+    // Workspaces > Freeze Workspace (2026-11-03): the workspaces whose tabs,
+    // names and workers are locked, by name; "" is the unsaved one open when no
+    // workspace is (amux-workspace.swift).
+    var frozenWorkspaces: [String]?
 }
 
 /// One line in the app's log: NSLog, which reaches the file below too.
@@ -442,6 +451,9 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
             cfg.websiteDataStore = .default()
             cfg.preferences.setValue(true, forKey: "developerExtrasEnabled")
             cfg.mediaTypesRequiringUserActionForPlayback = []
+            // The word suggestions macOS shows as you type (Ethan, 2026-11-07:
+            // "add spellcheck/autocorrect/ suggestions into the inputs").
+            if #available(macOS 14.0, *) { cfg.allowsInlinePredictions = true }
         }
         // A configuration handed over by window.open already carries the
         // script from the window that opened it.
@@ -454,10 +466,11 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         // wrong cell (2026-10-26; the page's zoom-mode beacon read apple_webkit:false).
         cfg.applicationNameForUserAgent = "Amux-Desktop/2.0"
         webView = WKWebView(frame: .zero, configuration: cfg)
+        QuietTestCopy.keepRendering(webView)
         webView.allowsMagnification = true
         webView.allowsBackForwardNavigationGestures = true
 
-        let window = NSWindow(
+        let window = AmuxWindow(
             contentRect: frame ?? DashboardWindowController.defaultFrame(),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
@@ -497,6 +510,10 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         // A zoom from the page (app.js _zoomShare): every other page follows it.
         cfg.userContentController.removeScriptMessageHandler(forName: "amuxZoom")
         cfg.userContentController.add(WeakScriptHandler(self), name: "amuxZoom")
+        // Print from the file viewer (app.js _filePrint): WebKit here ignores
+        // window.print(), so the page sends the file's bytes or its HTML.
+        cfg.userContentController.removeScriptMessageHandler(forName: "amuxPrint")
+        cfg.userContentController.add(WeakScriptHandler(self), name: "amuxPrint")
         webView.navigationDelegate = self
         webView.uiDelegate = self
         themeObservation = webView.observe(\.themeColor, options: [.initial, .new]) { [weak self] wv, _ in
@@ -510,6 +527,12 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     required init?(coder: NSCoder) { fatalError("not used") }
 
     func userContentController(_ c: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "amuxPrint" {
+            if webView.url.map({ app?.isServerURL($0) ?? false }) ?? false, let d = message.body as? [String: Any], let w = window {
+                FilePrint.run(d, in: w)
+            }
+            return
+        }
         if message.name == "amuxZoom" {
             if let n = message.body as? NSNumber { app?.zoomOthers(from: self, level: n.intValue) }
             return
@@ -536,6 +559,15 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
                 let found = app?.focusOpenPage(hash: hash, asker: self) ?? false
                 let t = token.filter { $0.isLetter || $0.isNumber }
                 webView.evaluateJavaScript("typeof _cmdkFocusAck === 'function' && _cmdkFocusAck('\(t)', \(found))", completionHandler: nil)
+                return
+            }
+            // ⌘K asks which places the other tabs and panes show, to mark
+            // those rows Open (owner, 2026-11-07).
+            if (d?["op"] as? String) == "places", let token = d?["token"] as? String {
+                let places = app?.openPlaces(except: self) ?? []
+                let t = token.filter { $0.isLetter || $0.isNumber }
+                let json = (try? JSONSerialization.data(withJSONObject: places)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+                webView.evaluateJavaScript("typeof _cmdkPlacesAck === 'function' && _cmdkPlacesAck('\(t)', \(json))", completionHandler: nil)
                 return
             }
             guard (d?["op"] as? String) == "split" else { return }
@@ -575,6 +607,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     }
 
     func rename(_ name: String?) {
+        if app?.frozen("rename") == true { return }
         let n = name?.trimmingCharacters(in: .whitespacesAndNewlines)
         customName = (n?.isEmpty ?? true) ? nil : n
         dlog("verdict=tab_renamed named=\(customName == nil ? 0 : 1) view=\(viewHash)")
@@ -585,6 +618,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     /// Renames the tab in the window's tab bar: the whole tab when the
     /// window is split into panes, else its page.
     func renameTab(_ name: String?) {
+        if app?.frozen("rename") == true { return }
         guard grid != nil else { rename(name); return }
         let n = name?.trimmingCharacters(in: .whitespacesAndNewlines)
         windowName = (n?.isEmpty ?? true) ? nil : n
@@ -613,6 +647,8 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
 
     func updateTitle() {
         window?.title = pageTitle
+        // A frozen workspace says so under every window's title (amux-workspace.swift).
+        if paneHost == nil { window?.subtitle = (app?.isFrozen ?? false) ? "Frozen" : "" }
         // The tab's dot says which server this page is on.
         if let w = window, let badge = ConnectionBadge.of(webView.url ?? lastServerURL),
            w.tab.accessoryView?.identifier?.rawValue != "amux-connection-" + badge.host {
@@ -663,6 +699,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     /// ⌘W in a window split into panes closes the focused pane's tab
     /// (amux-panes.swift); the window's close button still closes the window.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if app?.frozen("close_tab") == true { return false }
         if let top = grid, let app = app, top.all.count > 1, NSApp.currentEvent?.type == .keyDown {
             // The innermost focused pane's tab, inside a split tab included.
             let g = app.deepestFocused(top)
@@ -709,6 +746,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         // fall back to the default server (Ethan, 2026-10-26).
         if let u = webView.url, u.scheme == "https" || u.scheme == "http" { lastServerURL = u }
         app?.loadNextDeferred(after: self)
+        applyFreeze()
         // The first dashboard page carries the token the server's copy of the
         // workspaces needs; until one sync reaches it, each page load tries again.
         if let a = app, a.workspacesSync == .never, a.workspacesKey != nil, webView.url.map(a.isServerURL) ?? false {
@@ -859,6 +897,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if let url = navigationAction.request.url, let app = app {
             if app.isServerURL(url) {
+                if app.frozen("page_new_window") { return nil }
                 dlog("verdict=page_opened_window url=\(url.absoluteString) from=\(webView.url?.absoluteString ?? "-")")
                 let c = app.openWindow(url: nil, frame: nil, configuration: configuration)
                 return c.webView
@@ -932,7 +971,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
             decisionHandler(.grant)
         case .notDetermined:
             dlog("verdict=mic_permission_asked view=\(viewHash)")
-            NSApp.activate(ignoringOtherApps: true)
+            activateApp()
             AVCaptureDevice.requestAccess(for: .audio) { ok in
                 DispatchQueue.main.async {
                     dlog("verdict=mic_permission_\(ok ? "granted" : "refused") view=\(self.viewHash)")
@@ -994,6 +1033,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     var tabDragMonitor: Any?
     var globeMonitor: Any?
     var globeDown = false, globeUsed = false
+    var lastGlobeTap: TimeInterval = 0
     var tearWatchTimer: Timer?
     var tabGroupSeen: [ObjectIdentifier: (tabs: Int, frame: NSRect)] = [:]
     var lastTabPlaced = Date.distantPast
@@ -1041,6 +1081,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         routeStderrToLogFile()
+        QuietTestCopy.start()
+        registerTextCheckingDefaults()
         NSWindow.allowsAutomaticWindowTabbing = true
         buildMenuBar(self)
         NotificationCenter.default.addObserver(forName: .amuxOverlayClosed, object: nil, queue: .main) { [weak self] n in
@@ -1071,7 +1113,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         DispatchQueue.main.asyncAfter(deadline: .now() + 90) { [weak self] in self?.reportResources() }
         resourcesTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in self?.reportResources() }
         memoryGuardTimer = Timer.scheduledTimer(withTimeInterval: envSeconds("AMUX_DESKTOP_MEM_TICK_S", 60), repeats: true) { [weak self] _ in self?.guardTabMemory() }
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         // `amux amux://worker/x` on the command line, once the pins are known.
         let links = CommandLine.arguments.dropFirst().compactMap { URL(string: $0) }.filter { $0.scheme == "amux" }
         if !links.isEmpty {
@@ -1114,6 +1156,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     /// connection (like sandbox) it should open the tab in that"); only a tab on
     /// no server falls back to the default connection.
     func newTab(nextTo c: DashboardWindowController, hash: String = "#view=sessions") {
+        if frozen("new_tab") { return }
         let n = DashboardWindowController(app: self, frame: c.window?.frame, configuration: nil)
         controllers.append(n)
         let u = url(withHash: hash, on: c.serverOrigin)
@@ -1201,7 +1244,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         if NSApp.isActive, NSApp.keyWindow != nil {
             NSApp.hide(nil)
         } else {
-            NSApp.activate(ignoringOtherApps: true)
+            activateApp()
             if !controllers.contains(where: { $0.window?.isVisible == true }) { openWindow(url: nil, frame: nil) }
         }
     }
@@ -1255,7 +1298,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     func handleAmuxURL(_ url: URL) {
         NSLog("amux-desktop: amux_url=%@ server=%@", url.absoluteString, serverURL?.absoluteString ?? "-")
         if handleTestURL(url) { return }
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         let arg = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).removingPercentEncoding ?? ""
         let enc = arg.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-_."))) ?? arg
         switch url.host ?? "" {
@@ -1633,11 +1676,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     // ── Needs you: Dock badge and notifications ──
     /// Notifications need a real .app bundle: UNUserNotificationCenter throws
     /// (and takes the app down) when the binary runs outside one.
-    var canNotify: Bool { Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil }
+    var canNotify: Bool { Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil && !desktopTestQuiet }
+    var notifyUnavailableReason: String { desktopTestQuiet ? "quiet_test_copy" : "not_in_app_bundle" }
 
     func setUpNotifications() {
         guard canNotify else {
-            NSLog("amux-desktop: verdict=notifications_unavailable reason=not_in_app_bundle path=%@", Bundle.main.bundlePath)
+            NSLog("amux-desktop: verdict=notifications_unavailable reason=%@ path=%@", notifyUnavailableReason, Bundle.main.bundlePath)
             return
         }
         let c = UNUserNotificationCenter.current()
@@ -1705,7 +1749,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         if let hash = response.notification.request.content.userInfo["hash"] as? String, hash.hasPrefix("#messages=") || hash == "#view=messages" {
             openNotificationTab(hash, why: "message")
             completionHandler()
@@ -1736,7 +1780,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         let safe = hash.allSatisfy { $0.isLetter || $0.isNumber || "#=&:-_.%|@".contains($0) }
         guard safe else { return }
         NSApp.unhide(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         let withWindow = controllers.filter { $0.window != nil }
         let host = withWindow.first { $0.window == NSApp.keyWindow }
             ?? withWindow.last { $0.window?.isVisible == true }
@@ -1756,6 +1800,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     static func placeKey(_ fragment: String) -> String {
         let f = fragment.hasPrefix("#") ? String(fragment.dropFirst()) : fragment
         return String(f.split(separator: "&").first ?? "")
+    }
+    /// The places ("peek=<worker>", "view=<tab>") every tab and pane other
+    /// than `asker` shows, once each.
+    func openPlaces(except asker: DashboardWindowController) -> [String] {
+        var seen = Set<String>()
+        return controllers.compactMap { c -> String? in
+            guard c !== asker else { return nil }
+            let k = AppDelegate.placeKey(c.webView.url?.fragment ?? "")
+            guard k.hasPrefix("peek=") || k.hasPrefix("view="), seen.insert(k).inserted else { return nil }
+            return k
+        }
     }
     /// Brings forward the tab or pane, other than `asker`, already showing the
     /// place `hash` names, selecting it in its pane and its window in its tab
@@ -1821,7 +1876,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     }
 
     // ── Menu actions ──
-    @objc func newWindow(_ sender: Any?) { openWindow(url: nil, frame: nil) }
+    @objc func newWindow(_ sender: Any?) { if !frozen("new_window") { openWindow(url: nil, frame: nil) } }
 
     @objc func newTabAction(_ sender: Any?) {
         // A window split into panes: a tab in the focused pane (amux-panes.swift).
@@ -1831,6 +1886,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
 
     /// The current worker or tab in its own window.
     @objc func openCurrentInNewWindow(_ sender: Any?) {
+        if frozen("new_window") { return }
         guard let c = keyPage else { openWindow(url: nil, frame: nil); return }
         c.webView.evaluateJavaScript(currentViewJS) { [weak self] result, _ in
             guard let self = self else { return }
@@ -1995,6 +2051,30 @@ extension Config {
 }
 
 // ── Standard menu bar ──
+/// Spelling in every text box (Ethan, 2026-11-07: "add spellcheck/autocorrect/
+/// suggestions into the inputs"). The page asks for it (spellcheck="true",
+/// autocorrect="on"), but in a WKWebView the app decides: WebKit reads these
+/// keys from the app's defaults, and none were set, so nothing was checked or
+/// corrected. Registered defaults lose to a choice made in Edit > Spelling and
+/// Grammar or Edit > Substitutions, which WebKit saves under the same keys.
+/// Smart quotes and dashes stay off: a curly quote breaks a command sent to a
+/// worker.
+func registerTextCheckingDefaults() {
+    UserDefaults.standard.register(defaults: [
+        "WebContinuousSpellCheckingEnabled": true,
+        "WebAutomaticSpellingCorrectionEnabled": true,
+        "WebAutomaticTextReplacementEnabled": true,
+        "WebGrammarCheckingEnabled": false,
+        "WebAutomaticQuoteSubstitutionEnabled": false,
+        "WebAutomaticDashSubstitutionEnabled": false,
+    ])
+    let d = UserDefaults.standard
+    NSLog("amux-desktop: verdict=text_checking_defaults spelling=%d autocorrect=%d replacement=%d",
+          d.bool(forKey: "WebContinuousSpellCheckingEnabled") ? 1 : 0,
+          d.bool(forKey: "WebAutomaticSpellingCorrectionEnabled") ? 1 : 0,
+          d.bool(forKey: "WebAutomaticTextReplacementEnabled") ? 1 : 0)
+}
+
 func buildMenuBar(_ d: AppDelegate) {
     let mainMenu = NSMenu()
     func add(_ menu: NSMenu, _ title: String, _ action: Selector?, _ key: String,
@@ -2044,6 +2124,22 @@ func buildMenuBar(_ d: AppDelegate) {
     add(edit, "Copy", #selector(NSText.copy(_:)), "c")
     add(edit, "Paste", #selector(NSText.paste(_:)), "v")
     add(edit, "Select All", #selector(NSText.selectAll(_:)), "a")
+    edit.addItem(.separator())
+    // The standard spelling menus. The focused WKWebView answers each action
+    // and shows its checkmark.
+    let spelling = NSMenu(title: "Spelling and Grammar")
+    add(spelling, "Show Spelling and Grammar", #selector(NSText.showGuessPanel(_:)), ":")
+    add(spelling, "Check Document Now", #selector(NSText.checkSpelling(_:)), ";")
+    spelling.addItem(.separator())
+    add(spelling, "Check Spelling While Typing", #selector(NSTextView.toggleContinuousSpellChecking(_:)), "", [])
+    add(spelling, "Check Grammar With Spelling", #selector(NSTextView.toggleGrammarChecking(_:)), "", [])
+    add(spelling, "Correct Spelling Automatically", #selector(NSTextView.toggleAutomaticSpellingCorrection(_:)), "", [])
+    edit.addItem(withTitle: "Spelling and Grammar", action: nil, keyEquivalent: "").submenu = spelling
+    let subs = NSMenu(title: "Substitutions")
+    add(subs, "Smart Quotes", #selector(NSTextView.toggleAutomaticQuoteSubstitution(_:)), "", [])
+    add(subs, "Smart Dashes", #selector(NSTextView.toggleAutomaticDashSubstitution(_:)), "", [])
+    add(subs, "Text Replacement", #selector(NSTextView.toggleAutomaticTextReplacement(_:)), "", [])
+    edit.addItem(withTitle: "Substitutions", action: nil, keyEquivalent: "").submenu = subs
     editItem.submenu = edit
     mainMenu.addItem(editItem)
 
@@ -2121,7 +2217,68 @@ struct AmuxDesktop {
     static func main() {
         let app = NSApplication.shared
         app.delegate = delegate
-        app.setActivationPolicy(.regular)
+        app.setActivationPolicy(desktopTestQuiet ? .accessory : .regular)
         app.run()
+    }
+}
+
+
+// Printing a file from the viewer (owner, 2026-11-08: "make it so i can print
+// files"). A PDF prints its own pages and an image prints as one page through
+// PDFKit; any other file arrives as the HTML the viewer shows and prints from
+// an offscreen WebKit view. The print panel is a sheet on the asking window.
+// Each job logs one line to Console under "amux print".
+final class FilePrint: NSObject, WKNavigationDelegate {
+    private static var jobs: Set<FilePrint> = []
+    private let window: NSWindow
+    private let name: String
+    private var web: WKWebView?
+
+    private init(window: NSWindow, name: String) { self.window = window; self.name = name }
+
+    static func run(_ d: [String: Any], in window: NSWindow) {
+        let name = (d["name"] as? String) ?? "file"
+        let kind = (d["kind"] as? String) ?? "document"
+        if let b64 = d["data"] as? String, let data = Data(base64Encoded: b64) {
+            var doc = kind == "pdf" ? PDFDocument(data: data) : nil
+            if doc == nil, let img = NSImage(data: data), let page = PDFPage(image: img) {
+                doc = PDFDocument(); doc?.insert(page, at: 0)
+            }
+            guard let pdf = doc, let op = pdf.printOperation(for: NSPrintInfo.shared, scalingMode: .pageScaleToFit, autoRotate: true) else {
+                NSLog("amux print: could not read %@ as %@ verdict=print_unreadable", name, kind)
+                return
+            }
+            op.jobTitle = name
+            op.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
+            NSLog("amux print: %@ (%@) verdict=print_panel_shown", name, kind)
+            return
+        }
+        guard let html = d["html"] as? String else {
+            NSLog("amux print: %@ arrived with nothing to print verdict=print_empty", name)
+            return
+        }
+        let job = FilePrint(window: window, name: name)
+        let web = WKWebView(frame: NSRect(x: 0, y: 0, width: 816, height: 1056))
+        web.navigationDelegate = job
+        job.web = web
+        jobs.insert(job)
+        web.loadHTMLString(html, baseURL: nil)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        let op = webView.printOperation(with: NSPrintInfo.shared)
+        op.jobTitle = name
+        op.view?.frame = webView.bounds
+        op.runModal(for: window, delegate: self, didRun: #selector(printed(_:success:contextInfo:)), contextInfo: nil)
+        NSLog("amux print: %@ (document) verdict=print_panel_shown", name)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        NSLog("amux print: %@ did not load: %@ verdict=print_load_failed", name, error.localizedDescription)
+        FilePrint.jobs.remove(self)
+    }
+
+    @objc private func printed(_ op: NSPrintOperation, success: Bool, contextInfo: UnsafeMutableRawPointer?) {
+        FilePrint.jobs.remove(self)
     }
 }

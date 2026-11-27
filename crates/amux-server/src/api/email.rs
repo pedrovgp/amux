@@ -64,6 +64,9 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
         .route("/approve/{id}", post(approve))
         .route("/reject/{id}", post(reject))
         .route("/approvals", get(list_approvals))
+        // One held draft's attachment, for the approver's preview: the list
+        // names each file and never carries its bytes.
+        .route("/approvals/{id}/attachments/{index}", get(approval_attachment))
         // AF-540: the READ-ONLY half. `fate()` has always said the right thing —
         // including "this approval EXPIRED unreleased (1h TTL)" — and was
         // reachable ONLY as the error body of POST /approve/{id}, a mutation a
@@ -404,6 +407,89 @@ fn parse_attachments(body: &Value) -> Result<Vec<Attachment>, String> {
     Ok(out)
 }
 
+/// What an approver sees of each held attachment: its name, type and size,
+/// never its bytes or the path of a file on disk. Each one is read the way a
+/// release reads it (`parse_attachments`), so `ok: false` means the send
+/// would fail on it too: the file is gone, or the data is not valid.
+pub(crate) fn attachment_summaries(payload: &Value) -> Vec<Value> {
+    let Some(list) = payload.get("attachments").and_then(Value::as_array) else { return vec![] };
+    list.iter().enumerate().map(|(i, a)| match parse_attachments(&json!({ "attachments": [a] })) {
+        Ok(mut v) if v.len() == 1 => {
+            let a = v.remove(0);
+            json!({ "index": i, "filename": a.filename, "content_type": a.content_type, "size": a.data.len(), "ok": true })
+        }
+        _ => {
+            let name = a.get("filename").and_then(Value::as_str).map(str::to_string)
+                .or_else(|| a.get("path").and_then(Value::as_str)
+                    .and_then(|p| std::path::Path::new(p).file_name()).map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| "attachment".into());
+            json!({ "index": i, "filename": name, "content_type": Value::Null, "size": Value::Null, "ok": false })
+        }
+    }).collect()
+}
+
+/// GET /api/email/approvals/{id}/attachments/{index}: the bytes of one held
+/// attachment, inline, for the approval card's preview. Read through the
+/// same parse as the send, so what previews is what would go out. Served
+/// sandboxed and not sniffed: a held HTML file must not run as the dashboard.
+pub async fn approval_attachment(
+    Extension(ctx): Extension<Arc<EmailCtx>>,
+    axum::extract::Path((id, index)): axum::extract::Path<(String, usize)>,
+) -> Response {
+    let Some(doc) = crate::api::email_approval::peek(ctx.client.home(), &id) else {
+        return err(StatusCode::NOT_FOUND, json!({ "error": "no held draft with that id", "id": id }));
+    };
+    let Some(a) = doc["payload"]["attachments"].get(index).cloned() else {
+        return err(StatusCode::NOT_FOUND, json!({ "error": "that draft has no attachment at that index", "id": id, "index": index }));
+    };
+    match parse_attachments(&json!({ "attachments": [a] })) {
+        Ok(mut v) if v.len() == 1 => {
+            let a = v.remove(0);
+            tracing::info!(approval_id = %id, index, bytes = a.data.len(), measured = true, n_considered = 1,
+                verdict = "email_approval_attachment_served", "[email] a held attachment was opened for review");
+            let fname = a.filename.replace(['"', '\r', '\n'], "");
+            (
+                [
+                    (axum::http::header::CONTENT_TYPE, a.content_type),
+                    (axum::http::header::CONTENT_DISPOSITION, format!("inline; filename=\"{fname}\"")),
+                    (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    (axum::http::header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
+                    (axum::http::header::CACHE_CONTROL, "private, no-store".to_string()),
+                ],
+                a.data,
+            ).into_response()
+        }
+        _ => {
+            tracing::warn!(approval_id = %id, index, measured = true, n_considered = 1,
+                verdict = "email_approval_attachment_unreadable",
+                "[email] a held attachment cannot be read; its release would fail the same way");
+            err(StatusCode::GONE, json!({ "error": "this attachment cannot be read (the file is gone or its data is not valid); the send would fail on it", "id": id, "index": index }))
+        }
+    }
+}
+
+/// The attachments as a held send keeps them: their bytes, read when the send
+/// is held (owner, 2026-11-09: "make sure the attachment works"). A
+/// `{"path": ...}` kept as a path was read again only at release: a temp file
+/// gone by then failed the send, and a file changed since went out with bytes
+/// the approver never saw. A bad path is refused now, while the worker can fix it.
+fn frozen_attachments(body: &Value) -> Result<Value, String> {
+    let atts = parse_attachments(body)?;
+    if atts.is_empty() {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Array(
+        atts.into_iter()
+            .map(|a| {
+                json!({
+                    "filename": a.filename, "content_type": a.content_type,
+                    "content_base64": base64::engine::general_purpose::STANDARD.encode(&a.data),
+                })
+            })
+            .collect(),
+    ))
+}
+
 /// Feed a real Gmail outcome into the registry (RR-0073). Auth-shaped
 /// failures are `Unavailable` (re-auth needed / no token); transient ones
 /// `Degraded`; success is the only path to `Available`.
@@ -565,11 +651,15 @@ pub async fn send(
                 "body": message.chars().take(2000).collect::<String>(),
                 "external_recipients": externals,
             });
+            let attachments = match frozen_attachments(&body) {
+                Ok(a) => a,
+                Err(e) => return err(StatusCode::BAD_REQUEST, json!({ "error": e })),
+            };
             let payload = json!({
                 "from": from_acct, "to": to, "cc": cc, "subject": subject,
                 "body": message,
                 "signature": body.get("signature").cloned().unwrap_or(Value::Null),
-                "attachments": body.get("attachments").cloned().unwrap_or(Value::Null),
+                "attachments": attachments,
             });
             return match crate::api::email_approval::request_approval(
                 &home,
@@ -842,12 +932,16 @@ pub async fn reply(
                         "body": reply_body.chars().take(2000).collect::<String>(),
                         "external_recipients": externals,
                     });
+                    let frozen = match frozen_attachments(&body) {
+                        Ok(a) => a,
+                        Err(e) => return err(StatusCode::BAD_REQUEST, json!({ "error": e })),
+                    };
                     let payload = json!({
                         "from": gmail_from, "message_id": message_id,
                         "body": reply_body, "reply_all": reply_all,
                         "allow_self": allow_self, "cc": extra_cc,
                         "signature": body.get("signature").cloned().unwrap_or(Value::Null),
-                        "attachments": body.get("attachments").cloned().unwrap_or(Value::Null),
+                        "attachments": frozen,
                     });
                     return match crate::api::email_approval::request_approval(
                         &home,
@@ -1232,6 +1326,40 @@ pub async fn approve(
             );
         }
     }
+    // SCHEDULE INSTEAD OF SEND (Ethan, 2026-11-08: "when i approve outbound
+    // email there should be another button to schedule for a date/time"). The
+    // same checks above apply; the draft stays pending with the human's
+    // decision on it, and the scheduled-send job releases it through this
+    // endpoint when the time comes.
+    let send_at = body.as_ref().and_then(|Json(v)| v.get("send_at").and_then(Value::as_f64));
+    if let Some(send_at) = send_at {
+        let edit = body
+            .as_ref()
+            .and_then(|Json(v)| v.get("body").and_then(Value::as_str))
+            .filter(|b| !b.trim().is_empty());
+        return match crate::api::email_approval::schedule(&home, &id, send_at, &approver, edit) {
+            Ok(doc) => {
+                email_log(
+                    ctx.client.home(),
+                    json!({
+                        "endpoint": "approve", "scheduled": true, "approval_id": id,
+                        "send_at": send_at, "approved_by": approver, "approver_verified": false,
+                        "approver_edited": edit.is_some(),
+                        "session": doc.get("session").cloned().unwrap_or(Value::Null),
+                    }),
+                );
+                Json(json!({
+                    "ok": true, "scheduled": true, "delivered": false, "approval_id": id,
+                    "send_at": send_at,
+                    "sent_for_session": doc.get("session").cloned().unwrap_or(Value::Null),
+                }))
+                .into_response()
+            }
+            Err(e) => err(StatusCode::BAD_REQUEST, json!({ "error": e, "approval_id": id })),
+        };
+    }
+    let scheduled_for = crate::api::email_approval::peek(&home, &id)
+        .and_then(|d| d.get("scheduled").and_then(|s| s.get("send_at")).and_then(Value::as_f64));
     let doc = match crate::api::email_approval::consume(&home, &id) {
         crate::api::email_approval::Consume::Ready(d) => d,
         crate::api::email_approval::Consume::Expired => {
@@ -1307,7 +1435,10 @@ pub async fn approve(
     let include_sig = payload.get("signature") != Some(&Value::Bool(false));
     let attachments = match parse_attachments(&payload) {
         Ok(a) => a,
-        Err(e) => return err(StatusCode::BAD_REQUEST, json!({ "error": e })),
+        Err(e) => {
+            crate::api::email_approval::reopen_after_failed_send(&home, &id, &e);
+            return err(StatusCode::BAD_REQUEST, json!({ "error": e, "approval_id": id }));
+        }
     };
     let res = match endpoint.as_str() {
         "send" => {
@@ -1343,10 +1474,9 @@ pub async fn approve(
                 .await
         }
         other => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": format!("frozen approval has unknown endpoint {other:?}") }),
-            )
+            let e = format!("frozen approval has unknown endpoint {other:?}");
+            crate::api::email_approval::reopen_after_failed_send(&home, &id, &e);
+            return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e }));
         }
     };
     report_outcome(
@@ -1357,7 +1487,26 @@ pub async fn approve(
         // Same classification as every other path (AMUX-3809): a revoked token is
         // a refusal here too. `approval_id` is merged in so the caller keeps the
         // handle it needs to retry.
-        Err(e) => email_err_with(&e, json!({ "approval_id": id })),
+        Err(e) => {
+            // The handle in the error is only worth retrying if the approval is
+            // pending again; `reopened` says whether it is.
+            // Only an answer from Gmail proves nothing left. A transport error
+            // (timeout, dropped connection) may have sent it, so that approval
+            // stays released rather than risk a second copy to the recipient.
+            let lower = e.to_ascii_lowercase();
+            let maybe_sent = ["timed out", "timeout", "error sending request", "connection", "broken pipe", "reset by peer"]
+                .iter()
+                .any(|m| lower.contains(m));
+            let reopened = if maybe_sent {
+                tracing::warn!(approval = %id, measured = true, n_considered = 1,
+                    verdict = "email_approval_send_outcome_unknown",
+                    "[email] the release failed in transit; it may have sent, so it stays released: {e}");
+                false
+            } else {
+                crate::api::email_approval::reopen_after_failed_send(&home, &id, &e)
+            };
+            email_err_with(&e, json!({ "approval_id": id, "reopened": reopened }))
+        }
         Ok(res) => {
             // The audit answers "who approved this", not only "which worker
             // sent it" (autodesk's point 5). The approver is the dashboard
@@ -1380,6 +1529,7 @@ pub async fn approve(
                     // tell what actually left; without this the body_preview
                     // below would attribute the approver's words to the lane.
                     "approver_edited": approver_edited,
+                    "scheduled_for": scheduled_for,
                     "from": p("from"),
                     "to": resolved_envelope(&res, "to", &p("to")),
                     "cc": resolved_envelope(&res, "cc", &p("cc")),
@@ -1406,10 +1556,21 @@ pub async fn approve(
 
 /// GET /api/email/approvals — pending approvals for the dashboard / a
 /// human's curl. Previews only; the frozen payload stays server-side.
+///
+/// `pending` is what still needs a decision. A draft the human approved for a
+/// later time is in `scheduled`, soonest first (Ethan, 2026-11-09: "When an
+/// email is approved -> scheduled it shouldnt be in the scheduled thing
+/// anymore but we should be able to see the scheduled list").
 pub async fn list_approvals(Extension(ctx): Extension<Arc<EmailCtx>>) -> Response {
-    let pending = crate::api::email_approval::list_pending(ctx.client.home());
+    let (mut scheduled, pending): (Vec<Value>, Vec<Value>) =
+        crate::api::email_approval::list_pending(ctx.client.home())
+            .into_iter()
+            .partition(crate::api::email_approval::is_scheduled);
+    let at = |d: &Value| d["scheduled"]["send_at"].as_f64().unwrap_or(0.0);
+    scheduled.sort_by(|a, b| at(a).partial_cmp(&at(b)).unwrap_or(std::cmp::Ordering::Equal));
     Json(json!({
         "pending": pending,
+        "scheduled": scheduled,
         "approve_with": "POST /api/email/approve/<id> from a human context (no worker origin header)",
     }))
     .into_response()
@@ -3365,6 +3526,239 @@ mod tests {
             "an origin-less caller claiming to be the dashboard still succeeds — that IS the \
              open residual, and asserting it stops this test reading as a boundary: {ok}"
         );
+    }
+
+    /// Schedule instead of send (Ethan, 2026-11-08). The human's Schedule keeps
+    /// the draft pending and sends nothing; the job releases it once, at its
+    /// time, with the approver and the edit it was scheduled with.
+    #[tokio::test]
+    async fn a_scheduled_approval_sends_once_at_its_time_with_its_edit() {
+        let home = temp_home();
+        let http = MockHttp::new(vec![
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "sch1", "threadId": "ts1" })),
+        ]);
+        let (app, _d, _r) = app_with(http.clone(), home.path());
+        let ctx = Arc::new(EmailCtx {
+            client: Arc::new(GmailClient::new(http.clone(), home.path().to_path_buf())),
+            registry: Arc::new(IntegrationRegistry::new()),
+        });
+        let (st, res) = send_req(&app, "POST", "/api/email/send",
+            Some(json!({ "to": "cto@customer.com", "subject": "Q", "body": "draft",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", "autodesk")]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let apr = res["approval_id"].as_str().unwrap().to_string();
+        let now = crate::config::now_f64();
+        let path = format!("/api/email/approve/{apr}");
+
+        // A worker cannot schedule, and a time in the past is refused.
+        let (st, e) = send_req(&app, "POST", &path, Some(json!({ "send_at": now + 600.0 })),
+            &[("x-amux-session", "autodesk")]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert_eq!(e["code"], json!("worker_cannot_approve"));
+        let (st, _) = send_req(&app, "POST", &path, Some(json!({ "send_at": now - 5.0 })),
+            &[("x-amux-approver", "dashboard")]).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        let (st, ok) = send_req(&app, "POST", &path,
+            Some(json!({ "send_at": now + 3600.0, "body": "edited words" })),
+            &[("x-amux-approver", "dashboard")]).await;
+        assert_eq!(st, StatusCode::OK, "{ok}");
+        assert_eq!(ok["scheduled"], json!(true));
+        assert_eq!(ok["delivered"], json!(false));
+        let sends = |h: &MockHttp| h.calls.lock().unwrap().iter().filter(|c| c.1.contains("/messages/send")).count();
+        assert_eq!(sends(&http), 0, "scheduling sends nothing");
+
+        // Still pending, marked scheduled, showing the words that will go out.
+        let list = crate::api::email_approval::list_pending(home.path());
+        let row = list.iter().find(|r| r["id"] == json!(apr)).expect("still pending");
+        assert_eq!(row["scheduled"]["send_at"].as_f64(), Some(now + 3600.0));
+        assert_eq!(row["scheduled"]["edited"], json!(true));
+        assert!(row["scheduled"].get("body").is_none(), "the edit stays out of `scheduled`");
+        assert_eq!(row["review"]["body"], json!("edited words"));
+        // It no longer waits for a decision: the approvals list carries it
+        // under `scheduled`, not `pending`.
+        let (_, lst) = send_req(&app, "GET", "/api/email/approvals", None, &[]).await;
+        assert!(lst["pending"].as_array().unwrap().iter().all(|r| r["id"] != json!(apr)), "{lst}");
+        assert_eq!(lst["scheduled"][0]["id"], json!(apr), "{lst}");
+        assert_eq!(lst["scheduled"][0]["scheduled"]["send_at"].as_f64(), Some(now + 3600.0));
+
+        // Not due yet: nothing goes out.
+        assert_eq!(crate::runtime_jobs::email_scheduled_send::tick_with(ctx.clone(), home.path(), now + 60.0).await, 0);
+        assert_eq!(sends(&http), 0);
+
+        // Due: it goes out once, with the edit, attributed to the approver.
+        assert_eq!(crate::runtime_jobs::email_scheduled_send::tick_with(ctx.clone(), home.path(), now + 3601.0).await, 1);
+        assert_eq!(sends(&http), 1);
+        assert_eq!(crate::runtime_jobs::email_scheduled_send::tick_with(ctx.clone(), home.path(), now + 3700.0).await, 0,
+            "one-shot: a released schedule never fires again");
+        assert_eq!(sends(&http), 1);
+        assert!(crate::api::email_approval::list_pending(home.path()).iter().all(|r| r["id"] != json!(apr)));
+        let log = crate::integrations::email::read_email_log(home.path(), 1, 50, "");
+        let sent = log["log"].as_array().unwrap().iter()
+            .find(|x| x.get("approved") == Some(&json!(true))).expect("a send row");
+        assert_eq!(sent["approved_by"], json!("dashboard"));
+        assert_eq!(sent["approver_edited"], json!(true));
+        assert_eq!(sent["body_preview"], json!("edited words"));
+        assert_eq!(sent["scheduled_for"].as_f64(), Some(now + 3600.0));
+        assert_eq!(sent["session"], json!("autodesk"));
+        assert!(log["log"].as_array().unwrap().iter().any(|x| x.get("scheduled") == Some(&json!(true))),
+            "the schedule itself is a ledger row");
+    }
+
+    /// A held draft keeps its attachment however it is released: approved as
+    /// is, approved with the approver's edit, and scheduled (with an edit) then
+    /// released by the job. Each sent MIME carries the file part. The approval
+    /// card previews the same bytes through its route, sandboxed.
+    /// A file attached by path is kept when the send is held: gone from disk
+    /// before approval, the preview and the release both still have its bytes.
+    /// A path that cannot be read is refused at the hold.
+    #[tokio::test]
+    async fn a_held_path_attachment_is_kept_when_its_file_goes() {
+        let home = temp_home();
+        let http = MockHttp::new(vec![
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "pa1", "threadId": "tp1" })),
+        ]);
+        let (app, _d, _r) = app_with(http.clone(), home.path());
+        let file = home.path().join("deck.pdf");
+        let pdf = b"%PDF-1.4 the deck the owner approves".to_vec();
+        std::fs::write(&file, &pdf).unwrap();
+        let (st, res) = send_req(&app, "POST", "/api/email/send",
+            Some(json!({ "to": "cto@customer.com", "subject": "Deck", "body": "Attached.", "from": ACCT,
+                         "force_new_thread": true, "attachments": [{ "path": file.to_string_lossy() }] })),
+            &[("x-amux-session", "gtm-engine")]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{res}");
+        let apr = res["approval_id"].as_str().unwrap().to_string();
+        std::fs::remove_file(&file).unwrap();
+
+        let res = app.clone().oneshot(Request::builder().uri(format!("/api/email/approvals/{apr}/attachments/0"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "the preview still has the file");
+        assert_eq!(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()[..], &pdf[..]);
+        let (st, ok) = send_req(&app, "POST", &format!("/api/email/approve/{apr}"), None,
+            &[("x-amux-approver", "dashboard")]).await;
+        assert_eq!(st, StatusCode::OK, "{ok}");
+        let call = http.calls.lock().unwrap().iter().find(|c| c.1.contains("/messages/send")).cloned().unwrap();
+        let mime = String::from_utf8(crate::integrations::email::base64url_decode(call.2.unwrap()["raw"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(mime.contains("filename=\"deck.pdf\""), "{mime}");
+        assert!(mime.replace("\r\n", "").contains(&base64::engine::general_purpose::STANDARD.encode(&pdf)));
+
+        let (st, e) = send_req(&app, "POST", "/api/email/send",
+            Some(json!({ "to": "cto@customer.com", "subject": "y", "body": "y", "from": ACCT, "force_new_thread": true,
+                         "attachments": [{ "path": "/nonexistent/deck.pdf" }] })),
+            &[("x-amux-session", "gtm-engine")]).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "refused at the hold: {e}");
+    }
+
+    #[tokio::test]
+    async fn a_released_draft_still_carries_its_attachment() {
+        let home = temp_home();
+        let mut script = Vec::new();
+        for _ in 0..3 {
+            script.push(("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })));
+            script.push(("POST", "/messages/send", 200, json!({ "id": "att", "threadId": "ta" })));
+        }
+        let http = MockHttp::new(script);
+        let (app, _d, _r) = app_with(http.clone(), home.path());
+        let ctx = Arc::new(EmailCtx {
+            client: Arc::new(GmailClient::new(http.clone(), home.path().to_path_buf())),
+            registry: Arc::new(IntegrationRegistry::new()),
+        });
+        let pdf = b"%PDF-1.4 quote";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pdf);
+        let hold = |subject: &'static str| {
+            let (app, b64) = (app.clone(), b64.clone());
+            async move {
+                let (st, res) = send_req(&app, "POST", "/api/email/send",
+                    Some(json!({ "to": "cto@customer.com", "subject": subject, "body": "draft", "from": ACCT,
+                                 "force_new_thread": true,
+                                 "attachments": [{ "filename": "quote.pdf", "content_base64": b64 }] })),
+                    &[("x-amux-session", "gtm-engine")]).await;
+                assert_eq!(st, StatusCode::FORBIDDEN, "{res}");
+                res["approval_id"].as_str().unwrap().to_string()
+            }
+        };
+        let last_mime = |h: &MockHttp| {
+            let calls = h.calls.lock().unwrap();
+            let body = calls.iter().rev().find(|c| c.1.contains("/messages/send")).and_then(|c| c.2.clone()).expect("a send");
+            String::from_utf8(crate::integrations::email::base64url_decode(body["raw"].as_str().unwrap()).unwrap()).unwrap()
+        };
+        let carries = |mime: &str| mime.contains("filename=\"quote.pdf\"") && mime.contains(&b64);
+
+        // The card previews the held file: its bytes, typed, sandboxed.
+        let plain = hold("as is").await;
+        let res = app.clone().oneshot(Request::builder().uri(format!("/api/email/approvals/{plain}/attachments/0"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "application/pdf");
+        assert_eq!(res.headers()["content-security-policy"], "sandbox");
+        assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()[..], pdf);
+        let (st, _) = send_req(&app, "GET", &format!("/api/email/approvals/{plain}/attachments/1"), None, &[]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _) = send_req(&app, "GET", "/api/email/approvals/apr_0000000000000000/attachments/0", None, &[]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Approved as is.
+        let (st, ok) = send_req(&app, "POST", &format!("/api/email/approve/{plain}"), None, &[("x-amux-approver", "dashboard")]).await;
+        assert_eq!(st, StatusCode::OK, "{ok}");
+        assert!(carries(&last_mime(&http)), "approved as is: {}", last_mime(&http));
+
+        // Approved with the approver's edit to the body.
+        let edited = hold("edited").await;
+        let (st, ok) = send_req(&app, "POST", &format!("/api/email/approve/{edited}"),
+            Some(json!({ "body": "edited words" })), &[("x-amux-approver", "dashboard")]).await;
+        assert_eq!(st, StatusCode::OK, "{ok}");
+        let mime = last_mime(&http);
+        assert!(carries(&mime) && mime.contains(&base64::engine::general_purpose::STANDARD.encode("edited words")), "approved with an edit: {mime}");
+
+        // Scheduled with an edit, then released by the job at its time.
+        let later = hold("scheduled").await;
+        let now = crate::config::now_f64();
+        let (st, ok) = send_req(&app, "POST", &format!("/api/email/approve/{later}"),
+            Some(json!({ "send_at": now + 600.0, "body": "scheduled words" })), &[("x-amux-approver", "dashboard")]).await;
+        assert_eq!(st, StatusCode::OK, "{ok}");
+        let row = crate::api::email_approval::list_pending(home.path()).into_iter().find(|r| r["id"] == json!(later)).unwrap();
+        assert_eq!(row["review"]["attachments"][0]["filename"], json!("quote.pdf"), "the Scheduled folder names it too");
+        assert_eq!(crate::runtime_jobs::email_scheduled_send::tick_with(ctx.clone(), home.path(), now + 601.0).await, 1);
+        let mime = last_mime(&http);
+        assert!(carries(&mime) && mime.contains(&base64::engine::general_purpose::STANDARD.encode("scheduled words")), "scheduled release: {mime}");
+    }
+
+    /// A scheduled release that fails goes back to plain pending: left
+    /// scheduled, the job would retry it every tick.
+    #[tokio::test]
+    async fn a_failed_scheduled_release_waits_for_a_human_again() {
+        let home = temp_home();
+        let http = MockHttp::new(vec![
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 400, json!({ "error": { "message": "Invalid To header" } })),
+        ]);
+        let (app, _d, _r) = app_with(http.clone(), home.path());
+        let ctx = Arc::new(EmailCtx {
+            client: Arc::new(GmailClient::new(http.clone(), home.path().to_path_buf())),
+            registry: Arc::new(IntegrationRegistry::new()),
+        });
+        let (_, res) = send_req(&app, "POST", "/api/email/send",
+            Some(json!({ "to": "cto@customer.com", "subject": "Q", "body": "draft",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", "autodesk")]).await;
+        let apr = res["approval_id"].as_str().unwrap().to_string();
+        let now = crate::config::now_f64();
+        let (st, _) = send_req(&app, "POST", &format!("/api/email/approve/{apr}"),
+            Some(json!({ "send_at": now + 60.0, "body": "kept words" })), &[("x-amux-approver", "dashboard")]).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(crate::runtime_jobs::email_scheduled_send::tick_with(ctx.clone(), home.path(), now + 61.0).await, 0);
+        let list = crate::api::email_approval::list_pending(home.path());
+        let row = list.iter().find(|r| r["id"] == json!(apr)).expect("pending again after the failure");
+        assert!(row.get("scheduled").is_none(), "no longer scheduled: {row}");
+        assert!(row.get("schedule_failed").is_some());
+        // The approver's edit survives the failure: it is now the draft.
+        assert_eq!(row["review"]["body"], json!("kept words"));
+        assert_eq!(row["schedule_failed"]["edit_kept"], json!(true));
+        assert!(crate::api::email_approval::due_scheduled(home.path(), now + 9999.0).is_empty());
     }
 
     #[tokio::test]

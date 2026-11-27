@@ -180,6 +180,10 @@ fn worker_stack_bytes() -> usize {
 }
 
 pub fn run() {
+    // Before any thread or child exists: a handed-over listener arrives with
+    // close-on-exec cleared, and every process spawned before adopt_or_bind
+    // (gh, bash, pgrep from boot jobs) would otherwise hold port 8824.
+    listener_handoff::seal_inherited();
     let stack = worker_stack_bytes();
     let maintenance = tokio::runtime::Builder::new_multi_thread()
         .thread_name("amux-maintenance")
@@ -188,6 +192,16 @@ pub fn run() {
         .build()
         .expect("maintenance runtime");
     runtime_jobs::executor::install(maintenance.handle().clone());
+    // AF-1006: board-drive and orchestrator-runtime hold a thread for seconds
+    // per tick; two threads of their own keep that off the shared pool.
+    let heavy = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("amux-heavy-jobs")
+        .worker_threads(2)
+        .thread_stack_size(stack)
+        .enable_all()
+        .build()
+        .expect("heavy-job runtime");
+    runtime_jobs::executor::install_heavy(heavy.handle().clone());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(stack)
         .enable_all()
@@ -367,7 +381,7 @@ async fn async_main() {
 
     let running_build = build_hash();
     tracing::info!(port = cfg.port, db = %cfg.db_path.display(), pid = std::process::id(),
-        commit = env!("AMUX_BUILD_COMMIT_FULL"), build = %running_build,
+        commit = %activation::served().full, build_commit = env!("AMUX_BUILD_COMMIT_FULL"), build = %running_build,
         self_adopted = std::env::var("AMUX_SELF_ADOPTED").is_ok(), "starting amux-rust");
     {
         let dir = crate::api::session_verbs::tmux_fleet_shim_dir();
@@ -464,7 +478,7 @@ async fn async_main() {
     runtime_jobs::heartbeat::record_boot(&store, cfg.port);
     tracing::info!(target: "runtime", verdict = "maintenance_runtime_isolated",
         runtime_pool = runtime_jobs::executor::pool_name(), pid = std::process::id(),
-        commit = env!("AMUX_BUILD_COMMIT_FULL"),
+        commit = %activation::served().full,
         "registered maintenance jobs run on separate threads from HTTP and TLS");
 
     // Migration-rehearsal mode (Phase 11): open + migrate + report + exit.
@@ -665,6 +679,10 @@ async fn async_main() {
     drop(runtime_jobs::capture_reconcile::spawn(state.clone()));
     // AMUX-5240: one daily owner digest of pending outbound-email approvals.
     drop(runtime_jobs::email_approval_digest::spawn(state.clone()));
+    drop(runtime_jobs::email_scheduled_send::spawn(state.clone()));
+    // Z15: daily digest of needsyou cards, dry run until the owner opts in.
+    drop(runtime_jobs::decision_digest::spawn(state.clone()));
+    drop(runtime_jobs::directive::spawn(state.clone()));
     // AMUX-5301: approve new needs-input items the owner's policy covers.
     drop(runtime_jobs::needs_input_auto::spawn(state.clone()));
     // AMUX-5239: a lane that pushed and said "live in ~40 min" was never told
@@ -683,6 +701,7 @@ async fn async_main() {
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
     // Storage tiers: watched folders between the internal disk and a cold drive.
     drop(crate::api::tiering::spawn(state.clone()));
+    crate::api::file_visits::spawn_seed(state.store.clone());
     drop(runtime_jobs::host_metrics::spawn(state.clone()));
     drop(runtime_jobs::trace_archive::spawn(state.clone()));
     drop(runtime_jobs::host_guard::spawn());
@@ -702,6 +721,11 @@ async fn async_main() {
     // channel reads. WhatsApp and Slack arrive by webhook (api/bridge.rs).
     drop(bridge::spawn(state.clone()));
     drop(bridge::adapters::spawn_discord(state.clone()));
+    // The owner's WhatsApp self chat, read from the WhatsApp app on this Mac.
+    drop(bridge::whatsapp_app::spawn(state.clone()));
+    // The owner's own iMessage thread and email to themselves (bridge/self_chat.rs).
+    drop(bridge::imessage::spawn(state.clone()));
+    drop(bridge::email::spawn(state.clone()));
     // Auto-relay: send session replies back to Telegram when linked sessions respond
     // to Telegram-routed messages. Works for all workers without per-session configuration.
     drop(runtime_jobs::telegram_relay::spawn(state.clone()));
@@ -766,7 +790,7 @@ async fn async_main() {
     // so "was that badge accurate?" is answerable after the screenshot arrives.
     drop(runtime_jobs::status_history::spawn(state.clone()));
     drop(runtime_jobs::browser_login_sync::spawn());
-    drop(runtime_jobs::connector_maintenance::spawn());
+    drop(runtime_jobs::connector_maintenance::spawn(state.clone()));
     drop(runtime_jobs::social_metrics::spawn(state.clone()));
     drop(runtime_jobs::social_publish::spawn(state.clone()));
     drop(runtime_jobs::episodes::spawn(state.clone()));
@@ -1089,10 +1113,15 @@ async fn async_main() {
             let Ok(exe) = std::env::current_exe() else {
                 return;
             };
-            let Ok(meta) = std::fs::metadata(&exe) else {
+            if std::fs::metadata(&exe).is_err() {
                 return;
-            };
-            let mut observed = meta.modified().ok();
+            }
+            // The receipt is watched too: a deploy with no compile re-stamps it
+            // and leaves the binary as it is.
+            let receipt = activation::receipt_path(&exe);
+            let stamp = || (std::fs::metadata(&exe).ok().and_then(|m| m.modified().ok()),
+                            std::fs::metadata(&receipt).ok().and_then(|m| m.modified().ok()));
+            let mut observed = stamp();
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             // An in-flight shell schedule run holds adoption, for at most
             // AMUX_ADOPT_SHELL_DEFER_MAX_S (default 900, like the builder's).
@@ -1103,8 +1132,8 @@ async fn async_main() {
             loop {
                 interval.tick().await;
                 jobs::tick(jobs::ids::SELF_ADOPT);
-                let current = std::fs::metadata(&exe).ok().and_then(|m| m.modified().ok());
-                if current.is_some() && current != observed {
+                let current = stamp();
+                if current.0.is_some() && current != observed {
                     let busy = runtime_jobs::scheduler::shell_runs_in_flight(defer_max);
                     if !busy.is_empty() {
                         let since = *defer_since.get_or_insert_with(std::time::Instant::now);
@@ -1141,7 +1170,7 @@ async fn async_main() {
                             continue;
                         }
                     };
-                    let running_commit = env!("AMUX_BUILD_COMMIT_FULL");
+                    let running_commit = activation::served().full.as_str();
                     if let Some(reason) = candidate.skip_reason(running_commit, &running_build) {
                         tracing::warn!(verdict = reason, pid = std::process::id(),
                             running_commit, running_build = %running_build,
@@ -1152,6 +1181,7 @@ async fn async_main() {
                     }
                     tracing::info!(pid = std::process::id(), running_commit, running_build = %running_build,
                         candidate_commit = ?candidate.commit, candidate_build = %candidate.build,
+                        revision_only = candidate.build == running_build,
                         "binary changed on disk — exec'ing the new build in place (self-adoption, \
                          AMUX-3458: no exit means no launchd throttle window)"
                     );
@@ -1287,6 +1317,10 @@ async fn async_main() {
     if let Some(apps_port) = api::static_files::apps_origin::apps_port(cfg.port) {
         let apps_addr = std::net::SocketAddr::new(addr.ip(), apps_port);
         let apps_tls = rustls_cfg.clone();
+        // Each app also gets a port of its own, with the app at `/`
+        // (static_files/app_ports.rs); apps that had one are served again now.
+        api::static_files::app_ports::set_tls(addr.ip(), rustls_cfg.clone());
+        api::static_files::app_ports::resume();
         tokio::spawn(async move {
             tracing::info!(%apps_addr, measured = true, n_considered = 1, verdict = "apps_origin_listening",
                 "apps origin listening: /app/<id>/ only");

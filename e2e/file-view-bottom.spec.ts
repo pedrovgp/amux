@@ -209,7 +209,7 @@ test('PDF final page remains reachable; cached Markdown still reaches the last l
     await page.evaluate(()=>(window as any).closeFilePreview());
     await page.route('**/api/file?**',r=>r.abort('internetdisconnected'));
     await page.evaluate(p=>(window as any).openFilePreview(p),cached);
-    await expect(page.locator('#file-title')).toContainText('cached');
+    await expect(page.locator('#file-fresh')).toContainText('Offline');
     await fits(page); await finalLine(page);
     await page.screenshot({path:info.outputPath('cached-markdown-final-line.png')});
   } finally { await cleanup('remove temp folder', () => rm(dir,{recursive:true,force:true})); }
@@ -229,7 +229,9 @@ test('a clipped file scrollport emits the existing server diagnostic without fil
     expect(JSON.stringify(data)).not.toContain(end);expect(JSON.stringify(data)).not.toContain(file);
     await page.locator('#file-overlay').evaluate(el=>{el.style.removeProperty('height');el.style.removeProperty('max-height');});
     await page.evaluate(()=>(window as any).closeFilePreview());
-    const binary=join(dir,'probe.bin');await writeFile(binary,Buffer.alloc(100));
+    // A centred card (file-image): an ebook format the browser cannot show.
+    // A plain binary opens to its preview now (file_viewer/preview.rs).
+    const binary=join(dir,'probe.djvu');await writeFile(binary,Buffer.alloc(100));
     await page.evaluate(p=>(window as any).openFilePreview(p),binary);
     const mediaBeacon=page.waitForRequest(r=>r.url().endsWith('/api/client-debug')&&r.postDataJSON()?.clipped?.includes('file-overlay:start-content-unreachable'));
     await page.locator('#file-body').evaluate(el=>{el.style.alignItems='center';(el.firstElementChild as HTMLElement).style.minHeight='2000px';el.scrollTop=0;});

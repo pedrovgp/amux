@@ -17,9 +17,11 @@ pub mod contract;
 pub mod deep_links;
 pub mod scratchpad;
 pub(crate) mod send_profile;
+pub(crate) mod board_groom;
 pub mod prompt_block;
 pub mod land_approvals;
 pub mod land_queue;
+pub mod land_red;
 pub mod worker_identity;
 pub mod contract_fresh;
 pub mod prod_change;
@@ -61,6 +63,7 @@ pub mod env_config;
 pub mod file_viewer;
 pub mod media_hls;
 pub mod files;
+pub mod file_visits;
 pub mod fs;
 pub mod git_guard;
 pub mod gmail;
@@ -78,6 +81,7 @@ pub mod harness;
 pub mod health;
 pub mod history;
 pub mod history_ask;
+pub mod history_ask_rank;
 pub mod history_backfill;
 pub mod interactions;
 pub mod invariants_api;
@@ -96,6 +100,8 @@ pub mod map_store;
 pub mod mcp;
 pub mod mdai;
 pub mod measured;
+pub mod decision_digest;
+pub mod directive;
 pub mod needs_input;
 pub mod needs_input_auto;
 pub mod memories;
@@ -105,12 +111,14 @@ pub(crate) mod cross_site;
 pub mod metrics;
 pub mod traces;
 pub mod observability;
+pub mod scoreboard;
 pub mod offline_origin;
 pub mod orchestrate;
 pub mod orchestrations;
 pub mod org;
 pub(crate) mod pane_prompts;
 pub mod pages;
+pub mod photos;
 pub mod palette;
 pub mod pinned;
 pub mod planning;
@@ -172,6 +180,7 @@ pub mod usage_accounts;
 pub mod verify;
 pub mod why;
 pub mod worker_create;
+pub mod outcome_plan;
 pub mod worker_exec;
 pub mod workers;
 mod worker_messaging;
@@ -228,6 +237,7 @@ pub fn router_with_connector_transport(
         .route("/api/sync", axum::routing::get(sync::delta_sync))
         .route("/api/events", axum::routing::get(sse::events))
         .nest("/api/board", board::routes())
+        .nest("/api/board-groom", board_groom::routes())
         // Dead-letter routes merge into the workers nest (RR-0068): same
         // /api/workers prefix, second nest at one path is an axum conflict.
         .nest(
@@ -240,6 +250,7 @@ pub fn router_with_connector_transport(
         )
         .route("/api/models", axum::routing::get(workers::model_catalog))
         .route("/api/peek/steps", axum::routing::get(session_verbs::peek_steps))
+        .route("/api/session-renames", axum::routing::get(session_verbs::session_renames))
         .route("/api/sessions/{name}/task-history", axum::routing::get(sessions_legacy::task_history))
         .route("/api/sessions/{name}/quota", axum::routing::get(agent_limit_resume::worker_quota))
         .route("/api/task-history", axum::routing::get(sessions_legacy::task_list))
@@ -319,6 +330,8 @@ pub fn router_with_connector_transport(
         // fleet substrate (env files + tmux + shared DB), api/session_verbs.rs.
         // Was PROXIED_FAMILIES' SessionVerbs row; the rust-worker 501 pointer
         // guard moved into the module's dispatch.
+        // The Photos tab's BYO Mixpeek connection (api/photos.rs).
+        .merge(photos::routes())
         .merge(palette::routes())
         .merge(session_verbs::routes())
         .merge(typing::routes())
@@ -397,10 +410,12 @@ pub fn router_with_connector_transport(
         .nest("/api/pinned", pinned::routes())
         // The New Worker / Connect modals' supporting reads (AMUX-2871).
         .merge(worker_create::routes())
+        .merge(outcome_plan::routes())
         .merge(worker_exec::routes())
         .nest("/api/saved-messages", saved_messages::routes())
         .merge(habits::routes())
         .merge(observability::routes())
+        .merge(scoreboard::routes())
         .merge(connectors::routes_with(connector_ctx.clone()))
         .nest("/api/telegram", telegram::routes_with(http))
         .merge(grants::routes())
@@ -409,6 +424,8 @@ pub fn router_with_connector_transport(
         // AMUX-5286: the owner's one-at-a-time triage queue.
         .merge(needs_input::routes())
         .merge(needs_input_auto::routes())
+        .merge(decision_digest::routes())
+        .merge(directive::routes())
         .merge(contract::routes())
         .merge(land_approvals::routes())
         .merge(bridge::routes())
@@ -609,7 +626,7 @@ pub fn router_with_connector_transport(
         )
         .route(
             "/api/page-links/{id}",
-            axum::routing::delete(static_files::public_links::revoke),
+            axum::routing::delete(static_files::public_links::revoke).patch(static_files::public_links::rename),
         )
         .route(
             "/api/page-links/{id}/approve",
@@ -993,7 +1010,7 @@ pub(crate) fn py_truthy(v: &serde_json::Value) -> bool {
 /// it a table (D1: "in-memory state is fiction").
 /// GET /api/debug/sse — is the realtime backbone actually carrying the fleet?
 ///
-/// AF-262. `.claude/rules/sse-realtime.md` states the failure mode plainly:
+/// AF-262. `crates/amux-dashboard/CLAUDE.md (Realtime)` states the failure mode plainly:
 /// clients declare SSE stale after 18s of silence and FALL BACK TO POLLING,
 /// and the fallback fetches both sessions and board. So an SSE degradation
 /// shows up as a rise in ordinary poll traffic, which is indistinguishable
@@ -1128,9 +1145,24 @@ pub(crate) fn ui_stuck_snapshot() -> Option<StuckTally> {
 /// One such report from a background tab failed the fleet invariant and
 /// filed a card. The tab retries when it is shown, and a stall that a person
 /// can see arrives with hidden=0. Still logged, at INFO, with the reason.
+///
+/// A BOUNDED WAIT THAT RECOVERED IS NOT A STUCK CONTROL EITHER (AF-1050). A
+/// beacon whose own `waited_ms` is under [`UI_STUCK_MIN_WAIT_MS`] reports a
+/// designed recovery: the outbox steals a frozen window's replay lock after
+/// 1.5 s and sends (`action:"stole"`), and storage already known dead is given
+/// 250 ms before the pass goes on. On 2026-10-30, after AF-1008 shipped, those
+/// two were 19 of the 22 reports keeping this invariant red, all from one Mac
+/// app. Every other stuck verdict waits 3 s or more (storage steal 3 s, queue
+/// 3 s, attachment save 8 s, delivery steal 30 s), and a first storage timeout
+/// still holds the send 5 s, so those still count.
 pub(crate) fn counts_as_stuck(body: &serde_json::Value) -> bool {
-    !matches!(body.get("hidden"), Some(v) if v.as_i64() == Some(1) || v.as_bool() == Some(true))
+    let hidden = matches!(body.get("hidden"), Some(v) if v.as_i64() == Some(1) || v.as_bool() == Some(true));
+    let recovered = body.get("waited_ms").and_then(|v| v.as_i64()).is_some_and(|ms| ms < UI_STUCK_MIN_WAIT_MS);
+    !hidden && !recovered
 }
+
+/// Below this, a stuck-UI beacon's own wait was a designed recovery (AF-1050).
+pub(crate) const UI_STUCK_MIN_WAIT_MS: i64 = 2_000;
 
 const CLIENT_DEBUG_RING_MAX: usize = 500;
 
@@ -1183,9 +1215,14 @@ async fn client_debug_post(
     // A stuck control or view: counted and said at WARN (see UI_STUCK_VERDICTS).
     let verdict = body.get("verdict").or_else(|| body.get("action")).and_then(|v| v.as_str()).unwrap_or("");
     if UI_STUCK_VERDICTS.contains(&verdict) && !counts_as_stuck(&body) {
+        let reason = if body.get("waited_ms").and_then(|v| v.as_i64()).is_some_and(|ms| ms < UI_STUCK_MIN_WAIT_MS) {
+            "recovered within its bounded wait"
+        } else {
+            "hidden tab"
+        };
         tracing::info!(kind = %kind, verdict, client = %client, measured = true, n_considered = 1,
-            payload = %body, reason = "hidden tab",
-            "client UI stall in a hidden tab: logged, not counted (ui.controls_do_not_stick)");
+            payload = %body, reason,
+            "client UI stall that a person did not see stuck: logged, not counted (ui.controls_do_not_stick)");
     } else if UI_STUCK_VERDICTS.contains(&verdict) {
         tracing::warn!(kind = %kind, verdict, client = %client, measured = true, n_considered = 1,
             payload = %body, "client UI stuck: a control or view did not settle (ui.controls_do_not_stick)");
@@ -1625,5 +1662,21 @@ mod ui_stuck_hidden_tests {
         assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_flight_stalled", "hidden": true})));
         assert!(super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout", "hidden": 0})));
         assert!(super::counts_as_stuck(&json!({"verdict": "composer_send_stuck"})), "no visibility recorded still counts");
+    }
+
+    /// AF-1050: the outbox's designed recoveries (a 1.5 s lock steal, the 250 ms
+    /// dead-storage wait) are not stuck controls; a 5 s first storage timeout,
+    /// and every verdict with no wait recorded, still are.
+    #[test]
+    fn a_bounded_wait_that_recovered_does_not_count_as_a_stuck_control() {
+        use serde_json::json;
+        assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_replay_lock_stalled",
+            "action": "stole", "waited_ms": 1500, "hidden": 0})));
+        assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout",
+            "after_reset": 1, "waited_ms": 250, "hidden": 0})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout",
+            "after_reset": 0, "waited_ms": 5000, "hidden": 0})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "message_queue_stalled_sent_direct", "waited_ms": 3000})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "outbox_flight_stalled", "hidden": 0})));
     }
 }

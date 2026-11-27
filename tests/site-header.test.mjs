@@ -34,3 +34,19 @@ test('the checker catches an old header and --fix repairs it', () => {
   assert.deepEqual(problems('walkthrough/index.html', fixed), []);
   assert.ok(fixed.includes(expectedHeader('walkthrough/index.html')));
 });
+
+test('a redirect-only page needs no header, and a page that merely mentions refresh still does', () => {
+  const stub = `<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0; url=/demos/messages/"></head><body><p>moved</p></body></html>`;
+  assert.deepEqual(problems('demos/old/index.html', stub), []);
+  const page = `<!DOCTYPE html><html><head></head><body><p>http-equiv="refresh" is how a stub redirects</p></body></html>`;
+  assert.ok(problems('demos/old/index.html', page).length > 0);
+});
+
+test('the baked star count is one number: the header generator and site.js agree', async () => {
+  const { STARS } = await import('../scripts/site-header.mjs');
+  const js = fs.readFileSync(path.join(SITE, 'site.js'), 'utf8');
+  const fallback = (js.match(/var STARS_FALLBACK = (\d+);/) || [])[1];
+  assert.equal(fallback, STARS, 'scripts/site-header.mjs STARS and site.js STARS_FALLBACK');
+  const home = fs.readFileSync(path.join(SITE, 'index.html'), 'utf8');
+  for (const n of home.match(/class="(?:count )?gh-stars">(\d+)</g) || []) assert.ok(n.includes(`>${STARS}<`), n);
+});

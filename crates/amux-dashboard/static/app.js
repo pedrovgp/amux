@@ -231,6 +231,144 @@ function _amuxClientIdentity() {
   };
 })();
 
+// ── A renamed worker's old name follows to the new one (2026-11-06) ──
+//
+// `workflows` became `wexus`; a phone that still had `workflows` open kept
+// sending to it, and its outbox said "the worker did not accept it" with a
+// Send again that retried the same dead name. The server now serves an old
+// name as the worker it became (and says so in `x-amux-renamed-to`), and
+// GET /api/session-renames lists every retired name. This rewrites the names
+// this app stored (the open worker, queued sends, the split panes, the grid
+// order) so the app stops asking for a worker that is gone. Runs at load and
+// whenever an answer says a name was renamed or not found.
+function _workerRenameRewrite(value, map) {
+  const urlRe = /(\/api\/(?:sessions|workers)\/)([^/?#]+)/g;
+  let changed = false;
+  const walk = v => {
+    if (typeof v === 'string') {
+      if (Object.prototype.hasOwnProperty.call(map, v)) { changed = true; return map[v]; }
+      if (v.indexOf('/api/') < 0 && v.indexOf('#peek=') < 0) return v;
+      const out = v.replace(urlRe, (m, pre, n) => {
+        const name = decodeURIComponent(n);
+        if (!Object.prototype.hasOwnProperty.call(map, name)) return m;
+        changed = true;
+        return pre + encodeURIComponent(map[name]);
+      }).replace(/(#peek=)([^&]+)/, (m, pre, n) => {
+        const name = decodeURIComponent(n);
+        if (!Object.prototype.hasOwnProperty.call(map, name)) return m;
+        changed = true;
+        return pre + encodeURIComponent(map[name]);
+      });
+      return out;
+    }
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === 'object') {
+      const o = {};
+      for (const [k, x] of Object.entries(v)) {
+        const key = Object.prototype.hasOwnProperty.call(map, k) ? (changed = true, map[k]) : k;
+        o[key] = walk(x);
+      }
+      return o;
+    }
+    return v;
+  };
+  const out = walk(value);
+  return {value: out, changed};
+}
+// Stored values that hold worker names. Board, history and pins live on the
+// server, which the rename already carried.
+const _WORKER_NAME_KEYS = ['amux_offline_queue', 'amux_peek_state', 'amux_peek_split_panes', 'amux_card_order'];
+async function _applyWorkerRenames(map) {
+  if (!map || typeof map !== 'object' || !Object.keys(map).length) return 0;
+  let rewritten = 0;
+  for (const [store, keys] of [[localStorage, _WORKER_NAME_KEYS], [sessionStorage, ['peekState']]]) {
+    for (const key of keys) {
+      if (key === 'amux_offline_queue') continue;
+      try {
+        const raw = store.getItem(key);
+        if (raw === null) continue;
+        const r = _workerRenameRewrite(JSON.parse(raw), map);
+        if (r.changed) { store.setItem(key, JSON.stringify(r.value)); rewritten++; }
+      } catch (e) { console.warn('[rename] could not rewrite a stored name', e); }
+    }
+  }
+  // The outbox goes through its own lock, so a delivery in flight is not raced.
+  try {
+    if (typeof _mutateQueue === 'function') {
+      await _mutateQueue(current => {
+        let n = 0;
+        for (let i = 0; i < current.length; i++) {
+          const r = _workerRenameRewrite(current[i], map);
+          if (r.changed) {
+            // A send refused only because its name was gone is sendable again.
+            const q = r.value;
+            if (q.state === 'blocked' || q.needs_decision) Object.assign(q, {state: 'pending', needs_decision: '', error: '', attempts: 0});
+            current[i] = q; n++;
+          }
+        }
+        if (n) rewritten++;
+      });
+    }
+  } catch (e) { console.warn('[rename] could not rewrite the outbox', e); }
+  try { if (typeof cardOrder !== 'undefined' && Array.isArray(cardOrder)) cardOrder = cardOrder.map(n => map[n] || n); } catch (e) { console.warn('[rename] could not rewrite the card order', e); }
+  try { if (typeof _peekSplitPanes !== 'undefined' && Array.isArray(_peekSplitPanes)) _peekSplitPanes = _peekSplitPanes.map(n => map[n] || n); } catch (e) { console.warn('[rename] could not rewrite the split panes', e); }
+  let reopened = '';
+  try {
+    if (typeof peekSession !== 'undefined' && peekSession && map[peekSession] && typeof openPeek === 'function') {
+      reopened = map[peekSession];
+      openPeek(reopened, typeof _peekTab === 'string' && _peekTab ? {tab: _peekTab} : undefined);
+    } else {
+      const h = _workerRenameRewrite(location.hash, map);
+      if (h.changed) history.replaceState(history.state, '', location.pathname + location.search + h.value);
+    }
+  } catch (e) { console.warn('[rename] could not reopen the renamed worker', e); }
+  try { amuxTrack('worker_renames_applied', {measured: true, n_considered: Object.keys(map).length, rewritten, reopened, verdict: rewritten || reopened ? 'renamed_names_rewritten' : 'renamed_names_none_stored'}); } catch (e) { console.warn('[rename] rename beacon failed', e); }
+  try { if (typeof _peekMessagesRender === 'function') _peekMessagesRender(); } catch (e) { console.warn('[rename] could not redraw messages after a rename', e); }
+  return rewritten;
+}
+let _workerRenamesInFlight = null;
+let _workerRenamesAgain = false;
+function _syncWorkerRenames() {
+  // A request during a sync (or its 2s hold) may follow a rename that sync's
+  // answer predates: the load-time sync read the list, a rename landed, and
+  // the next "renamed" answer got the stale result, so a queued send kept the
+  // old name. Ask once more after the hold rather than dropping it.
+  if (_workerRenamesInFlight) { _workerRenamesAgain = true; return _workerRenamesInFlight; }
+  _workerRenamesInFlight = (async () => {
+    try {
+      const r = await fetch('/api/session-renames', {cache: 'no-store'});
+      if (!r.ok) return 0;
+      const d = await r.json();
+      return await _applyWorkerRenames(d && d.renames);
+    } catch (e) { console.warn('[rename] could not read the rename list', e); return 0; } finally {
+      setTimeout(() => {
+        _workerRenamesInFlight = null;
+        if (_workerRenamesAgain) { _workerRenamesAgain = false; _syncWorkerRenames(); }
+      }, 2000);
+    }
+  })();
+  return _workerRenamesInFlight;
+}
+window._workerRenameRewrite = _workerRenameRewrite;
+window._applyWorkerRenames = _applyWorkerRenames;
+window._syncWorkerRenames = _syncWorkerRenames;
+(function installRenamedWorkerWatch() {
+  const _origFetch = window.fetch;
+  window.fetch = function(input, init) {
+    const p = _origFetch.call(this, input, init);
+    try {
+      const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input || ''));
+      if (!/\/api\/(sessions|workers)\/[^/?]+/.test(url)) return p;
+      p.then(r => {
+        if (r && (r.headers.get('x-amux-renamed-to') || r.status === 404)) _syncWorkerRenames();
+      }, () => {});
+    } catch (e) { console.warn('[rename] rename watch could not read a fetch URL', e); }
+    return p;
+  };
+  const start = () => setTimeout(() => _syncWorkerRenames(), 1500);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+})();
+
 // ── A 200 is not proof the edit was applied (AMUX-2673, after AC-323) ──
 //
 // The API names unapplied request fields in `ignored_fields` (AC-263). Nothing
@@ -992,6 +1130,7 @@ async function _upgradeCheckout(billing) {
 }
 
 let sessions = [];
+let _sessionsReadAt = 0;   // when the worker list was last read from the server (_waitingNow)
 // A stream update and a poll response are two snapshots of the same runtime
 // truth. A request begun before an SSE update must not finish later and put the
 // old task attribution back on screen.
@@ -1033,22 +1172,40 @@ let _logSearchAbort = null;
 let filterProviders = new Set();   // 'claude' | 'codex' | 'gemini' | 'iterm2' | 'ollama' | 'grok' | 'muse'
 let filterStatuses = new Set();    // 'working' | 'blocked' | 'waiting' | 'idle' | 'stopped'
 // Stable status key for filtering: card WORKING = 'active' internally.
-function _sessStatusKey(s) {
-  if (s.status === 'starting') return 'starting';
-  if (!s.running) return 'stopped';
-  if (s.agent_state === 'unknown') return 'unknown';
-  if (s.status === 'rate_limited') return 'rate_limited';
-  if (s.status === 'api_error') return 'api_error';
-  if (s.status === 'error') return 'error';
-  if (s.status === 'unattributed') {
-    const rb = s.runtime_board || {};
-    return rb.runtime_status === 'active' ? 'working' : 'waiting';
-  }
-  if (s.status === 'blocked') return 'blocked';
-  if (s.status === 'active') return 'working';
-  if (s.status === 'waiting') return 'waiting';
-  return 'idle';
+// THE ONE CLIENT READING of a worker's status (implicit state machines
+// inventory 2026-10-31, #1). The card badge, the status filter and groups,
+// the sort, the grid dots and the board's is:working/is:waiting all read this,
+// so they cannot disagree. Before, the badge checked `waiting` before
+// `!running` and the filter the other way round: a stopped worker carrying a
+// stale waiting/owner showed "Needs input" on its card and filtered as
+// stopped; a paused worker still running filtered as working; the grid dot
+// showed a guessed (`unknown`) status as green.
+// `key` is what the badge shows; `group` is the filter/bucket it belongs to.
+// When the worker last did anything. last_activity is the last human or
+// message interaction, so a worker on a long run read "WORKING 12h ago".
+function _lastSeen(s) {
+  return Math.max(s.last_activity || 0, Math.floor(s.last_progress_at || 0));
 }
+
+function _workerStatus(s) {
+  const g = (key, group) => ({ key, group: group || key });
+  if (_workerLifecyclePending.has(s.name)) return g('pending', 'starting');
+  if (s.lifecycle === 'paused') return s.running ? g('pause_incomplete', 'blocked') : g('paused', 'stopped');
+  if (s.status === 'starting') return g('starting');
+  if (!s.running) return g('stopped');
+  if (s.agent_state === 'unknown') return g('unknown');
+  if (s.status === 'active' && s.activity === 'api_retry') return g('retrying', 'working');
+  if (s.status === 'active' && s.activity === 'background_shell') return g('background', 'working');
+  if (s.status === 'waiting') return s.waiting_reason === 'owner' ? g('needs_input', 'waiting') : g('waiting');
+  if (s.status === 'error') return g('error');
+  if (s.status === 'active') return g('working');
+  if (s.status === 'unattributed') return g('unattributed', (s.runtime_board || {}).runtime_status === 'active' ? 'working' : 'waiting');
+  if (s.status === 'blocked') return g('blocked');
+  if (s.status === 'rate_limited') return g('rate_limited');
+  if (s.status === 'api_error') return g('api_error');
+  return g('idle');
+}
+function _sessStatusKey(s) { return _workerStatus(s).group; }
 let filterModels = new Set();      // typed model family/capability from /api/models
 // Group pills HIDE as well as filter (Ethan, 2026-09-24: "press a pill/group
 // and that will hide them from the list"). A tap cycles neutral -> only this
@@ -2246,6 +2403,9 @@ async function _cloudOfferTry(trigger, worker) {
   if (!st || st.dismissed || st[trigger] || document.getElementById('cloud-offer')) return;
   const setup = document.getElementById('apikey-setup-modal');
   if (setup && setup.style.display === 'flex') return;   // first run comes first
+  // Not over an open file or worker: it covered the markdown editor's text on a phone
+  // (2026-10-31). Left unmarked, so it is offered again on the next trigger.
+  if (document.querySelector('#file-overlay.active, #peek-overlay.active')) return;
   _cloudOfferMark(trigger);
   _cloudOfferShow(trigger, worker);
 }
@@ -2810,13 +2970,20 @@ function _connectionSessionControls() {
   if (cloud) cloud.style.display = inApp ? '' : 'none';
   const out = document.getElementById('connection-sign-out');
   if (out && inApp) out.textContent = 'Sign out and switch server';
+  // A server behind the sign-in door (amux Cloud and dedicated hosts): its owner limits which
+  // addresses may reach it on the door's own page (cloud/desktop/door.py, /_door/allowlist).
+  const allow = document.getElementById('connection-allowlist');
+  if (allow) allow.style.display = _onDoorHost() ? '' : 'none';
+}
+function _onDoorHost() {
+  return /\.amux\.io$/.test(location.hostname) && location.hostname !== 'cloud.amux.io';
 }
 // Sign out of this server on this device (2026-10-17). In the iOS app, back to its setup
 // screen (an address, or amux Cloud sign-in). On an amux Cloud server, the door's logout.
 // Elsewhere the owner/member cookies end and the page reloads to its sign-in.
 async function _connectionSignOut() {
   if (_appBridge('switch-server')) return;
-  if (/\.amux\.io$/.test(location.hostname) && location.hostname !== 'cloud.amux.io') {
+  if (_onDoorHost()) {
     location.assign('/_door/logout');
     return;
   }
@@ -4552,7 +4719,24 @@ async function _pendingSummary() {
   try { clips = ((await _idb.get('dict_pending')) || []).filter(x => x.state !== 'done'); } catch (e) {}
   const bytes = files.reduce((a, x) => a + (x.size || 0), 0)
               + clips.reduce((a, x) => a + ((x.blob && x.blob.size) || 0), 0);
-  return { files: files.length, clips: clips.length, total: files.length + clips.length, bytes };
+  // A clip past its automatic retries is waiting for a person, not sending.
+  const held = clips.filter(x => (x.attempts || 0) >= _DICT_MAX_AUTO && x.state !== 'sending');
+  // Sending only while a send is live; a clip that failed and waits for its next
+  // try says so, with its error, rather than reading "sending" (owner, 2026-10-31).
+  const sending = clips.filter(x => x.state === 'sending' && !_dictSendingStale(x));
+  const waiting = clips.filter(x => !held.includes(x) && !sending.includes(x));
+  return { files: files.length, clips: clips.length, total: files.length + clips.length, bytes,
+    clipsHeld: held.length, clipsSending: sending.length, clipsWaiting: waiting.length,
+    clipError: ((waiting[0] || held[0] || {}).error || ''),
+    clipSession: (held[0] || clips[0] || {}).session || '' };
+}
+// The recordings live in a worker's Dictation tab, which lists each one with
+// Play, Retry and Delete; the Files pill opens it.
+function _upqOpenRecordings(session) {
+  const s = session || (typeof peekSession !== 'undefined' && peekSession) || ((sessions || [])[0] || {}).name;
+  if (!s) return;
+  openPeek(s);
+  setPeekTab('dictation');
 }
 
 function _fmtPendingBytes(b) {
@@ -4572,7 +4756,16 @@ async function _upqRenderBadge() {
     if (p.clips) parts.push(p.clips + ' recording' + (p.clips === 1 ? '' : 's'));
     el.style.display = '';
     el.textContent = parts.join(' + ') + ' queued (' + _fmtPendingBytes(p.bytes) + ')'
-      + (online ? ' \u2014 sending\u2026' : ' \u2014 waiting for connection');
+      + (!online ? ' \u2014 waiting for connection'
+        : p.clipsHeld ? ' \u2014 ' + p.clipsHeld + ' not sent, open to retry'
+        : p.clips && !p.clipsSending ? ' \u2014 retrying soon' + (p.clipError ? ' (' + p.clipError.slice(0, 60) + ')' : '')
+        : ' \u2014 sending\u2026');
+    // Recordings are handled in the Dictation tab; say so and go there.
+    el.classList.toggle('upq-badge-link', !!p.clips);
+    el.title = p.clips ? 'Open the Dictation tab, where each recording can be played, retried or deleted' : '';
+    el.onclick = p.clips ? () => _upqOpenRecordings(p.clipSession) : null;
+    if (p.clips) { el.setAttribute('role', 'button'); el.tabIndex = 0; el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _upqOpenRecordings(p.clipSession); } }; }
+    else { el.removeAttribute('role'); el.removeAttribute('tabindex'); el.onkeydown = null; }
   });
 }
 
@@ -4684,6 +4877,58 @@ let _upqResetSinceOk = false;
 // The hung read keeps running, and if it ever completes it clears the flag,
 // so storage that is slow rather than dead gets the full 5s on the next pass.
 const _UPQ_DEAD_MS = 250;
+// ONE REPORT PER EPISODE, NOT PER PASS (AF-1117). With storage dead for
+// hours, every outbox pass beaconed the same timeout: 3,846 reports in one
+// log from two WebKit clients. The first timeout of an episode reports at
+// once, later ones at most every _UPQ_REPORT_EVERY_MS with how many were
+// folded in, and the first good read reports the episode's length.
+const _UPQ_REPORT_EVERY_MS = 10 * 60 * 1000;
+let _upqEpisode = null; // {start, last, folded, timeouts}
+// HOW BIG IS THE STORAGE THAT STOPPED ANSWERING (AF-1166). On 2026-11-02 every
+// window of one Mac app timed out on IndexedDB reads, about 200 resets an hour
+// each, while reads still finished now and then. Slow and dead read the same
+// from here, and so does a large origin. Each report carries the origin's
+// usage and quota from the last estimate that answered, how long it took, and
+// how many asks are still out: an estimate that never answers says the storage
+// process itself is stuck, not this store.
+const _upqEstimate = {asked: 0, answered: 0, usage: null, quota: null, ms: null};
+function _upqStorageFields() {
+  const est = typeof navigator !== 'undefined' && navigator.storage && navigator.storage.estimate;
+  // Read before asking again, so an ask counts as unanswered only once a later
+  // report finds it still out.
+  const fields = {usage_bytes: _upqEstimate.usage, quota_bytes: _upqEstimate.quota, estimate_ms: _upqEstimate.ms,
+    estimates_unanswered: est ? _upqEstimate.asked - _upqEstimate.answered : null};
+  if (est && _upqEstimate.asked === _upqEstimate.answered) {
+    _upqEstimate.asked++;
+    const t0 = Date.now();
+    navigator.storage.estimate()
+      .then(e => { _upqEstimate.usage = e.usage ?? null; _upqEstimate.quota = e.quota ?? null; _upqEstimate.ms = Date.now() - t0; })
+      .catch(() => {})
+      .finally(() => { _upqEstimate.answered++; });
+  }
+  return fields;
+}
+function _upqTimeoutReport(fields) {
+  const now = Date.now();
+  if (!_upqEpisode) {
+    _upqEpisode = {start: now, last: now, folded: 0, timeouts: 1};
+    _outboxDiagnostic('outbox_upload_list_timeout', Object.assign({episode_start: 1}, _upqStorageFields(), fields));
+    return;
+  }
+  _upqEpisode.timeouts++;
+  if (now - _upqEpisode.last < _UPQ_REPORT_EVERY_MS) { _upqEpisode.folded++; return; }
+  _outboxDiagnostic('outbox_upload_list_timeout', Object.assign({folded: _upqEpisode.folded,
+    episode_s: Math.round((now - _upqEpisode.start) / 1000)}, _upqStorageFields(), fields));
+  _upqEpisode.last = now;
+  _upqEpisode.folded = 0;
+}
+function _upqReadOk() {
+  _upqResetSinceOk = false;
+  if (!_upqEpisode) return;
+  _outboxDiagnostic('outbox_upload_list_recovered', Object.assign({timeouts: _upqEpisode.timeouts,
+    episode_s: Math.round((Date.now() - _upqEpisode.start) / 1000)}, _upqStorageFields()));
+  _upqEpisode = null;
+}
 function _upqListBounded(ms) {
   if (ms == null) ms = _upqResetSinceOk ? _UPQ_DEAD_MS : 5000;
   let timer;
@@ -4692,10 +4937,10 @@ function _upqListBounded(ms) {
   // as a 255 s frozen-page "stall"). Give the read one fresh window instead.
   let t0 = Date.now(), rearmed = false;
   return Promise.race([
-    _upqList().then(rows => { _upqResetSinceOk = false; return rows; }).catch(() => []),
+    _upqList().then(rows => { _upqReadOk(); return rows; }).catch(() => []),
     new Promise(resolve => { const fire = () => {
       if (!rearmed && Date.now() - t0 > ms + 10000) { rearmed = true; t0 = Date.now(); timer = setTimeout(fire, ms); return; }
-      _outboxDiagnostic('outbox_upload_list_timeout', {waited_ms:ms, after_reset:_upqResetSinceOk ? 1 : 0, hidden:typeof document !== 'undefined' && document.hidden ? 1 : 0});
+      _upqTimeoutReport({waited_ms:ms, after_reset:_upqResetSinceOk ? 1 : 0, hidden:typeof document !== 'undefined' && document.hidden ? 1 : 0});
       _idb.reset('upload_list_timeout');
       _upqResetSinceOk = true;
       resolve([]);
@@ -5037,7 +5282,7 @@ async function _runSyncBanner(quiet = false, token = null) {
         // 5xx on its own to trip the route.mounted_routes_answer invariant
         // (AMUX-4900) where it was then filed as a server fault.
         if (!retryableMessageRefusal && (_outboxPermanentRefusal(r.status)
-          || !(r.status >= 500 || [401, 408, 429].includes(r.status)))) q.state = 'blocked';
+          || !(r.status >= 500 || [401, 408, 429].includes(r.status)))) Object.assign(q, {state: 'blocked', refused_status: r.status});
         throw new Error(await _apiErrText(r));
       }
       if (/\/api\/board\/[^/?]+$/.test(q.url) && (q.options.method || '').toUpperCase() === 'PATCH') {
@@ -5072,7 +5317,7 @@ async function _runSyncBanner(quiet = false, token = null) {
       } else if (e.outboxBlocked) q.state = 'blocked';
       if (_outboxIsMessage(q) && !q.needs_decision) {
         if (q.delivery_uncertain && q.checking_since && Date.now() - q.checking_since > _OUTBOX_DECIDE_AFTER_MS) _outboxMarkDecision(q, 'unconfirmed');
-        else if (q.state === 'blocked' && !q.delivery_uncertain) _outboxMarkDecision(q, 'refused');
+        else if (q.state === 'blocked' && !q.delivery_uncertain) _outboxBlockedMessageDecision(q);
       }
       if (!q.needs_decision) q.error = q.delivery_uncertain && _outboxMessageId(q)
         ? 'Awaiting confirmation — checking automatically' : String(e.message || e);
@@ -5080,7 +5325,7 @@ async function _runSyncBanner(quiet = false, token = null) {
         ...(q.delivery_uncertain ? {measured:false, why_unmeasured:'Server has not confirmed message acceptance'} : {}), feedback:{message:q.error}});
       q.attempts = (q.attempts || 0) + 1;
       _writeError = q.error;
-      await _mutateQueue(current => { const saved = current.find(entry => entry.id === q.id); if (saved) Object.assign(saved, {state: q.state, error: q.error, attempts: q.attempts, delivery_uncertain:!!q.delivery_uncertain, checking_since:q.checking_since || 0, needs_decision: q.needs_decision || ''}); });
+      await _mutateQueue(current => { const saved = current.find(entry => entry.id === q.id); if (saved) Object.assign(saved, {state: q.state, error: q.error, attempts: q.attempts, delivery_uncertain:!!q.delivery_uncertain, checking_since:q.checking_since || 0, needs_decision: q.needs_decision || '', refused_status: q.refused_status || 0}); });
       if (!q.needs_decision) failedResources.add(q.url);
       item.status = q.delivery_uncertain ? 'checking' : 'failed';
       item.label += ' — ' + q.error;
@@ -5311,10 +5556,35 @@ function _outboxIsMessage(q) {
 function _outboxNeedsDecision(q) {
   return !!(q && _outboxIsMessage(q) && q.needs_decision);
 }
+// "The worker did not accept it" is a claim about the SERVER'S ANSWER, so it
+// needs one (refused_status). A send that got no answer at all (WebKit's
+// "Fetch is aborted" on a reload or a dropped connection) was labelled refused
+// over a message the server never saw (owner, 2026-10-30: "mixpeek-vision and
+// other workers messages are not going thru"). It is sent again on its own,
+// with the same msg_id, so send_dedup never pastes it twice. After the attempt
+// cap it asks the reader, saying it never reached the server.
+// The server's answer: the recorded status, or for an entry stored before it
+// was recorded, the "409: ..." or "Error: 409" _apiErrText made its error.
+function _outboxServerAnswered(q) {
+  return !!(q.refused_status || /^(?:Error: )?[1-5]\d\d\b/.test(String(q.error || '')));
+}
+function _outboxBlockedMessageDecision(q, now = Date.now()) {
+  // Without a msg_id a resend could paste twice, so it waits for the reader.
+  if (_outboxServerAnswered(q) || !_outboxMessageId(q)) return _outboxMarkDecision(q, 'refused', now);
+  if ((q.attempts || 0) < 5) return _outboxRearmUnreached(q, 'no_server_answer');
+  return _outboxMarkDecision(q, 'unreached', now);
+}
+function _outboxRearmUnreached(q, why) {
+  try { _outboxDiagnostic('outbox_unanswered_send_rearmed', {id: q.id, msg_id: _outboxMessageId(q), why,
+    error: String(q.error || '').slice(0, 120), attempts: q.attempts || 0, measured: true, n_considered: 1}); } catch (_) {}
+  return Object.assign(q, {needs_decision: '', state: 'pending', delivery_uncertain: false,
+    attempts: why === 'mislabelled_refused' ? 0 : (q.attempts || 0)});
+}
 function _outboxMarkDecision(q, reason, now = Date.now()) {
   Object.assign(q, {needs_decision: reason, state: 'blocked', delivery_uncertain: false,
     error: reason === 'unconfirmed' ? 'Not confirmed by the worker; it may already be there'
          : reason === 'stale' ? 'Saved on this device and never sent'
+         : reason === 'unreached' ? 'Never reached the server: ' + String(q.error || 'no answer')
          : (q.error && !/^Awaiting confirmation/.test(q.error) ? q.error : 'The worker did not accept it')});
   try { amuxTrack('outbox_needs_decision', {id: q.id, reason, measured: true, n_considered: 1,
     age_ms: now - (q.timestamp || now)}); } catch (_) {}
@@ -5325,10 +5595,15 @@ function _outboxMarkDecision(q, reason, now = Date.now()) {
 function _outboxSettleDecisions(list, now = Date.now()) {
   let changed = 0;
   for (const q of list) {
+    // Labelled "refused" before 2026-10-30 with no answer from the server: the
+    // send was cut off (a reload, a dropped connection). Deliver it after all.
+    if (_outboxIsMessage(q) && q.needs_decision === 'refused' && !_outboxServerAnswered(q) && _outboxMessageId(q) && !_outboxActive.has(q.id)) {
+      _outboxRearmUnreached(q, 'mislabelled_refused'); changed++; continue;
+    }
     if (!_outboxIsMessage(q) || q.needs_decision || _outboxActive.has(q.id)) continue;
     const uncertain = _outboxUncertainMessage(q);
     if (uncertain && q.checking_since && now - q.checking_since > _OUTBOX_DECIDE_AFTER_MS) { _outboxMarkDecision(q, 'unconfirmed', now); changed++; }
-    else if (q.state === 'blocked' && !uncertain) { _outboxMarkDecision(q, 'refused', now); changed++; }
+    else if (q.state === 'blocked' && !uncertain) { _outboxBlockedMessageDecision(q, now); changed++; }
     else if (!uncertain && !q.attempted_at && !q.attempts && now - (q.timestamp || now) > _OUTBOX_STALE_SEND_MS) { _outboxMarkDecision(q, 'stale', now); changed++; }
   }
   return changed;
@@ -6312,9 +6587,33 @@ function _notifPush(icon, title, body, session, card) {
   _notifFireNative(title, body, session, card);
 }
 
+// One device alert per transition, however many tabs are open. Each tab runs
+// its own edge detector (implicit state machines inventory 2026-10-31, #30),
+// so the same "needs input" fired once per tab and Mac-app window. The first
+// tab to claim the notification's signature in the shared record fires it;
+// the Web Lock makes the check-and-set atomic across tabs where supported.
+const _NOTIF_CLAIM_KEY = 'amux_notif_claim';
+function _notifClaimOnce(sig) {
+  const claim = () => {
+    let prev = {};
+    try { prev = JSON.parse(localStorage.getItem(_NOTIF_CLAIM_KEY) || '{}'); } catch (e) {}
+    if (prev.sig === sig && Date.now() - (prev.ts || 0) < 20000) return false;
+    try { localStorage.setItem(_NOTIF_CLAIM_KEY, JSON.stringify({ sig, ts: Date.now() })); } catch (e) {}
+    return true;
+  };
+  // WebKit syncs localStorage between tabs after the lock is released, so the
+  // holder waits long enough to read the previous holder's claim.
+  if (navigator.locks && navigator.locks.request) return navigator.locks.request('amux-notif-claim', () => new Promise(r => setTimeout(() => r(claim()), 120))).catch(() => claim());
+  return Promise.resolve(claim());
+}
+
 async function _notifFireNative(title, body, session, card) {
   if (!amuxNotifyAllowed('native')) return;
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  if (!(await _notifClaimOnce(title + '|' + (body || '') + '|' + (session || '')))) {
+    try { amuxTrack('notif_native_deduped', { measured: true, n_considered: 1 }); } catch (e) {}
+    return;
+  }
   const opts = {
     body, icon: '/icon-192.png', badge: '/icon-192.png',
     tag: 'amux-' + (session || Date.now()), renotify: true, silent: false,
@@ -6694,8 +6993,20 @@ function _fireAmuxAlert(a) {
   _notifPush(icon, title, body, a.session || '', /^[A-Za-z0-9_-]+$/.test(card) ? card : '');
 }
 
+let _transitionsCheckedAt = 0;
 function _checkSessionTransitions(newData) {
   if (_initialLoad) return;
+  // A tab that saw nothing for a minute (asleep, offline, backgrounded) would
+  // diff against a stale snapshot and announce long-past changes as new, such
+  // as a "finished" from an hour ago. Re-baseline instead (#30).
+  const now = Date.now();
+  const stale = _transitionsCheckedAt && now - _transitionsCheckedAt > 60000;
+  _transitionsCheckedAt = now;
+  if (stale) {
+    for (const s of newData) _prevSessionState[s.name] = { status: s.status, running: s.running, goal: s.goal?.state };
+    try { amuxTrack('notif_transitions_rebaselined', { measured: true, n_considered: newData.length }); } catch (e) {}
+    return;
+  }
   for (const s of newData) {
     const prev = _prevSessionState[s.name];
     if (!prev) { _prevSessionState[s.name] = { status: s.status, running: s.running, goal: s.goal?.state }; continue; }
@@ -6961,13 +7272,15 @@ async function _fetchSessionsOnce() {
     const firstLoad = _initialLoad;
     _initialLoad = false;
     _sessionReadRecovered();
+    _sessionsReadAt = Date.now();
     if (firstLoad) render();
     if (!online) setOnline(true);
     const j = JSON.stringify(data);
     if (j !== lastSessionsJSON) {
       _checkSessionTransitions(data);
       lastSessionsJSON = j;
-      sessions = data;
+      sessions = _applyLifecycleAcks(data);
+      _peekChatStateSync();
       _stateQuery.set(['sessions'], data);
       _sessionsSnapshotEpoch++;
       // Quota-full store: drop the cache rather than let the throw break rendering.
@@ -7179,8 +7492,12 @@ async function openNeedsInput() {
   ov.querySelector('.ni-close').focus();
   _niFetch();
 }
+// Closing the overlay ends an Approve all in progress: the owner approved the
+// batch they could see, and some of its items send outside (2026-11-06).
+let _niBatchGen = 0;
 function closeNeedsInput() {
   _niOpen = false;
+  _niBatchGen++;
   const ov = document.getElementById('ni-overlay');
   if (ov) ov.remove();
   document.body.classList.remove('ni-open');
@@ -7444,14 +7761,26 @@ async function _niApply(it, action, typed, rule, surface = 'needs-input triage')
       else if (action === 'dismiss') text = '';
       else if (action === 'decline') text = 'Declined' + ref + ': ' + q + '. Do not proceed' + (typed ? '; ' + typed : '') + '.';
       else text = 'Re' + ref + ': ' + typed;
-      if (it.worker && text) {
+      // A LAND APPROVAL IS RECORDED BY PATCH-ID, NOT BY THE CARD (2026-11-09:
+      // Approve moved AMUX-6809 to todo while the land gate, which reads only
+      // /api/land/approvals, kept refusing the diff). Approve records it there;
+      // that endpoint also closes the card, so the card is not moved again.
+      let landed = false;
+      if ((action === 'approve' || action === 'approve_always') && it.land_patch_id) {
+        const r = await fetch(API + '/api/land/approvals', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ patch_id: it.land_patch_id, note: 'approved in ' + surface }) });
+        const d = await _niJson(r);
+        if (r.ok && d.approved_at) { landed = true; done.push('change ' + it.land_patch_id.slice(0, 12) + ' approved to land' + (d.card_closed ? ', ' + (d.card || it.card) + ' closed' : '')); }
+        else errs.push('land approval ' + it.land_patch_id.slice(0, 12) + ': ' + _niErr(d, r));
+      }
+      if (it.worker && text && !landed) {
         const s = await _niSend(it.worker, text, it.key, action);
         // A plain send returns on durable local acceptance (the outbox owns
         // delivery and its failures), so say "queued", never "delivered".
         if (s.ok) done.push(s.deduped ? 'already sent to ' + it.worker : (s.queued ? 'message queued for ' + it.worker : 'sent to ' + it.worker));
         else errs.push('send to ' + it.worker + ': ' + s.error);
       }
-      if (it.card) {
+      if (it.card && !landed && !(it.land_patch_id && errs.length)) {
         const verb = action === 'approve' && _niOwnerMustAct(it) ? 'Provided'
           : { approve: 'Approved', approve_always: 'Approved (standing rule)', decline: 'Declined', reply: 'Owner reply', dismiss: 'Dismissed without an answer' }[action];
         const note = '[' + stamp + '] ' + verb + ' by owner in ' + surface + (action === 'reply' || (action === 'decline' && typed) ? ': ' + typed
@@ -7561,8 +7890,10 @@ async function _niApproveAllRun() {
   if (_niBusy) return;
   _niAllArmed = false;
   const skip = new Set();
-  let ok = 0, refused = 0;
+  const gen = _niBatchGen;
+  let ok = 0, refused = 0, stopped = false;
   for (let guard = 0; guard < 200; guard++) {
+    if (!_niOpen || gen !== _niBatchGen) { stopped = true; break; }
     const list = _niItems(_niShowOlder);
     const next = list.findIndex(i => !skip.has(i.key) && _niApprovable().some(a => a.key === i.key));
     if (next < 0) break;
@@ -7571,8 +7902,10 @@ async function _niApproveAllRun() {
     await _niAct('approve');
     if (_niItems(_niShowOlder).some(i => i.key === key)) { skip.add(key); refused++; } else ok++;
   }
-  _niLog('approve_all', { key: 'batch', card: '', worker: '' }, refused ? (ok ? 'partial' : 'refused') : 'ok', ok + ' approved, ' + refused + ' refused');
-  showToast('Approved ' + ok + (refused ? '; ' + refused + ' refused and left in the queue' : ''));
+  _niLog('approve_all', { key: 'batch', card: '', worker: '' }, stopped ? 'stopped' : refused ? (ok ? 'partial' : 'refused') : 'ok',
+    ok + ' approved, ' + refused + ' refused' + (stopped ? ', stopped when the overlay closed' : ''));
+  showToast('Approved ' + ok + (refused ? '; ' + refused + ' refused and left in the queue' : '') + (stopped ? '; stopped when you closed it' : ''));
+  if (!_niOpen) return;
   _niIdx = 0; _niRender();
 }
 
@@ -8088,21 +8421,20 @@ function _workerLifecycleInactive(s) {
   return !!(s && (s.archived || ['paused','archived','expired'].includes(s.lifecycle)));
 }
 function _workerExecutionBadge(s, runtimeBoard, opts) {
-  const pending = _workerLifecyclePending.get(s.name);
-  if (pending) return '<span class="status-badge idle">' + pending + '…</span>';
-  if (s.lifecycle === 'paused') return s.running
-    ? '<span class="status-badge blocked" title="Pause has not finished stopping this worker. Retry Pause.">pause incomplete</span>'
-    : '<span class="status-badge paused">paused</span>';
+  const k = _workerStatus(s).key;
+  if (k === 'pending') return '<span class="status-badge idle">' + _workerLifecyclePending.get(s.name) + '…</span>';
+  if (k === 'pause_incomplete') return '<span class="status-badge blocked" title="Pause has not finished stopping this worker. Retry Pause.">pause incomplete</span>';
+  if (k === 'paused') return '<span class="status-badge paused">paused</span>';
   let badge = '';
   const tele = s.telemetry || {};
   // MSG-69352 items 2 and 4: a guess on an unhealthy status channel is shown
   // as a guess, and a finished turn waiting on its own background shell is
   // not "working".
-  if (s.running && s.agent_state === 'unknown') badge = '<button type="button" class="status-badge unknown" title="'
+  if (k === 'unknown') badge = '<button type="button" class="status-badge unknown" title="'
     + esc('Agent state unknown: only a screen guess (' + (s.status || '?') + ') is available and the status channel is ' + (tele.health || 'unmeasured') + '. ' + (tele.reason || '') + ' Automation will not act on it.')
     + '" onclick="event.stopPropagation();_openStatusDetail(\'' + escJs(s.name) + '\')">unknown ▾</button>';
-  else if (s.running && s.status === 'active' && s.activity === 'api_retry') badge = '<span class="status-badge rate-limited" title="A request to the API failed; the agent is waiting to retry it on its own.">retrying</span>';
-  else if (s.running && s.status === 'active' && s.activity === 'background_shell') {
+  else if (k === 'retrying') badge = '<span class="status-badge rate-limited" title="A request to the API failed; the agent is waiting to retry it on its own.">retrying</span>';
+  else if (k === 'background') {
     // A status name and the job's age (MSG-99658: "idle" for 16 minutes while
     // etl_rest2.sh ran for 1h02m). The badge never shows the job's command: a
     // label is the whole command line ("cd /Users/... && AMUX_RESOURCES_ACK=..."),
@@ -8115,20 +8447,20 @@ function _workerExecutionBadge(s, runtimeBoard, opts) {
       + (jobs.length ? ' ' + jobs.map(j => j.label + ' (' + _bgJobAge(j.elapsed_s) + ')').join(', ') : '');
     badge = '<span class="status-badge background" title="' + esc(tip) + '">' + text + '</span>';
   }
-  else if (s.status === 'starting') badge = '<span class="status-badge idle">starting</span>';
-  else if (s.status === 'waiting' && s.waiting_reason === 'owner') badge = _needsInputBadge(s);
-  else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
-  else if (!s.running) badge = '<span class="status-badge idle">stopped</span>';
-  else if (s.status === 'error') badge = '<button type="button" class="status-badge blocked" title="' + esc(s.error_detail || s.state_detail || 'Worker failed; inspect the terminal for the provider error') + '" onclick="event.stopPropagation();_openStatusDetail(\'' + escJs(s.name) + '\')">error ▾</button>';
-  else if (s.status === 'active')  badge = runtimeBoard.syncing
+  else if (k === 'starting') badge = '<span class="status-badge idle">starting</span>';
+  else if (k === 'stopped') badge = '<span class="status-badge idle">stopped</span>';
+  else if (k === 'needs_input') badge = _needsInputBadge(s);
+  else if (k === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
+  else if (k === 'error') badge = '<button type="button" class="status-badge blocked" title="' + esc(s.error_detail || s.state_detail || 'Worker failed; inspect the terminal for the provider error') + '" onclick="event.stopPropagation();_openStatusDetail(\'' + escJs(s.name) + '\')">error ▾</button>';
+  else if (k === 'working')  badge = runtimeBoard.syncing
     ? _runtimeBoardSyncBadge()
     : '<span class="status-badge active">working</span>' + _agentsChip(s)
       + (runtimeBoard.cardless ? _runtimeBoardCardlessBadge() : '');
-  else if (s.status === 'unattributed') badge = _runtimeBoardSplitBadge(s);
-  else if (s.status === 'blocked') badge = '<button type="button" class="status-badge blocked" title="Agent is waiting on a permission decision. Click for details." onclick="event.stopPropagation();_openStatusDetail(\'' + escJs(s.name) + '\')">blocked ▾</button>';
-  else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
-  else if (s.status === 'api_error') badge = `<button type="button" class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;." onclick="event.stopPropagation();_openStatusDetail('${escJs(s.name)}')">API ${esc(s.api_error_code || '5xx')} ▾</button>`;
-  else if (s.status === 'idle')    badge = '<span class="status-badge idle"' + _idleMovedTitle(s) + '>idle' + _idleMovedSuffix(s) + '</span>';
+  else if (k === 'unattributed') badge = _runtimeBoardSplitBadge(s);
+  else if (k === 'blocked') badge = '<button type="button" class="status-badge blocked" title="Agent is waiting on a permission decision. Click for details." onclick="event.stopPropagation();_openStatusDetail(\'' + escJs(s.name) + '\')">blocked ▾</button>';
+  else if (k === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
+  else if (k === 'api_error') badge = `<button type="button" class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;." onclick="event.stopPropagation();_openStatusDetail('${escJs(s.name)}')">API ${esc(s.api_error_code || '5xx')} ▾</button>`;
+  else if (k === 'idle')    badge = '<span class="status-badge idle"' + _idleMovedTitle(s) + '>idle' + _idleMovedSuffix(s) + '</span>';
 
   if (s.running && (tele.health === 'degraded' || tele.health === 'missing')) badge += '<span class="status-badge telemetry-warn" title="'
     + esc('Status channel ' + tele.health + ': ' + (tele.reason || '') + ' The status shown is ' + (s.status_authority || 'inferred') + '.') + '">⚠ telemetry</span>';
@@ -8448,8 +8780,9 @@ function _cardDoingItem(name) {
 // An observed stale claim is a navigation aid, never promoted to a live claim.
 function _workerHasLiveActivity(s) {
   if (!s?.running || s.archived || ['paused','archived','expired'].includes(s.lifecycle)) return false;
-  const truth = s.runtime_board || {};
-  return truth.measured === true ? truth.runtime_status === 'active' : s.status === 'active';
+  // The list's own status decides. A status report can move it ahead of the
+  // board reading in the same row, and an idle worker is not "Working".
+  return s.status === 'active' || (s.status === 'unattributed' && s.runtime_board?.runtime_status === 'active');
 }
 
 function _boardActivityEntries(workerName) {
@@ -8958,9 +9291,260 @@ function _setCardsHtml(el, html) {
   el._cardsHtml = html;
   _cardsRenderStats.written++;
 }
+// HOVER PREVIEW OF AN @WORKER (owner, 2026-11-09: "when I hover a tagged
+// worker it shows a preview of the card of that worker like in the worker
+// list page. I want to see the task, status, etc."). Any .md-worker-link, in a
+// file preview, a note or a message. The card is the worker list's own
+// (_renderSessionCard), read-only: its ids are stripped so nothing in the page
+// finds the copy, and it is inert, so it never takes a click or focus. A click
+// on the mention still opens the worker. Pointers that hover only: a phone taps.
+let _wkHoverTimer = null;
+let _wkHoverLink = null;
+function _wkHoverCard() {
+  let pop = document.getElementById('worker-hovercard');
+  if (!pop) {
+    pop = document.createElement('div');
+    pop.id = 'worker-hovercard';
+    pop.className = 'worker-hovercard';
+    pop.setAttribute('role', 'tooltip');
+    pop.inert = true;
+    pop.hidden = true;
+    document.body.appendChild(pop);
+  }
+  return pop;
+}
+function _wkHoverShow(a) {
+  const name = a.dataset.worker || '';
+  const s = sessions.find(x => x.name === name);
+  const pop = _wkHoverCard();
+  if (s) {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = _renderSessionCard(s);
+    tmp.querySelectorAll('[id]').forEach(n => n.removeAttribute('id'));
+    pop.replaceChildren(...tmp.childNodes);
+  } else {
+    pop.innerHTML = '<div class="worker-hovercard-none">No worker named <b>' + esc(name) + '</b> is running here.</div>';
+  }
+  pop.dataset.worker = name;
+  pop.hidden = false;
+  // Below the mention, or above it when there is no room; inside the window.
+  const r = a.getBoundingClientRect(), pr = pop.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight, gap = 6;
+  let top = r.bottom + gap;
+  if (top + pr.height > vh - 8 && r.top - gap - pr.height >= 8) top = r.top - gap - pr.height;
+  pop.style.top = Math.max(8, Math.min(top, vh - pr.height - 8)) + 'px';
+  pop.style.left = Math.max(8, Math.min(r.left, vw - pr.width - 8)) + 'px';
+}
+function _wkHoverHide() {
+  clearTimeout(_wkHoverTimer);
+  _wkHoverTimer = null;
+  _wkHoverLink = null;
+  const pop = document.getElementById('worker-hovercard');
+  if (pop) pop.hidden = true;
+}
+document.addEventListener('mouseover', (e) => {
+  if (!window.matchMedia('(hover: hover)').matches) return;
+  const a = e.target.closest && e.target.closest('.md-worker-link');
+  if (!a || a === _wkHoverLink) return;
+  _wkHoverHide();
+  _wkHoverLink = a;
+  _wkHoverTimer = setTimeout(() => { if (_wkHoverLink === a && a.isConnected) _wkHoverShow(a); }, 300);
+});
+document.addEventListener('mouseout', (e) => {
+  if (!_wkHoverLink) return;
+  const to = e.relatedTarget;
+  if (to && _wkHoverLink.contains(to)) return;
+  if (e.target.closest && e.target.closest('.md-worker-link') === _wkHoverLink) _wkHoverHide();
+});
+['scroll', 'mousedown', 'keydown'].forEach(t => document.addEventListener(t, () => { if (_wkHoverLink) _wkHoverHide(); }, true));
+
+// One worker's card, as the worker list draws it. Top level so a hover
+// preview of an @worker mention draws the same card (owner, 2026-11-09).
+function _renderSessionCard(s) {
+  const isExp = expanded.has(s.name);
+  const flags = s.flags || '';
+  // Server verdict, not a re-derivation: see session_verbs::yolo_enabled.
+  // The old local form ORed in `s.auto_continue`, which is default-ON, so it
+  // badged lanes YOLO that would still stop and ask for approval.
+  const isYolo = !!s.yolo;
+  const provider = sessionProvider(s);
+  const model = sessionConfiguredModel(s);
+  const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
+  const pLabel = providerLabel(provider);
+  const runtimeBoard = _runtimeBoardPresentation(s);
+  // The measured object and the task text were serialized together by the
+  // server. Do not let a faster/slower board poll replace either side with a
+  // different snapshot; it is presentation-only evidence for the board view.
+  const displayTaskName = s.task_name || runtimeBoard.cardId || '';
+  const displayTaskSource = runtimeBoard.cardId ? 'board' : s.task_source;
+  const displayTaskBoardId = runtimeBoard.cardId;
+  const taskStale = runtimeBoard.cardId ? 0 : _taskStaleAge(s);
+  const offCached = !!(_peekIndex && _peekIndex[s.name]);
+  const taskDim = taskStale && displayTaskSource === 'board';   // stale board title shown as last resort
+  // AF-148: a lane with no active card falls back to its static DESCRIPTION,
+  // and the payload says so (`task_source: 'desc'`) — but the client only ever
+  // read task_source to dim a STALE BOARD title, so the fallback rendered
+  // identically to a live task: same weight, same colour, no badge.
+  //
+  // Found by the frustration sweep on its first run. Ethan asked tubescience
+  // "what's the status?" three times in 34 hours; that lane has 652 cards, 0
+  // in doing/review, 50 blocked — so the task slot was showing its job
+  // description ("The TubeScience customer account: product requirements…"),
+  // which reads exactly like a current task. He had no way to tell "working on
+  // this" from "no task, here is what this lane is for", so he asked.
+  //
+  // Same discriminator the stale case already uses, applied to the case it
+  // skipped. Not a mood, not a guess: the field was in the payload the whole
+  // time and one consumer read it for one branch.
+  const taskIsDesc = !runtimeBoard.cardless && displayTaskSource === 'desc' && !!displayTaskName;
+  return `
+  <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" data-worker-status="${_sessStatusKey(s)}" data-pinned="${s.pinned ? '1' : '0'}" onclick="event.stopPropagation();toggle('${s.name}')">
+    <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
+      <div class="card-header-top">
+        <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
+        <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${s.isolated ? '<span class="card-isolated" title="ISOLATED (raw agent): tmux plus the CLI, no amux harness — no AMUX_SESSION/AMUX_URL, no MCP config or behavioral hooks. Passive lifecycle hooks report status only. Undiscoverable to peers: hidden from their fleet list and roster, and peer sends are refused. You can still peek and send from here. Applies at the next spawn.">ISOLATED</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
+        <button class="card-menu-btn" onclick="event.stopPropagation();toggleMenu('${s.name}')" title="Options">&#x22EF;</button>
+        <div class="card-menu" id="menu-${s.name}">
+        ${_renderWorkerActionMenu(s, 'card')}
+      </div>
+      </div>
+      ${(s.status || s.tokens || s.last_activity || s.rate_limited_until || s.credit_limited || s.sched_on || s.sched_off || !online) ? `<div class="card-header-meta">
+        ${!s.running || !s.rate_limited_until ? _workerExecutionBadge(s, runtimeBoard) : ''}
+        ${s.running && s.status === 'waiting' ? _stalledFor(s) : ''}
+        ${s.running && s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
+        ${s.running && s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
+        ${_steerHumanCount(s) ? `<span class="status-badge steering" title="${_steerHumanCount(s)} steering message${_steerHumanCount(s)>1?'s':''} queued">${_steerHumanCount(s)} queued</span>` : ''}
+        ${_lastSeen(s) ? `<span class="last-active">${timeAgo(_lastSeen(s))}</span>` : ''}
+        ${(() => {
+          /* Bare numbers, no chips (Ethan: "just numbers no outline ...
+             conservative with real estate"). Keep runtime status and board
+             state separate: "idle · 11 active" called parked/human-blocked
+             and even done cards active, making Primis's correctly parked
+             queue look like a stalled worker. Spell out the nonzero board
+             columns from the SSE-synced boardItems instead. */
+          if (s.isolated) return '';
+          _ownerReqWant(s.name);
+          const byStatus = _cardBoardStatusCounts(s.name);
+          const d = byStatus.doing || 0;
+          const todo = byStatus.todo || 0;
+          const backlog = byStatus.backlog || 0;
+          const needsYou = (byStatus.needsyou || 0) + (byStatus.blocked || 0);
+          const review = byStatus.review || 0;
+          const done = byStatus.done || 0;
+          const parts = [];
+          if (s.sched_on || s.sched_off) {
+            parts.push(_schedCountHTML(s.sched_on, s.sched_off) + ' sched');
+          }
+          if (d) parts.push(`<span class="mc-doing">${d}</span> doing`);
+          if (todo) parts.push(`<span class="mc-active mc-todo">${todo}</span> todo`);
+          const drive = s.board_drive || null;
+          const driveFresh = drive && drive.checked_at && (Date.now()/1000 - drive.checked_at) < 180;
+          // A non-empty queue plus an idle badge is never left unexplained.
+          // This applies to backlog-only and doing/review lanes too, not only
+          // todo: Primis was parked on a live trigger and looked abandoned;
+          // rtsp-connection had a dependency chain and looked identical.
+          if (s.status === 'idle' && (todo || backlog || d || review) && driveFresh) {
+            const ready = Number(drive.eligible_todos || 0);
+            const why = _boardDriveCardReason(drive);
+            parts.push(`<span class="mc-total" title="${esc(drive.detail || 'Latest board-drive decision')}">${ready} ready · ${esc(why)}</span>`);
+          }
+          if (backlog) parts.push(`<span class="mc-total mc-backlog">${backlog}</span> backlog`);
+          if (needsYou) parts.push(`<span class="mc-total">${needsYou}</span> needs you`);
+          if (review) parts.push(`<span class="mc-total">${review}</span> review`);
+          if (done) parts.push(`<span class="mc-total">${done}</span> done`);
+          // Inside the one meta line, never a second row (css-mobile.md).
+          return `<span class="meta-count" title="Board status breakdown; parked or review work does not mean this worker is running">${_ownerReqHTML(s.name, parts.length > 0)}${parts.join(' · ')}</span>`;
+        })()}
+        ${!online ? '<span class="cached-badge">cached</span>' : ''}
+      </div>` : ''}
+    </div>
+    ${s.dir ? `<div class="card-dir"><span class="card-dir-path" title="${esc(s.worktree_active && s.worktree_path ? s.worktree_path : s.dir)}">${esc(s.worktree_active && s.worktree_path ? s.worktree_path : s.dir)}</span></div>` : ''}
+    ${s.creator ? `<div class="card-dir" style="font-size:var(--fs-xs);">${esc(s.creator)}</div>` : ''}
+    ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
+    ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
+
+    ${!isExp && (displayTaskName || s.task_override) ? (() => {
+      const llmTask = s.task_override || '';
+      const hasBoard = !!displayTaskBoardId;
+      const showLlm = llmTask && llmTask !== displayTaskName;
+      return (showLlm
+        ? `<div class="card-preview card-task-full" style="font-weight:600;color:var(--text);">${esc(llmTask)}</div>`
+        : '')
+      + (displayTaskName
+        ? `<div class="card-preview card-task-full${taskDim || taskIsDesc ? ' task-stale' : ''}${showLlm ? ' card-task-board-ctx' : ''}" style="${showLlm ? 'font-size:var(--fs-base);font-weight:400;' : 'font-weight:600;color:var(--text);'}">${hasBoard ? _activeTaskLink(s.name, displayTaskBoardId, displayTaskName) : esc(displayTaskName)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>`
+        : '');
+    })() : ''}
+    ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
+    ${logSearchMode && _logMatches[s.name] ? (() => {
+      const hits = _logMatches[s.name];
+      const sq = searchQuery.replace(/'/g,"\\'");
+      return hits.slice(0, 2).map((h, hi) =>
+        `<div class="card-log-hit" onclick="event.stopPropagation();_peekOpenLogAt('${s.name}',${parseInt(h.line, 10) || 0},'${sq}')"><span class="log-hit-loc">${esc(s.name)}:${h.line}</span> <span class="log-hit-text">${esc(h.text.slice(0, 80))}</span></div>`
+      ).join('') + (hits.length > 2 ? `<div class="card-log-hit" style="color:var(--dim);font-style:italic;" onclick="event.stopPropagation();openPeek('${s.name}',{query:'${sq}'})">+${hits.length - 2} more matches</div>` : '');
+    })() : ''}
+    ${(isYolo || (provider && provider !== 'claude') || effort || s.backend === 'herdr' || model || (s.tags||[]).length || s.worktree_active || s.ephemeral || (s.worker_type && s.worker_type !== 'coding') || _goalTileShown(s.goal)) ? `<div class="badges">
+      ${_goalTile(s.goal)}
+      ${s.worker_type && s.worker_type !== 'coding' ? `<span class="badge worker-type ${esc(s.worker_type)}" title="${esc(_workerTypeInfo(s.worker_type).label)} worker: ${esc(_workerTypeInfo(s.worker_type).description || '')}">${esc(_workerTypeInfo(s.worker_type).label.toLowerCase())}</span>` : ''}
+      ${s.backend === 'herdr' ? `<span class="badge herdr" title="Hosted on herdr">herdr</span>` : ''}
+      ${provider && provider !== 'claude' ? `<span class="badge provider ${provider}" onclick="event.stopPropagation();editField('${s.name}','provider','${escJs(provider)}')" title="Change provider">${pLabel}</span>` : ''}
+      ${isYolo ? '<span class="badge yolo">YOLO</span>' : ''}
+      ${s.worktree_active ? '<span class="badge worktree" title="Running in an isolated git worktree">worktree</span>' : ''}
+      ${s.ephemeral ? `<span class="badge ephemeral" title="Ephemeral fan-out worker${s.ephemeral_parent ? ' of ' + esc(s.ephemeral_parent) : ''}">eph${s.ephemeral_parent ? ' of ' + esc(s.ephemeral_parent) : ''}</span>` : ''}
+      ${effort ? `<span class="badge effort" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Reasoning effort — click to change">${esc(effort)}</span>` : ''}
+      ${(s.tags||[]).map(g => `<span class="grp-chip" title="Filter by group ${esc(g)}" onclick="event.stopPropagation();toggleTagFilter('${escJs(g)}')">${esc(g)}</span>`).join('')}
+      ${model ? `<span class="badge model card-model-inline" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Change model">${esc(model)}</span>` : ''}
+    </div>` : ''}
+    ${!s.running ? `<div style="padding:var(--space-1-5) 0 var(--space-0-5);" onclick="event.stopPropagation()">
+      <button class="btn primary" style="width:100%;" onclick="doStart('${s.name}')">&#x25B6; Start</button>
+    </div>` : ''}
+    <div class="panel" onclick="event.stopPropagation()">
+      ${isExp && (displayTaskName || s.task_override) ? (() => {
+        const llmTask = s.task_override || '';
+        const hasBoard = !!displayTaskBoardId;
+        const showLlm = llmTask && llmTask !== displayTaskName;
+        // The card this line already names (displayTaskBoardId, from the
+        // server's runtime link), found by id. Board rows arrive slimmed, so
+        // `desc` is absent and `desc_head` is the field that carries the line;
+        // reading `.desc` rendered nothing for every worker.
+        const shownCard = hasBoard ? (boardItems || []).find(c => c.id === displayTaskBoardId) : null;
+        const cardDesc = shownCard ? _descPreviewLine(shownCard.desc || shownCard.desc_head).slice(0, 120) : '';
+        return (showLlm
+          ? `<div class="card-task-name" style="font-weight:600;">${esc(llmTask)}</div>`
+          : '')
+        + (displayTaskName
+          ? `<div class="card-task-name${taskDim || taskIsDesc ? ' task-stale' : ''}${showLlm ? ' card-task-board-ctx' : ''}" title="Open the active board card" style="${showLlm ? 'font-size:var(--fs-md);font-weight:400;' : 'font-weight:600;'}">${hasBoard ? _activeTaskLink(s.name, displayTaskBoardId, displayTaskName) : `<span onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_override || '')}')" style="cursor:pointer;">${esc(displayTaskName)}</span>`}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>`
+          : '')
+        + (cardDesc && !showLlm ? `<div class="card-task-desc" style="font-size:var(--fs-sm);color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:var(--space-0-5) 0 0;">${esc(cardDesc)}</div>` : '');
+      })() : ''}
+      ${isExp && s.running ? `<div class="card-timing">
+        ${s.session_created ? `<div class="timing-item"><span class="timing-label">Worker</span><span class="timing-value">${fmtDuration(Math.floor(Date.now()/1000) - s.session_created)}</span></div>` : ''}
+        ${s.task_time ? `<div class="timing-item"><span class="timing-label">Task</span><span class="timing-value accent">${esc(s.task_time)}</span></div>` : ''}
+        ${s.last_activity ? `<div class="timing-item"><span class="timing-label">Last interaction</span><span class="timing-value">${timeAgo(s.last_activity)}</span></div>` : ''}
+      </div>` : ''}
+      ${s.preview_lines && s.preview_lines.length ? `<div class="card-preview-lines" onclick="event.stopPropagation();openPeek('${s.name}')" style="cursor:pointer;">${rewriteLocalhostUrls(s.preview_lines.map(l => esc(l)).join('\n'))}</div>` : ''}
+      <div class="card-stats" id="stats-${s.name}"></div>
+      ${s.running ? `
+      <div class="chips" id="card-chips-${s.name}"></div>
+      <div class="peek-attach-bar card-attach-bar${(_cardFiles[s.name]||[]).length ? ' has-files' : ''}" id="card-attach-${s.name}">${_renderCardFileChips(s.name)}</div>
+      <div class="send-row" style="position:relative;" ondragover="cardDragOver(event)" ondragleave="cardDragLeave(event)" ondrop="cardDrop('${s.name}',event)" title="Drag files here to attach">
+        <div id="card-ac-${s.name}" class="ac-list slash-ac"></div>
+        <textarea class="send-input" id="input-${s.name}" rows="1"
+          placeholder="Send to ${esc(s.name)}..." autocomplete="off" autocorrect="on"
+          autocapitalize="sentences" spellcheck="true" enterkeyhint="enter"
+          oninput="autoGrow(this);cardSlashAcUpdate('${s.name}');cmdHistoryReset();_draftSaveDebounced('${s.name}',this.value)"
+          onkeydown="cardSlashAcKeydown('${s.name}',event)"
+          onpaste="handleCardPaste('${s.name}',event)"
+          onbeforeinput="cardSlashAcBeforeInput('${s.name}',event)"></textarea>
+        <div class="send-split${_sendLabelFor(s.name) === 'Queue' ? ' mode-queue' : ''}"><button class="btn primary send-split-main" ${_composerPendingSends.has(s.name) ? 'disabled' : ''} onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => sendFromInput('${s.name}'))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => sendFromInput('${s.name}'))" onclick="_btnFire(event, () => sendFromInput('${s.name}'))" title="${esc(_sendTitleFor(s.name))}">${_sendLabelFor(s.name)}</button><button class="btn primary send-split-arrow" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => _toggleSendMode(event))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => _toggleSendMode(event))" onclick="_btnFire(event, () => _toggleSendMode(event))" title="Switch send mode">&#x25BC;</button></div>
+      </div>` : ''}
+    </div>
+  </div>`;
+}
+
 function render() {
   // The Send/Queue label reads the target's status, so it follows each render.
   try { _syncComposerPending(); } catch (_) {}
+  try { _sbLiveTick(); } catch (e) { console.warn('[scoreboard] live refresh failed', e); }
   // THE PEEK HEADER UPDATES FIRST, ahead of the card-clobbering guard below.
   //
   // It used to sit AFTER that guard, so an open card menu / edit overlay froze
@@ -9146,186 +9730,6 @@ function render() {
     if (inp.value) savedInputs[inp.id] = { value: inp.value, start: inp.selectionStart, end: inp.selectionEnd };
   });
 
-  function _renderSessionCard(s) {
-    const isExp = expanded.has(s.name);
-    const flags = s.flags || '';
-    // Server verdict, not a re-derivation: see session_verbs::yolo_enabled.
-    // The old local form ORed in `s.auto_continue`, which is default-ON, so it
-    // badged lanes YOLO that would still stop and ask for approval.
-    const isYolo = !!s.yolo;
-    const provider = sessionProvider(s);
-    const model = sessionConfiguredModel(s);
-    const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
-    const pLabel = providerLabel(provider);
-    const runtimeBoard = _runtimeBoardPresentation(s);
-    // The measured object and the task text were serialized together by the
-    // server. Do not let a faster/slower board poll replace either side with a
-    // different snapshot; it is presentation-only evidence for the board view.
-    const displayTaskName = s.task_name || runtimeBoard.cardId || '';
-    const displayTaskSource = runtimeBoard.cardId ? 'board' : s.task_source;
-    const displayTaskBoardId = runtimeBoard.cardId;
-    const taskStale = runtimeBoard.cardId ? 0 : _taskStaleAge(s);
-    const offCached = !!(_peekIndex && _peekIndex[s.name]);
-    const taskDim = taskStale && displayTaskSource === 'board';   // stale board title shown as last resort
-    // AF-148: a lane with no active card falls back to its static DESCRIPTION,
-    // and the payload says so (`task_source: 'desc'`) — but the client only ever
-    // read task_source to dim a STALE BOARD title, so the fallback rendered
-    // identically to a live task: same weight, same colour, no badge.
-    //
-    // Found by the frustration sweep on its first run. Ethan asked tubescience
-    // "what's the status?" three times in 34 hours; that lane has 652 cards, 0
-    // in doing/review, 50 blocked — so the task slot was showing its job
-    // description ("The TubeScience customer account: product requirements…"),
-    // which reads exactly like a current task. He had no way to tell "working on
-    // this" from "no task, here is what this lane is for", so he asked.
-    //
-    // Same discriminator the stale case already uses, applied to the case it
-    // skipped. Not a mood, not a guess: the field was in the payload the whole
-    // time and one consumer read it for one branch.
-    const taskIsDesc = !runtimeBoard.cardless && displayTaskSource === 'desc' && !!displayTaskName;
-    return `
-    <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" data-worker-status="${_sessStatusKey(s)}" data-pinned="${s.pinned ? '1' : '0'}" onclick="event.stopPropagation();toggle('${s.name}')">
-      <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
-        <div class="card-header-top">
-          <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
-          <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${s.isolated ? '<span class="card-isolated" title="ISOLATED (raw agent): tmux plus the CLI, no amux harness — no AMUX_SESSION/AMUX_URL, no MCP config or behavioral hooks. Passive lifecycle hooks report status only. Undiscoverable to peers: hidden from their fleet list and roster, and peer sends are refused. You can still peek and send from here. Applies at the next spawn.">ISOLATED</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
-          <button class="card-menu-btn" onclick="event.stopPropagation();toggleMenu('${s.name}')" title="Options">&#x22EF;</button>
-          <div class="card-menu" id="menu-${s.name}">
-          ${_renderWorkerActionMenu(s, 'card')}
-        </div>
-        </div>
-        ${(s.status || s.tokens || s.last_activity || s.rate_limited_until || s.credit_limited || s.sched_on || s.sched_off || !online) ? `<div class="card-header-meta">
-          ${!s.running || !s.rate_limited_until ? _workerExecutionBadge(s, runtimeBoard) : ''}
-          ${s.running && s.status === 'waiting' ? _stalledFor(s) : ''}
-          ${s.running && s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
-          ${s.running && s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
-          ${_steerHumanCount(s) ? `<span class="status-badge steering" title="${_steerHumanCount(s)} steering message${_steerHumanCount(s)>1?'s':''} queued">${_steerHumanCount(s)} queued</span>` : ''}
-          ${s.last_activity ? `<span class="last-active">${timeAgo(s.last_activity)}</span>` : ''}
-          ${(() => {
-            /* Bare numbers, no chips (Ethan: "just numbers no outline ...
-               conservative with real estate"). Keep runtime status and board
-               state separate: "idle · 11 active" called parked/human-blocked
-               and even done cards active, making Primis's correctly parked
-               queue look like a stalled worker. Spell out the nonzero board
-               columns from the SSE-synced boardItems instead. */
-            if (s.isolated) return '';
-            _ownerReqWant(s.name);
-            const byStatus = _cardBoardStatusCounts(s.name);
-            const d = byStatus.doing || 0;
-            const todo = byStatus.todo || 0;
-            const backlog = byStatus.backlog || 0;
-            const needsYou = (byStatus.needsyou || 0) + (byStatus.blocked || 0);
-            const review = byStatus.review || 0;
-            const done = byStatus.done || 0;
-            const parts = [];
-            if (s.sched_on || s.sched_off) {
-              parts.push(_schedCountHTML(s.sched_on, s.sched_off) + ' sched');
-            }
-            if (d) parts.push(`<span class="mc-doing">${d}</span> doing`);
-            if (todo) parts.push(`<span class="mc-active mc-todo">${todo}</span> todo`);
-            const drive = s.board_drive || null;
-            const driveFresh = drive && drive.checked_at && (Date.now()/1000 - drive.checked_at) < 180;
-            // A non-empty queue plus an idle badge is never left unexplained.
-            // This applies to backlog-only and doing/review lanes too, not only
-            // todo: Primis was parked on a live trigger and looked abandoned;
-            // rtsp-connection had a dependency chain and looked identical.
-            if (s.status === 'idle' && (todo || backlog || d || review) && driveFresh) {
-              const ready = Number(drive.eligible_todos || 0);
-              const why = _boardDriveCardReason(drive);
-              parts.push(`<span class="mc-total" title="${esc(drive.detail || 'Latest board-drive decision')}">${ready} ready · ${esc(why)}</span>`);
-            }
-            if (backlog) parts.push(`<span class="mc-total mc-backlog">${backlog}</span> backlog`);
-            if (needsYou) parts.push(`<span class="mc-total">${needsYou}</span> needs you`);
-            if (review) parts.push(`<span class="mc-total">${review}</span> review`);
-            if (done) parts.push(`<span class="mc-total">${done}</span> done`);
-            // Inside the one meta line, never a second row (css-mobile.md).
-            return `<span class="meta-count" title="Board status breakdown; parked or review work does not mean this worker is running">${_ownerReqHTML(s.name, parts.length > 0)}${parts.join(' · ')}</span>`;
-          })()}
-          ${!online ? '<span class="cached-badge">cached</span>' : ''}
-        </div>` : ''}
-      </div>
-      ${s.dir ? `<div class="card-dir"><span class="card-dir-path" title="${esc(s.worktree_active && s.worktree_path ? s.worktree_path : s.dir)}">${esc(s.worktree_active && s.worktree_path ? s.worktree_path : s.dir)}</span></div>` : ''}
-      ${s.creator ? `<div class="card-dir" style="font-size:var(--fs-xs);">${esc(s.creator)}</div>` : ''}
-      ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
-      ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
-
-      ${!isExp && (displayTaskName || s.task_override) ? (() => {
-        const llmTask = s.task_override || '';
-        const hasBoard = !!displayTaskBoardId;
-        const showLlm = llmTask && llmTask !== displayTaskName;
-        return (showLlm
-          ? `<div class="card-preview card-task-full" style="font-weight:600;color:var(--text);">${esc(llmTask)}</div>`
-          : '')
-        + (displayTaskName
-          ? `<div class="card-preview card-task-full${taskDim || taskIsDesc ? ' task-stale' : ''}${showLlm ? ' card-task-board-ctx' : ''}" style="${showLlm ? 'font-size:var(--fs-base);font-weight:400;' : 'font-weight:600;color:var(--text);'}">${hasBoard ? _activeTaskLink(s.name, displayTaskBoardId, displayTaskName) : esc(displayTaskName)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>`
-          : '');
-      })() : ''}
-      ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
-      ${logSearchMode && _logMatches[s.name] ? (() => {
-        const hits = _logMatches[s.name];
-        const sq = searchQuery.replace(/'/g,"\\'");
-        return hits.slice(0, 2).map((h, hi) =>
-          `<div class="card-log-hit" onclick="event.stopPropagation();_peekOpenLogAt('${s.name}',${parseInt(h.line, 10) || 0},'${sq}')"><span class="log-hit-loc">${esc(s.name)}:${h.line}</span> <span class="log-hit-text">${esc(h.text.slice(0, 80))}</span></div>`
-        ).join('') + (hits.length > 2 ? `<div class="card-log-hit" style="color:var(--dim);font-style:italic;" onclick="event.stopPropagation();openPeek('${s.name}',{query:'${sq}'})">+${hits.length - 2} more matches</div>` : '');
-      })() : ''}
-      ${(isYolo || (provider && provider !== 'claude') || effort || s.backend === 'herdr' || model || (s.tags||[]).length || s.worktree_active || s.ephemeral || (s.worker_type && s.worker_type !== 'coding') || _goalTileShown(s.goal)) ? `<div class="badges">
-        ${_goalTile(s.goal)}
-        ${s.worker_type && s.worker_type !== 'coding' ? `<span class="badge worker-type ${esc(s.worker_type)}" title="${esc(_workerTypeInfo(s.worker_type).label)} worker: ${esc(_workerTypeInfo(s.worker_type).description || '')}">${esc(_workerTypeInfo(s.worker_type).label.toLowerCase())}</span>` : ''}
-        ${s.backend === 'herdr' ? `<span class="badge herdr" title="Hosted on herdr">herdr</span>` : ''}
-        ${provider && provider !== 'claude' ? `<span class="badge provider ${provider}" onclick="event.stopPropagation();editField('${s.name}','provider','${escJs(provider)}')" title="Change provider">${pLabel}</span>` : ''}
-        ${isYolo ? '<span class="badge yolo">YOLO</span>' : ''}
-        ${s.worktree_active ? '<span class="badge worktree" title="Running in an isolated git worktree">worktree</span>' : ''}
-        ${s.ephemeral ? `<span class="badge ephemeral" title="Ephemeral fan-out worker${s.ephemeral_parent ? ' of ' + esc(s.ephemeral_parent) : ''}">eph${s.ephemeral_parent ? ' of ' + esc(s.ephemeral_parent) : ''}</span>` : ''}
-        ${effort ? `<span class="badge effort" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Reasoning effort — click to change">${esc(effort)}</span>` : ''}
-        ${(s.tags||[]).map(g => `<span class="grp-chip" title="Filter by group ${esc(g)}" onclick="event.stopPropagation();toggleTagFilter('${escJs(g)}')">${esc(g)}</span>`).join('')}
-        ${model ? `<span class="badge model card-model-inline" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Change model">${esc(model)}</span>` : ''}
-      </div>` : ''}
-      ${!s.running ? `<div style="padding:var(--space-1-5) 0 var(--space-0-5);" onclick="event.stopPropagation()">
-        <button class="btn primary" style="width:100%;" onclick="doStart('${s.name}')">&#x25B6; Start</button>
-      </div>` : ''}
-      <div class="panel" onclick="event.stopPropagation()">
-        ${isExp && (displayTaskName || s.task_override) ? (() => {
-          const llmTask = s.task_override || '';
-          const hasBoard = !!displayTaskBoardId;
-          const showLlm = llmTask && llmTask !== displayTaskName;
-          // The card this line already names (displayTaskBoardId, from the
-          // server's runtime link), found by id. Board rows arrive slimmed, so
-          // `desc` is absent and `desc_head` is the field that carries the line;
-          // reading `.desc` rendered nothing for every worker.
-          const shownCard = hasBoard ? (boardItems || []).find(c => c.id === displayTaskBoardId) : null;
-          const cardDesc = shownCard ? String(shownCard.desc || shownCard.desc_head || '').split('\n')[0].slice(0, 120) : '';
-          return (showLlm
-            ? `<div class="card-task-name" style="font-weight:600;">${esc(llmTask)}</div>`
-            : '')
-          + (displayTaskName
-            ? `<div class="card-task-name${taskDim || taskIsDesc ? ' task-stale' : ''}${showLlm ? ' card-task-board-ctx' : ''}" title="Open the active board card" style="${showLlm ? 'font-size:var(--fs-md);font-weight:400;' : 'font-weight:600;'}">${hasBoard ? _activeTaskLink(s.name, displayTaskBoardId, displayTaskName) : `<span onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_override || '')}')" style="cursor:pointer;">${esc(displayTaskName)}</span>`}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>`
-            : '')
-          + (cardDesc && !showLlm ? `<div class="card-task-desc" style="font-size:var(--fs-sm);color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:var(--space-0-5) 0 0;">${esc(cardDesc)}</div>` : '');
-        })() : ''}
-        ${isExp && s.running ? `<div class="card-timing">
-          ${s.session_created ? `<div class="timing-item"><span class="timing-label">Worker</span><span class="timing-value">${fmtDuration(Math.floor(Date.now()/1000) - s.session_created)}</span></div>` : ''}
-          ${s.task_time ? `<div class="timing-item"><span class="timing-label">Task</span><span class="timing-value accent">${esc(s.task_time)}</span></div>` : ''}
-          ${s.last_activity ? `<div class="timing-item"><span class="timing-label">Last interaction</span><span class="timing-value">${timeAgo(s.last_activity)}</span></div>` : ''}
-        </div>` : ''}
-        ${s.preview_lines && s.preview_lines.length ? `<div class="card-preview-lines" onclick="event.stopPropagation();openPeek('${s.name}')" style="cursor:pointer;">${rewriteLocalhostUrls(s.preview_lines.map(l => esc(l)).join('\n'))}</div>` : ''}
-        <div class="card-stats" id="stats-${s.name}"></div>
-        ${s.running ? `
-        <div class="chips" id="card-chips-${s.name}"></div>
-        <div class="peek-attach-bar card-attach-bar${(_cardFiles[s.name]||[]).length ? ' has-files' : ''}" id="card-attach-${s.name}">${_renderCardFileChips(s.name)}</div>
-        <div class="send-row" style="position:relative;" ondragover="cardDragOver(event)" ondragleave="cardDragLeave(event)" ondrop="cardDrop('${s.name}',event)" title="Drag files here to attach">
-          <div id="card-ac-${s.name}" class="ac-list slash-ac"></div>
-          <textarea class="send-input" id="input-${s.name}" rows="1"
-            placeholder="Send to ${esc(s.name)}..." autocomplete="off" autocorrect="on"
-            autocapitalize="sentences" spellcheck="true" enterkeyhint="enter"
-            oninput="autoGrow(this);cardSlashAcUpdate('${s.name}');cmdHistoryReset();_draftSaveDebounced('${s.name}',this.value)"
-            onkeydown="cardSlashAcKeydown('${s.name}',event)"
-            onpaste="handleCardPaste('${s.name}',event)"
-            onbeforeinput="cardSlashAcBeforeInput('${s.name}',event)"></textarea>
-          <div class="send-split${_sendLabelFor(s.name) === 'Queue' ? ' mode-queue' : ''}"><button class="btn primary send-split-main" ${_composerPendingSends.has(s.name) ? 'disabled' : ''} onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => sendFromInput('${s.name}'))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => sendFromInput('${s.name}'))" onclick="_btnFire(event, () => sendFromInput('${s.name}'))" title="${esc(_sendTitleFor(s.name))}">${_sendLabelFor(s.name)}</button><button class="btn primary send-split-arrow" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => _toggleSendMode(event))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => _toggleSendMode(event))" onclick="_btnFire(event, () => _toggleSendMode(event))" title="Switch send mode">&#x25BC;</button></div>
-        </div>` : ''}
-      </div>
-    </div>`;
-  }
 
   // Freeze mode: flat list locked to captured order — bypasses status grouping and activity re-sort
   if (_frozen && cardOrder.length) {
@@ -9604,9 +10008,8 @@ function _bindPeekTaskIdentity(s, identity) {
   const runtime = _runtimeBoardPresentation(s);
   const cardId = runtime.cardId || '';
   const llmTask = s.task_override || '';
-  const boardTitle = runtime.syncing
-    ? 'Synchronizing runtime/board truth…'
-    : (s.task_name || cardId || '');
+  // Not a "syncing" placeholder: a Task line reads the task it last knew.
+  const boardTitle = s.task_name || cardId || '';
   const showBoth = llmTask && boardTitle && llmTask !== boardTitle;
   row.style.display = (llmTask || boardTitle) ? 'flex' : 'none';
   if (showBoth) {
@@ -9702,20 +10105,27 @@ function _taskStaleAge(s) {
 // bare badge back, so the never case is spelled out instead of left blank.
 //
 // COMPACT ON PURPOSE: this badge sits in the worker list, which has to survive
-// 375px per .claude/rules/css-mobile.md. The badge carries "19m"; the full
+// 375px per crates/amux-dashboard/CLAUDE.md. The badge carries "19m"; the full
 // sentence goes in the title where it costs no width.
+// One line of a card's description as plain text: a preview shows no markdown
+// heading marks ("### Updated request").
+function _descPreviewLine(desc) {
+  return String(desc || '').split('\n')[0].replace(/^\s*#{1,6}\s+/, '');
+}
 function _idleMovedAt(s) {
   const at = Number(s && s.last_board_change_ts);
   return Number.isFinite(at) && at > 0 ? at : 0;
 }
+// A worker with no board has no card to have moved (the board is opt-in since
+// 2026-11-02), so "· never" said nothing about it.
 function _idleMovedSuffix(s) {
-  if (s?.isolated) return '';
+  if (s?.isolated || s?.board_used === false) return '';
   const at = _idleMovedAt(s);
   if (!at) return ' · never';
   return ' · ' + esc(timeAgo(at).replace(/ ago$/, ''));
 }
 function _idleMovedTitle(s) {
-  if (s?.isolated) return ' title="Idle — ready for your next message."';
+  if (s?.isolated || s?.board_used === false) return ' title="Idle — ready for your next message."';
   const at = _idleMovedAt(s);
   return at
     ? ' title="Idle right now. Last moved a board card ' + esc(timeAgo(at)) + '."'
@@ -10972,7 +11382,7 @@ function _embedFitZoom() {
 const _EMBED_VIEW_EL = {
   sessions:'session-view', board:'board-view', groups:'groups-view', calendar:'calendar-view',
   scheduler:'scheduler-view', files:'files-view', logs:'logs-view',
-  messages:'messages-view', map:'map-view', metrics:'metrics-view', cost:'cost-view',
+  messages:'messages-view', map:'map-view', metrics:'metrics-view', cost:'cost-view', scoreboard:'scoreboard-view',
   torrents:'torrents-view', terminal:'terminal-view', browser:'browser-view', sql:'sql-view',
   graph:'graph-view', journal:'journal-view', habits:'habits-view', skills:'skills-view',
   draw:'draw-view'
@@ -11057,7 +11467,7 @@ function _renderPausedSection() {
   if (showExpanded) {
     html += '<div class="paused-body">';
     (q ? paused : allPaused).forEach(s => {
-      const ago = s.last_activity ? timeAgo(s.last_activity) : '';
+      const ago = _lastSeen(s) ? timeAgo(_lastSeen(s)) : '';
       const rawDir = s.worktree_active && s.worktree_path ? s.worktree_path : (s.dir || '');
       const dir = rawDir.replace(/^\/Users\/[^/]+/, '~');
       const model = s.active_model || sessionConfiguredModel(s) || '';
@@ -11248,7 +11658,7 @@ function _renderArchivedSectionBody() {
   if (showExpanded) {
     html += '<div class="archived-body">';
     (q ? archived : allArchived).forEach(s => {
-      const ago = s.last_activity ? timeAgo(s.last_activity) : '';
+      const ago = _lastSeen(s) ? timeAgo(_lastSeen(s)) : '';
       const created = s.session_created ? new Date(s.session_created * 1000).toLocaleDateString([], {month:'short', day:'numeric', year:'2-digit'}) : '';
       const rawDir2 = s.worktree_active && s.worktree_path ? s.worktree_path : (s.dir || '');
       const dir = rawDir2.replace(/^\/Users\/[^/]+/, '~');
@@ -11625,23 +12035,27 @@ function closeAddMenu() {
 }
 
 // ── Describe what you want (Ethan, 2026-10-18) ──
-// One box: describe the outcome. Everything else is a default under a closed
-// "Defaults and constraints" section, remembered in prefs (outcome_defaults)
-// so the next one needs only the description. The worker starts on
-// `/goal <outcome + constraints>`: Claude Code's own evaluator decides when it
-// is done, the goal keeper keeps it going until then, and the dashboard (and
-// the goal keeper's push) say when it is met. Nothing here calls a model: the
-// name and description are computed from the text, and the worker does the
-// judging.
+// One box: describe the outcome, and attach a recording or files if the
+// outcome lives in them. Everything else is a default under a closed
+// "Defaults and constraints" section, remembered in prefs (outcome_defaults).
+// The server (POST /api/outcome/plan) names the worker and picks the
+// directory and groups the fleet already uses for this work, reading the
+// text and the attachments (a recording is transcribed and the transcript
+// saved beside it). It starts as a plain first prompt, not a /goal (Ethan,
+// 2026-10-29: "it shouldn't create a goal"; `need-worker-behave-crm` in
+// /home/amux was the computed name and the remembered directory).
 const _OUTCOME_DEFAULT_CONSTRAINTS = 'Do not spend money or contact anyone outside the company. '
   + 'Ask before deleting or overwriting data you did not create. Commit finished work. '
   + 'When only steps that need the owner remain, stop and list them.';
 const _OUTCOME_STOP = new Set(['a','an','the','and','or','to','of','for','in','on','with','my','our','me','i','we',
-  'it','is','be','that','this','so','can','please','want','would','like','make','some','new','into','from','at','by']);
+  'it','is','be','that','this','so','can','please','want','would','like','make','some','new','into','from','at','by',
+  // the request's scaffolding, not its subject (the server's fallback_name drops the same words)
+  'need','needs','worker','workers','agent','behave','behaves','act','acts','as','wanna','gonna','able','dedicated',
+  'help','helps','create','build','set','up','you','your','something','lets']);
 
 function _outcomeName(text, taken) {
   const words = (text.toLowerCase().match(/[a-z0-9]+/g) || []).filter(w => !_OUTCOME_STOP.has(w));
-  let base = words.slice(0, 4).join('-').slice(0, 32).replace(/-+$/, '') || 'outcome';
+  let base = words.slice(0, 3).join('-').slice(0, 24).replace(/-+$/, '') || 'outcome';
   let name = base, n = 2;
   while (taken.has(name)) name = base + '-' + n++;
   return name;
@@ -11667,10 +12081,9 @@ async function _outcomeDefaults() {
   } catch (_) { /* offline: the cached copy stands */ }
   return {
     group: d.group ?? ((typeof activeTag === 'string' && activeTag) ? activeTag : ''),
-    dir: d.dir || ((_filesCwd && _filesCwd !== '/') ? _filesCwd : ''),
+    dir: d.dir || '',
     provider: d.provider || 'claude',
     model: d.model || '',
-    goal: d.goal !== false,
     isolated: d.isolated !== false,
     constraints: d.constraints ?? _OUTCOME_DEFAULT_CONSTRAINTS,
   };
@@ -11684,21 +12097,26 @@ async function openOutcome() {
     <textarea id="outcome-text" class="input outcome-text" rows="4"
       placeholder="e.g. Add a dark mode toggle to settings and ship it"
       onkeydown="if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)){event.preventDefault();_modalClose(true)}">${esc(draft)}</textarea>
+    <div class="outcome-files">
+      <button type="button" class="btn" onclick="document.getElementById('outcome-file').click()">&#x1F4CE; Attach a recording or files</button>
+      <input type="file" id="outcome-file" multiple hidden onchange="_outcomeAttach(this.files);this.value=''">
+      <div id="outcome-file-list" class="ui-help" aria-live="polite"></div>
+    </div>
     <details class="outcome-settings">
       <summary>Defaults and constraints</summary>
       <label class="outcome-field">Group<input id="outcome-group" class="input" list="outcome-group-list" value="${esc(d.group)}" placeholder="none"></label>
       <datalist id="outcome-group-list">${groups.map(g => '<option value="' + esc(g) + '"></option>').join('')}</datalist>
-      <label class="outcome-field">Working directory<input id="outcome-dir" class="input" value="${esc(d.dir)}" placeholder="~/Dev/project"></label>
+      <label class="outcome-field">Working directory<input id="outcome-dir" class="input" value="${esc(d.dir)}" placeholder="Chosen from your description"></label>
       <label class="outcome-field">Provider<select id="outcome-provider" class="input">
         ${['claude', 'codex', 'gemini'].map(p => `<option value="${p}"${p === d.provider ? ' selected' : ''}>${p}</option>`).join('')}
       </select></label>
       <label class="outcome-field">Model<input id="outcome-model" class="input" value="${esc(d.model)}" placeholder="${esc(window._AMUX_DEFAULT_MODEL || 'default')}"></label>
       <label class="outcome-field">Constraints<textarea id="outcome-constraints" class="input" rows="3">${esc(d.constraints)}</textarea></label>
-      ${chk('outcome-goal', d.goal, 'Keep going until done (/goal, Claude)')}
       ${chk('outcome-isolated', d.isolated, 'Isolated (no board or harness prompts)')}
       ${chk('outcome-remember', true, 'Remember these as my defaults')}
     </details>
   </div>`;
+  _outcomeFiles = [];
   const shown = showFormModal('Describe what you want', html, 'Start');
   setTimeout(() => document.getElementById('outcome-text')?.focus(), 30);
   const ok = await shown;
@@ -11708,24 +12126,66 @@ async function openOutcome() {
   if (text) localStorage.setItem('amux_outcome_draft', text);   // kept until a worker exists
   if (!ok || !text) return;
   const cfg = { group: v('outcome-group'), dir: v('outcome-dir'), provider: v('outcome-provider') || 'claude',
-    model: v('outcome-model'), goal: on('outcome-goal'), isolated: on('outcome-isolated'),
+    model: v('outcome-model'), isolated: on('outcome-isolated'),
     constraints: document.getElementById('outcome-constraints')?.value ?? d.constraints };
+  const files = await _outcomeFilesReady();
+  if (files === null) { showToast('Not started: an attachment did not upload. Your description is kept.'); return; }
   if (on('outcome-remember')) {
     const val = JSON.stringify(cfg);
     localStorage.setItem('amux_outcome_defaults', val);
     fetch(API + '/api/prefs', { method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}),
       body: JSON.stringify({ key: 'outcome_defaults', value: val }) }).catch(() => {});
   }
-  await _outcomeStart(text, cfg);
+  await _outcomeStart(text, cfg, files);
 }
-async function _outcomeStart(text, cfg) {
-  const name = _outcomeName(text, new Set((sessions || []).map(s => s.name)));
-  const goal = cfg.goal && cfg.provider === 'claude';
-  const body = { name, dir: cfg.dir || (window._cloudEmail ? '/root' : ''), creator: _getDeviceName(),
-    desc: _outcomeDesc(text), prompt: _outcomePrompt(text, cfg.constraints || '', goal) };
+// Attachments upload as soon as they are picked (the same upload API voice
+// notes use), so Start only waits for the ones still in flight.
+let _outcomeFiles = [];
+function _outcomeAttach(list) {
+  for (const file of list || []) {
+    const it = { name: file.name, path: '', failed: false };
+    it.done = _cvUploadVoice(file).then(p => { it.path = p; it.failed = !p; _outcomeRenderFiles(); return p; });
+    _outcomeFiles.push(it);
+  }
+  _outcomeRenderFiles();
+}
+function _outcomeRenderFiles() {
+  const el = document.getElementById('outcome-file-list');
+  if (!el) return;
+  el.innerHTML = _outcomeFiles.map((f, i) => '<span class="outcome-file">' + esc(f.name)
+    + (f.failed ? ' (did not upload)' : f.path ? '' : ' (uploading)')
+    + ' <button type="button" class="btn" aria-label="Remove ' + esc(f.name) + '" onclick="_outcomeFiles.splice(' + i + ',1);_outcomeRenderFiles()">&times;</button></span>').join(' ');
+}
+async function _outcomeFilesReady() {
+  const paths = await Promise.all(_outcomeFiles.map(f => f.done));
+  return paths.some(p => !p) ? null : paths;
+}
+// The server reads the text and attachments and picks the name, directory
+// and groups. If it cannot answer, the computed name stands and the worker
+// starts where the dialog says.
+async function _outcomePlan(text, files) {
+  try {
+    const r = await fetch(API + '/api/outcome/plan', { method: 'POST',
+      headers: _authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify({ text, files }) });
+    if (r.ok) return await r.json();
+  } catch (_) {}
+  return null;
+}
+async function _outcomeStart(text, cfg, files) {
+  files = files || [];
+  showToast('Reading your description' + (files.length ? ' and attachments' : '') + '...');
+  const plan = await _outcomePlan(text, files);
+  const name = plan?.name || _outcomeName(text, new Set((sessions || []).map(s => s.name)));
+  const dir = cfg.dir || plan?.dir || (window._cloudEmail ? '/root' : '');
+  const context = (plan?.attachments || []).map(a => a.transcript
+    ? a.path + ' (recording; transcript at ' + a.transcript + ')' : a.path);
+  for (const p of files) if (!context.some(c => c.startsWith(p))) context.push(p);
+  const ask = text + (context.length ? '\n\nRead these first, they are part of the request: ' + context.join('; ') : '');
+  const body = { name, dir, creator: _getDeviceName(),
+    desc: plan?.desc || _outcomeDesc(text), prompt: _outcomePrompt(ask, cfg.constraints || '', false) };
   if (cfg.provider !== 'claude') body.provider = cfg.provider;
   if (cfg.model) body.model = cfg.model;
-  const groups = _createGroupsFrom(cfg.group);
+  const groups = _createGroupsFrom(cfg.group || (plan?.groups || []).join(','));
   if (groups.length) body.tags = groups;
   if (cfg.isolated) body.isolated = true;
   if (_yoloDefault) body.yolo = true;
@@ -11747,10 +12207,10 @@ async function _outcomeStart(text, cfg) {
     return;
   }
   localStorage.removeItem('amux_outcome_draft');
-  showToast(goal ? 'Started ' + name + ': it keeps going until done and tells you when it is'
-                 : 'Started ' + name);
+  showToast('Started ' + name + (dir ? ' in ' + dir : ''));
   await fetchSessions();
   document.querySelector('[data-session="' + CSS.escape(name) + '"]')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  return name;
 }
 
 // ── Set default model label from server config ──
@@ -12301,6 +12761,25 @@ async function deleteSession(session) {
 async function pauseWorker(session) { return _changeWorkerPaused(session, true); }
 async function resumeWorker(session) { return _changeWorkerPaused(session, false); }
 
+// An acknowledged pause/resume, kept until a snapshot agrees (or 30 s). A
+// sessions snapshot taken before the server applied it used to replace the
+// projection and flip the badge and the paused section back (implicit state
+// machines inventory 2026-10-31, #31). Re-applied to every incoming snapshot.
+const _lifecycleAck = new Map();
+function _applyLifecycleAcks(list) {
+  if (!_lifecycleAck.size || !Array.isArray(list)) return list;
+  const now = Date.now();
+  for (const [name, ack] of _lifecycleAck) {
+    const w = list.find(s => s.name === name);
+    if (!w || now - ack.at > 30000 || w.lifecycle === ack.lifecycle) { _lifecycleAck.delete(name); continue; }
+    w.lifecycle = ack.lifecycle;
+    if (typeof ack.running === 'boolean') w.running = ack.running;
+    if (ack.status) w.status = ack.status;
+    try { amuxTrack('lifecycle_ack_held_over_stale_snapshot', { measured: true, n_considered: 1 }); } catch (e) {}
+  }
+  return list;
+}
+
 async function _changeWorkerPaused(session, paused) {
   if (_workerLifecyclePending.has(session)) return;
   closeAllMenus();
@@ -12318,9 +12797,10 @@ async function _changeWorkerPaused(session, paused) {
       // must not leave a stale Resume action or a Working badge behind.
       const worker = sessions.find(s => s.name === session);
       if (worker && body.lifecycle) {
-        worker.lifecycle = body.lifecycle;
-        if (typeof body.running === 'boolean') worker.running = body.running;
-        if (body.session === 'starting' || (!paused && body.session === 'started')) worker.status = 'starting';
+        _lifecycleAck.set(session, { lifecycle: body.lifecycle, at: Date.now(),
+          running: typeof body.running === 'boolean' ? body.running : undefined,
+          status: (body.session === 'starting' || (!paused && body.session === 'started')) ? 'starting' : '' });
+        _applyLifecycleAcks(sessions);
       }
       updatePeekStatus();
       if (!paused) {
@@ -12661,7 +13141,10 @@ async function doKeys(name, keys) {
 
 const _fieldSizingSupported = typeof CSS !== 'undefined' && CSS.supports && CSS.supports('field-sizing', 'content');
 function autoGrow(el) {
-  if (_fieldSizingSupported) return;
+  // A hand-sized box keeps its height while its draft lasts; its text scrolls
+  // (see _composerSetHeight). An empty box sizes to its content again.
+  if (el.classList.contains('user-sized') && !el.value) _composerSetHeight(el, 0);
+  if (_fieldSizingSupported || el.classList.contains('user-sized')) return;
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, parseFloat(getComputedStyle(el).maxHeight) || 999) + 'px';
 }
@@ -12669,9 +13152,14 @@ function autoGrow(el) {
 // drag this input box by a corner and manually make it bigger"). The box sits
 // on the bottom edge, so the native bottom-right resize handle could only push
 // it off screen; the grip is on its top-left corner and dragging it up raises
-// the box's minimum height. Text still grows the box past that, up to 70% of
-// the screen. The height is kept per device; a double-click on the grip goes
-// back to sizing by content.
+// the box's height. Since 2026-11-06 that height holds in both directions
+// ("i should be able to drag this down even if the text is full"): longer text
+// scrolls inside it instead of holding the box open. Up to 70% of the screen.
+// The hand-set height lasts for the draft (Ethan, 2026-11-07: "the input box
+// should expand vertically as i type but i can also collapse it if i drag").
+// Kept per device, it held every later draft at one size and the box stopped
+// growing. Emptying the box (a send, or deleting the text) or a double-click
+// on the grip goes back to sizing by content.
 const _COMPOSER_H_KEY = 'amux_peek_composer_h';
 function _composerSetHeight(ta, h) {
   if (!ta) return;
@@ -12679,6 +13167,7 @@ function _composerSetHeight(ta, h) {
   const max = Math.round(innerHeight * 0.7);
   h = Math.max(44, Math.min(max, Math.round(h)));
   ta.style.setProperty('--composer-h', h + 'px');
+  ta.style.height = '';   // an inline height from autoGrow would override the hand-set one
   ta.classList.add('user-sized');
   return h;
 }
@@ -12686,20 +13175,18 @@ function _composerGripInit(gripId, taId, key) {
   const grip = document.getElementById(gripId), ta = document.getElementById(taId);
   if (!grip || !ta || grip._wired) return;
   grip._wired = true;
-  const saved = parseInt(localStorage.getItem(key) || '', 10);
-  if (saved > 0) _composerSetHeight(ta, saved);
-  let startY = 0, startH = 0, last = 0;
-  const move = e => { last = _composerSetHeight(ta, startH + (startY - e.clientY)) || last; e.preventDefault(); };
+  try { localStorage.removeItem(key); } catch (e) {}   // a height saved before 2026-11-07
+  let startY = 0, startH = 0;
+  const move = e => { _composerSetHeight(ta, startH + (startY - e.clientY)); e.preventDefault(); };
   const up = () => {
     grip.classList.remove('dragging');
     window.removeEventListener('pointermove', move);
     window.removeEventListener('pointerup', up);
     window.removeEventListener('pointercancel', up);
-    if (last) { try { localStorage.setItem(key, String(last)); } catch (e) {} }
   };
   grip.addEventListener('pointerdown', e => {
     e.preventDefault();
-    startY = e.clientY; startH = ta.getBoundingClientRect().height; last = 0;
+    startY = e.clientY; startH = ta.getBoundingClientRect().height;
     grip.classList.add('dragging');
     window.addEventListener('pointermove', move, { passive: false });
     window.addEventListener('pointerup', up);
@@ -12707,7 +13194,6 @@ function _composerGripInit(gripId, taId, key) {
   });
   grip.addEventListener('dblclick', () => {
     _composerSetHeight(ta, 0);
-    try { localStorage.removeItem(key); } catch (e) {}
     autoGrow(ta);
   });
 }
@@ -12988,7 +13474,12 @@ function _draftInputChanged(input) {
   if (id === 'peek-cmd-input' || id === 'peek-input-fs-ta') _draftSave(_peekComposerTarget(), input.value);
   else if (id.startsWith('input-')) _draftSave(id.slice(6), input.value);
 }
-document.addEventListener('input', event => _draftInputChanged(event.target));
+document.addEventListener('input', event => {
+  _draftInputChanged(event.target);
+  // Deleting a hand-sized draft down to nothing sizes the box by content again.
+  const t = event.target;
+  if (t && t.classList && t.classList.contains('user-sized') && !t.value) _composerSetHeight(t, 0);
+});
 window.addEventListener('storage', event => {
   if (event.storageArea !== localStorage || !event.key || !event.key.startsWith(_DRAFT_PREFIX)) return;
   const session = event.key.slice(_DRAFT_PREFIX.length);
@@ -13033,11 +13524,10 @@ async function sendFromInput(name) {
     return;
   }
   const original = inp.value;
-  const queued = _sendMode === 'queue' && (sessions.find(s => s.name === name) || {}).status !== 'waiting';
+  const queued = _sendMode === 'queue' && !_waitingNow(name);
   if (_composerPendingSends.has(name)) return;
   const draftRevision = _draftSave(name, original);
-  _composerPendingSends.add(name);
-  _composerLockWatch(name, original);
+  const lock = _composerLockTake(name, original);
   _syncComposerPending();
   try {
     const identity = {};
@@ -13072,7 +13562,7 @@ async function sendFromInput(name) {
     _composerUnconfirmed(name, 'exception', _files.length);
     showToast('Message not confirmed — draft and attachments kept');
   } finally {
-    _composerPendingSends.delete(name);
+    _composerLockRelease(name, lock);
     _syncComposerPending();
   }
 }
@@ -13553,7 +14043,7 @@ async function _scopeEditSave() {
 const _BOARD_SWITCHES = [
   { field: 'board_force_adherence', value: 'board_force_adherence', own: null, group: 'The board and this worker',
     label: 'Board steers this worker',
-    note: 'Lets the board type into this worker: start cards, nudge and remind it. With planning on, a task-like message is held until it becomes cards, and the worker gets the cards instead. Off: the board only keeps records.' },
+    note: 'Lets the board type into this worker (start cards, nudge and remind it) only where AMUX_BOARD_STEERS=1 is set; otherwise the board records only. With planning on, a task-like message is held until it becomes cards, and the worker gets the cards instead. Off: the board is not used for this worker.' },
   { field: 'board_auto_pickup', value: 'auto_pickup_raw', active: 'auto_pickup', own: 'auto_pickup_own', parents: ['board_force_adherence'],
     label: 'Start To Do cards when idle',
     note: 'When the worker goes idle it claims its next To Do card and starts on it.' },
@@ -13603,10 +14093,14 @@ const _WORKER_BOARD_CONFIGS = _BOARD_SWITCHES;
 function _boardOneState(s) {
   if (!s || s.isolated) return { mode: 'off', on: false, label: 'Off' };
   if ('board_enabled' in _pbcPending) return _pbcPending.board_enabled ? { mode: 'on', on: true, label: 'On' } : { mode: 'off', on: false, label: 'Off' };
+  // The server's own answer (2026-10-31): `board_used` is the predicate every
+  // board gate enforces, so Off here means the board is not used at all. A
+  // worker nobody turned on reads Off (the board is opt-in since 2026-11-02).
+  if (typeof s.board_used === 'boolean') return s.board_used ? { mode: 'on', on: true, label: 'On' } : { mode: 'off', on: false, label: 'Off' };
   const st = _boardSwitchStates(s, _pbcPending);
   return st.board_force_adherence.effective ? { mode: 'on', on: true, label: 'On' } : { mode: 'off', on: false, label: 'Off' };
 }
-const _BOARD_ONE_NOTE = 'On: the board starts this worker\u2019s To Do cards when it is idle, keeps it going on unfinished cards, refills To Do from Backlog, turns task-like messages into cards, and nudges and reminds it. Off: the board only keeps records and never types into this worker.';
+const _BOARD_ONE_NOTE = 'On: the board keeps this worker\u2019s cards and turns task-like messages into cards. It never types into the worker: no card starts, nudges or reminders, unless AMUX_BOARD_STEERS=1 is set in its scope. Off: the board is not used for this worker. No cards are filed for it, nothing about the board is typed into it, and its own board calls are refused.';
 function _boardOneSwitchHTML(name, s, cls) {
   const b = _boardOneState(s);
   const dis = s && s.isolated ? ' disabled' : '';
@@ -14391,8 +14885,8 @@ async function _simpleRender(gen) {
 // companion worker, `<worker>-chat`, listed in the fleet with its own board,
 // schedules and steering. The chat is now addressed as `<worker>@chat`, a key
 // no worker can have, and the server keeps its state under the worker
-// (chat_worker.rs, COMPANION LANES). The on switch is AMUX_CHAT_COMPANION on
-// the worker; nothing else is created.
+// (chat_worker.rs, COMPANION LANES). The switch is AMUX_CHAT_COMPANION on the
+// worker, on unless it says 0 (sessions_legacy.rs chat_on); nothing else is created.
 // The worker the peek composer writes to: this worker, or its chat companion
 // while the Chat tab shows one. Drafts are keyed on it, so text typed in the
 // Chat tab is the companion's draft and a send there clears it (it used to
@@ -14429,7 +14923,7 @@ async function _peekChatSet(on) {
   const w = peekSession;
   if (!w) return;
   try {
-    await _peekChatScope(w, { AMUX_CHAT_COMPANION: on ? '1' : null });
+    await _peekChatScope(w, { AMUX_CHAT_COMPANION: on ? '1' : '0' });
     // The session list is cached server-side, so the switch can be missing
     // from the first refresh; the tab would then keep the off panel over the
     // composer. Refresh until the state it shows is the one just set.
@@ -14442,6 +14936,14 @@ async function _peekChatSet(on) {
     showToast(on ? 'Chat is on for ' + w : 'Chat is off for ' + w + ' (its history is kept)');
     setPeekTab('chat');
   } catch (e) { showToast('Chat: ' + (e.message || e)); }
+}
+// The Off panel is chosen when the tab opens, from the list the client holds
+// then. A new worker is not in it yet, so with Chat on by default the panel stayed
+// over the composer after the list caught up. Every fresh list settles it.
+function _peekChatStateSync() {
+  if (_peekTab !== 'chat' || !peekSession) return;
+  const panel = document.getElementById('peek-chat-panel');
+  if (panel && panel.classList.contains('active') === !!_peekChatTarget()) setPeekTab('chat');
 }
 function _peekChatPanelRender() {
   const p = document.getElementById('peek-chat-panel');
@@ -14884,7 +15386,7 @@ function _steeringDelayPrompt(msgId) {
   val.oninput = unit.onchange = preview; preview();
   box.querySelector('#steer-dp-cancel').onclick = () => bg.remove();
   box.querySelector('#steer-dp-set').onclick = () => { const s = secs(); bg.remove(); _steeringSetDelay(msgId, s); };
-  val.onkeydown = (e) => { if (e.key === 'Enter') box.querySelector('#steer-dp-set').click(); if (e.key === 'Escape') bg.remove(); };
+  val.onkeydown = (e) => { if (e.key === 'Enter') box.querySelector('#steer-dp-set').click(); if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); bg.remove(); } };   // one Escape closes only the picker, not the worker view under it
   setTimeout(() => val.select(), 0);
   bg.onclick = (e) => { if (e.target === bg) bg.remove(); };
 }
@@ -16509,6 +17011,14 @@ window._clientDebug = function (kind, fields) {
       body: JSON.stringify(Object.assign({ kind: kind, ver: APP_VER }, fields || {})) }).catch(() => {});
   } catch (e) {}
 };
+// The page asks for the app.js of its own build (index.html: /app.js?v=<ver>).
+// Running any other one means HTML and code came from different builds, which
+// breaks on the first element one has and the other does not. Say so.
+try {
+  const asked = new URL(document.currentScript.src).searchParams.get('v');
+  if (asked && asked !== APP_VER && asked.indexOf('__') !== 0)
+    window._clientDebug('asset-version-mismatch', { verdict: 'html_and_app_js_builds_differ', measured: true, n_considered: 1, html_ver: asked });
+} catch (e) {}
 // The dashboard's code ran, so a cache-clear pass reached it: reset the landing
 // page's loop guard (api/static_files.rs clear_sw_landing, AMUX-5385).
 try { sessionStorage.removeItem('amux_clear_sw_n'); } catch (e) {}
@@ -17635,7 +18145,21 @@ function _selectWorkerType(id) {
   if (prompt) prompt.placeholder = t.renderer === 'chat' ? 'First message (optional)' : 'What should Claude work on first?';
 }
 
+// The Mac app's Freeze Workspace (desktop/amux-workspace.swift) sets
+// window.__amuxFrozen: a page showing a worker keeps showing that worker.
+// True, with a toast and a beacon, when `next` would replace or close it.
+function _frozenWorker(next) {
+  if (!window.__amuxFrozen || !peekSession || next === peekSession) return false;
+  if (!document.getElementById('peek-overlay')?.classList.contains('active')) return false;
+  showToast('This workspace is frozen. Unfreeze it in Window > Workspaces.');
+  fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'}, keepalive:true,
+    body: JSON.stringify({kind:'frozen_refused', what: next ? 'switch_worker' : 'close_worker', worker: peekSession})})
+    .catch(e => console.warn('frozen_refused beacon failed', e));
+  return true;
+}
+
 function openPeek(name, opts) {
+  if (_frozenWorker(name)) return;
   _peekAgentsReset();
   _vxOnPeekOpen(name);   // switching worker ends another worker's live conversation
   if (_chat.name && _chat.name !== name) _chatUnmount();
@@ -17991,6 +18515,7 @@ async function _peekAgentRefresh() {
 }
 
 function closePeek() {
+  if (_frozenWorker(null)) return;
   _chatUnmount();
   _vxOnPeekClose();   // a live Converse conversation must not keep the mic open
   _peekFollowBottom = false;
@@ -19231,7 +19756,23 @@ function _detectTextLinks(plain) {
     // The host after the scheme. `slice(8)` assumed `https://` and cut the
     // first letter off an http host, so http://localhost:3077 was never a
     // link (owner, 2026-10-17: the port proxy links in the peek were dead).
-    if (/\.[a-z]|localhost|\d+\.\d+\.\d+\.\d+/i.test(v.replace(/^https?:\/\//i, ''))) add(m.index, m.index + v.length, 'url', v);
+    if (!/\.[a-z]|localhost|\d+\.\d+\.\d+\.\d+/i.test(v.replace(/^https?:\/\//i, ''))) continue;
+    // A HARD WRAP IS NOT THE END OF A URL (Ethan, 2026-11-07: "this isnt working
+    // this link"). A worker wrapped .../#view=apps&open=<32 hex> after 18 of the
+    // id's characters, the link stopped at the newline, and the Apps tab got an
+    // id it could not match. A URL that runs to the end of a long line takes the
+    // next line's first token when that token reads as URL text (a digit or
+    // / ? = & # % _ in it); a prose word or a "- " bullet ends it as before.
+    let val = v, end = m.index + v.length, open = v === m[0];   // trailing punctuation closed it
+    while (open && plain[end] === '\n' && end - (plain.lastIndexOf('\n', end - 1) + 1) >= 40) {
+      const tail = /^[ \t]*([^\s<>\]\)'"`,;\\$-]+)(?=\s|$)/.exec(plain.slice(end + 1));
+      if (!tail || tail[1].length < 3 || !/[0-9\/?=&#%_]/.test(tail[1])) break;
+      const t2 = trim(tail[1]);
+      val += t2;
+      end += 1 + tail[0].length - tail[1].length + t2.length;
+      open = t2 === tail[1];
+    }
+    add(m.index, end, 'url', val);
   }
   // `@` before a path is Claude Code's file-mention marker, not part of the path.
   const abs = new RegExp(String.raw`(^|[\s(\x60'"=:\[@])((?:\/|\.\.?\/|~\/)[\w.\/@+-]*\w` + fileEnd + String.raw`(?::\d+(?::\d+)?)?)(?![\w\/])`, 'g');
@@ -19270,8 +19811,11 @@ function _detectTextLinks(plain) {
 }
 function _linkWrap(L, htmlText) {
   const ea = s => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  if (L.type === 'url')
-    return '<a href="' + ea(L.value) + '" target="_blank" rel="noopener noreferrer">' + htmlText + '</a>';
+  if (L.type === 'url') {
+    const fp = typeof _ownFilePath === 'function' ? _ownFilePath(L.value) : '';
+    return '<a href="' + ea(L.value) + '" target="_blank" rel="noopener noreferrer"' + (fp ? ' class="own-file-link" title="' + ea(L.value) + '"' : '') + '>'
+      + (fp ? ea(fp) : htmlText) + '</a>';
+  }
   const cls = /\.md(?::\d+)*$/i.test(L.value) ? 'md-link' : 'file-link';
   const title = typeof _resolveOutputPath === 'function' ? ' title="Open: ' + ea(_resolveOutputPath(L.value.replace(/(?::\d+){1,2}$/, ''))) + '"' : '';
   return '<span class="' + cls + '" data-path="' + ea(L.value) + '"' + title + ' onclick="_openLinkedPath(this,event)">' + htmlText + '</span>';
@@ -19405,7 +19949,7 @@ function ansiToHtml(text) {
 // Split out from ansiToHtml so the href policy is one readable place. Two
 // refusals are deliberate:
 //
-//  * ONLY http/https/file are linked. A terminal can emit any scheme it likes
+//  * ONLY http/https (and a local file://, as a file-viewer link) are linked. A terminal can emit any scheme it likes
 //    and this href lands in the DOM, so `javascript:`, `data:` and friends are
 //    an injection surface. An unknown scheme keeps the LABEL as plain text —
 //    exactly what the terminal itself shows — rather than guessing.
@@ -19422,7 +19966,8 @@ function _osc8Resolve(html, urls) {
     // Localhost URLs go through the same rewrite as every other link in the
     // peek: to the app's Apps entry, so an OSC-8 link works from a phone or the cloud.
     const s = rewriteLocalhostUrls(String(u == null ? '' : u).trim());
-    if (!/^(?:https?|file):\/\//i.test(s)) return null;
+    // file:// is handled by filePath below; one naming another host stays text.
+    if (!/^https?:\/\//i.test(s)) return null;
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
             .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
   };
@@ -19441,10 +19986,32 @@ function _osc8Resolve(html, urls) {
     .map(seg => (!seg || /^<\/?span/i.test(seg)) ? seg
       : '<a href="' + h + '" target="_blank" rel="noopener noreferrer">' + seg + '</a>')
     .join('');
+  // A file:// link names a path on the machine amux runs on, which is often not
+  // the one showing this page. Handed to the browser it did nothing, and the Mac
+  // app passed it to Finder, which failed on a path it does not have ("The
+  // application can't be opened. -50", owner 2026-11-08). It opens like any
+  // path in worker output instead: in amux's file viewer, resolved on the server.
+  const filePath = u => {
+    try {
+      const url = new URL(String(u == null ? '' : u).trim());
+      if (url.protocol !== 'file:' || (url.hostname && url.hostname !== 'localhost')) return null;
+      return decodeURIComponent(url.pathname);
+    } catch (e) { return null; }
+  };
+  const ea = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  const wrapFile = (label, p) => label
+    .split(/(<\/?span[^>]*>)/)
+    .map(seg => (!seg || /^<\/?span/i.test(seg)) ? seg
+      : '<span class="' + (/\.md$/i.test(p) ? 'md-link' : 'file-link') + '" data-path="' + ea(p) + '" title="Open: ' + ea(p)
+        + '" onclick="_openLinkedPath(this,event)">' + seg + '</span>')
+    .join('');
   return html
     .replace(/\uE000(\d+)\uE001([\s\S]*?)\uE002/g, (_m, idx, label) => {
+      if (/<a\s/i.test(label)) return label;
+      const fp = filePath(urls[+idx]);
+      if (fp) return wrapFile(label, fp);
       const h = href(urls[+idx]);
-      if (!h || /<a\s/i.test(label)) return label;
+      if (!h) return label;
       return wrap(label, h);
     })
     // Unpaired sentinels: peek captures a rolling window, so a link routinely
@@ -20353,6 +20920,8 @@ function _classifyPromptKind(promptText) {
   // and delivers through the steering queue, which writes no ledger row. It
   // is the harness acting on standing policy, so Harness, never Human.
   if (clean.includes("(Approved automatically under the owner's needs-input policy.)")) return 'amux';
+  // A published digest default (decision_digest.rs) is harness text too.
+  if (clean.includes('(Applied by digest default, not by the owner.)')) return 'amux';
   // Its send-back (needs_input_auto.rs send_back_text) is harness text too.
   if (clean.includes("This is yours to do; Ethan's needs-input policy returns")) return 'amux';
   // The Messages tab is a fetched snapshot; cmdHistoryAdd is the immediate
@@ -21474,7 +22043,7 @@ function _paintPeekRegions(body) {
 }
 // The DOM a search pass built, so the next pass can reuse it.
 let _peekSearchDom = { hist: null, live: null, first: null };
-const _peekSearchStats = { reused: 0, rebuilt: 0 };
+const _peekSearchStats = { reused: 0, rebuilt: 0, phases: null };
 function _peekClearHighlights(body) {
   const parents = new Set();
   for (const mark of body.querySelectorAll('span.peek-highlight')) {
@@ -21489,19 +22058,29 @@ function _peekSearchTyped(value) {
   peekSearchQuery = value;
   document.getElementById('peek-search-wrap')?.classList.toggle('has-value', !!value);
   clearTimeout(_peekSearchTimer);
-  _peekSearchTimer = setTimeout(() => { _peekSearchTimer = 0; _peekSearchTimed(); }, value.trim() ? 120 : 0);
+  _peekSearchTimer = setTimeout(() => { _peekSearchTimer = 0; _peekSearchTimed(); }, value.trim() ? _peekSearchPause() : 0);
+}
+// A pass on a big page blocks for seconds (3.4 s at 55,000 elements, 6.7 s at
+// 154,000: Ethan, 2026-11-02, "increase the speed of peek search"), so the pause
+// follows what the last pass cost, and a word typed there runs one pass, not one
+// per letter.
+let _peekSearchLastMs = 0;
+function _peekSearchPause() {
+  return _peekSearchLastMs > 1000 ? 600 : _peekSearchLastMs > 250 ? 350 : 120;
 }
 // A typed search that blocks the page for over 100ms says so in the server log.
 function _peekSearchTimed() {
   const t0 = performance.now();
   applyPeekSearch();
   const ms = Math.round(performance.now() - t0);
+  _peekSearchLastMs = peekSearchQuery.trim() ? ms : 0;
   if (ms <= 100 || !peekSearchQuery.trim()) return;
   try {
     fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'peek-search-slow', session: peekSession, ver: APP_VER, ms,
         nodes: document.getElementById('peek-body')?.getElementsByTagName('*').length || 0,
         reused: _peekSearchStats.reused, rebuilt: _peekSearchStats.rebuilt,
+        phases: _peekSearchStats.phases, matches: _peekMatches.length,
         verdict: 'peek_search_slow', measured: true, n_considered: 1 }) }).catch(() => {});
   } catch (e) {}
 }
@@ -21526,6 +22105,7 @@ function applyPeekSearch(keepIndex, doScroll) {
     if (countEl) countEl.textContent = '';
     return;
   }
+  const _t0 = performance.now();
   if (_peekHistHidden) _peekHistExpand(false);
   // Search the rendered text, not serialized HTML. Entities and ANSI/link
   // spans must not turn one visible phrase into missing or duplicate matches.
@@ -21559,6 +22139,7 @@ function applyPeekSearch(keepIndex, doScroll) {
     _peekSearchDom = { hist: null, live: null, first: null };
   }
   _peekSearchStats[reuse ? 'reused' : 'rebuilt']++;
+  const _t1 = performance.now();
   const roots = !_peekFiltersActive() ? [body]
     : [...body.querySelectorAll('.peek-prompt')].filter(el => _peekPromptMatchesFilters(el));
   _peekMatches = [];
@@ -21592,12 +22173,14 @@ function applyPeekSearch(keepIndex, doScroll) {
       entry.node.replaceWith(fragment);
     }
   }
-  if (!reuse) _peekReclassifyPrompts();
+  // The paint above already classified; a highlight does not change the text.
+  const _t2 = performance.now();
   if (!keepIndex || peekSearchIndex >= _peekMatches.length) peekSearchIndex = 0;
   // Typed Find has the same late-history race as Locate: an empty live frame
   // is not proof that the requested text is absent from the arriving history.
   if (!keepIndex && doScroll !== false) _peekPendingFindScroll = !_peekMatches.length;
   _peekScrollTo(peekSearchIndex, doScroll);
+  _peekSearchStats.phases = { paint: Math.round(_t1 - _t0), mark: Math.round(_t2 - _t1), scroll: Math.round(performance.now() - _t2) };
   if (countEl) countEl.textContent = _peekMatches.length > 0 ? (peekSearchIndex + 1) + '/' + _peekMatches.length : 'none here · \u21b5 all logs';
 }
 
@@ -22571,6 +23154,7 @@ function _attachPreviewOpen(f, opener) {
   if (f.file instanceof Blob) { src = URL.createObjectURL(f.file); revoke = src; from = 'device'; }
   else if (kind === 'image' && f.previewUrl) { src = f.previewUrl; from = 'device'; }
   else if (f.path) { src = _htmlPreviewUrl(f.path) || ''; from = 'server'; }
+  else if (f.url) { src = f.url; from = f.from || 'server'; }
   let body;
   if (!src) body = '<p class="ui-help">This file has no copy to show yet. It can be previewed once it finishes uploading.</p>';
   else if (kind === 'image') body = `<img class="attach-preview-img" src="${esc(src)}" alt="${esc(f.name)}">`;
@@ -22581,7 +23165,7 @@ function _attachPreviewOpen(f, opener) {
   else body = `<p class="attach-preview-icon">${_fileIcon(f.name)}</p><p class="ui-help">No preview for this kind of file here.</p>`;
   if (f.path) body += `<p><button type="button" class="btn" data-open-file>Open in the file viewer</button></p>`;
   const size = f.sizeMB ? f.sizeMB + ' MB' : (f.file && f.file.size ? (f.file.size / 1048576).toFixed(1) + ' MB' : '');
-  const state = f.path ? 'uploaded' : (f.error ? 'upload failed' : 'uploading');
+  const state = f.state || (f.path ? 'uploaded' : (f.error ? 'upload failed' : 'uploading'));
   const ov = _chipDetailModal('attach-preview', f.name, [size, state].filter(Boolean).join(' · '), body,
     { returnFocus: opener, onClose: () => { if (revoke) URL.revokeObjectURL(revoke); } });
   ov.querySelector('.modal').classList.add('attach-preview');
@@ -23429,6 +24013,20 @@ function handleCardPaste(name, e) {
   });
 })();
 
+// Queue mode sends straight to a worker that is waiting at a question, so the
+// reply answers it. Only on a FRESH reading: a snapshot older than 10 s may
+// say waiting for a worker that has moved on, and the message then skipped
+// the queue and landed mid-turn (implicit state machines inventory #36).
+// Fresh means the WORKER LIST was read in the last 10 s. _lastDataTime moves on
+// every SSE message, the 10 s ping included, so it called a minutes-old list
+// fresh and the queued message still landed mid-turn (2026-11-06).
+function _waitingNow(name) {
+  const s = (sessions || []).find(x => x.name === name);
+  if (!s || s.status !== 'waiting') return false;
+  const fresh = Date.now() - _sessionsReadAt < 10000;
+  if (!fresh) { try { amuxTrack('queue_kept_stale_waiting', { measured: true, n_considered: 1 }); } catch (e) {} }
+  return fresh;
+}
 let _sendMode = localStorage.getItem('amux_send_mode') || 'send'; // 'send' or 'queue'
 // Default flipped to SEND (2026-07-17): pressing Send should send — it types
 // straight into the terminal, and Claude Code itself queues mid-turn input and
@@ -23471,7 +24069,25 @@ function _updateSendSplit() {
 }
 setTimeout(_updateSendSplit, 0);
 
-const _composerPendingSends = new Set();
+// session -> the token of the ONE send holding that composer. A send releases
+// the lock only while it still holds it: after the 20 s watch gives the button
+// back and a second send starts, the first send's late finish must not unlock
+// the composer under the second (inventory #2, 2026-11-06).
+const _composerPendingSends = new Map();
+function _composerLockTake(name, original) {
+  const token = {};
+  _composerPendingSends.set(name, token);
+  _composerLockWatch(name, original, token);
+  return token;
+}
+function _composerLockRelease(name, token) {
+  if (_composerPendingSends.get(name) !== token) {
+    console.info('[amux] composer_stale_release_ignored', name);
+    return;
+  }
+  _composerPendingSends.delete(name);
+  _composerPendingSince.delete(name);
+}
 function _composerUnconfirmed(session, result, attachments) {
   // The local log is available even with analytics disabled. Never send message
   // contents, upload paths or credentials in a failure beacon.
@@ -23486,11 +24102,11 @@ function _composerUnconfirmed(session, result, attachments) {
 // arrived shows in Messages, so the toast says to look there before resending.
 const _COMPOSER_LOCK_MS = 20000;
 const _composerPendingSince = new Map();
-function _composerLockWatch(name, original) {
+function _composerLockWatch(name, original, token) {
   _composerPendingSince.set(name, Date.now());
   setTimeout(() => {
     const t = _composerPendingSince.get(name);
-    if (!t || !_composerPendingSends.has(name) || Date.now() - t < _COMPOSER_LOCK_MS) return;
+    if (!t || _composerPendingSends.get(name) !== token || Date.now() - t < _COMPOSER_LOCK_MS) return;
     _composerPendingSends.delete(name);
     _composerPendingSince.delete(name);
     // The text back where it was typed, as a refused send does.
@@ -23535,7 +24151,7 @@ async function sendPeekCmd() {
   if (!text && !files.length) { _submitSuggestion(session, true, 'Enter'); return; }
   let message = text;
   if (files.length) message = [text, ...files.map(f => '@' + f.path)].filter(Boolean).join(' ');
-  const atSelector = (sessions.find(s => s.name === session) || {}).status === 'waiting';
+  const atSelector = _waitingNow(session);
   // The Chat tab's chat queues turns itself and has no steering queue.
   const queued = _sendMode === 'queue' && !atSelector && !_chatCompanionOf(session);
   if (!queued) {
@@ -23551,8 +24167,7 @@ async function sendPeekCmd() {
   // Persist text and upload references in the local outbox before clearing.
   // A network refusal remains reviewable in Sync and pending Messages.
   const draftRevision = _draftSave(session, original);
-  _composerPendingSends.add(session);
-  _composerLockWatch(session, original);
+  const lock = _composerLockTake(session, original);
   _syncComposerPending();
   let result = 'failed';
   try {
@@ -23592,7 +24207,7 @@ async function sendPeekCmd() {
     _composerUnconfirmed(session, 'exception', files.length);
     showToast('Message not confirmed — draft and attachments kept');
   } finally {
-    _composerPendingSends.delete(session);
+    _composerLockRelease(session, lock);
     _syncComposerPending();
   }
 }
@@ -24355,6 +24970,11 @@ const _ACTION_CHIPS = [
     { id: 'sendnow', label: 'Send Now', action: 'keys', value: 'C-x C-s', desc: 'Ctrl+X, release, then Ctrl+S' },
     { id: 'up', label: '\u2191', action: 'keys', value: 'Up', desc: 'Arrow Up' },
     { id: 'down', label: '\u2193', action: 'keys', value: 'Down', desc: 'Arrow Down' },
+    // Left/Right and Shift+Tab move between the questions of a multi-question
+    // prompt (Tab only goes forward). The server already accepts all three keys.
+    { id: 'left', label: '\u2190', action: 'keys', value: 'Left', desc: 'Arrow Left (previous question)' },
+    { id: 'right', label: '\u2192', action: 'keys', value: 'Right', desc: 'Arrow Right (next question)' },
+    { id: 'btab', label: 'Shift+Tab', action: 'keys', value: 'BTab', desc: 'Shift+Tab (previous question)' },
     { id: 'push', label: '\u2B06 Push', action: 'special', value: 'gitPush', desc: 'Git push' },
     { id: 'ctrlc', label: 'Ctrl+C', action: 'keys', value: 'C-c', desc: 'Interrupt', danger: true },
     { id: 'ctrlo', label: 'Ctrl+O', action: 'keys', value: 'C-o', desc: 'Accept & continue' },
@@ -24384,7 +25004,10 @@ function _getAllChips() {
 }
 
 let _chipEditing = false;
-let _chipDragIdx = -1;
+// The boot read of the shared chip set finished (ok or not). A later default
+// is only offered after it: offered before, a device that never saw the
+// removal re-added the chip and its pending save overwrote the server's set.
+let _chipsSynced = false;
 
 function _loadChips() {
   try {
@@ -24400,25 +25023,79 @@ function _loadChips() {
 // at boot; saves push up debounced (a drag-reorder is one POST, not ten);
 // an empty server pref is seeded from the first device that has local
 // customizations, so nobody's existing layout is lost by the migration.
-let _chipsPushTimer = null;
-function _pushChipsToServer(chips) {
-  clearTimeout(_chipsPushTimer);
-  _chipsPushTimer = setTimeout(() => {
-    fetch(API + '/api/prefs', {
-      method: 'POST',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
-      body: JSON.stringify({ key: 'ui_chips', value: JSON.stringify(chips) }),
-    }).catch(() => {});  // offline: localStorage still holds it; the next save retries
-  }, 800);
+//
+// SAVED MEANS THE SERVER HAS IT (Ethan, 2026-11-08: "today it doesnt save").
+// The push used to be fire-and-forget: a refused or dropped POST left the
+// server on the old set, and the next boot, where the server wins, put the old
+// order back. A change is now PENDING (amux_chips_pending) until a POST
+// answers ok; a pending change wins at boot and is pushed again, a failed push
+// retries, and leaving the page flushes a push still waiting on its debounce.
+// Each outcome is beaconed as kind=chips-sync.
+let _chipsPushTimer = null, _chipsRetryTimer = null;
+const _CHIPS_PENDING = 'amux_chips_pending';
+const _CHIPS_OFFERED = 'amux_chips_offered';
+function _chipsBeacon(verdict, extra) {
+  try { fetch(API + '/api/client-debug', { method: 'POST', _skipOutbox: true, keepalive: true, headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(Object.assign({ kind: 'chips-sync', verdict, measured: true, n_considered: 1, ver: typeof APP_VER !== 'undefined' ? APP_VER : '?' }, extra || {})) }).catch(() => {}); } catch (_) { /* a beacon must never break the save it reports */ }
 }
+function _chipsPrefPost(key, value) {
+  return fetch(API + '/api/prefs', {
+    method: 'POST', keepalive: true, _skipOutbox: true,
+    headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+    body: JSON.stringify({ key, value }),
+  }).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r; });
+}
+function _pushChipsNow() {
+  clearTimeout(_chipsPushTimer); _chipsPushTimer = null;
+  clearTimeout(_chipsRetryTimer); _chipsRetryTimer = null;
+  const value = localStorage.getItem('amux_chips');
+  if (!value || !localStorage.getItem(_CHIPS_PENDING)) return Promise.resolve();
+  const offered = localStorage.getItem(_CHIPS_OFFERED) || '[]';
+  return Promise.all([_chipsPrefPost('ui_chips', value), _chipsPrefPost('ui_chips_offered', offered)]).then(() => {
+    // Only clear the mark for the set that was sent: a change made while the
+    // POST was in flight stays pending.
+    if (localStorage.getItem('amux_chips') === value) localStorage.removeItem(_CHIPS_PENDING);
+    _chipsBeacon('chips_saved', { count: (JSON.parse(value) || []).length });
+  }).catch(e => {
+    _chipsBeacon('chips_save_failed', { error: String(e && e.message || e).slice(0, 120) });
+    _chipsRetryTimer = setTimeout(_pushChipsNow, 15000);
+  });
+}
+function _pushChipsToServer() {
+  clearTimeout(_chipsPushTimer);
+  _chipsPushTimer = setTimeout(_pushChipsNow, 400);   // a drag is one POST, not ten
+}
+// Leaving the page must not drop a change still waiting on its debounce.
+document.addEventListener('visibilitychange', () => { if (document.hidden && localStorage.getItem(_CHIPS_PENDING)) _pushChipsNow(); });
+window.addEventListener('pagehide', () => { if (localStorage.getItem(_CHIPS_PENDING)) _pushChipsNow(); });
 async function _syncChipsFromServer() {
+  try { await _syncChipsOnce(); } finally { _chipsSynced = true; }
+  if (_NEW_DEFAULT_CHIPS.length) refreshAllChipBars();
+}
+async function _syncChipsOnce() {
   try {
-    const r = await fetch(API + '/api/prefs?key=ui_chips', { headers: _authHeaders() });
+    // A change this device has not had confirmed wins: the server copy is the
+    // one that is behind.
+    if (localStorage.getItem(_CHIPS_PENDING) && _loadChips()) { _chipsBeacon('chips_local_pending_pushed'); _pushChipsNow(); return; }
+    const [r, ro] = await Promise.all([
+      fetch(API + '/api/prefs?key=ui_chips', { headers: _authHeaders() }),
+      fetch(API + '/api/prefs?key=ui_chips_offered', { headers: _authHeaders() }),
+    ]);
     if (!r.ok) return;
     const d = await r.json();
+    // Which later defaults were already offered, on any device: one removed
+    // on a phone stays removed on the desktop.
+    try {
+      const od = ro.ok ? await ro.json() : null;
+      const theirs = od && typeof od.value === 'string' && od.value ? JSON.parse(od.value) : [];
+      const mine = JSON.parse(localStorage.getItem(_CHIPS_OFFERED) || '[]');
+      if (Array.isArray(theirs)) localStorage.setItem(_CHIPS_OFFERED, JSON.stringify([...new Set(mine.concat(theirs))]));
+    } catch (e) { _chipsBeacon('chips_offered_unreadable', { error: String(e && e.message || e).slice(0, 120) }); }
+    if (localStorage.getItem(_CHIPS_PENDING)) return;   // changed while this read was in flight
     if (d && typeof d.value === 'string' && d.value) {
       const chips = JSON.parse(d.value);
       if (Array.isArray(chips) && chips.length) {
+        if (_chipEditing) return;   // never swap the set under a drag
         localStorage.setItem('amux_chips', JSON.stringify(chips));
         refreshAllChipBars();
         return;
@@ -24426,9 +25103,8 @@ async function _syncChipsFromServer() {
     }
     // Server has no chip pref yet: seed it from this device's customizations
     // (null when the user never customized — nothing to seed, defaults rule).
-    const local = _loadChips();
-    if (local) _pushChipsToServer(local);
-  } catch (e) {}
+    if (_loadChips()) { localStorage.setItem(_CHIPS_PENDING, String(Date.now())); _pushChipsNow(); }
+  } catch (e) { _chipsBeacon('chips_read_failed', { error: String(e && e.message || e).slice(0, 120) }); }
 }
 if (document.body) _syncChipsFromServer();
 else document.addEventListener('DOMContentLoaded', _syncChipsFromServer);
@@ -24450,6 +25126,10 @@ async function _approvalsRefresh() {
     if (!r.ok) return;
     const d = await r.json();
     const pending = Array.isArray(d.pending) ? d.pending : [];
+    // Approved for a later time: no longer a decision, so not in this banner.
+    // The Email tab's Scheduled folder lists them (Ethan, 2026-11-09).
+    _emailScheduled = Array.isArray(d.scheduled) ? d.scheduled : [];
+    _emailSchedPaint();
     // PERMISSION GRANTS SHARE THIS BANNER (AMUX-3997). Ethan asked for the email
     // approval flow to be leveraged for other ad-hoc permissions, and "leverage"
     // has to include the SURFACE: a second banner elsewhere would mean a human
@@ -24537,7 +25217,9 @@ async function _approvalsRefresh() {
       // show how long the draft has waited and how often it was re-requested.
       const _ageM = Math.max(1, Math.round((p.age_s || 0) / 60));
       const _waited = _ageM < 120 ? _ageM + 'm' : (_ageM < 2880 ? Math.round(_ageM / 60) + 'h' : Math.round(_ageM / 1440) + 'd');
-      const apprWhen = (p.expires_in_s == null)
+      const _sched = p.scheduled && p.scheduled.send_at ? p.scheduled : null;
+      const apprWhen = _sched ? 'sends ' + _apprWhenText(_sched.send_at)
+        : (p.expires_in_s == null)
         ? 'waiting ' + _waited + ((p.requests || 1) > 1 ? ', asked ' + p.requests + 'x' : '')
         : 'expires in ' + Math.max(1, Math.round(p.expires_in_s / 60)) + 'm';
       // OPEN BY DEFAULT (Ethan: "i should be able to see the draft email").
@@ -24552,7 +25234,13 @@ async function _approvalsRefresh() {
         + '<span style="opacity:0.7;font-size:var(--fs-sm);">' + esc(apprWhen) + '</span>'
         + '<button onclick="event.preventDefault();_apprApprove(\'' + esc(p.id) + '\',this)" '
         + 'style="background:color-mix(in srgb, var(--green) 84%, var(--shade));color:var(--on-solid);border:none;border-radius:var(--radius-md);'
-        + 'padding:var(--space-2) var(--space-3-5);font-size:var(--fs-md);cursor:pointer;min-height:34px;">Approve</button>'
+        + 'padding:var(--space-2) var(--space-3-5);font-size:var(--fs-md);cursor:pointer;min-height:34px;">' + (_sched ? 'Send now' : 'Approve') + '</button>'
+        // SCHEDULE (Ethan, 2026-11-08: "when i approve outbound email there
+        // should be another button to schedule for a date/time"). Opens a date
+        // and time row under the draft; the server holds the draft and sends
+        // it then (runtime_jobs/email_scheduled_send.rs).
+        + '<button class="appr-schedule appr-btn-outline" onclick="event.preventDefault();_apprSchedule(\'' + esc(p.id) + '\')">'
+        + (_sched ? 'Reschedule' : 'Schedule') + '</button>'
         // EDIT (Ethan, 2026-09-23: "just make it Approve, Discard and Edit. and
         // then make edit enter edit mode where i can edit it manually"). The
         // preview becomes a textarea in place; Approve then sends what is in it.
@@ -24584,6 +25272,10 @@ async function _approvalsRefresh() {
         + 'style="white-space:pre-wrap;word-break:break-word;background:color-mix(in srgb, var(--shade) 25%, transparent);'
         + 'border-radius:var(--radius-md);padding:var(--space-2) var(--space-2-5);margin:var(--space-1-5) 0;font-size:var(--fs-md);max-height:320px;overflow:auto;">'
         + esc(_bodyText) + '</div>'
+        + _apprAttachHtml(p)
+        + '<div id="appr-sched-' + esc(p.id) + '" class="appr-sched-row" data-send-at="' + (_sched ? _sched.send_at : '') + '" hidden></div>'
+        + (p.schedule_failed ? '<div class="appr-sched-failed">'
+          + 'It was scheduled for ' + esc(_apprWhenText(p.schedule_failed.send_at)) + ' and did not send. It is waiting for you again.</div>' : '')
         + (_full ? '' : '<div style="font-size:var(--fs-sm);color:color-mix(in srgb, var(--yellow) 47%, var(--on-solid));margin:0 0 var(--space-1-5);">Showing only the first '
           + _bodyText.length + ' characters of this draft. Approve sends the complete stored message.</div>')
         + '</details>';
@@ -24594,6 +25286,36 @@ async function _approvalsRefresh() {
     el.innerHTML = html;
     el.style.display = 'block';
   } catch (e) {}
+}
+// THE FILES GO OUT TOO (Ethan, 2026-11-09: "make sure amux supports
+// attachments too in the approval flow"). Each held attachment is a chip with
+// its name and size; a click previews the bytes that will be sent, in the same
+// dialog the composer's chips use, read from the held draft by
+// /api/email/approvals/<id>/attachments/<i>. The list itself never carries them.
+const _apprFiles = {};
+function _apprAttachHtml(p) {
+  const list = ((p.review || {}).attachments || []);
+  _apprFiles[p.id] = list;
+  if (!list.length) return '';
+  return '<div class="appr-attach" aria-label="Attachments">' + list.map(a => {
+    const size = a.ok ? _apprSize(a.size) : 'cannot be read, so it will not send';
+    return '<button type="button" class="appr-attach-chip' + (a.ok ? '' : ' appr-attach-bad') + '" '
+      + 'onclick="event.preventDefault();event.stopPropagation();_apprAttachOpen(\'' + esc(p.id) + '\',' + a.index + ',this)" '
+      + 'title="Preview ' + esc(a.filename) + '">' + _fileIcon(a.filename) + ' <span class="appr-attach-name">'
+      + esc(a.filename) + '</span> <span class="appr-attach-size">' + esc(size) + '</span></button>';
+  }).join('') + '</div>';
+}
+function _apprSize(n) {
+  if (typeof n !== 'number') return '';
+  return n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(0) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+}
+function _apprAttachOpen(id, i, btn) {
+  const a = (_apprFiles[id] || []).find(x => x.index === i);
+  if (!a) return;
+  _attachPreviewOpen({ name: a.filename, mime: a.content_type || '', from: 'held-draft',
+    state: a.ok ? 'attached, sends with this email' : 'cannot be read, so it will not send',
+    sizeMB: a.ok ? (a.size / 1048576).toFixed(1) : '',
+    url: a.ok ? _authUrl(API + '/api/email/approvals/' + encodeURIComponent(id) + '/attachments/' + i) : '' }, btn);
 }
 function _apprHeaders(pv) {
   const row = (k, v) => v ? '<div style="display:flex;gap:var(--space-2);"><span style="opacity:0.7;min-width:56px;">' + k
@@ -24732,12 +25454,76 @@ async function _apprApprove(id, btn) {
   } catch (e) { showToast('Approve failed: ' + e); }
   _approvalsRefresh();
 }
+// "today 3:00 PM", "tomorrow 9:00 AM", "Tue, Nov 11, 9:00 AM": when a scheduled
+// draft goes out, in this device's time.
+function _apprWhenText(sec) {
+  const d = new Date(sec * 1000), now = new Date();
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  // Calendar days, not milliseconds: a daylight-saving day is 23 or 25 hours.
+  const same = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  if (same(d, now)) return 'today ' + time;
+  if (same(d, next)) return 'tomorrow ' + time;
+  return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ', ' + time;
+}
+// A <input type="datetime-local"> value for a Date, in local time.
+function _apprLocalInput(d) {
+  const z = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + z(d.getMonth() + 1) + '-' + z(d.getDate()) + 'T' + z(d.getHours()) + ':' + z(d.getMinutes());
+}
+// Open (or close) the date and time row under a draft. The native picker is
+// the control on a phone. The poll pauses while it is open, like an edit.
+function _apprSchedule(id) {
+  const row = document.getElementById('appr-sched-' + id);
+  if (!row) return;
+  if (!row.hidden) { _apprScheduleClose(id); return; }
+  const at = parseFloat(row.dataset.sendAt);
+  let when = at > 0 ? new Date(at * 1000) : new Date();
+  if (!(at > 0)) { when.setDate(when.getDate() + 1); when.setHours(9, 0, 0, 0); }   // tomorrow 9 AM
+  _apprEditing.add('sched:' + id);
+  row.innerHTML = '<label class="appr-sched-form"><span class="appr-sched-label">Send at</span>'
+    + '<input type="datetime-local" class="input appr-sched-at" id="appr-sched-at-' + esc(id) + '" value="' + _apprLocalInput(when) + '" min="' + _apprLocalInput(new Date()) + '">'
+    + '<button class="appr-sched-confirm" onclick="event.preventDefault();_apprScheduleConfirm(\'' + esc(id) + '\',this)">Schedule send</button>'
+    + '<button class="appr-btn-outline appr-sched-cancel" onclick="event.preventDefault();_apprScheduleClose(\'' + esc(id) + '\')">Cancel</button>'
+    + '</label>';
+  row.hidden = false;
+}
+function _apprScheduleClose(id) {
+  _apprEditing.delete('sched:' + id);
+  const row = document.getElementById('appr-sched-' + id);
+  if (row) { row.hidden = true; row.innerHTML = ''; }
+  _approvalsRefresh();
+}
+async function _apprScheduleConfirm(id, btn) {
+  const inp = document.getElementById('appr-sched-at-' + id);
+  const when = inp && inp.value ? new Date(inp.value) : null;
+  if (!when || isNaN(when) || when.getTime() <= Date.now()) { showToast('Pick a time in the future'); return; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Scheduling…'; }
+  try {
+    // Same approver marker as Approve; a send time makes it a schedule. An
+    // open edit goes with it, so what is on screen is what will send.
+    const body = { send_at: when.getTime() / 1000 };
+    const ta = document.getElementById('appr-edit-' + id);
+    if (ta) body.body = ta.value;
+    const r = await fetch(API + '/api/email/approve/' + encodeURIComponent(id), {
+      method: 'POST', headers: { ..._authHeaders(), 'X-Amux-Approver': 'dashboard', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.scheduled) {
+      _apprEditing.delete(id);
+      showToast('Scheduled: sends ' + _apprWhenText(d.send_at) + '. It is listed in Email, Scheduled.');
+    } else { showToast('Schedule failed: ' + (d.error || r.status)); if (btn) { btn.disabled = false; btn.textContent = 'Schedule send'; } return; }
+  } catch (e) { showToast('Schedule failed: ' + e); if (btn) { btn.disabled = false; btn.textContent = 'Schedule send'; } return; }
+  _apprScheduleClose(id);
+}
 function _approvalsBoot() { _approvalsRefresh(); setInterval(_approvalsRefresh, 60_000); }
 if (document.body) _approvalsBoot();
 else document.addEventListener('DOMContentLoaded', _approvalsBoot);
 function _saveChips(chips) {
   localStorage.setItem('amux_chips', JSON.stringify(chips));
-  _pushChipsToServer(chips);
+  localStorage.setItem(_CHIPS_PENDING, String(Date.now()));
+  _pushChipsToServer();
 }
 function _getChips() {
   const saved = _loadChips();
@@ -24752,16 +25538,16 @@ function _getChips() {
     // A chip added to the defaults later joins a customized set once, after
     // Enter (or at the front). Removing it afterwards sticks: it is offered once.
     let offered = [];
-    try { offered = JSON.parse(localStorage.getItem('amux_chips_offered') || '[]'); } catch (e) {}
+    try { offered = JSON.parse(localStorage.getItem(_CHIPS_OFFERED) || '[]'); } catch (e) {}
     const fresh = _NEW_DEFAULT_CHIPS.filter(id => !offered.includes(id) && !saved.some(c => c.id === id));
-    if (fresh.length) {
+    if (fresh.length && _chipsSynced) {
       const next = saved.slice();
       for (const id of fresh) {
         const chip = DEFAULT_CHIPS.find(c => c.id === id);
         const at = next.findIndex(c => c.id === 'enter');
         next.splice(at >= 0 ? at + 1 : 0, 0, { ...chip });
       }
-      try { localStorage.setItem('amux_chips_offered', JSON.stringify(offered.concat(_NEW_DEFAULT_CHIPS))); } catch (e) {}
+      try { localStorage.setItem(_CHIPS_OFFERED, JSON.stringify([...new Set(offered.concat(_NEW_DEFAULT_CHIPS))])); } catch (e) {}
       _saveChips(next);
       return next;
     }
@@ -24836,7 +25622,40 @@ function _chipAction(chip, sessionName, isPeek) {
   }
 }
 
+// A press runs the chip the bar SHOWS (Ethan, 2026-11-02: "when i press these
+// it should be send not put in the input"). It used to look up _getChips()[i]
+// at click time, and a list replaced after the render (synced from another
+// device, or a migration) ran whatever chip now sat at that position: Yes and
+// Status? sent "continue", and a slash chip there filled the input instead.
+function _chipPress(el, sessionName, isPeek) {
+  // Editing the bar: a press picks a button up, it never sends (2026-11-08).
+  if (_chipEditing) return;
+  const bar = el.parentElement;
+  const i = parseInt(el.dataset.chipIdx, 10);
+  const chip = bar && bar._chips && bar._chips[i];
+  if (!chip) return;
+  const now = _getChips()[i];
+  if (!now || now.id !== chip.id) {
+    fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' }, _skipOutbox: true,
+      body: JSON.stringify({ kind: 'chip-list-moved', shown: chip.id, current: now ? now.id : null, measured: true, n_considered: 1, ver: APP_VER }) }).catch(() => {});
+    setTimeout(() => renderChips(bar, sessionName, isPeek), 0);
+  }
+  _chipAction(chip, sessionName, isPeek);
+}
+
 function renderChips(container, sessionName, isPeek) {
+  // While a button is held for a drag (Sortable marks it chosen on the press)
+  // no chip bar is rebuilt: replacing the held one cancels the drag, and
+  // re-creating another bar's Sortable resets the drag Sortable shares across
+  // instances. CI caught it as drag_not_started after a refresh landed
+  // mid-press. Render again once the button is let go.
+  if (document.querySelector('.chips .tab-drag-chosen')) {
+    if (container._chipRenderDeferred) return;
+    container._chipRenderDeferred = true;
+    _chipsBeacon('chips_render_deferred', {});
+    setTimeout(() => { container._chipRenderDeferred = false; renderChips(container, sessionName, isPeek); }, 200);
+    return;
+  }
   const chips = _getChips();
   // Keystroke chips drive a terminal; a worker whose renderer is not a
   // terminal (chat) has nothing for them to press. Indexes stay the originals.
@@ -24847,9 +25666,8 @@ function renderChips(container, sessionName, isPeek) {
   chips.forEach((chip, i) => {
     if (chatTab ? (chip.action === 'keys' && !_CHAT_CHIP_KEYS[chip.value]) : (noKeys && chip.action === 'keys')) return;
     const cls = chip.danger ? 'chip danger' : 'chip';
-    const drag = _chipEditing ? 'draggable="true"' : '';
-    html += '<div class="' + cls + '" ' + drag + ' data-chip-idx="' + i + '" data-chip-action="' + esc(chip.action || '') + '"'
-      + ' onclick="_chipAction(_getChips()[' + i + '],\'' + esc(sessionName || '') + '\',' + !!isPeek + ')">'
+    html += '<div class="' + cls + '" data-chip-idx="' + i + '" data-chip-action="' + esc(chip.action || '') + '"'
+      + ' onclick="_chipPress(this,\'' + esc(sessionName || '') + '\',' + !!isPeek + ')">'
       + (_chipEditing ? '<span class="chip-drag-handle">\u2630</span>' : '')
       + esc(chip.label)
       + (_chipEditing ? '<span class="chip-remove-btn" onclick="event.stopPropagation();removeChip(' + i + ')">\u00D7</span>' : '')
@@ -24861,84 +25679,70 @@ function renderChips(container, sessionName, isPeek) {
   html += '<div class="chip chip-edit-toggle' + (_chipEditing ? ' active' : '') + '" onclick="toggleChipEdit()">'
     + (_chipEditing ? '\u2713' : '\u270E') + '</div>';
   container.innerHTML = html;
+  container._chips = chips;
   if (_chipEditing) {
     container.classList.add('editing');
     _setupChipDrag(container, sessionName, isPeek);
   } else {
     container.classList.remove('editing');
+    _chipSortableDrop(container);
   }
 }
 
+// REORDERING BUTTONS (Ethan, 2026-11-08: "the drag is not intuitive/ordering
+// isnt saved"). The bar drags with the shared Sortable setup the tab menus use
+// (_tabMenuSortableCreate): pointer driven, so it works in the Mac app where
+// native drag and drop does not, the neighbours make room as a button moves so
+// where it lands shows before letting go, touch waits a short press, and the
+// click a drop would send is swallowed. It replaced native HTML5 drag on
+// desktop beside a separate touch path, which showed no drop mark with a mouse
+// and always landed a right-moving button one place short. With a button
+// focused, ArrowLeft and ArrowRight move it one place. Buttons this bar hides
+// (keystroke buttons on a chat worker) keep their slots in the saved list.
+// Drags are beaconed as kind=tabcust-drag which=chips, saves as kind=chips-sync.
+function _chipBarOrder(container) {
+  // The full saved list with this bar's visible buttons in their on-screen order.
+  const chips = _getChips();
+  const shown = [...container.querySelectorAll('.chip[data-chip-idx]')].map(c => parseInt(c.dataset.chipIdx, 10));
+  const slots = shown.slice().sort((a, b) => a - b);
+  const next = chips.slice();
+  slots.forEach((slot, k) => { next[slot] = chips[shown[k]]; });
+  return next;
+}
+function _chipCommitOrder(container, how) {
+  const before = _getChips().map(c => c.id).join(',');
+  const next = _chipBarOrder(container);
+  if (next.map(c => c.id).join(',') === before) return false;
+  _saveChips(next);
+  _chipsBeacon('chips_reordered', { how });
+  refreshAllChipBars();
+  return true;
+}
+function _chipSortableDrop(container) {
+  const s = container._chipSortable;
+  container._chipSortable = null;
+  // Sortable throws when its element was already replaced; the instance is gone either way.
+  if (s) { try { s.destroy(); } catch (e) { console.warn('chips: sortable destroy', e); } }
+}
 function _setupChipDrag(container) {
-  const draggables = container.querySelectorAll('.chip[draggable]');
-  draggables.forEach(el => {
-    el.addEventListener('dragstart', e => {
-      _chipDragIdx = parseInt(el.dataset.chipIdx);
-      el.classList.add('dragging');
-      e.dataTransfer.effectAllowed = 'move';
-    });
-    el.addEventListener('dragend', () => {
-      el.classList.remove('dragging');
-      _chipDragIdx = -1;
-    });
-    el.addEventListener('dragover', e => {
+  _chipSortableDrop(container);
+  container._chipSortable = _tabMenuSortableCreate(container, 'chips', '.chip[data-chip-idx]',
+    () => _chipCommitOrder(container, 'drag'));
+  container.querySelectorAll('.chip[data-chip-idx]').forEach(el => {
+    el.tabIndex = 0;
+    el.addEventListener('keydown', e => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
       e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-    });
-    el.addEventListener('drop', e => {
-      e.preventDefault();
-      const toIdx = parseInt(el.dataset.chipIdx);
-      if (_chipDragIdx < 0 || _chipDragIdx === toIdx) return;
-      const chips = _getChips();
-      const [moved] = chips.splice(_chipDragIdx, 1);
-      chips.splice(toIdx, 0, moved);
-      _saveChips(chips);
-      refreshAllChipBars();
-    });
-    let _touchClone = null;
-    el.addEventListener('touchstart', e => {
-      _chipDragIdx = parseInt(el.dataset.chipIdx);
-      el.classList.add('dragging');
-      _touchClone = el.cloneNode(true);
-      _touchClone.style.cssText = 'position:fixed;pointer-events:none;z-index:9999;opacity:0.85;transform:scale(1.05);';
-      _touchClone.style.width = el.offsetWidth + 'px';
-      _touchClone.style.left = e.touches[0].clientX - el.offsetWidth / 2 + 'px';
-      _touchClone.style.top = e.touches[0].clientY - el.offsetHeight / 2 + 'px';
-      document.body.appendChild(_touchClone);
-      e.preventDefault();
-    }, {passive: false});
-    el.addEventListener('touchmove', e => {
-      if (_chipDragIdx < 0) return;
-      const t = e.touches[0];
-      if (_touchClone) {
-        _touchClone.style.left = t.clientX - el.offsetWidth / 2 + 'px';
-        _touchClone.style.top = t.clientY - el.offsetHeight / 2 + 'px';
+      const sib = e.key === 'ArrowLeft' ? el.previousElementSibling : el.nextElementSibling;
+      if (!sib || !sib.matches('.chip[data-chip-idx]')) return;
+      const id = ((container._chips || [])[parseInt(el.dataset.chipIdx, 10)] || {}).id;
+      if (e.key === 'ArrowLeft') container.insertBefore(el, sib); else container.insertBefore(sib, el);
+      // The commit re-renders the bar; keep focus on the same button in its new place.
+      if (_chipCommitOrder(container, 'keyboard')) {
+        const at = _getChips().findIndex(c => c.id === id);
+        const again = container.querySelector('.chip[data-chip-idx="' + at + '"]');
+        if (again) again.focus();
       }
-      container.querySelectorAll('.chip[data-chip-idx]').forEach(c => c.classList.remove('drag-over'));
-      const target = document.elementFromPoint(t.clientX, t.clientY);
-      const chipTarget = target && target.closest('.chip[data-chip-idx]');
-      if (chipTarget && chipTarget !== el) chipTarget.classList.add('drag-over');
-      e.preventDefault();
-    }, {passive: false});
-    el.addEventListener('touchend', e => {
-      if (_touchClone) { _touchClone.remove(); _touchClone = null; }
-      el.classList.remove('dragging');
-      container.querySelectorAll('.chip[data-chip-idx]').forEach(c => c.classList.remove('drag-over'));
-      if (_chipDragIdx < 0) return;
-      const ct = e.changedTouches[0];
-      const target = document.elementFromPoint(ct.clientX, ct.clientY);
-      const chipTarget = target && target.closest('.chip[data-chip-idx]');
-      if (chipTarget) {
-        const toIdx = parseInt(chipTarget.dataset.chipIdx);
-        if (toIdx !== _chipDragIdx) {
-          const chips = _getChips();
-          const [moved] = chips.splice(_chipDragIdx, 1);
-          chips.splice(toIdx, 0, moved);
-          _saveChips(chips);
-          refreshAllChipBars();
-        }
-      }
-      _chipDragIdx = -1;
     });
   });
 }
@@ -26883,9 +27687,11 @@ function _linkifyUrls(safeHtml) {
     return String(safeHtml).replace(/(https?:\/\/[^\s<>"'`]+)(?![^<]*>)/g, (m) => {
       const url = m.replace(/[.,;:!?)]+$/, '');   // trailing punctuation is prose, not URL
       const tail = m.slice(url.length);
+      const fp = _ownFilePath(url.replace(/&amp;/g, '&'));   // a file on this amux reads as its path
       return '<a href="' + url + '" target="_blank" rel="noopener noreferrer" '
-        + 'style="color:var(--accent);text-decoration:underline;" onclick="event.stopPropagation();">'
-        + url + '</a>' + tail;
+        + 'style="color:var(--accent);text-decoration:underline;" onclick="event.stopPropagation();"'
+        + (fp ? ' title="' + url + '"' : '') + '>'
+        + (fp ? esc(fp) : url) + '</a>' + tail;
     });
   } catch (e) { return safeHtml; }
 }
@@ -26967,6 +27773,56 @@ function _msgCardChips(message) {
 // be shared and the three drifted into looking like different content — which is
 // exactly what Ethan reported. Normalize once, at every fetch, and set BOTH names
 // so nothing downstream has to know which surface it came from.
+// Pinned messages in a worker's Messages tab. The list opens from the 📌 count
+// in the one control row, the same way a channel's pins do.
+let _pmPins = [], _pmPinsFor = null;
+function _pmPinned(id) { return _pmPinsFor === peekSession && _pmPins.some(p => String(p.id) === String(id)); }
+function _pmRenderPinsBtn() {
+  const btn = document.getElementById('pm-pins-btn'); if (!btn) return;
+  const n = _pmPinsFor === peekSession ? _pmPins.length : 0;
+  btn.hidden = !n;
+  document.getElementById('pm-pins-n').textContent = n ? String(n) : '';
+}
+async function _pmLoadPins() {
+  const sess = peekSession;
+  try {
+    const r = await fetch(API + '/api/history/pins?session=' + encodeURIComponent(sess));
+    if (!r.ok || sess !== peekSession) return;
+    _pmPins = (await r.json()).pins || []; _pmPinsFor = sess;
+    _pmRenderPinsBtn(); _peekMessagesRender();
+  } catch (e) { console.warn('pinned messages did not load', e); }
+}
+async function _pmPin(id, on) {
+  try {
+    const r = await fetch(API + '/api/history/' + id + '/pin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pinned: on }) });
+    const d = await r.json();
+    if (!r.ok) { showToast(d.error || 'Not saved', 'error'); return; }
+    _pmPins = d.pins || []; _pmPinsFor = peekSession;
+    _pmRenderPinsBtn(); _peekMessagesRender();
+    showToast(on ? 'Pinned' : 'Unpinned');
+  } catch (e) { showToast('Not saved: ' + e.message, 'error'); }
+}
+async function _pmShowPins() {
+  if (!_pmPins.length) return;
+  const html = '<div class="cv-pins-list">' + _pmPins.map((x, i) => '<div class="pm-pin-row"><button type="button" class="btn cv-pin-item" data-i="' + i + '">'
+    + '<span class="cv-pin-who">MSG-' + esc(String(x.id)) + ' <span class="cv-pin-when">' + esc(new Date(x.ts).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })) + '</span></span>'
+    + '<span class="cv-pin-body">' + esc(String(x.text || '').replace(/\s+/g, ' ').slice(0, 200)) + '</span></button>'
+    + '<button type="button" class="btn pm-pin-unpin" data-id="' + esc(String(x.id)) + '">Unpin</button></div>').join('') + '</div>';
+  const chosen = new Promise(resolve => {
+    setTimeout(() => {
+      document.querySelectorAll('.cv-pin-item').forEach(el => el.onclick = () => { resolve(_pmPins[Number(el.dataset.i)]); _modalClose(false); });
+      // Here as well as on the row: an older pin may not be on this page.
+      document.querySelectorAll('.pm-pin-unpin').forEach(el => el.onclick = async () => {
+        await _pmPin(Number(el.dataset.id), false);
+        el.closest('.pm-pin-row')?.remove();
+        if (!_pmPins.length) { resolve(null); _modalClose(false); }
+      });
+    }, 0);
+    showFormModal('Pinned messages', html, 'Close').then(() => resolve(null));
+  });
+  const x = await chosen; if (!x) return;
+  _pickCmdHistory(x.text);
+}
 function _msgCtxPeek() {
   return { sel: _pmSel, key: _pmKey, toggle: '_pmSelToggle', resend: '_pmResend',
            searchId: 'peek-messages-search', rowClass: 'pm-row', ownTab: true,
@@ -27192,7 +28048,8 @@ function _cmdHistItemHTML(e, ctx) {
   const idTag = _mid
     ? `<code class="msg-id-badge" title="Message id — click to copy" onclick="event.stopPropagation();_copyMsgId('${esc(_mid)}')">MSG-${esc(_mid)}</code>`
     : '';
-  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + senderTag + sessTag + tsTag
+  const pinTag = ctx.ownTab && _mid && _pmPinned(_mid) ? '<span class="pm-pin-mark" title="Pinned">\u{1F4CC}</span>' : '';
+  const meta = pinTag + tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + senderTag + sessTag + tsTag
     + _msgContextChip(e) + idTag
     + _msgCardChips(e);
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
@@ -27205,7 +28062,26 @@ function _cmdHistItemHTML(e, ctx) {
   const _matches = _mq && safe.toLowerCase().includes(_mq.trim().toLowerCase());
   const _collapsed = _msgCollapsed.has(_pk) && !_matches;
   const caret = `<button class="msg-caret" aria-expanded="${!_collapsed}" title="${_collapsed ? 'Expand message' : 'Collapse message'}" onclick="_msgToggleCollapse(this,&#39;${escJs(_pk)}&#39;,event)">${_collapsed ? '&#9656;' : '&#9662;'}</button>`;
-  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="${esc(ctx.title || 'Click to insert into the composer')}" style="cursor:pointer;padding:var(--space-2) var(--space-3);background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:var(--radius-md);font-size:var(--fs-lg);color:var(--text);transition:border-color 0.15s;display:flex;gap:var(--space-1-5);align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:var(--space-1);">${meta}</div>`:''}${(ctx.taskChip !== false && session && e.ts) ? `<span class="msg-task-chip" data-task-at="${esc(session + '@' + Math.floor(e.ts / 1000))}" hidden></span>` : ''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyScheduleIds(_linkifyCardIds(safe)), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu">${ctx.ownTab ? `<button class="pm-menu-phone" onclick="event.stopPropagation();this.closest('.msg-menu').classList.remove('open');${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)">${_psel ? 'Unselect' : 'Select'}</button><button class="pm-menu-phone" onclick="event.stopPropagation();this.closest('.msg-menu').classList.remove('open');_msgToggleCollapse(this.closest('[data-msg-key]').querySelector('.msg-caret'),&#39;${escJs(_pk)}&#39;,event)">${_collapsed ? 'Expand' : 'Collapse'}</button>${_mid ? `<button class="pm-menu-phone" onclick="event.stopPropagation();this.closest('.msg-menu').classList.remove('open');_copyMsgId('${esc(_mid)}')">Copy MSG-${esc(_mid)}</button>` : ''}` : ''}<button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
+  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="${esc(ctx.title || 'Click to insert into the composer')}" style="cursor:pointer;padding:var(--space-2) var(--space-3);background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:var(--radius-md);font-size:var(--fs-lg);color:var(--text);transition:border-color 0.15s;display:flex;gap:var(--space-1-5);align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:var(--space-1);">${meta}</div>`:''}${(ctx.taskChip !== false && session && e.ts) ? `<span class="msg-task-chip" data-task-at="${esc(session + '@' + Math.floor(e.ts / 1000))}" hidden></span>` : ''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyScheduleIds(_linkifyCardIds(safe)), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu">${ctx.ownTab && _mid ? `<button class="pm-menu-pin" onclick="event.stopPropagation();this.closest('.msg-menu').classList.remove('open');_pmPin(${Number(_mid)},${!_pmPinned(_mid)})">${_pmPinned(_mid) ? 'Unpin' : 'Pin'}</button>` : ''}${ctx.ownTab ? `<button class="pm-menu-phone" onclick="event.stopPropagation();this.closest('.msg-menu').classList.remove('open');${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)">${_psel ? 'Unselect' : 'Select'}</button><button class="pm-menu-phone" onclick="event.stopPropagation();this.closest('.msg-menu').classList.remove('open');_msgToggleCollapse(this.closest('[data-msg-key]').querySelector('.msg-caret'),&#39;${escJs(_pk)}&#39;,event)">${_collapsed ? 'Expand' : 'Collapse'}</button>${_mid ? `<button class="pm-menu-phone" onclick="event.stopPropagation();this.closest('.msg-menu').classList.remove('open');_copyMsgId('${esc(_mid)}')">Copy MSG-${esc(_mid)}</button>` : ''}` : ''}${_mid && kind === 'human' ? `<button class="msg-menu-answer" onclick="event.stopPropagation();this.closest('.msg-menu').classList.remove('open');_msgShowAnswer(${Number(_mid)})">Show answer</button>` : ''}<button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
+}
+// What the worker answered, read from its transcript, so an answer that scrolled
+// away or sat behind a compact can be read from the message that asked for it.
+async function _msgShowAnswer(id) {
+  let d;
+  try {
+    const r = await fetch(API + '/api/history/' + encodeURIComponent(id) + '/reply', { headers: _authHeaders() });
+    d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  } catch (e) { showToast('Could not read the answer to MSG-' + id + ': ' + e.message); return; }
+  const who = d.session || 'The worker';
+  const note = !d.measured ? 'Could not read it: ' + (d.why_unmeasured || 'unknown')
+    : !d.found ? 'This message is not in the current transcript of ' + who + '.'
+    : d.text ? (d.ended ? '' : 'The turn is still open, so this is the answer so far.')
+    : d.ended === 'next_input' ? 'Another message reached ' + who + ' before it answered this one. Read the answer to that message.'
+    : who + ' has not answered yet.';
+  showAlertHtml('Answer to MSG-' + id,
+    (note ? '<div class="msg-answer-note">' + esc(note) + '</div>' : '')
+    + (d.text ? '<div class="msg-answer-text">' + _askFormat(d.text) + '</div>' : ''));
 }
 // The sender half of "owner → cowork-bot". `owner` is the server's own login
 // (no team-member or gateway identity on the send); the tooltip says so, and
@@ -27253,6 +28129,7 @@ function _pendingMsgState(p) {
   const [label, note] = p.decision === 'refused' ? ['Not sent', 'the worker did not accept it']
     : p.decision === 'unconfirmed' ? ['Not confirmed', 'it may already be with the worker; check its terminal']
     : p.decision === 'stale' ? ['Not sent', 'saved on this device and never sent']
+    : p.decision === 'unreached' ? ['Not sent', 'it never reached the server']
     : p.checking ? ['Awaiting confirmation', 'may already be with the worker']
     : p.attempted ? ['Awaiting confirmation', 'may already be with the worker']
     : ['Saved on this device', online ? 'waiting to sync' : 'waiting for connection'];
@@ -27479,8 +28356,8 @@ function _peekMessagesRender() {
               '<br><button class="btn" style="margin-top:var(--space-2-5);min-height:36px;" ' +
               'onclick="_peekMessagesLoad(false)">Retry</button>')
       : _note(_empty);
-  list.innerHTML = (_body || _placeholder)
-    + (!_body && !_loaded ? '' : moreHTML);
+  _msgListWrite(list, (_body || _placeholder)
+    + (!_body && !_loaded ? '' : moreHTML));
   _peekMessagesBadge();
   _msgTaskChipsFill(list);
 }
@@ -27673,6 +28550,7 @@ async function _exportMessageHistory() {
 
 async function _peekMessagesLoad(more) {
   const sess = peekSession;
+  if (more !== true) _pmLoadPins();
   if (_peekMsgRowsFor !== sess) {              // session changed -> back to page 1
     _peekMsgRows = null; _peekMsgServerRows = []; _peekMsgOffset = 0; _peekMsgDone = false;
     _peekMsgRowsFor = sess; _peekMsgPage = 1; _peekMsgTotal = null; more = false;
@@ -27854,7 +28732,11 @@ async function _dictStartRec() {
   try { _dictRecorder = new MediaRecorder(_dictStream, opts); }
   catch(e) { try { _dictRecorder = new MediaRecorder(_dictStream); } catch(e2) { showToast('Recorder unavailable'); return; } }
   _dictChunks = [];
-  await _dictLiveClear();
+  // Not awaited: in the Mac app a storage write can hang for minutes, and the
+  // recorder waited on it with the popup on "Starting mic…" at 0:00 (owner,
+  // 2026-11-03). Storage runs its writes in order, so this clear still lands
+  // before the first second is saved.
+  _dictLiveClear();
   _dictRecorder.ondataavailable = e => { if (e.data && e.data.size) { _dictChunks.push(e.data); _dictLiveSave(e.data); } };
   _dictRecorder.onstop = () => { _dictStopMeter(); if (_dictCancelled) { _dictChunks = []; _dictLiveClear(); _dictStatus('Cancelled'); } else _dictUpload(); };
   // 1 s slices: each second reaches IndexedDB as it is spoken (see _dictLiveSave).
@@ -27936,34 +28818,61 @@ const _DICT_OUTBOX_MAX = 25;   // ring buffer; oldest fall off first
 const _DICT_KEEP_DONE  = 6;    // transcribed clips kept so a bad transcript can be re-run
 const _DICT_MAX_AUTO   = 6;    // give up auto-retrying after this many; manual Retry still works
 
-async function _dictOutbox() { try { return (await _idb.get('dict_pending')) || []; } catch(e) { return []; } }
-// The cap trims only clips that were already transcribed: a clip that never
-// sent is the one thing that cannot be recorded again, so it is never the one
-// dropped (it used to be: slice(-25) kept the newest 25 whatever their state).
-async function _dictOutboxSet(q) {
-  const done = q.filter(x => x.state === 'done');
-  const drop = new Set(done.slice(0, Math.max(0, q.length - _DICT_OUTBOX_MAX)).map(x => x.id));
-  try { await _idb.set('dict_pending', q.filter(x => !drop.has(x.id))); }
-  catch(e) {
-    // Never silent: the clip is still in memory, and the person is told it is not saved.
-    _dictStatus('This device could not save the recording: ' + ((e && e.message) || 'storage error'));
-    try { fetch(API + '/api/client-debug', {method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}), keepalive: true,
-      body: JSON.stringify({kind: 'dictation_outbox_write_failed', error: String((e && e.message) || e)})}).catch(() => {}); } catch(_) {}
-  }
-  _dictPendingBadge();
+// A read is bounded: in the Mac app a WebKit storage read can hang for hours
+// (outbox_upload_list_timeout), and the retry loop below awaits this one. A read
+// that never settled left _dictFlushing set for good, so every 45s pass returned
+// at once and a recording sat "1 recording queued (2.4 MB) — sending…" (owner,
+// 2026-10-31). A timeout reads as empty for this pass and is beaconed.
+const _DICT_READ_MS = 5000;
+async function _dictOutbox() {
+  let timer;
+  try {
+    return await Promise.race([
+      _idb.get('dict_pending').then(v => v || []),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('dict_read_timeout')), _DICT_READ_MS); }),
+    ]);
+  } catch (e) {
+    if (e && e.message === 'dict_read_timeout') {
+      try { amuxTrack('dictation_outbox_read_timeout', {waited_ms: _DICT_READ_MS, measured: true, n_considered: 1}); } catch (_) {}
+      try { _idb.reset('dict_read_timeout'); } catch (_) {}
+    }
+    return [];
+  } finally { clearTimeout(timer); }
 }
 
 // A take in progress is saved every second (`dict_live`), so a reload or a
 // crash mid-dictation keeps it: the next page load files it in the outbox as
 // a recovered clip, and it is transcribed like any other.
+// Once a storage write has hung, dictation leaves storage alone for two
+// minutes and sends from memory: every take otherwise paid two 5 s waits, under
+// "Could not save on this device — sending now…" (owner, 2026-11-03). The
+// connection is dropped so the next use reopens it; beaconed as dict_storage_hung.
+let _dictStoreDownUntil = 0;
+function _dictStoreHung(why) {
+  _dictStoreDownUntil = Date.now() + 120000;
+  _idb.reset(why);   // catches its own errors
+  _dictBeacon('dict_storage_hung', { why });
+}
+const _dictStoreDown = () => Date.now() < _dictStoreDownUntil;
 async function _dictLiveSave(chunk) {
+  if (_dictStoreDown()) return;
   try {
     const live = (await _idb.get('dict_live')) || {started: _dictStartedAt, mime: chunk.type || 'audio/webm', session: peekSession || '', chunks: []};
     live.chunks.push(chunk);
     await _idb.set('dict_live', live);
   } catch(e) {}
 }
-async function _dictLiveClear() { try { await _idb.set('dict_live', null); } catch(e) {} }
+// Bounded like the outbox read: a clear that never settles must not hold up
+// whoever awaits it (the upload after Done does). A timeout is beaconed.
+async function _dictLiveClear() {
+  let timer;
+  try {
+    await Promise.race([_idb.set('dict_live', null),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('dict_live_clear_timeout')), _DICT_READ_MS); })]);
+  } catch(e) {
+    if (e && e.message === 'dict_live_clear_timeout') _dictStoreHung('dict_live_clear_timeout');
+  } finally { clearTimeout(timer); }
+}
 async function _dictRecoverLive() {
   let live = null;
   try { live = await _idb.get('dict_live'); } catch(e) { return; }
@@ -27977,24 +28886,48 @@ async function _dictRecoverLive() {
   setTimeout(_dictFlushOffline, 1500);
 }
 setTimeout(_dictRecoverLive, 3000);
+// Read, change and write the outbox in ONE storage transaction, bounded. The
+// three writers used to read, change and write it back separately, so a read that
+// failed (now also one that times out) wrote back a list without the other
+// clips: a new recording replaced every one still waiting. A write that cannot
+// finish throws; nothing is written from a guess.
+function _dictUpdate(mutate) {
+  let timer;
+  return Promise.race([
+    _idb.update('dict_pending', q => {
+      const next = mutate(Array.isArray(q) ? q : []);
+      const done = next.filter(x => x.state === 'done');
+      const drop = new Set(done.slice(0, Math.max(0, next.length - _DICT_OUTBOX_MAX)).map(x => x.id));
+      return next.filter(x => !drop.has(x.id));
+    }),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('dict_write_timeout')), _DICT_READ_MS); }),
+  ]).finally(() => clearTimeout(timer))
+    // Every change repaints the Files badge and the Dictation count, as the
+    // old whole-list write did (land review F1/F2): otherwise they keep the
+    // state from before the change until the Dictation tab is opened.
+    .then(r => { _dictPendingBadge(); return r; });
+}
+// Returns the new clip's id, or null when this device could not save it (the
+// caller then sends the recording straight from memory).
 async function _dictOutboxAdd(blob, mime, ms) {
   const id = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  const q = await _dictOutbox();
-  q.push({ id, blob, mime, ms, ts: Date.now(), session: peekSession || '',
-           state: 'pending', attempts: 0, last: 0, error: '', text: '' });
-  await _dictOutboxSet(q);
-  return id;
+  try {
+    await _dictUpdate(q => q.concat([{ id, blob, mime, ms, ts: Date.now(), session: peekSession || '',
+      state: 'pending', attempts: 0, last: 0, error: '', text: '' }]));
+    return id;
+  } catch (e) {
+    if (e && e.message === 'dict_write_timeout') _dictStoreHung('dict_write_timeout');
+    try { amuxTrack('dictation_outbox_add_failed', {error: String((e && e.message) || e).slice(0, 120), bytes: blob.size, measured: true, n_considered: 1}); } catch (_) {}
+    return null;
+  }
 }
 async function _dictOutboxPatch(id, patch) {
-  const q = await _dictOutbox();
-  const i = q.findIndex(x => x.id === id);
-  if (i < 0) return;
-  q[i] = Object.assign(q[i], patch);
-  await _dictOutboxSet(q);
+  try { await _dictUpdate(q => q.map(x => x.id === id ? Object.assign({}, x, patch) : x)); }
+  catch (e) { try { amuxTrack('dictation_outbox_patch_failed', {error: String((e && e.message) || e).slice(0, 120), measured: true, n_considered: 1}); } catch (_) {} }
 }
 async function _dictOutboxDel(id) {
-  const q = await _dictOutbox();
-  await _dictOutboxSet(q.filter(x => x.id !== id));
+  try { await _dictUpdate(q => q.filter(x => x.id !== id)); }
+  catch (e) { showToast('This device could not delete the recording yet; try again'); }
   if (_peekTab === 'dictation') _dictRender();
 }
 
@@ -28005,7 +28938,17 @@ async function _dictUpload() {
   _dictChunks = [];
   if (blob.size < 1200) { _dictStatus('Too short — hold a bit longer'); _dictClosePopup(false); return; }
   const mime = (blob.type || 'audio/webm').split(';')[0];
-  const id = await _dictOutboxAdd(blob, mime, ms);   // safe on disk before anything can fail
+  const online_ = typeof online === 'undefined' || online;
+  const id = _dictStoreDown() && online_ ? null : await _dictOutboxAdd(blob, mime, ms);   // safe on disk before anything can fail
+  if (id === null) {
+    // This device's storage would not take it: send it now, from memory, rather
+    // than lose it. The live take is kept until the send answers.
+    _dictStatus('Transcribing… (' + _dictKB(blob.size) + ')');
+    _dictBeacon('dict_sent_unsaved', { bytes: blob.size, storage_down: _dictStoreDown() });
+    const txt = await _dictSendDirect(blob, mime, ms);
+    if (txt !== null) { _dictLiveClear(); _dictClosePopup(false); }
+    return;
+  }
   await _dictLiveClear();                              // the take now lives in the outbox
   if (typeof online !== 'undefined' && !online) {
     await _dictOutboxPatch(id, { state: 'offline', error: 'no connection' });
@@ -28016,6 +28959,25 @@ async function _dictUpload() {
   }
   const txt = await _dictTrySend(id, true);
   if (txt !== null) _dictClosePopup(false);
+}
+
+// A recording this device could not store, sent once from memory. Returns the
+// transcript, or null with the reason in the status line (the take stays live).
+async function _dictSendDirect(blob, mime, ms) {
+  const url = API + '/api/dictate?session=' + encodeURIComponent(peekSession || '')
+    + '&dur_ms=' + (ms || 0) + '&mime=' + encodeURIComponent(mime || 'audio/webm');
+  try {
+    const r = await fetch(url, { method: 'POST', headers: _authHeaders({ 'Content-Type': mime || 'audio/webm' }),
+      body: blob, signal: AbortSignal.timeout(120000) });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    _dictStatus('Added to the composer — review, then send');
+    _dictInsert(d.text);
+    return d.text || '';
+  } catch (e) {
+    _dictStatus('Not sent and not saved: ' + String((e && e.message) || 'failed').slice(0, 80) + '. The recording is still here; try again.');
+    return null;
+  }
 }
 
 // One attempt against a stored clip. Never discards audio: a failure of ANY kind
@@ -28029,7 +28991,7 @@ async function _dictTrySend(id, interactive) {
     await _dictOutboxPatch(id, { state: 'offline', error: 'no connection' });
     return null;
   }
-  await _dictOutboxPatch(id, { state: 'sending' });
+  await _dictOutboxPatch(id, { state: 'sending', sending_at: Date.now() });
   if (interactive) _dictStatus('Transcribing… (' + _dictKB(it.blob.size) + ')');
   if (_peekTab === 'dictation') _dictRender();
   const url = API + '/api/dictate?session=' + encodeURIComponent(it.session || peekSession || '')
@@ -28062,37 +29024,57 @@ async function _dictTrySend(id, interactive) {
 // SAME audio — the "retry" that used to be impossible because we threw the
 // recording away the moment it succeeded.
 async function _dictPruneDone() {
-  const q = await _dictOutbox();
-  const done = q.filter(x => x.state === 'done');
-  if (done.length <= _DICT_KEEP_DONE) return;
-  const drop = new Set(done.slice(0, done.length - _DICT_KEEP_DONE).map(x => x.id));
-  await _dictOutboxSet(q.filter(x => !drop.has(x.id)));
+  try {
+    await _dictUpdate(q => {
+      const done = q.filter(x => x.state === 'done');
+      if (done.length <= _DICT_KEEP_DONE) return q;
+      const drop = new Set(done.slice(0, done.length - _DICT_KEEP_DONE).map(x => x.id));
+      return q.filter(x => !drop.has(x.id));
+    });
+  } catch (_) {}   // pruning is housekeeping; the next success prunes
 }
 
 // Exponential backoff so a hard failure (bad key, no quota) doesn't hammer the
 // endpoint on every reconnect, while a flaky link still recovers quickly.
+// A send gives up after 120s, so a clip still marked `sending` well past that
+// was cut off (the page reloaded or the tab was closed mid-upload) and nothing
+// owns it. It used to stay `sending` for good: never retried, while Files read
+// "1 recording queued (2.4 MB) - sending..." (Ethan, 2026-10-30).
+const _DICT_SENDING_STALE_MS = 150000;
+function _dictSendingStale(it) {
+  return it.state === 'sending' && Date.now() - (it.sending_at || 0) > _DICT_SENDING_STALE_MS;
+}
 function _dictReady(it) {
-  if (it.state === 'done' || it.state === 'sending') return false;
+  if (it.state === 'done' || (it.state === 'sending' && !_dictSendingStale(it))) return false;
   if ((it.attempts || 0) >= _DICT_MAX_AUTO) return false;
   const wait = Math.min(300000, 4000 * Math.pow(2, it.attempts || 0));
   return Date.now() - (it.last || 0) > wait;
 }
-let _dictFlushing = false;
+// When the running pass started, or 0. A pass older than _DICT_FLUSH_STALE_MS is
+// taken as hung (a send gives up at 120s, a read at 5s) and the next tick starts
+// a fresh one, said with dictation_flush_stalled.
+let _dictFlushing = 0;
+const _DICT_FLUSH_STALE_MS = 180000;
 async function _dictFlushOffline() {
-  if (_dictFlushing) return;
+  if (_dictFlushing && Date.now() - _dictFlushing < _DICT_FLUSH_STALE_MS) return;
+  if (_dictFlushing) { try { amuxTrack('dictation_flush_stalled', {age_ms: Date.now() - _dictFlushing, measured: true, n_considered: 1}); } catch (_) {} }
   if (typeof online !== 'undefined' && !online) return;
-  _dictFlushing = true;
+  _dictFlushing = Date.now();
   try {
     let sent = 0;
     for (const it of (await _dictOutbox())) {
       if (!_dictReady(it)) continue;
+      if (it.state === 'sending') {
+        try { amuxTrack('dictation_stale_sending_recovered', {id: it.id, age_ms: Date.now() - (it.sending_at || 0),
+          had_sending_at: !!it.sending_at, bytes: (it.blob && it.blob.size) || 0, measured: true, n_considered: 1}); } catch (_) {}
+      }
       if (await _dictTrySend(it.id, false) !== null) sent++;
     }
     if (sent) {
       showToast(sent + ' queued dictation' + (sent === 1 ? '' : 's') + ' transcribed');
       if (_peekTab === 'dictation') _dictLoad();
     }
-  } finally { _dictFlushing = false; }
+  } finally { _dictFlushing = 0; }
 }
 async function _dictRetry(id) { await _dictOutboxPatch(id, { attempts: 0, last: 0 }); await _dictTrySend(id, true); }
 
@@ -28687,7 +29669,7 @@ function renderFilterOptions() {
   // Status chips — fixed order, only states that exist (or are selected)
   const sEl = document.getElementById('filter-statuses');
   if (sEl) {
-    const opts = ['working', 'blocked', 'waiting', 'rate_limited', 'api_error', 'idle', 'unknown', 'stopped']
+    const opts = ['working', 'blocked', 'waiting', 'error', 'starting', 'rate_limited', 'api_error', 'idle', 'unknown', 'stopped']
       .filter(k => filterStatuses.has(k) || live.some(x => _sessStatusKey(x) === k));
     sEl.innerHTML = opts.length ? opts.map(k => {
       const on = filterStatuses.has(k);
@@ -29021,6 +30003,7 @@ function _toggleFileMenu(e) {
   const m = document.getElementById('file-actions');
   if (!m) return;
   const open = m.classList.toggle('open');
+  if (open) _fileMenuSync();
   document.removeEventListener('click', _fileMenuOutside);
   if (open) setTimeout(() => document.addEventListener('click', _fileMenuOutside), 0);
 }
@@ -29032,6 +30015,295 @@ function _fileMenuOutside(e) {
     m.classList.remove('open');
     document.removeEventListener('click', _fileMenuOutside);
   }
+}
+
+// ── File actions in the viewer (Ethan, 2026-11-08: "make it so i can print
+// files have all the file options like i have for any os for files"). The ⋯
+// menu carries what a Finder or Explorer file menu does: open in a new window,
+// show in folder, print, download, share, duplicate, rename, move, get info and
+// delete. Rename, move and delete use the same /api/fs routes as the Files row
+// menu; duplicate re-uploads the bytes through the durable upload, which never
+// overwrites (a taken name gets _1). Every action is beaconed as
+// kind=file-action with its verdict.
+function _fvPath() { return (_fileData && !_fileData._isNew && _fileData.path) || ''; }
+function _fvBeacon(action, verdict, extra) {
+  try { window._clientDebug && window._clientDebug('file-action', Object.assign({}, extra || {}, { action, verdict, measured: true, n_considered: 1, kind: 'file-action' })); } catch (e) { console.warn('file-action beacon', e); }
+}
+function _fvNeedPath() {
+  const p = _fvPath();
+  if (!p) showToast('Save the file first');
+  return p;
+}
+const _FV_IMAGE = /\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i;
+// PRINT. A PDF prints its own pages and an image prints alone; any other file
+// prints as it is shown (rendered markdown, highlighted code, a table). In a
+// browser that is a hidden frame's print(). The Mac app's WebKit ignores
+// print(), so there the page hands the bytes or the HTML to the app
+// (amuxPrint), which opens the native print panel.
+function _fvPrintHtml(name) {
+  const body = document.getElementById('file-body');
+  const shown = body && body.style.display !== 'none' && body.innerHTML.trim() ? body.innerHTML
+    : '<pre>' + esc((_fileData && _fileData.content) || '') + '</pre>';
+  return '<!doctype html><html><head><meta charset="utf-8"><title>' + esc(name) + '</title><style>'
+    + '@page{margin:14mm}body{font:11pt/1.5 -apple-system,system-ui,sans-serif;color:#000;background:#fff;margin:0}'   // design-tokens: allow (print is black on white paper; the page tokens do not reach the print frame)
+    + 'pre,code{white-space:pre-wrap;word-break:break-word;font:9.5pt/1.45 ui-monospace,Menlo,monospace}'   // design-tokens: allow (print is black on white paper; the page tokens do not reach the print frame)
+    + 'img,video{max-width:100%}table{border-collapse:collapse}td,th{border:1px solid #999;padding:3px 6px}'   // design-tokens: allow (print is black on white paper; the page tokens do not reach the print frame)
+    + 'a{color:#000}button,.md-copy-btn{display:none}</style></head><body>' + shown + '</body></html>';   // design-tokens: allow (print is black on white paper; the page tokens do not reach the print frame)
+}
+async function _fvBlobBase64(blob) {
+  return await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1] || ''); r.onerror = () => rej(r.error); r.readAsDataURL(blob); });
+}
+let _fvPrintPoll = 0;
+async function _filePrint() {
+  const path = _fvNeedPath(); if (!path) return;
+  const name = path.split('/').pop();
+  const kind = /\.pdf$/i.test(name) ? 'pdf' : _FV_IMAGE.test(name) && !/\.svg$/i.test(name) ? 'image' : 'document';
+  let blob = null;
+  if (kind !== 'document') {
+    try {
+      const r = await fetch(API + '/api/file/raw?path=' + encodeURIComponent(path), { headers: _authHeaders() });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      blob = await r.blob();
+    } catch (e) { showToast('Could not load ' + name + ' to print'); _fvBeacon('print', 'load_failed', { file_kind: kind, error: String(e.message || e) }); return; }
+  }
+  const native = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.amuxPrint;
+  if (native) {
+    const msg = { name, kind };
+    if (blob) msg.data = await _fvBlobBase64(blob); else msg.html = _fvPrintHtml(name);
+    native.postMessage(msg);
+    _fvBeacon('print', 'sent_to_app', { file_kind: kind });
+    return;
+  }
+  // A new print replaces the last one, and the last one's wait stops with it.
+  clearInterval(_fvPrintPoll);
+  document.getElementById('file-print-frame')?.remove();
+  const fr = document.createElement('iframe');
+  fr.id = 'file-print-frame'; fr.className = 'file-print-frame'; fr.title = 'Print ' + name;
+  fr.setAttribute('aria-hidden', 'true');
+  if (kind === 'pdf') {
+    fr.src = URL.createObjectURL(new Blob([blob], { type: 'application/pdf' }));
+  } else if (kind === 'image') {
+    fr.srcdoc = '<!doctype html><title>' + esc(name) + '</title><style>@page{margin:10mm}body{margin:0}img{max-width:100%;max-height:100vh;display:block;margin:auto}</style><img src="' + URL.createObjectURL(blob) + '">';
+  } else {
+    fr.srcdoc = _fvPrintHtml(name);
+  }
+  fr.dataset.kind = kind;
+  // Print once the frame is ready: its load event, or its document reporting
+  // complete (Chromium does not always fire load for a frame hosting a PDF).
+  let done = false;
+  const go = () => {
+    if (done) return;
+    done = true; clearInterval(poll);
+    fr.dataset.loaded = '1';
+    _fvBeacon('print', 'print_opened', { file_kind: kind });
+    try { fr.contentWindow.focus(); fr.contentWindow.print(); fr.dataset.printed = '1'; }
+    catch (e) {
+      // A PDF viewer that refuses a scripted print still prints from its own toolbar.
+      _fvBeacon('print', 'print_blocked', { file_kind: kind, error: String(e.message || e) });
+      if (kind === 'pdf') window.open(fr.src, '_blank'); else showToast('Printing was blocked by the browser');
+    }
+  };
+  fr.addEventListener('load', go);
+  let waited = 0;
+  const poll = _fvPrintPoll = setInterval(() => {
+    if (!fr.isConnected) { clearInterval(poll); return; }
+    waited += 250;
+    let ready = false;
+    try { ready = !!fr.contentDocument && fr.contentDocument.readyState === 'complete' && waited >= 750; } catch (e) { ready = false; }
+    if (ready) { go(); return; }
+    if (waited >= 10000 && !done) {
+      done = true; clearInterval(poll);
+      _fvBeacon('print', 'print_timeout', { file_kind: kind });
+      if (kind === 'pdf') window.open(fr.src, '_blank'); else showToast('Could not print ' + name);
+    }
+  }, 250);
+  document.body.appendChild(fr);
+}
+function _fileOpenNewWindow() {
+  const path = _fvNeedPath(); if (!path) return;
+  _fvBeacon('window', 'opened');
+  window.open(location.origin + location.pathname + '#path=' + _encodeHashPath(path), '_blank');
+}
+function _fileShowInFolder() {
+  const path = _fvNeedPath(); if (!path) return;
+  const dir = path.replace(/\/[^/]*$/, '') || '/';
+  // The folder opens underneath either way; a file with unsaved edits stays
+  // on top until its own save-or-discard prompt is answered.
+  closeFilePreview();
+  _filesPath = dir;
+  switchView('files');
+  loadFiles(dir);
+  _fvBeacon('reveal', 'shown');
+}
+async function _fileShare() {
+  const path = _fvNeedPath(); if (!path) return;
+  const name = path.split('/').pop();
+  try {
+    const r = await fetch(API + '/api/file/raw?path=' + encodeURIComponent(path), { headers: _authHeaders() });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const blob = await r.blob();
+    const file = new File([blob], name, { type: blob.type || 'application/octet-stream' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: name }); _fvBeacon('share', 'shared'); return; }
+    _copyFileDeeplink(path);
+    _fvBeacon('share', 'link_copied');
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    showToast('Could not share ' + name);
+    _fvBeacon('share', 'failed', { error: String(e.message || e) });
+  }
+}
+// Download is offered for every saved file. A file the viewer already set a
+// download for (a binary, a capped PDF or large text) keeps its own URL.
+function _fileMenuSync() {
+  const dl = document.getElementById('file-download-btn'), path = _fvPath();
+  if (dl && path && dl.style.display === 'none') {
+    dl.dataset.url = API + '/api/file/raw?path=' + encodeURIComponent(path);
+    dl.dataset.filename = path.split('/').pop();
+    dl.style.display = '';
+  }
+  const share = document.getElementById('file-tab-share');
+  if (share) share.style.display = navigator.share ? '' : 'none';
+}
+async function _fileRenameOpen() {
+  const path = _fvNeedPath(); if (!path) return;
+  const old = path.split('/').pop();
+  const name = ((await showPrompt('Rename "' + old + '" to:', old, old)) || '').trim();
+  if (!name || name === old) return;
+  if (/[\/\0]/.test(name) || name === '.' || name === '..') { showToast('Invalid name'); return; }
+  const r = await apiCall(API + '/api/fs/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, new_name: name }) });
+  if (!r) { _fvBeacon('rename', 'failed'); return; }   // apiCall said why
+  const d = await r.json().catch(() => ({}));
+  if (!d.ok) { showToast(d.error || 'Rename failed'); _fvBeacon('rename', 'failed'); return; }
+  showToast('Renamed to ' + name);
+  _fvBeacon('rename', 'renamed');
+  closeFilePreview();
+  await openFilePreview(d.path || path.replace(/[^/]*$/, name));
+  _fileViewRefresh();
+}
+async function _fileMoveOpen() {
+  const path = _fvNeedPath(); if (!path) return;
+  const name = path.split('/').pop(), dir = path.replace(/\/[^/]*$/, '') || '/';
+  const to = ((await showPrompt('Move "' + name + '" to folder:', dir, dir)) || '').trim().replace(/\/+$/, '');
+  if (!to || to === dir) return;
+  const r = await apiCall(API + '/api/fs/move', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, dest: to + '/' + name }) });
+  if (!r) { _fvBeacon('move', 'failed'); return; }   // apiCall said why
+  const d = await r.json().catch(() => ({}));
+  if (!d.ok) { showToast(d.error === 'target already exists' ? to + ' already has a ' + name : (d.error || 'Move failed')); _fvBeacon('move', 'failed'); return; }
+  showToast('Moved to ' + to);
+  _fvBeacon('move', 'moved');
+  closeFilePreview();
+  await openFilePreview(d.path || to + '/' + name);
+  _fileViewRefresh();
+}
+async function _fileDuplicate() {
+  const path = _fvNeedPath(); if (!path) return;
+  const name = path.split('/').pop(), dir = path.replace(/\/[^/]*$/, '') || '/';
+  const dot = name.lastIndexOf('.');
+  const copy = dot > 0 ? name.slice(0, dot) + ' copy' + name.slice(dot) : name + ' copy';
+  try {
+    const r = await fetch(API + '/api/file/raw?path=' + encodeURIComponent(path), { headers: _authHeaders() });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const blob = await r.blob();
+    const { queued, failed } = await _uploadOrQueue([new File([blob], copy, { type: blob.type })], dir, 'file');
+    if (failed || !queued) throw new Error('not saved');
+    showToast('Duplicating as ' + copy);
+    _fvBeacon('duplicate', 'queued');
+  } catch (e) { showToast('Could not duplicate ' + name); _fvBeacon('duplicate', 'failed', { error: String(e.message || e) }); }
+}
+async function _fileInfo() {
+  const path = _fvNeedPath(); if (!path) return;
+  const name = path.split('/').pop(), dir = path.replace(/\/[^/]*$/, '') || '/';
+  let e = null;
+  try {
+    const d = await (await fetch(API + '/api/ls?path=' + encodeURIComponent(dir) + '&hidden=1')).json();
+    e = (d.entries || []).find(x => x.name === name) || null;
+  } catch (err) { console.warn('file info', err); }
+  const when = t => t ? new Date(t * 1000).toLocaleString() : 'unknown';
+  const ext = name.includes('.') ? name.split('.').pop().toUpperCase() + ' file' : 'File';
+  const rows = [['Name', name], ['Kind', ext], ['Size', e && e.size != null ? _fmtSize(e.size) + ' (' + e.size.toLocaleString() + ' bytes)' : 'unknown'],
+    ['Where', dir], ['Modified', when(e && e.modified)]];
+  if (e && e.created) rows.push(['Created', when(e.created)]);
+  if (e && e.opened) rows.push(['Opened', when(e.opened)]);
+  _fvBeacon('info', e ? 'shown' : 'shown_without_listing');
+  await showAlertHtml(name, '<table class="file-info-table">' + rows.map(([k, v]) => '<tr><th>' + esc(k) + '</th><td>' + esc(String(v)) + '</td></tr>').join('') + '</table>');
+}
+async function _fileDeleteOpen() {
+  const path = _fvNeedPath(); if (!path) return;
+  const name = path.split('/').pop();
+  if (!(await showConfirm('Delete "' + name + '"? This cannot be undone.', 'Delete', true))) return;
+  const r = await apiCall(API + '/api/fs/delete', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) });
+  if (!r) { _fvBeacon('delete', 'failed'); return; }   // apiCall said why
+  showToast('Deleted ' + name);
+  _fvBeacon('delete', 'deleted');
+  _fileData = null;
+  closeFilePreview();
+  _fileViewRefresh();
+}
+
+// ── Open in worker (owner, 2026-10-31 mockup) ──
+// Hands the open file to a worker, new or existing, with instructions. The file
+// goes as an @path the worker reads itself; nothing is copied or uploaded.
+const _FOW_CHIPS = { summarize: 'Summarize this file.', issues: 'Find issues in this file and list them.', change: 'Make these changes to this file: ' };
+function _fowChip(b) {
+  const ta = document.getElementById('fow-text');
+  if (!ta) return;
+  ta.value = _FOW_CHIPS[b.dataset.chip] || '';
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+function _fowMode() {
+  const existing = document.querySelector('input[name="fow-to"]:checked')?.value === 'existing';
+  const f = document.getElementById('fow-worker-field');
+  if (f) f.style.display = existing ? '' : 'none';
+}
+async function _fileOpenInWorker() {
+  const path = _fileData && _fileData.path;
+  if (!path) return;
+  const names = (typeof sessions !== 'undefined' ? sessions : []).map(s => s.name).filter(n => n && !String(n).endsWith('@chat'));
+  let last = '';
+  try { last = localStorage.getItem('amux_fow_to') || ''; } catch (e) {}
+  const def = names.includes(last) ? last : ((typeof _lastPeekedSession !== 'undefined' && _lastPeekedSession) || names[0] || '');
+  const dirty = _fileEditDirty();
+  const name = path.split('/').pop();
+  const html = '<div class="fow-to" role="radiogroup" aria-label="Send to">'
+    + '<label><input type="radio" name="fow-to" value="new" onchange="_fowMode()"> New worker</label>'
+    + '<label><input type="radio" name="fow-to" value="existing" checked onchange="_fowMode()"> Existing worker</label></div>'
+    + '<label class="ui-field" id="fow-worker-field">Worker<input id="fow-worker" class="input" list="fow-workers" value="' + esc(def) + '" autocomplete="off"></label>'
+    + '<datalist id="fow-workers">' + names.map(n => '<option value="' + esc(n) + '">').join('') + '</datalist>'
+    + '<label class="ui-field">Instructions<textarea id="fow-text" class="input" rows="4" placeholder="What should it do with this file?"></textarea></label>'
+    + '<div class="fow-chips"><button type="button" class="btn" data-chip="summarize" onclick="_fowChip(this)">Summarize</button>'
+    + '<button type="button" class="btn" data-chip="issues" onclick="_fowChip(this)">Find issues</button>'
+    + '<button type="button" class="btn" data-chip="change" onclick="_fowChip(this)">Make changes</button></div>'
+    + '<div class="ui-help fow-file">Attached: <b>' + esc(name) + '</b> <code>' + esc(path) + '</code><br>'
+    + (dirty ? 'Your unsaved edits are saved first, so the worker reads them.' : 'No unsaved edits: the worker reads the file as it is on disk.') + '</div>';
+  const shown = showFormModal('Open in worker', html, 'Open in worker');
+  setTimeout(() => document.getElementById('fow-text')?.focus(), 30);
+  if (!(await shown)) return;
+  const to = document.querySelector('input[name="fow-to"]:checked')?.value || 'existing';
+  const worker = ((document.getElementById('fow-worker') || {}).value || '').trim();
+  const instr = ((document.getElementById('fow-text') || {}).value || '').trim();
+  if (!instr) { showToast('Say what the worker should do with the file'); return; }
+  if (to === 'existing' && !worker) { showToast('Pick a worker to send to'); return; }
+  if (dirty) { await _fileSave(); if (_fileEditDirty()) { showToast('Not sent: the file could not be saved first'); return; } }
+  const text = instr + '\n@' + path;
+  let opened = '';
+  if (to === 'new') {
+    const cfg = await _outcomeDefaults();
+    cfg.dir = path.slice(0, path.lastIndexOf('/')) || cfg.dir;
+    opened = await _outcomeStart(text, cfg) || '';
+  } else {
+    try { localStorage.setItem('amux_fow_to', worker); } catch (e) {}
+    const res = await doSend(worker, text);
+    if (res === 'sent' || res === 'queued') { showToast((res === 'sent' ? 'Sent to ' : 'Queued for ') + worker); opened = worker; }
+    else if (res !== 'declined') showToast('Not sent to ' + worker);
+  }
+  _mdBeacon('file_open_in_worker', { to, sent: opened ? 1 : 0 });
+  if (!opened) return;
+  // The worker opens over the file, and Back returns to it (as a @worker link does).
+  if (typeof _navNote === 'function') { clearTimeout(_nav.timer); _navNote(); }
+  closeFilePreview();
+  if (typeof openPeek === 'function') openPeek(opened);
+  if (typeof _navSoon === 'function') _navSoon();
 }
 
 // ── Reading position (resume where you left off) ─────────────────────────────
@@ -29677,6 +30949,118 @@ function _officeFlash(el) {
   el.classList.remove('office-flash'); void el.offsetWidth; el.classList.add('office-flash');
 }
 
+// A preview for every binary the browser cannot show by itself (owner,
+// 2026-11-08: "native previews of every file type", over a TIFF that opened as
+// a box and a Download button). The server names the previewer
+// (file_viewer/preview.rs): an image it converts, an archive's entries, a
+// font's specimen, a database's tables, or the first bytes in hex. Download
+// stays in the header of each one.
+let _binPrevGen = 0;
+function _binPrevUrl(route, data) {
+  return API + '/api/file/' + route + '?path=' + encodeURIComponent(data.path) + (peekSessionDir ? '&cwd=' + encodeURIComponent(peekSessionDir) : '');
+}
+function _binPrevBeacon(fields) {
+  fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+    body: JSON.stringify(Object.assign({ kind: 'file-preview', measured: true, n_considered: 1, ver: APP_VER }, fields)) })
+    .catch(e => console.warn('file-preview beacon not sent', e));
+}
+async function _renderBinaryPreview(data, body) {
+  const gen = ++_binPrevGen;
+  const fname = data.path.split('/').pop();
+  const rawUrl = _binPrevUrl('raw', data);
+  body.className = 'file-overlay-body file-binprev';
+  body.innerHTML = '<div class="binprev-head"><span class="binprev-meta">' + esc(data.kind || (data.ext || '').replace(/^\./, '').toUpperCase() + ' file')
+    + (data.size ? ' &middot; ' + esc(_fmtBytes(data.size)) : '') + '</span>'
+    + '<a class="btn" href="' + esc(_authUrl(rawUrl)) + '" download="' + esc(fname) + '">Download</a></div><div class="binprev-main"><div class="pdf-note">Loading preview&hellip;</div></div>';
+  const main = body.querySelector('.binprev-main');
+  const live = () => gen === _binPrevGen && main.isConnected;
+  const getJson = async (route) => {
+    const r = await fetch(_authUrl(_binPrevUrl(route, data)), { cache: 'no-store' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    return d;
+  };
+  const kind = data.preview;
+  try {
+    if (kind === 'image' || kind === 'quicklook') {
+      await new Promise((ok, fail) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'img-zoom-wrap';
+        const img = document.createElement('img');
+        img.className = 'img-zoomable';
+        img.alt = fname;
+        img.onload = () => { if (!live()) return ok(); main.replaceChildren(wrap); _attachImageZoom(wrap, img); ok(); };
+        img.onerror = () => fail(new Error(kind === 'quicklook' ? 'Quick Look could not draw it' : 'no tool here could convert it'));
+        wrap.appendChild(img);
+        img.src = _authUrl(_binPrevUrl('preview-image', data));
+      });
+    } else if (kind === 'archive') {
+      const d = await getJson('archive');
+      if (!live()) return;
+      if (typeof d.text === 'string') {
+        main.innerHTML = '<div class="binprev-note">Unpacked from gzip:</div><pre class="binprev-text">' + esc(d.text) + '</pre>';
+      } else {
+        const rows = (d.entries || []).map(e => '<tr><td>' + (e.dir ? '&#x1F4C1; ' : '') + esc(e.name) + '</td><td class="binprev-num">' + (e.dir ? '' : esc(_fmtBytes(e.size || 0))) + '</td></tr>').join('');
+        main.innerHTML = '<div class="binprev-note">' + (d.total || 0) + ' entr' + (d.total === 1 ? 'y' : 'ies') + (d.truncated ? ', first ' + (d.entries || []).length + ' shown' : '') + '</div>'
+          + '<div class="xlsx-scroll"><table class="xlsx-table"><thead><tr><th>Name</th><th>Size</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+      }
+    } else if (kind === 'sqlite') {
+      const d = await getJson('sqlite');
+      if (!live()) return;
+      const cellHtml = v => v === null ? '<span class="binprev-null">NULL</span>' : esc(String(v));
+      main.innerHTML = '<div class="binprev-note">' + (d.total_tables || 0) + ' table' + (d.total_tables === 1 ? '' : 's') + ' and views, opened read-only</div>'
+        + (d.tables || []).map(t => '<details class="binprev-table"' + ((d.tables || []).length <= 3 ? ' open' : '') + '><summary><b>' + esc(t.name) + '</b> <span class="binprev-note">'
+          + esc(t.type || 'table') + (t.count != null ? ' &middot; ' + t.count + ' row' + (t.count === 1 ? '' : 's') : '') + '</span></summary>'
+          + (t.error ? '<div class="binprev-note">' + esc(t.error) + '</div>'
+            : '<div class="xlsx-scroll"><table class="xlsx-table"><thead><tr>' + (t.columns || []).map(c => '<th>' + esc(c) + '</th>').join('') + '</tr></thead><tbody>'
+              + (t.rows || []).map(r => '<tr>' + r.map(v => '<td>' + cellHtml(v) + '</td>').join('') + '</tr>').join('') + '</tbody></table></div>')
+          + '</details>').join('');
+    } else if (kind === 'font') {
+      const fam = 'amux-prev-' + gen;
+      const face = new FontFace(fam, 'url(' + JSON.stringify(_authUrl(rawUrl)) + ')');
+      await face.load();
+      if (!live()) return;
+      document.fonts.add(face);
+      const sample = 'The quick brown fox jumps over the lazy dog';
+      main.innerHTML = '<div class="binprev-font">'
+        + ['s1', 's2', 's3', 's4'].map(c => '<div class="binprev-font-' + c + '">' + sample + '</div>').join('')
+        + '<div class="binprev-font-chars">ABCDEFGHIJKLMNOPQRSTUVWXYZ<br>abcdefghijklmnopqrstuvwxyz<br>0123456789 !?&amp;@#%()[]{}</div></div>';
+      // The loaded face, by its generated name.
+      main.querySelector('.binprev-font').style.fontFamily = "'" + fam + "'";
+    } else {
+      await _binPrevHex(data, main, rawUrl, live);
+    }
+    _binPrevBeacon({ verdict: 'file_preview_shown', preview: kind, ext: data.ext || '' });
+  } catch (e) {
+    if (!live()) return;
+    // Whatever the previewer, the bytes themselves still show.
+    _binPrevBeacon({ verdict: 'file_preview_fell_back_to_hex', preview: kind, ext: data.ext || '', error: String(e && e.message || e) });
+    main.innerHTML = '';
+    const note = document.createElement('div');
+    note.className = 'binprev-note';
+    note.textContent = 'No ' + (kind === 'quicklook' ? 'Quick Look' : kind) + ' preview: ' + (e && e.message || e) + '. Its first bytes:';
+    main.appendChild(note);
+    const box = document.createElement('div');
+    main.appendChild(box);
+    try { await _binPrevHex(data, box, rawUrl, live); } catch (e2) { box.textContent = 'Could not read the file: ' + (e2.message || e2); }
+  }
+}
+// The first 4 KB as offset, hex and printable text.
+async function _binPrevHex(data, el, rawUrl, live) {
+  const r = await fetch(_authUrl(rawUrl), { headers: { Range: 'bytes=0-4095' }, cache: 'no-store' });
+  if (!r.ok && r.status !== 206) throw new Error('HTTP ' + r.status);
+  const b = new Uint8Array(await r.arrayBuffer()).slice(0, 4096);
+  if (!live()) return;
+  const lines = [];
+  for (let o = 0; o < b.length; o += 16) {
+    const row = b.slice(o, o + 16);
+    const hex = Array.from(row, x => x.toString(16).padStart(2, '0')).join(' ').padEnd(47, ' ');
+    const txt = Array.from(row, x => x >= 32 && x < 127 ? String.fromCharCode(x) : '.').join('');
+    lines.push(o.toString(16).padStart(8, '0') + '  ' + hex + '  ' + txt);
+  }
+  el.innerHTML = '<pre class="binprev-hex">' + esc(lines.join('\n')) + '</pre>'
+    + (data.size > 4096 ? '<div class="binprev-note">First 4 KB of ' + esc(_fmtBytes(data.size)) + '.</div>' : '');
+}
 async function _renderOffice(data, body) {
   const gen = ++_officeGen;
   const isDoc = /\.(docx|docm|dotx)$/i.test(data.path);
@@ -30003,6 +31387,10 @@ function _renderFileBody(data, mode) {
     _renderOffice(data, body);
     return;
   }
+  if (data.is_binary && !data.is_ebook && data.preview) {
+    _renderBinaryPreview(data, body);
+    return;
+  }
   if (data.is_binary) {
     body.className = 'file-overlay-body file-image';
     const fname = data.path.split('/').pop();
@@ -30193,7 +31581,7 @@ function _mdxShow(data, mode) {
   const want = mode === 'raw' || mode === 'edit' ? (_mdxWide() && localStorage.getItem('amux_mdx_mode') === 'split' ? 'split' : 'edit')
     : mode === 'split' ? 'split' : 'preview';
   _mdxSetMode(want, false);
-  _mdxSetTab(_mdx.tab === 'history' || _mdx.tab === 'diff' ? _mdx.tab : 'preview');
+  _mdxSetTab(want === 'preview' && (_mdx.tab === 'history' || _mdx.tab === 'diff') ? _mdx.tab : 'preview');
   _mdxHighlight();
   _mdxStatus();
   return true;
@@ -30224,13 +31612,16 @@ function _mdxSetMode(mode, remember) {
   _mdx.mode = mode;
   const root = document.getElementById('mdx');
   root.dataset.mode = mode;
+  // The source is highlighted only while it shows (_mdxHighlight).
+  if (mode !== 'preview' && !_mdx.hlLines) _mdxHighlight();
   _fileViewMode = mode === 'preview' ? 'preview' : 'edit';
   // The layout switch lives in whichever pane is showing.
   const seg = document.getElementById('mdx-mode');
   const into = document.getElementById(mode === 'preview' ? 'mdx-view-bar' : 'mdx-src-bar');
   if (seg && into && seg.parentElement !== into) into.insertBefore(seg, into.firstChild);
-  seg.querySelectorAll('[data-m]').forEach(b => { const on = b.dataset.m === mode; b.classList.toggle('active', on); b.setAttribute('aria-selected', String(on)); });
-  if (remember) { try { localStorage.setItem('amux_mdx_mode', mode); } catch (e) {} }
+  _mdxSyncBar();
+  // Remembered is the layout Edit opens in (edit or split); Preview is never remembered over it.
+  if (remember && mode !== 'preview') { try { localStorage.setItem('amux_mdx_mode', mode); } catch (e) {} }
   ['file-tab-search', 'file-tab-readaloud'].forEach(id => { const el = document.getElementById(id); if (el) el.style.display = mode === 'edit' ? 'none' : ''; });
   if (mode === 'edit') _mdSearchClose();
   if (mode !== 'preview') { const ta = document.getElementById('file-edit-ta'); if (ta && !ta.readOnly) requestAnimationFrame(() => ta.focus({ preventScroll: true })); }
@@ -30241,7 +31632,10 @@ function _mdxSetMode(mode, remember) {
 
 function _mdxSetTab(tab) {
   _mdx.tab = tab;
-  document.querySelectorAll('#mdx-tab [data-v]').forEach(b => { const on = b.dataset.v === tab; b.classList.toggle('active', on); b.setAttribute('aria-selected', String(on)); });
+  _mdxSyncBar();
+  // Copy and Copy-as act on the rendered note, so they show only beside it.
+  const acts = document.getElementById('mdx-preview-acts');
+  if (acts) acts.hidden = tab !== 'preview';
   const body = document.getElementById('file-body'), alt = document.getElementById('mdx-alt');
   body.style.display = tab === 'preview' ? '' : 'none';
   document.getElementById('mdx-out-host').hidden = tab !== 'preview';
@@ -30337,7 +31731,34 @@ function _mdxInline(s) {
       : link || url ? '<span class="mdx-url">' + m + '</span>' : tag ? '<span class="mdx-tg">' + m + '</span>'
       : at ? '<span class="mdx-at">' + m + '</span>' : '<span class="mdx-i">' + m + '</span>');
 }
-function _mdxHighlight() {
+// The highlighted copy of the source, under a transparent textarea. Kept in step
+// with the text one changed stretch at a time: a keystroke rewrote every line
+// (a 3,600-line note took 105 ms a key on desktop and 178 ms in WebKit, owner
+// 2026-10-31: "make it snappier ... faster to edit"). Line numbers are a CSS
+// counter, so inserting a line renumbers nothing. Not built while only the
+// preview shows, and not on a phone, which edits in the plain textarea.
+function _mdxLineHtml(raw, fence, big) {
+  const e = esc(raw);
+  let cls = '', inner;
+  if (fence) { cls = 'mdx-codeln'; inner = e; }
+  else if (/^#{1,6}\s/.test(raw)) { cls = 'mdx-h'; inner = e; }
+  else if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(raw)) { cls = 'mdx-hr'; inner = e; }
+  else if (big) inner = e;
+  else {
+    const li = /^(\s*)((?:[-*+]|\d+[.)]))(\s+)(\[[ xX]\]\s)?/.exec(raw);
+    if (li) {
+      inner = esc(li[1]) + '<span class="mdx-li">' + esc(li[2]) + '</span>' + li[3]
+        + (li[4] ? '<span class="mdx-task">' + esc(li[4]) + '</span>' : '') + _mdxInline(esc(raw.slice(li[0].length)));
+    } else if (/^\s*>/.test(raw)) { cls = 'mdx-q'; inner = _mdxInline(e); }
+    else inner = _mdxInline(e);
+  }
+  return '<span class="ln' + (cls ? ' ' + cls : '') + '">' + (inner || '') + '\n</span>';
+}
+const _MDX_FENCE = /^\s*(```|~~~)/;
+// A phone edits in the plain textarea: one layer, so the text, the caret and
+// iOS's selection handles always line up, at a size meant for a thumb.
+function _mdxPhone() { return !_mdxWide(); }
+function _mdxHighlight(force) {
   const { ta, wrap } = _mdxEls();
   if (!ta || !wrap || !_mdxActive()) return;
   let hl = document.getElementById('mdx-hl');
@@ -30346,29 +31767,41 @@ function _mdxHighlight() {
     hl.id = 'mdx-hl'; hl.setAttribute('aria-hidden', 'true');
     wrap.insertBefore(hl, ta);
   }
-  const big = ta.value.length > 300000;
-  wrap.classList.toggle('mdx-plain', big);
-  const lines = ta.value.split('\n');
-  let fence = false, h = '';
-  lines.forEach((raw, i) => {
-    const e = esc(raw);
-    let cls = '', inner;
-    if (/^\s*(```|~~~)/.test(raw)) { fence = !fence; cls = 'mdx-fence'; inner = e; }
-    else if (fence) { cls = 'mdx-codeln'; inner = e; }
-    else if (/^#{1,6}\s/.test(raw)) { cls = 'mdx-h'; inner = e; }
-    else if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(raw)) { cls = 'mdx-hr'; inner = e; }
-    else if (big) inner = e;
-    else {
-      const li = /^(\s*)((?:[-*+]|\d+[.)]))(\s+)(\[[ xX]\]\s)?/.exec(raw);
-      if (li) {
-        inner = esc(li[1]) + '<span class="mdx-li">' + esc(li[2]) + '</span>' + li[3]
-          + (li[4] ? '<span class="mdx-task">' + esc(li[4]) + '</span>' : '') + _mdxInline(esc(raw.slice(li[0].length)));
-      } else if (/^\s*>/.test(raw)) { cls = 'mdx-q'; inner = _mdxInline(e); }
-      else inner = _mdxInline(e);
+  const phone = _mdxPhone(), big = ta.value.length > 300000;
+  wrap.classList.toggle('mdx-phone', phone);
+  wrap.classList.toggle('mdx-plain', big || phone);
+  if (phone || big) { if (_mdx.hlLines) { hl.textContent = ''; _mdx.hlLines = null; } return; }
+  if (_mdx.mode === 'preview') { _mdx.hlLines = null; return; }   // built when the source shows
+  const lines = ta.value.split('\n'), old = _mdx.hlLines;
+  if (!force && old && hl.childElementCount === old.length) {
+    const max = Math.min(old.length, lines.length);
+    let p = 0; while (p < max && old[p] === lines[p]) p++;
+    let q = 0; while (q < max - p && old[old.length - 1 - q] === lines[lines.length - 1 - q]) q++;
+    const oldMid = old.slice(p, old.length - q), newMid = lines.slice(p, lines.length - q);
+    // A fence opened or closed changes every line after it: build it all.
+    if (!oldMid.some(l => _MDX_FENCE.test(l)) && !newMid.some(l => _MDX_FENCE.test(l))) {
+      const fence = _mdx.hlFence[p];
+      const t = document.createElement('template');
+      t.innerHTML = newMid.map(l => _mdxLineHtml(l, fence, false)).join('');
+      for (let k = 0; k < oldMid.length; k++) hl.children[p].remove();
+      hl.insertBefore(t.content, hl.children[p] || null);
+      _mdx.hlLines = lines;
+      _mdx.hlFence = _mdx.hlFence.slice(0, p).concat(new Array(newMid.length).fill(fence), _mdx.hlFence.slice(old.length - q));
+      _mdxSyncScroll();
+      return;
     }
-    h += '<span class="ln' + (cls ? ' ' + cls : '') + '" data-n="' + (i + 1) + '">' + (inner || '') + '\n</span>';
+  }
+  let fence = false, h = '';
+  const states = [];
+  lines.forEach(raw => {
+    states.push(fence);
+    if (_MDX_FENCE.test(raw)) { fence = !fence; h += '<span class="ln mdx-fence">' + esc(raw) + '\n</span>'; return; }
+    h += _mdxLineHtml(raw, fence, false);
   });
+  states.push(fence);
   hl.innerHTML = h;
+  _mdx.hlLines = lines;
+  _mdx.hlFence = states;
   // The pre wraps exactly as the textarea does: same width once its scrollbar is counted.
   hl.style.paddingRight = (parseFloat(getComputedStyle(ta).paddingRight) + (ta.offsetWidth - ta.clientWidth)) + 'px';
   _mdxSyncScroll();
@@ -30380,8 +31813,10 @@ function _mdxSyncScroll() {
 function _mdxStatus() {
   const ta = document.getElementById('file-edit-ta');
   if (!ta || !_mdxActive()) return;
-  const before = ta.value.slice(0, ta.selectionStart);
-  const ln = before.split('\n').length, col = ta.selectionStart - before.lastIndexOf('\n');
+  const v = ta.value, at = ta.selectionStart;
+  let ln = 1; for (let i = v.indexOf('\n'); i !== -1 && i < at; i = v.indexOf('\n', i + 1)) ln++;
+  // lastIndexOf reads a negative start as 0, so at the very start a leading newline read as Col 0.
+  const col = at - (at > 0 ? v.lastIndexOf('\n', at - 1) : -1);
   document.getElementById('mdx-pos').textContent = 'Ln ' + ln + ', Col ' + col;
   const n = ta.value.length;
   document.getElementById('mdx-chars').textContent = n.toLocaleString() + ' character' + (n === 1 ? '' : 's');
@@ -30391,7 +31826,8 @@ function _mdxStatus() {
   d.textContent = ta.readOnly ? 'Read-only' : dirty ? 'Unsaved' : 'Saved';
   d.classList.toggle('on', dirty);
   const save = document.getElementById('file-save-btn');
-  if (save) save.style.display = _fileEditable(_fileData) && (_mdx.mode !== 'preview' || dirty) ? '' : 'none';
+  // Edits save themselves (_mdxAutosave), so Save shows only while something is unsaved.
+  if (save) save.style.display = _fileEditable(_fileData) && dirty ? '' : 'none';
 }
 // Every change to the source: highlight now, the preview a beat later, and a
 // save once typing pauses (owner, 2026-10-29: "make sure edits are saved as
@@ -30611,8 +32047,11 @@ function _mdxRenderDiff() {
     : (_mdx.opened != null ? 'the file as you opened it' : 'the saved file');
   const rows = _mdxDiffLines(base, ta.value);
   const add = rows.filter(r => r[0] === '+').length, del = rows.filter(r => r[0] === '-').length;
-  let h = '<div class="mdx-diff-head">' + (add || del ? '<b class="mdx-add">+' + add + '</b> <b class="mdx-del">−' + del + '</b> against ' + what
-    : 'No changes against ' + what) + (_mdx.against ? ' <button type="button" class="btn mdx-diff-saved">Against the saved file</button>' : '') + '</div>';
+  // Both ends named (owner, 2026-10-31: "unclear Diff semantics"): red is the
+  // older side, green the text in the editor now.
+  let h = '<div class="mdx-diff-head"><span class="mdx-diff-ends"><span class="mdx-del">' + what + '</span> \u2192 <span class="mdx-add">the text now</span></span> '
+    + (add || del ? '<b class="mdx-add">+' + add + '</b> <b class="mdx-del">−' + del + '</b>' : '<span>no changes</span>')
+    + (_mdx.against ? ' <button type="button" class="btn mdx-diff-saved">Compare with the file as opened</button>' : '') + '</div>';
   if (add || del) {
     // Only the changes and three lines around each.
     const keep = new Set();
@@ -30656,11 +32095,15 @@ function _mdxDrawHistory(d) {
   const rel = (t) => { const s = Math.max(0, Date.now() / 1000 - t); return s < 3600 ? Math.round(s / 60) + 'm ago' : s < 86400 ? Math.round(s / 3600) + 'h ago' : Math.round(s / 86400) + 'd ago'; };
   let h = '<div class="mdx-hist-head">' + d.commits.length + ' commit' + (d.commits.length === 1 ? '' : 's') + (d.uncommitted ? ' · <span class="mdx-dirty on">edits not committed</span>' : '') + '</div>';
   if (!d.commits.length) h += '<div class="mdx-empty">No commits include this file yet.</div>';
+  // A version reads by when it was and what changed; the hash is metadata. The
+  // row itself compares it with the text now; Restore is the second, smaller
+  // action and asks first (owner, 2026-10-31).
   h += d.commits.map(c => '<div class="mdx-commit" data-sha="' + esc(c.sha) + '">'
-    + '<div class="mdx-commit-main"><div class="mdx-commit-subj">' + esc(c.subject) + '</div>'
-    + '<div class="mdx-commit-meta">' + esc(c.author) + ' · ' + rel(c.at) + ' · <code>' + esc(c.short) + '</code></div></div>'
-    + '<button type="button" class="btn" data-act="diff">Diff</button>'
-    + (_fileEditable(_fileData) ? '<button type="button" class="btn" data-act="restore" title="Put this version in the editor (not saved until you save)">Restore</button>' : '')
+    + '<button type="button" class="mdx-commit-main" data-act="diff" title="Compare this version with the text now">'
+    + '<span class="mdx-commit-when">' + rel(c.at) + '</span>'
+    + '<span class="mdx-commit-subj">' + esc(c.subject) + '</span>'
+    + '<span class="mdx-commit-meta">' + esc(c.author) + ' · <code>' + esc(c.short) + '</code></span></button>'
+    + (_fileEditable(_fileData) ? '<button type="button" class="btn mdx-commit-restore" data-act="restore" title="Put this version in the editor">Restore</button>' : '')
     + '</div>').join('');
   alt.innerHTML = h;
 }
@@ -30677,10 +32120,17 @@ async function _mdxHistoryAct(sha, act) {
     const content = await _mdxCommitAt(sha);
     if (act === 'diff') { _mdx.against = { sha, short: c.short, subject: c.subject, content }; _mdxSetTab('diff'); }
     else if (act === 'restore') {
+      // Edits save themselves, so Restore writes the file: the text now stays
+      // one step away, in Diff (compared against it) and in ⌘Z.
+      const ok = await showConfirm('Put the version from ' + c.short + ' (' + c.subject + ') in the editor? It saves like any edit. The text there now is kept: Diff compares against it and \u2318Z puts it back.', 'Restore');
+      if (!ok) return;
       const ta = document.getElementById('file-edit-ta');
+      const before = ta.value;
       _mdxReplace(0, ta.value.length, content, 0);
-      if (_mdx.mode === 'preview') _mdxSetMode(_mdxWide() ? 'split' : 'edit', false);
-      showToast('Version ' + c.short + ' is in the editor. Save to keep it.');
+      _mdx.against = { label: 'the text before restoring ' + c.short, content: before };
+      _mdxSetMode('preview', false);
+      _mdxSetTab('diff');
+      showToast('Restored ' + c.short + '. Diff shows what it changed.');
       _mdxBeacon('history_restored');
     }
   } catch (e) { showToast('Could not read that version: ' + (e.message || e)); }
@@ -30706,8 +32156,38 @@ function _mdxFull(on) {
   requestAnimationFrame(_mdxHighlight);
 }
 
-// The Preview / Diff / History switch (index.html onclick). Diff opened from
-// the switch is against the saved file; History's Diff picks a commit.
+// The one view switch (owner, 2026-10-31: "Edit Preview Split Preview Diff
+// History" showed Preview twice). Preview, Edit, Diff and History are where
+// you are; Split is a desktop-only way of showing Edit, toggled beside them.
+// Inside, mode says which panes show and tab what the rendered pane holds.
+function _mdxCurrentView() {
+  if (_mdx.tab === 'diff' || _mdx.tab === 'history') return _mdx.tab;
+  return _mdx.mode === 'preview' ? 'preview' : 'edit';
+}
+function _mdxSyncBar() {
+  const seg = document.getElementById('mdx-mode');
+  if (!seg) return;
+  const view = _mdxCurrentView();
+  seg.querySelectorAll('[role="tab"][data-m]').forEach(b => { const on = b.dataset.m === view; b.classList.toggle('active', on); b.setAttribute('aria-selected', String(on)); });
+  const sp = seg.querySelector('.mdx-split');
+  if (sp) { const on = _mdx.mode === 'split'; sp.classList.toggle('active', on); sp.setAttribute('aria-pressed', String(on)); }
+}
+function _mdxView(v) {
+  if (v === 'edit') {
+    const split = _mdxWide() && localStorage.getItem('amux_mdx_mode') === 'split';
+    _mdxSetMode(split ? 'split' : 'edit', false);
+    _mdxSetTab('preview');
+  } else {
+    _mdxSetMode('preview', false);
+    _mdxTabClick(v);
+  }
+  _mdxBeacon('view', { view: v });
+}
+function _mdxToggleSplit() {
+  _mdxSetMode(_mdx.mode === 'split' ? 'edit' : 'split', true);
+  _mdxSetTab('preview');
+}
+// Diff opened from the switch is against the saved file; History's Diff picks a commit.
 function _mdxTabClick(v) {
   if (v === 'diff' && _mdx.tab !== 'diff') _mdx.against = null;
   _mdxSetTab(v);
@@ -30723,7 +32203,8 @@ function _mdxBind() {
   ['keyup', 'click', 'select'].forEach(ev => ta.addEventListener(ev, () => { if (_mdxActive()) _mdxStatus(); }));
   ta.addEventListener('keydown', e => { if (_mdxActive()) _mdxKeydown(e); });
   _atAttach(ta);   // @ offers the workers
-  document.getElementById('mdx-tools').addEventListener('mousedown', e => { if (e.target.closest('[data-t]')) e.preventDefault(); });   // keep the selection
+  // Keep the selection, and on a phone the keyboard: a tap reaches pointerdown before mousedown.
+  for (const ev of ['pointerdown', 'mousedown']) document.getElementById('mdx-tools').addEventListener(ev, e => { if (e.target.closest('[data-t]')) e.preventDefault(); });
   document.getElementById('mdx-tools').addEventListener('click', e => {
     const b = e.target.closest('[data-t]');
     if (!b || ta.readOnly) return;
@@ -32043,6 +33524,7 @@ async function _openXlsxPreview(path) {
   if (subEl) { const dir = path.slice(0, path.lastIndexOf('/')) || '/'; subEl.textContent = dir; subEl.title = path; }
   document.getElementById('file-overlay').dataset.path = path;
   _fileHashSync(path);
+  _fileFresh(null);
   const body = document.getElementById('file-body');
   body.className = 'file-overlay-body';
   body.textContent = 'Loading spreadsheet…';
@@ -32158,6 +33640,7 @@ async function _cacheStreamedImage(path, data) {
 let _feOpenRecording = null;
 function _feRecordOpen(path) {
   if (!path) return;
+  _filesRecentAdd(path, 'file');
   return _feOpenRecording = fetch(API + '/api/fs/opened', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }), keepalive: true })
     .then(r => r.ok ? r.json() : null)
@@ -32256,6 +33739,7 @@ async function openFilePreview(path, options = {}) {
   // title can read as the markdown heading or carry a "cached" suffix.
   document.getElementById('file-overlay').dataset.path = path;
   _fileHashSync(path);
+  _fileFresh(null);   // the last file's label is not this one's
   document.getElementById('file-body').className = 'file-overlay-body';
   document.getElementById('file-body').textContent = 'Loading...';
   document.getElementById('file-view-tabs').style.display = 'none';
@@ -32281,6 +33765,7 @@ async function openFilePreview(path, options = {}) {
     const data = await r.json();
     if (gen !== _filePreviewGen) return;   // another file was opened meanwhile
     fresh = true;
+    _fileFresh(null);
     if (data.error) {
       // Say WHAT failed and WHERE, not a bare "Error: file not found" dead end
       // (Ethan, 2026-09-12: a terminal file link opened to that and nothing
@@ -32374,23 +33859,43 @@ async function openFilePreview(path, options = {}) {
     }
   } catch(e) {
     if (gen !== _filePreviewGen) return;
+    // The server has answered (by failing): the cache-first read above must
+    // not relabel the copy as "checking" after this says "Offline".
+    fresh = true;
     if (options.readOnly) {document.getElementById('file-body').textContent='Retained asset unavailable.';return;}
     // Offline or unreachable: the saved copy, if any (it may already be shown).
     const cached = await _idb.getFile(path).catch(() => null);
     if (gen !== _filePreviewGen) return;
-    if (cached && cached.type === 'file') { _fileShowCached(path, cached); return; }
+    if (cached && cached.type === 'file') { _fileShowCached(path, cached, true); return; }
     document.getElementById('file-body').textContent = 'Could not reach the server, and this file has no saved copy on this device yet.';
   }
 }
 
 let _filePreviewGen = 0;
-function _fileShowCached(path, cached) {
+// How fresh the shown copy is, beside the folder (owner, 2026-10-31: "To-Do.md
+// · cached 42h ago" stayed in the title after the file had loaded fresh, and
+// read as if the note were 42 hours stale while its last commit was 8h old).
+// The cached time is when this device last opened the file, not when the file
+// changed, so it says "your copy" and goes away once the server answers.
+// null: the file is the server's, nothing to say.
+function _fileFresh(state, ts) {
+  const el = document.getElementById('file-fresh');
+  if (!el) return;
+  if (!state) { el.hidden = true; el.textContent = ''; el.className = 'file-fresh'; return; }
+  const age = Math.max(0, Math.round((Date.now() - (ts || Date.now())) / 60000));
+  const ageStr = age < 1 ? 'just now' : age < 60 ? age + 'm ago' : age < 2880 ? Math.round(age / 60) + 'h ago' : Math.round(age / 1440) + 'd ago';
+  el.textContent = state === 'offline' ? 'Offline \u00b7 your copy from ' + ageStr : 'Your copy from ' + ageStr + ' \u00b7 checking\u2026';
+  el.title = state === 'offline'
+    ? 'The server could not be reached. This is the copy saved on this device when you last opened the file.'
+    : 'Showing the copy saved on this device while the current file loads.';
+  el.className = 'file-fresh' + (state === 'offline' ? ' offline' : '');
+  el.hidden = false;
+}
+function _fileShowCached(path, cached, offline) {
     {
       _idb.touchFile(path);   // opening refreshes the 30-day clock, even offline
       _fileData = cached.data;
-      const age = Math.round((Date.now() - cached.ts) / 60000);
-      const ageStr = age < 60 ? age + 'm ago' : Math.round(age/60) + 'h ago';
-      document.getElementById('file-title').textContent = path.split('/').pop() + ' \u2022 cached ' + ageStr;
+      _fileFresh(offline ? 'offline' : 'checking', cached.ts);
       const cachedIsText = !cached.data.is_image && !cached.data.is_pdf && !cached.data.is_video && !cached.data.is_audio && !cached.data.is_binary && !cached.data.is_ebook;
       if (cachedIsText) {
         document.getElementById('file-view-tabs').style.display = '';
@@ -32485,6 +33990,7 @@ function closeFilePreview() {
   delete _cTitleEl.dataset.spEditable;
   document.getElementById('file-overlay').classList.remove('active');
   _fileHashSync(null);
+  _fileFresh(null);
   document.getElementById('file-download-btn').style.display = 'none'; _presentSetup(null);
   document.getElementById('file-save-btn').style.display = 'none';
   const tpTab = document.getElementById('file-tab-teleprompter');
@@ -32495,6 +34001,10 @@ function closeFilePreview() {
   document.getElementById('file-body').style.display = '';
   _fileData = null;
   _fileViewMode = 'preview';
+  // A load still in flight belongs to a viewer that is gone: without this its
+  // cache read or reply passed the generation check and set _fileData on a
+  // closed overlay (2026-11-06).
+  _filePreviewGen++;
 }
 
 async function _downloadFileBytes(url, filename) {
@@ -32772,7 +34282,7 @@ async function copyFileContent() {
   await navigator.clipboard.writeText(_fileData.content);
   const btn = document.getElementById('file-tab-copy');
   btn.textContent = 'Copied!';
-  setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+  setTimeout(() => { btn.textContent = 'Copy text'; }, 1500);
 }
 
 // ═══════ FILE EXPLORER ═══════
@@ -33056,6 +34566,94 @@ function _filesBookmarkOpen(path, type) {
   else loadFiles(path);
 }
 
+// The row's filter (owner, 2026-10-31: "a filter that stays selected
+// locally ... all, pinned, recent, modified, shared"). Kept per device in
+// localStorage, never on the server. Where each list comes from:
+// - pinned: the scoped shortcuts (/api/prefs files_bookmarks*), as before.
+// - recent: files and folders opened on this device (_filesRecentAdd, fed by
+//   _feRecordOpen and loadFiles), newest first.
+// - modified: the newest files by mtime in the folder on screen (the listing
+//   the view already has; no endpoint lists modified files machine-wide).
+// - shared: files and folders with an approved public link (Apps tab, "Share
+//   a file or folder", /api/page-links kind=file). A pin "for all workers" is
+//   a scope of a shortcut and stays under Pinned.
+// - all: the four above in that order, each path once.
+const _FILES_ROW_FILTERS = ['all', 'pinned', 'recent', 'modified', 'shared'];
+const _FILES_ROW_FILTER_KEY = 'amux_files_row_filter';
+function _filesRowFilter() {
+  try { const v = localStorage.getItem(_FILES_ROW_FILTER_KEY); if (_FILES_ROW_FILTERS.includes(v)) return v; } catch(e) {}
+  return 'all';
+}
+function _filesRowFilterSet(v) {
+  if (!_FILES_ROW_FILTERS.includes(v)) return;
+  try { localStorage.setItem(_FILES_ROW_FILTER_KEY, v); } catch(e) {}
+  if (_filesSharedErr) _filesSharedAt = 0;   // choosing a list asks again after a failed load
+  _filesRenderBookmarks();
+  const row = document.getElementById('files-bookmarks');
+  if (row) row.scrollLeft = 0;
+}
+function _filesRowShows(kind) { const f = _filesRowFilter(); return f === 'all' || f === kind; }
+
+const _FILES_RECENT_KEY = 'amux_files_recent';
+const _FILES_RECENT_MAX = 15;
+function _filesRecentGet() {
+  try {
+    const a = JSON.parse(localStorage.getItem(_FILES_RECENT_KEY) || '[]');
+    return Array.isArray(a) ? a.filter(r => r && typeof r.path === 'string' && r.path) : [];
+  } catch(e) { return []; }
+}
+function _filesRecentAdd(path, type) {
+  if (!path || typeof path !== 'string') return;
+  const list = _filesRecentGet().filter(r => r.path !== path);
+  list.unshift({ path, type: type === 'file' ? 'file' : 'dir', at: Date.now() });
+  try { localStorage.setItem(_FILES_RECENT_KEY, JSON.stringify(list.slice(0, _FILES_RECENT_MAX))); } catch(e) {}
+  if (_filesRowShows('recent') && document.getElementById('files-bookmarks-list')) _filesRenderBookmarks();
+}
+function _filesModifiedItems() {
+  const fl = _filesLastData;
+  if (!fl || !fl.data || fl.path !== _filesPath) return [];
+  const base = String(fl.data.path || fl.path || '').replace(/\/$/, '');
+  return (fl.data.entries || [])
+    .filter(e => e && e.name && e.type !== 'dir' && e.modified)
+    .sort((a, b) => b.modified - a.modified)
+    .slice(0, 8)
+    .map(e => ({ path: base + '/' + e.name, label: e.name, type: 'file', note: 'modified ' + timeAgo(e.modified) + ' in this folder' }));
+}
+// Shared links, fetched only when the row shows them and at most once a
+// minute (a failure counts as a fetch, so a down endpoint is not retried on
+// every render). _filesSharedErr says the list is unknown rather than empty.
+let _filesShared = [], _filesSharedAt = 0, _filesSharedErr = '', _filesSharedLoading = null;
+function _filesSharedLoad() {
+  if (_filesSharedLoading || Date.now() - _filesSharedAt < 60000) return _filesSharedLoading;
+  _filesSharedAt = Date.now();
+  _filesSharedLoading = fetch(API + '/api/page-links', { headers: _authHeaders(), signal: AbortSignal.timeout(8000) })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+    .then(d => {
+      _filesShared = (d.links || []).filter(l => l && l.kind === 'file' && l.file && !l.pending).map(l => ({
+        path: l.file,
+        label: l.title || l.file.split('/').filter(Boolean).pop() || l.file,
+        type: ((l.files || 0) !== 1 || !/\.[^/]+$/.test(l.file)) ? 'dir' : 'file',
+        note: 'shared at ' + (l.url || l.path),
+      }));
+      _filesSharedErr = '';
+    })
+    .catch(e => { _filesSharedErr = (e && e.message) || 'unreachable'; })
+    .finally(() => { _filesSharedLoading = null; if (_filesRowShows('shared')) _filesRenderBookmarks(); });
+  return _filesSharedLoading;
+}
+// A chip that opens its path and has nothing to remove (recent, modified,
+// shared). `tag` names the source when the row mixes them (All).
+function _filesRowChip(b, src, tag) {
+  const t = b.type === 'file' ? 'file' : 'dir';
+  const ic = t === 'file' ? '\u{1F4C4} ' : '\u{1F4C1} ';
+  const label = b.label || b.path.split('/').filter(Boolean).pop() || b.path;
+  return '<span class="files-bm-chip files-row-chip" data-source="' + src + '" data-path="' + esc(b.path) + '" '
+    + 'style="display:inline-flex;align-items:center;background:transparent;border:1px solid var(--border);border-radius:var(--radius-md);padding:var(--space-0-5) var(--space-2);font-size:var(--fs-xs);color:var(--text);white-space:nowrap;flex-shrink:0;" '
+    + 'title="' + esc(b.path + (b.note ? ' (' + b.note + ')' : '')) + '">'
+    + '<span style="cursor:pointer;" onclick="_filesBookmarkOpen(\'' + escJs(b.path) + '\',\'' + t + '\')">' + ic + esc(label)
+    + (tag ? ' <span style="color:var(--dim);font-size:var(--fs-3xs);">' + src + '</span>' : '') + '</span></span>';
+}
+
 function _filesRenderBookmarks() {
   const addBtn = document.getElementById('files-bm-add');
   if (addBtn) {
@@ -33064,20 +34662,53 @@ function _filesRenderBookmarks() {
   }
   const container = document.getElementById('files-bookmarks-list');
   if (!container) return;
+  const filter = _filesRowFilter();
+  const sel = document.getElementById('files-row-filter');
+  if (sel && sel.value !== filter) sel.value = filter;
+  const all = filter === 'all';
   const bm = _filesGetBookmarks();
-  // Chip = tappable label (navigate / open) + a × button (remove). The × works
-  // on touch too — right-click can't (mobile-first). Right-click still removes.
-  container.innerHTML = bm.map((b, i) => {
-    const t = b.type === 'file' ? 'file' : 'dir';
-    const ic = t === 'file' ? '\u{1F4C4} ' : '';
-    return '<span class="files-bm-chip" oncontextmenu="event.preventDefault();_filesRemoveBookmark(' + i + ')" '
-      + 'style="display:inline-flex;align-items:center;gap:var(--space-0-5);background:var(--card);border:1px solid var(--border);border-radius:var(--radius-md);padding:var(--space-0-5) var(--space-0-5) var(--space-0-5) var(--space-2);font-size:var(--fs-xs);color:var(--text);white-space:nowrap;flex-shrink:0;" '
-      + 'title="' + esc(b.path) + '">'
-      + '<span style="cursor:pointer;" onclick="_filesBookmarkOpen(\'' + esc(b.path) + '\',\'' + t + '\')">' + ic + esc(b.label) + '</span>'
-      + '<button onclick="event.stopPropagation();_filesRemoveBookmark(' + i + ')" title="Remove shortcut" aria-label="Remove ' + esc(b.label) + '" '
-      + 'style="border:none;background:none;color:var(--dim);cursor:pointer;font-size:var(--fs-2xl);line-height:1;padding:var(--space-0-5) var(--space-1);min-width:24px;min-height:24px;border-radius:var(--radius-sm);">×</button>'
-      + '</span>';
-  }).join('') + (_exploreSession ? _filesInheritedChips(bm) : '');
+  const seen = new Set();
+  let html = '';
+  if (all || filter === 'pinned') {
+    // Chip = tappable label (navigate / open) + a × button (remove). The × works
+    // on touch too — right-click can't (mobile-first). Right-click still removes.
+    html += bm.map((b, i) => {
+      seen.add(b.path);
+      const t = b.type === 'file' ? 'file' : 'dir';
+      const ic = t === 'file' ? '\u{1F4C4} ' : '';
+      return '<span class="files-bm-chip" data-source="pinned" oncontextmenu="event.preventDefault();_filesRemoveBookmark(' + i + ')" '
+        + 'style="display:inline-flex;align-items:center;gap:var(--space-0-5);background:var(--card);border:1px solid var(--border);border-radius:var(--radius-md);padding:var(--space-0-5) var(--space-0-5) var(--space-0-5) var(--space-2);font-size:var(--fs-xs);color:var(--text);white-space:nowrap;flex-shrink:0;" '
+        + 'title="' + esc(b.path) + '">'
+        + '<span style="cursor:pointer;" onclick="_filesBookmarkOpen(\'' + esc(b.path) + '\',\'' + t + '\')">' + ic + esc(b.label) + '</span>'
+        + '<button onclick="event.stopPropagation();_filesRemoveBookmark(' + i + ')" title="Remove shortcut" aria-label="Remove ' + esc(b.label) + '" '
+        + 'style="border:none;background:none;color:var(--dim);cursor:pointer;font-size:var(--fs-2xl);line-height:1;padding:var(--space-0-5) var(--space-1);min-width:24px;min-height:24px;border-radius:var(--radius-sm);">×</button>'
+        + '</span>';
+    }).join('');
+    if (_exploreSession) {
+      html += _filesInheritedChips(bm);
+      for (const layer of _filesBmInherited) for (const b of layer.items) if (b && b.path) seen.add(b.path);
+    }
+  }
+  const add = (items, src) => {
+    for (const b of items) {
+      if (!b || !b.path || seen.has(b.path)) continue;
+      seen.add(b.path);
+      html += _filesRowChip(b, src, all);
+    }
+  };
+  if (all || filter === 'recent') add(_filesRecentGet(), 'recent');
+  if (all || filter === 'modified') add(_filesModifiedItems(), 'modified');
+  if (all || filter === 'shared') {
+    _filesSharedLoad();
+    add(_filesShared, 'shared');
+    if (filter === 'shared' && _filesSharedErr) html += '<span class="files-row-empty" style="color:var(--dim);font-size:var(--fs-xs);white-space:nowrap;">Shared links could not be loaded (' + esc(_filesSharedErr) + ')</span>';
+  }
+  if (!html) {
+    const empty = { all: 'Nothing pinned, opened or shared yet', pinned: 'No shortcuts pinned', recent: 'Nothing opened on this device yet',
+      modified: 'No files in this folder', shared: _filesSharedLoading ? 'Loading shared links…' : 'No files or folders shared' }[filter];
+    html = '<span class="files-row-empty" style="color:var(--dim);font-size:var(--fs-xs);white-space:nowrap;">' + esc(empty) + '</span>';
+  }
+  container.innerHTML = html;
 }
 // Chips from the worker's groups and the global list, each tagged with where
 // it comes from, so an inherited shortcut never reads as the worker's own.
@@ -33408,6 +35039,7 @@ async function loadFiles(path) {
   const body = document.getElementById('files-body');
   body.innerHTML = '<div style="padding:var(--space-4);color:var(--dim)">Loading...</div>';
   _filesPath = path;
+  _filesRecentAdd(path, 'dir');
   // Update URL hash so path is shareable / bookmarkable (hash works in PWA mode).
   // A file open over the listing keeps the address: the listing behind a
   // deep-linked or just-opened file loads after it, and writing the folder
@@ -33827,12 +35459,6 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && _fsel.paths.size) { e.preventDefault(); e.stopImmediatePropagation(); _fselClear(); return; }
   if (root && (e.metaKey || e.ctrlKey) && (e.key === 'a' || e.key === 'A')) { e.preventDefault(); _fselSelectAll(root); }
 }, true);
-// Navigate to the parent of the current Files-tab folder (the "Up" action).
-function _filesUp() {
-  const p = (_filesPath || '/').replace(/\/+$/, '');
-  const i = p.lastIndexOf('/');
-  loadFiles(i > 0 ? p.slice(0, i) : '/');
-}
 // Toggle a folder's inline expansion (accordion). Inserts/removes the folder's
 // child rows right after it, without navigating into the folder.
 async function _feToggleExpand(btn) {
@@ -33870,6 +35496,7 @@ async function _feToggleExpand(btn) {
 }
 function _renderFilesEntries(body, path, data, cacheTs) {
   _filesLastData = { path, data, cacheTs };
+  if (_filesRowShows('modified')) _filesRenderBookmarks();
   _libUpdateBtn(data.entries);   // show the Library button for ebook folders (+ auto-close on nav)
   body.innerHTML = '';
 
@@ -34386,12 +36013,50 @@ function _spHandlePaste(e, box) {
   const items = [...(e.clipboardData?.items || [])];
   const images = items.filter(i => i.kind === 'file').map(i => i.getAsFile()).filter(Boolean);
   const text = e.clipboardData?.getData('text/plain') || '';
-  if (box && box.value.trim()) return;
+  if (box && box.value.trim()) {
+    // Typing: an image goes into the note, saved beside it (Ethan, 2026-11-08).
+    if (images.length) _pasteImagesIntoNote(e, box, _spPath.replace(/\/$/, ''));
+    return;
+  }
   if (!images.length && !text.trim()) return;
   e.preventDefault();
   images.forEach(_spSaveImage);
   if (text.trim()) _spCaptureSave(text);
 }
+// PASTING AN IMAGE INTO A NOTE (Ethan, 2026-11-08: "I should be able to paste
+// images in scratchpad"). The image is saved as a file in the note's folder,
+// through the durable chunked upload, and the note gets ![](name) at the
+// cursor; the preview shows it (renderer.image resolves relative paths). The
+// name carries a random tail so the server never has to rename it on a
+// collision, which would break the link. Beaconed as kind=note-paste-image.
+function _pasteImageName(file) {
+  const ext = ((file.type || '').split('/')[1] || 'png').replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'png';
+  return 'pasted-' + _spStamp() + '-' + Math.random().toString(36).slice(2, 6) + '.' + ext;
+}
+function _pasteImagesIntoNote(e, ta, dir) {
+  const files = [...(e.clipboardData?.items || [])].filter(i => i.kind === 'file' && /^image\//.test(i.type))
+    .map(i => i.getAsFile()).filter(Boolean);
+  if (!files.length || !dir) return false;
+  e.preventDefault();
+  const named = files.map(f => new File([f], _pasteImageName(f), { type: f.type }));
+  const ins = named.map(f => '![](' + f.name + ')').join('\n');
+  const s = ta.selectionStart ?? ta.value.length, en = ta.selectionEnd ?? ta.value.length;
+  const before = ta.value.slice(0, s), lead = before && !before.endsWith('\n') ? '\n' : '';
+  ta.value = before + lead + ins + '\n' + ta.value.slice(en);
+  ta.selectionStart = ta.selectionEnd = s + lead.length + ins.length + 1;
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  _uploadOrQueue(named, dir, 'file').then(({ queued, failed }) => {
+    if (window._clientDebug) window._clientDebug('note-paste-image', { verdict: failed ? 'upload_failed' : 'queued', measured: true, n_considered: named.length, queued, failed });
+    if (failed) showToast('Could not save the pasted image');
+  });
+  return true;
+}
+document.addEventListener('paste', e => {
+  const ta = e.target;
+  if (!ta || ta.id !== 'file-edit-ta' || !_fileData || !_fileData.path) return;
+  if (!(_fileData.is_markdown || /\.(md|markdown|txt)$/i.test(_fileData.path))) return;
+  _pasteImagesIntoNote(e, ta, _fileData.path.replace(/\/[^/]*$/, ''));
+});
 async function _spCaptureSaveTyped() {
   const box = document.getElementById('sp-capture');
   if (!box || !box.value.trim()) return;
@@ -34860,6 +36525,15 @@ async function _emailLoad() {
   }
   if (!_emailAccount || accounts.indexOf(_emailAccount) < 0) _emailAccount = accounts[0];
   _emailRenderSubtabs(accounts, {});
+  if (_emailFolder === 'scheduled') {
+    _emailRenderFolders();
+    host.innerHTML = '<div class="conn-empty">Loading scheduled sends…</div>';
+    await _approvalsRefresh();
+    // A repaint was skipped while a draft is being edited; say so rather than spin.
+    if (_emailScheduled === null) host.innerHTML = '<div class="conn-empty">Could not load the scheduled sends.</div>';
+    else _emailSchedPaint();
+    return;
+  }
   host.innerHTML = '<div class="conn-empty">Loading ' + esc(_emailAccount) + '…</div>';
   try {
     const r = await fetch(API + '/api/email/ranked?count=60&folder=' + encodeURIComponent(_emailFolder)
@@ -34902,7 +36576,9 @@ function _emailRenderFolders() {
   if (!el) return;
   // Inbox is the UNFILED set, not "everything" — a list that keeps showing mail
   // you already filed is one you stop reading.
-  el.innerHTML = [['inbox','Inbox'],['approved','Approved'],['rejected','Rejected']].map(([k,label]) => {
+  const nSched = _emailScheduled ? _emailScheduled.length : 0;
+  el.innerHTML = [['inbox','Inbox'],['approved','Approved'],['rejected','Rejected'],
+    ['scheduled', 'Scheduled' + (nSched ? ' (' + nSched + ')' : '')]].map(([k,label]) => {
     const on = k === _emailFolder;
     return '<button class="conn-scope-btn" onclick="_emailFolderPick(\'' + k + '\')" '
       + 'style="min-height:34px;' + (on ? 'background:var(--accent);color:var(--on-solid);' : '') + '">'
@@ -35032,6 +36708,55 @@ function _emailRenderList(msgs) {
       + '<div class="mail-body" id="' + id + '" hidden>' + esc(String(m.body || '').slice(0, 4000)) + '</div>';
   }
   host.innerHTML = html;
+}
+
+// SCHEDULED SENDS (Ethan, 2026-11-09: "we should be able to see the scheduled
+// list of emails being sent somewhere (maybe the email tab)"). Outbound drafts a
+// human approved for a later time, soonest first, across every account. The
+// actions are the approval banner's own: Send now, Reschedule, Discard.
+let _emailScheduled = null;
+function _emailSchedPaint() {
+  // Only the folder count changes off this folder, and only once the tab has drawn its folders.
+  if (_emailFolder !== 'scheduled') { if (document.getElementById('email-folders')?.innerHTML) _emailRenderFolders(); return; }
+  const view = document.getElementById('email-view');
+  const host = document.getElementById('email-list');
+  if (!host || !view || view.style.display === 'none' || _emailScheduled === null) return;
+  _emailRenderFolders();
+  const themes = document.getElementById('email-themes');
+  if (themes) themes.innerHTML = '';
+  if (!_emailScheduled.length) {
+    host.innerHTML = '<div class="conn-empty">No scheduled sends. Schedule a held draft from the approval banner and it waits here until its time.</div>';
+    return;
+  }
+  let html = '<div class="mail-sched">';
+  for (const p of _emailScheduled) {
+    const pv = p.preview || {};
+    const rv = p.review || {};
+    const body = typeof rv.body === 'string' ? rv.body : (pv.body || '');
+    const at = p.scheduled && p.scheduled.send_at;
+    const id = esc(p.id);
+    html += '<div class="mail-row mail-sched-row" data-approval="' + id + '" onclick="_emailToggleBody(\'sched-' + id + '\')">'
+      + '<div class="mail-from" title="' + esc(pv.to || '') + '">To ' + esc(pv.to || '?') + '</div>'
+      + '<div class="mail-mid"><span class="mail-subj">' + esc(pv.subject || (pv.endpoint === 'reply' ? '(reply)' : '(no subject)')) + '</span>'
+      + '<span class="mail-snip"> — ' + esc(_emailSnippet(body)) + '</span></div>'
+      + '<div class="mail-sched-when">' + (at ? 'sends ' + esc(_apprWhenText(at)) : '') + '</div>'
+      + '</div>'
+      + '<div class="mail-body" id="sched-' + id + '" hidden>'
+      + _apprHeaders(pv)
+      + '<div class="mail-sched-meta">Drafted by ' + esc(p.session || '?')
+      + (p.scheduled && p.scheduled.approver ? ', scheduled by ' + esc(p.scheduled.approver) : '')
+      + (p.scheduled && p.scheduled.edited ? ', with your edit' : '') + '</div>'
+      + '<div class="mail-sched-text">' + esc(body) + '</div>'
+      + _apprAttachHtml(p)
+      + '<div class="mail-sched-actions">'
+      + '<button class="btn" onclick="event.stopPropagation();_apprApprove(\'' + id + '\',this)">Send now</button>'
+      + '<button class="btn" onclick="event.stopPropagation();_apprSchedule(\'' + id + '\')">Reschedule</button>'
+      + '<button class="btn" onclick="event.stopPropagation();_apprReject(\'' + id + '\',this)">Discard</button>'
+      + '</div>'
+      + '<div id="appr-sched-' + id + '" class="appr-sched-row mail-sched-at-row" data-send-at="' + (at || '') + '" onclick="event.stopPropagation()" hidden></div>'
+      + '</div>';
+  }
+  host.innerHTML = html + '</div>';
 }
 
 function _emailToggleBody(id) {
@@ -35529,7 +37254,10 @@ async function _connReconnect(family, account) {
       return;
     }
     if (d && d.authorize_url) {
-      window.open(d.authorize_url, '_blank');
+      // A popup opened after an await is often blocked (a phone, the Mac
+      // app); then go there in this tab, since the grant returns to amux.
+      const w = window.open(d.authorize_url, '_blank');
+      if (!w) { location.assign(d.authorize_url); return; }
       showToast('Approve in the opened tab — one approval repairs every worker using ' + account);
     } else if (!r.ok || (d && d.queued)) {
       showToast('Could not reach the server (HTTP ' + r.status + '). Try again in a moment.');
@@ -37695,6 +39423,16 @@ function _ownLinkHash(href) {
   if ((u.pathname === '/' || u.pathname === '') && u.hash.length > 1) return u.hash;
   return null;
 }
+// The absolute path behind a link to a file on THIS amux (/f/<path>), or ''.
+// Such a link is shown as its path, the way amux shows every file: a worker
+// asked for "a link to the plan" wrote https://<this amux>/f/Users/... and the
+// owner read a server URL where a clickable path belonged (Ethan, 2026-11-06).
+// The href stays, so a plain click opens the file here (_openOwnLink).
+function _ownFilePath(href) {
+  const h = _ownLinkHash(href);
+  if (!h || h.indexOf('#path=') !== 0) return '';
+  try { return decodeURIComponent(h.slice(6)); } catch (_) { return ''; }
+}
 function _openOwnLink(href, how) {
   const hash = _ownLinkHash(href);
   if (!hash) return false;
@@ -38596,8 +40334,18 @@ async function submitCreate() {
   }
   showToast('Starting ' + name + '...');
   await fetchSessions();
+  // OPEN THE NEW WORKER (Ethan, 2026-10-31: "i just tried to make a worker
+  // nothing happened"). The create had succeeded (201) and the worker was
+  // running, but this only scrolled to its card when the card was on screen:
+  // from a worker view, a filtered list or another group, the dialog closed
+  // and nothing else visibly changed.
+  const listed = (sessions || []).some(s => s.name === name);
   const newCard = document.querySelector('[data-session="' + CSS.escape(name) + '"]');
-  if (newCard) newCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  if (listed && typeof openPeek === 'function') openPeek(name);
+  else if (newCard) newCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  else showToast('Created ' + name + '; it appears in Workers once the list refreshes');
+  try { amuxTrack('worker_create_opened', {session: name, listed: listed ? 1 : 0, card_on_screen: newCard ? 1 : 0,
+    opened: listed ? 1 : 0, measured: true, n_considered: 1}); } catch (_) {}
 }
 
 // ── Directory autocomplete + recent dirs ──
@@ -39376,6 +41124,7 @@ const _WORKER_STATUS_GROUPS = [
   { key: 'api_error', label: 'API Error', defaultOpen: true },
   { key: 'rate_limited', label: 'Rate Limited', defaultOpen: true },
   { key: 'idle', label: 'Idle', defaultOpen: true },
+  { key: 'unknown', label: 'Unknown', defaultOpen: true },
   { key: 'stopped', label: 'Stopped', defaultOpen: false },
 ];
 const _WORKER_STATUS_PRI = Object.fromEntries(_WORKER_STATUS_GROUPS.map((g, i) => [g.key, i]));
@@ -40332,9 +42081,20 @@ let boardOwnerFilter = localStorage.getItem('amux_board_owner') || 'human';
 // Smart Board: derived display-status data, fetched from /api/board/derived.
 let _smartBoardData = null;
 let _smartBoardFetching = false;
-let _sessionGroupCollapsed = JSON.parse(localStorage.getItem('amux_board_collapsed') || '{}');
+// A corrupt saved value is dropped, never thrown: a bare JSON.parse here ran
+// at script load, so one bad byte stopped the whole dashboard from starting
+// (implicit state machines inventory 2026-10-31, #37).
+function _savedJson(key, fallback, ok) {
+  const raw = localStorage.getItem(key);
+  if (raw === null) return fallback;
+  try { const v = JSON.parse(raw); if (ok(v)) return v; } catch (e) {}
+  try { localStorage.removeItem(key); amuxTrack('saved_view_state_dropped', { key, measured: true, n_considered: 1 }); } catch (e) {}
+  return fallback;
+}
+const _isPlainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
+let _sessionGroupCollapsed = _savedJson('amux_board_collapsed', {}, _isPlainObject);
 let _boardWorkerDensityBeaconSent = false;
-let _tagGroupCollapsed = JSON.parse(localStorage.getItem('amux_status_collapsed') || '{}');
+let _tagGroupCollapsed = _savedJson('amux_status_collapsed', {}, _isPlainObject);
 // First visit collapses the archive columns. backlog + todo are 1082 of 1553
 // items — they are the reason the ~64 in-flight cards are invisible. Collapsed
 // still shows the count and expands in one tap, and the seed is written
@@ -40346,7 +42106,7 @@ let _collapsedCols;
     _collapsedCols = new Set(['backlog', 'todo']);
     try { localStorage.setItem('amux_col_collapsed', JSON.stringify([..._collapsedCols])); } catch(e) {}
   } else {
-    _collapsedCols = new Set(JSON.parse(_cc || '[]'));
+    _collapsedCols = new Set(_savedJson('amux_col_collapsed', [], Array.isArray));
   }
 }
 let _boardColPages = {};  // tracks how many cards to show per column (lazy load)
@@ -40663,10 +42423,10 @@ function switchView(view) {
     ['files', 'files', 'flex'], ['scratchpad', 'scratchpad', 'flex'], ['record', 'record', 'flex'], ['mdai', 'mdai', 'flex'],
     ['logs', 'logs', 'flex'], ['messages', 'messages', 'flex'], ['skills', 'skills', 'flex'],
     ['sql', 'sql', 'flex'], ['map', 'map', 'flex'], ['metrics', 'metrics', 'flex'],
-    ['cost', 'cost', 'flex'], ['disk', 'disk', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', 'flex'],
+    ['cost', 'cost', 'flex'], ['scoreboard', 'scoreboard', 'flex'], ['disk', 'disk', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', 'flex'],
     ['browser', 'browser', 'flex'], ['graph', 'graph', 'flex'],
     ['email', 'email', 'flex'], ['connectors', 'connectors', 'flex'], ['draw', 'draw', 'flex'], ['vault', 'vault', 'flex'], ['tasks', 'tasks', 'flex'],
-    ['pages', 'pages', 'flex'], ['hotkeys', 'hotkeys', 'flex'],
+    ['pages', 'pages', 'flex'], ['hotkeys', 'hotkeys', 'flex'], ['photos', 'photos', 'flex'],
   ];
   for (const [domId, name, display] of _svViews) {
     const ve = document.getElementById(domId + '-view');
@@ -40682,6 +42442,7 @@ function switchView(view) {
   if (view === 'map') { _mapLoad(); _mapInit(); if (_mapSwState()) _mapSwToggle(true); }
   if (view === 'metrics') { _metricsLoad(); _metricsApplySidebarState(); try { const m = localStorage.getItem('amux_metrics_mode'); if (m && ['system','host','resources','velocity','disk'].includes(m)) _metricsSetMode(m); } catch(e) {} } // always refresh on tab switch
   if (view === 'cost') _costLoad();
+  if (view === 'scoreboard') _sbLoad(); else _sbStop();
   if (view === 'disk') _reclaimLoad(); else { if (typeof _reclaimStopPolling === 'function') _reclaimStopPolling(); if (typeof _tierStopPolling === 'function') _tierStopPolling(); }
   if (view === 'browser') _bwInit(); else if (typeof _bwStopLive === 'function') _bwStopLive();
 
@@ -40710,6 +42471,7 @@ function switchView(view) {
   if (view === 'mdai') _mdaiTabLoad();
   if (view === 'email') _emailLoad();
   if (view === 'connectors') _connectorsTabLoad();
+  if (view === 'photos') _photosEnter(); else if (typeof _photosLeave === 'function') _photosLeave();
   if (view !== 'map' && typeof _mapMeStop === 'function') _mapMeStop();   // live location only while the map is open
   else if (typeof _connOpenId !== 'undefined' && _connOpenId) _connClose();
   if (view !== 'files') {
@@ -44063,7 +45825,7 @@ function _sxRowHTML(s, runMap, sessMap, scoped) {
   const freqTitle = s.cadence_class ? (s.schedule_expr || s.sched_type || '') : (s.schedule_expr || '') + ' (group guessed in the browser: this payload has no cadence_class)';
   return `<div class="sx-row sched-item${sel ? ' selected' : ''}" data-sched-id="${id}" data-status="${st.key}" role="button" tabindex="0"
       onclick="openSchedDetail('${idJs}')" onkeydown="if(event.key==='Enter'&&event.target===this)openSchedDetail('${idJs}')">
-    ${scoped ? '' : `<label class="sx-cell sx-sel" onclick="event.stopPropagation()"><input type="checkbox" ${sel ? 'checked' : ''} onchange="_sxToggleSel('${idJs}',this.checked)" aria-label="Select ${esc(s.title)}"></label>`}
+    <label class="sx-cell sx-sel" onclick="event.stopPropagation()"><input type="checkbox" ${sel ? 'checked' : ''} onchange="_sxToggleSel('${idJs}',this.checked)" aria-label="Select ${esc(s.title)}"></label>
     <div class="sx-cell sx-name">${_sxTypeIcon(s)}<div class="sx-name-text"><span class="sx-title">${esc(s.title)}</span><code class="sched-id-badge" title="Schedule id: click to copy" onclick="event.stopPropagation();_copySchedId('${idJs}')">${id}</code>${_sxToldHTML(s)}</div></div>
     ${scoped ? '' : `<div class="sx-cell sx-worker">${_sxWorkerChip(s, sessMap)}</div>`}
     <div class="sx-cell sx-freq"><span title="${esc(freqTitle)}">${esc(_sxFreq(s))}</span>${_schedLastRunHTML(s)}</div>
@@ -44076,7 +45838,7 @@ function _sxRowHTML(s, runMap, sessMap, scoped) {
 }
 function _sxHeadRow(scoped) {
   return `<div class="sx-row sx-row-head" aria-hidden="true">
-    ${scoped ? '' : '<span class="sx-cell sx-sel"></span>'}
+    <span class="sx-cell sx-sel"></span>
     <span class="sx-cell sx-name">Name</span>
     ${scoped ? '' : '<span class="sx-cell sx-worker">Worker</span>'}
     <span class="sx-cell sx-freq">Frequency</span><span class="sx-cell sx-nextc">Next run</span>
@@ -44092,22 +45854,37 @@ function _sxSetGroup(g) {
 }
 function _sxToggleSel(id, on) {
   if (on) _sxSelected.add(id); else _sxSelected.delete(id);
-  const row = document.querySelector('#scheduler-list [data-sched-id="' + CSS.escape(id) + '"]');
-  if (row) row.classList.toggle('selected', on);
+  // The Scheduler page and a worker's Schedules tab can both show the row.
+  document.querySelectorAll('.sx-row[data-sched-id="' + CSS.escape(id) + '"]').forEach(row => row.classList.toggle('selected', on));
   _sxRenderBulk();
 }
-function _sxClearSelection() { _sxSelected.clear(); renderScheduler(); }
+function _sxClearSelection(session) {
+  for (const id of _sxSelectedIds(session)) _sxSelected.delete(id);
+  renderScheduler(); _peekRenderSchedules();
+}
+// The selected schedules, or only one worker's: a worker's Schedules tab acts
+// on its own rows, never on rows picked earlier on the Scheduler page.
+function _sxSelectedIds(session) {
+  if (!session) return [..._sxSelected];
+  const mine = new Set((schedules || []).filter(s => s.session === session).map(s => s.id));
+  return [..._sxSelected].filter(id => mine.has(id));
+}
 function _sxRenderBulk() {
-  const bar = document.getElementById('sched-bulk');
-  if (!bar) return;
   const live = new Set((schedules || []).map(s => s.id));
   for (const id of [..._sxSelected]) if (!live.has(id)) _sxSelected.delete(id);
-  bar.hidden = !_sxSelected.size;
-  const n = document.getElementById('sched-bulk-n');
-  if (n) n.textContent = _sxSelected.size + ' selected';
+  // The Scheduler page's bar and the open worker's (Ethan, 2026-10-30: "make
+  // it so i can do multiselect on a workers' schedules like bulk delete").
+  for (const [barId, nId, session] of [['sched-bulk', 'sched-bulk-n', null], ['peek-sched-bulk', 'peek-sched-bulk-n', peekSession || '']]) {
+    const bar = document.getElementById(barId);
+    if (!bar) continue;
+    const n = session === '' ? 0 : _sxSelectedIds(session).length;
+    bar.hidden = !n;
+    const label = document.getElementById(nId);
+    if (label) label.textContent = n + ' selected';
+  }
 }
-async function _sxBulk(action) {
-  const ids = [..._sxSelected];
+async function _sxBulk(action, session) {
+  const ids = _sxSelectedIds(session);
   if (!ids.length) return;
   if (action === 'delete') {
     const ok = await showConfirm('Delete ' + ids.length + ' schedule' + (ids.length === 1 ? '' : 's') + '? They stop firing. Each is a soft delete, recorded in Change history.', 'Delete', true);
@@ -44125,7 +45902,7 @@ async function _sxBulk(action) {
   const verb = { pause: 'Paused', resume: 'Resumed', delete: 'Deleted' }[action];
   showToast(verb + ' ' + done + ' of ' + ids.length + ' schedule' + (ids.length === 1 ? '' : 's')
     + (done < ids.length ? '; the rest were refused (see the messages above)' : ''));
-  _sxSelected.clear();
+  for (const id of ids) _sxSelected.delete(id);
   await Promise.all([fetchSchedules(), fetchSchedulerAudit()]);
   renderScheduler(); renderSchedulerAudit(); renderCalendar();
   _peekRefreshSchedIfActive();
@@ -45602,6 +47379,13 @@ function _renderMarkdownInner(raw, basePath) {
           return '<a href="#" class="md-file-link" data-file="' + esc(target) + '"' +
                  (isDir ? ' data-dir="1"' : '') + ' title="' + esc(target) + '">' + text + '</a>';
         }
+        // A link to a file on THIS amux (/f/<path>) is that file: it opens in
+        // the viewer, and a bare URL reads as its path (Ethan, 2026-11-06).
+        const own = typeof _ownFilePath === 'function' ? _ownFilePath(href || '') : '';
+        if (own) {
+          const bare = text.replace(/<[^>]*>/g, '') === (href || '') || text === esc(href || '');
+          return '<a href="#" class="md-file-link" data-file="' + esc(own) + '" title="' + esc(own) + '">' + (bare ? esc(own) : text) + '</a>';
+        }
         const isAnchor = (href || '').startsWith('#');
         const tgt = (!isAnchor && /^https?:/i.test(href || '')) ? ' target="_blank" rel="noopener"' : '';
         const t = title ? ' title="' + esc(title) + '"' : '';
@@ -45610,7 +47394,11 @@ function _renderMarkdownInner(raw, basePath) {
       // Media inline, scaled to the container: an image link to a video file
       // plays in place instead of showing a broken image.
       renderer.image = function({ href, title, text }) {
-        const h = esc(href || ''), t = title ? ' title="' + esc(title) + '"' : '';
+        // A relative image (![](shot.png), as a pasted image is written) is the
+        // file beside this note, served by this amux.
+        const local = _resolveFileLink(basePath, href);
+        const src = local ? _authUrl(API + '/api/file/raw?path=' + encodeURIComponent(local)) : href;
+        const h = esc(src || ''), t = title ? ' title="' + esc(title) + '"' : '';
         if (/\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(href || ''))
           return '<video controls preload="metadata" src="' + h + '"' + t + '></video>';
         if (/\.(mp3|m4a|wav|ogg)(\?|#|$)/i.test(href || ''))
@@ -46100,8 +47888,8 @@ function _bqIs(item, val, ix) {
     // looks identical to one still legitimately waiting.
     case 'armedstale': return _BQ_DORMANT.has((item.type || '').toLowerCase()) && !_BQ_CLOSED.has(st)
                               && (Date.now() / 1000 - (item.updated || 0)) / 86400 > _BQ_ROT_DAYS;
-    case 'working':  return !!sess && sess.status === 'active';
-    case 'waiting':  return !!sess && sess.status === 'waiting';
+    case 'working':  return !!sess && _workerStatus(sess).group === 'working';
+    case 'waiting':  return !!sess && _workerStatus(sess).group === 'waiting';
     case 'gated':    return !!sess && !!(sess.credit_limited || sess.rate_limited_until);
     // Needs-you (AMUX-2167): the DURABLE union, not just live session state.
     // A session working other cards while these await your call read as
@@ -46855,8 +48643,12 @@ function renderBoardFilters() {
     if (t.includes(':') || t.includes('@')) return;
     tagCount[t] = (tagCount[t] || 0) + 1;
   }));
-  const topTags = Object.entries(tagCount).sort((a, b) => b[1] - a[1]).slice(0, 12);
+  const topTags = Object.entries(tagCount).filter(([t]) => t !== 'triage').sort((a, b) => b[1] - a[1]).slice(0, 12);
   let html = '';
+  // Cards a worker captured and the owner has not accepted yet: kept in
+  // backlog, never picked up automatically (amux board triage / accept).
+  const nTriage = tagCount.triage || 0;
+  if (nTriage) html += "<button class='board-filter-chip' id='board-triage-chip' title='Captured, waiting for you to accept; nothing picks these up automatically' onclick='_bfTarget=\"board\";_bfAppend(\"tag:triage\")'>Triage <span style='color:var(--dim)'>" + nTriage + "</span></button>";
   if (topTags.length) {
     html += '<span class="board-filter-label">Group:</span>';
     topTags.forEach(([t, n]) => {
@@ -47053,6 +48845,10 @@ function _boardCtxMenu(e, id) {
       + esc(st.label) + '</div>';
   });
   h += '<div class="card-menu-sep"></div>';
+  const triaged = _boardInTriage(item);
+  h += '<div class="card-menu-item" id="board-ctx-triage" onclick="event.stopPropagation();_boardCtxClose();_boardSetTriage(\''
+    + escJs(id) + '\',' + (!triaged) + ')"><span class="mi">' + (triaged ? '&#x2713;' : '&#x23F8;') + '</span> '
+    + (triaged ? 'Accept from triage' : 'Put in triage') + '</div>';
   h += '<div class="card-menu-item" onclick="event.stopPropagation();_boardCtxCopy(\''
     + escJs(id) + '\')"><span class="mi">&#x2398;</span> Copy ID</div>';
   const m = document.createElement('div');
@@ -47278,8 +49074,7 @@ function _renderBoardCard(item) {
   // is ALL slim ships of the description. Without this the card preview goes
   // blank for every card the moment the poll flips — the exact regression
   // list_body's own doc records from the last slimming attempt.
-  const firstLine = (item.desc !== undefined ? item.desc : (item.desc_head || ''))
-                      .split('\n')[0].slice(0, 80);
+  const firstLine = _descPreviewLine(item.desc !== undefined ? item.desc : item.desc_head).slice(0, 80);
   const pinned = item.pinned ? 1 : 0;
   // The server's exact runtime link drives live emphasis. A stale observed
   // claim is shown separately in amber, including cards outside Doing.
@@ -47365,6 +49160,25 @@ function _renderBoardCard(item) {
 //
 // Heartbeat age is the useful number, not the lease's existence: a held card
 // whose holder stopped beating looks identical to a healthy one in the column.
+// A board can sit open for an hour with nothing to re-render it, and an age
+// computed once read "just now" for the whole lease after its worker stopped.
+// While a Working strip shows, the list is also read again: one kept "Working
+// now" over a stopped worker for 37 minutes on a long-open page (VID-147).
+function _boardLiveTick() {
+  if (document.hidden) return;
+  document.querySelectorAll('.lease-beat[data-at]').forEach(el => { el.textContent = timeAgo(Number(el.dataset.at)); });
+  if (activeView !== 'board' || !_boardActivityEntries().length) return;
+  const before = window._boardLiveSig;
+  // The poll's ETag names the last polled list, and a late stream snapshot can
+  // be older than it: every poll then answers 304 over a stale screen until the
+  // fleet next changes. Only here, while a strip shows, so a phone keeps its 304s.
+  _sessEtag = null;
+  fetchSessions().then(() => {
+    if (window._boardLiveSig !== before) window._clientDebug?.('board-activity-tick', { verdict: 'board_activity_caught_by_tick', measured: true, n_considered: (sessions || []).length });
+  }).catch(e => console.warn('board activity tick', e));
+}
+setInterval(_boardLiveTick, 30000);
+
 function _leaseChip(item) {
   const lease = item && item.lease;
   if (!lease || !lease.holder) return '';
@@ -47375,7 +49189,7 @@ function _leaseChip(item) {
   const attempt = Number(lease.attempt || 0);
   const label = esc(lease.holder)
     + (attempt > 1 ? ' &middot; attempt ' + attempt : '')
-    + (beat ? ' &middot; \u2665 ' + timeAgo(beat) : ' &middot; no heartbeat recorded');
+    + (beat ? ' &middot; \u2665 <span class="lease-beat" data-at="' + beat + '">' + timeAgo(beat) + '</span>' : ' &middot; no heartbeat recorded');
   const why = expired
     ? 'Lease EXPIRED ' + timeAgo(expires) + '. ' + lease.holder + ' still holds the card on the board, but the hold is no longer alive, so another worker may claim it.'
     : 'Held by ' + lease.holder + ' (attempt ' + (attempt || 1) + ', generation ' + (lease.generation || 1) + ')'
@@ -49692,7 +51506,54 @@ function _renderDetailStatusBtns() {
   const sty = statusStyle(boardDetailStatus);
   document.getElementById('bd-status-row').innerHTML = '<label class="bd-status-control">Status <select id="bd-status-select" aria-label="Task status" style="background:' + sty.bg + ';color:' + sty.color + '" onchange="boardDetailSetStatus(this.value)">'
     + boardStatuses.map(s => '<option value="' + esc(s.id) + '"' + (boardDetailStatus === s.id ? ' selected' : '') + '>' + esc(s.label) + '</option>').join('')
-    + '</select></label><button type="button" class="btn" onclick="boardDetailSave()">Move</button>';
+    + '</select></label><button type="button" class="btn" onclick="boardDetailSave()">Move</button>'
+    + (() => {
+      const it = (boardItems || []).find(i => i.id === boardDetailId);
+      if (!it) return '';
+      const on = _boardInTriage(it);
+      return '<button type="button" class="btn" id="bd-triage-btn" title="' + (on ? 'Release it to the backlog, where workers pick it up' : 'Keep it in backlog; nothing picks it up until you accept it')
+        + '" onclick="_boardSetTriage(boardDetailId,' + (!on) + ')">' + (on ? 'Accept' : 'Triage') + '</button>';
+    })();
+}
+
+// TRIAGE (owner, 2026-10-31): a card in triage stays in backlog and nothing
+// picks it up until it is accepted. The `triage` tag is what the server's
+// board-drive honours; this writes the same tag `amux board triage` does.
+function _boardInTriage(item) {
+  return (item.tags || []).some(t => String(t).trim().toLowerCase() === 'triage');
+}
+
+async function _boardSetTriage(id, on) {
+  const item = (boardItems || []).find(i => i.id === id);
+  if (!item) return;
+  const tags = (item.tags || []).filter(t => String(t).trim().toLowerCase() !== 'triage');
+  if (on) tags.push('triage');
+  const body = { tags, desc_append: on
+    ? 'In triage (owner, from the board): kept in backlog, never picked up automatically, until accepted.'
+    : 'Accepted (owner, from the board): back in backlog, where auto-dispatch can take it.' };
+  if (on && item.status === 'todo') body.status = 'backlog';
+  try {
+    const r = await fetch(API + '/api/board/' + encodeURIComponent(id), { method: 'PATCH', headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body) });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); showToast((on ? 'Could not put ' : 'Could not accept ') + id + ': ' + (d.error || r.status)); return; }
+    item.tags = tags;
+    if (body.status) item.status = body.status;
+    showToast(on ? id + ' is in triage: kept, not picked up' : id + ' accepted into the backlog');
+    try { amuxTrack('board_triage', { on, measured: true, n_considered: 1 }); } catch (e) {}
+    // The open detail follows at once: its status select and the button label
+    // (a todo card put in triage moved to backlog). The live check of d27f00593
+    // showed both stale until the card was reopened.
+    if (boardDetailId === id) {
+      if (body.status) boardDetailStatus = body.status;
+      _renderDetailStatusBtns();
+    }
+    renderBoard();
+    await fetchBoard();
+    if (boardDetailId === id) {
+      const fresh = (boardItems || []).find(i => i.id === id);
+      if (fresh && !_boardInTriage(fresh) === on) { fresh.tags = tags; if (body.status) fresh.status = body.status; }
+      _renderDetailStatusBtns();
+    }
+  } catch (e) { showToast('Could not reach the server: ' + e.message); }
 }
 
 function boardDetailSetStatus(st) {
@@ -50220,6 +52081,7 @@ function moveBoardItem(id, newStatus, newPos, gateAck) {
   _boardMoveSeq.set(id, seq);
   // Optimistic: update in-memory + cache immediately; Sortable already moved the DOM
   const idx = boardItems.findIndex(i => i.id === id);
+  const before = idx >= 0 ? boardItems[idx] : null;
   if (idx >= 0) {
     const patch = { status: newStatus, updated: Math.floor(Date.now() / 1000) };
     if (typeof newPos === 'number' && isFinite(newPos)) patch.pos = newPos;
@@ -50233,7 +52095,18 @@ function moveBoardItem(id, newStatus, newPos, gateAck) {
   if (gateAck) { body.gate_ack = true; if (Array.isArray(gateAck)) body.gate_checked = gateAck; }
   apiCall(API + '/api/board/' + id, {
     method: 'PATCH', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    // The server said no: the card goes back where it was. Queued and offline
+    // moves also answer null, and those stay where the owner put them.
+    _onRefused: async status => {
+      if (!before || _boardMoveSeq.get(id) !== seq) return;
+      await _fenceBoardMutationReads();
+      const i = boardItems.findIndex(b => b.id === id);
+      if (i >= 0) boardItems[i] = before;
+      saveBoardCache();
+      renderBoard();
+      amuxTrack('board_move_rolled_back', { measured: true, n_considered: 1, status });
+    }
   }).then(async r => {
     if (!r) return;
     const updated = await r.json().catch(() => null);
@@ -51221,7 +53094,8 @@ function _updateGridPane(name) {
   if (!dot && !frame) { removeGridPane(name); return; }  // pane was removed
   if (dot) {
     const s = (sessions || []).find(s => s.name === name);
-    dot.className = 'gp-dot' + (!s || !s.running ? '' : s.status === 'active' ? ' working' : s.status === 'waiting' ? ' waiting' : ' idle');
+    const grp = s ? _workerStatus(s).group : 'stopped';
+    dot.className = 'gp-dot' + (grp === 'stopped' ? '' : grp === 'working' ? ' working' : (grp === 'waiting' || grp === 'blocked') ? ' waiting' : ' idle');
   }
 }
 
@@ -51953,19 +53827,42 @@ const _idb = (() => {
       if (isHidden()) flushCache(true); else flushCache();
     });
   }
+  const resetDb = (reason) => {
+    const had = !!db;
+    try { if (db) db.close(); } catch (_) {}
+    db = null;
+    try { fetch('/api/client-debug', {method: 'POST', headers: {'Content-Type': 'application/json'}, keepalive: true,
+      body: JSON.stringify({kind: 'idb-reopened', verdict: 'idb_connection_reset', reason: String(reason || ''), had_connection: had, measured: true, n_considered: 1})}).catch(() => {}); } catch (_) {}
+    return had;
+  };
+  // A CACHE READ HAS A DEADLINE (Ethan, 2026-11-07: a worker opened to an empty
+  // terminal, "this keeps happening"). A WebKit storage read can hang for hours.
+  // The terminal's failed-fetch path awaited its saved copy, so its request
+  // never settled, and every later poll for that worker reused the stuck
+  // request: no fetch reached the server again until the app was reloaded. A
+  // rebuildable cache key reads as absent after 3s and the connection is reset
+  // (kind=idb-reopened reason=cache_read_timeout). Pending work (drafts,
+  // offline_queue, dictation) keeps waiting: reading it as empty could let a
+  // caller write the empty value back over it.
+  const _CACHE_READ_MS = 3000;
+  const readKv = key => withDb(d => new Promise((resolve) => {
+    const tx = d.transaction('kv', 'readonly');
+    const req = tx.objectStore('kv').get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+  })).catch(() => null);
+  const readCache = key => {
+    let timer;
+    return Promise.race([readKv(key), new Promise(resolve => {
+      timer = setTimeout(() => { resetDb('cache_read_timeout'); resolve(null); }, _CACHE_READ_MS);
+    })]).finally(() => clearTimeout(timer));
+  };
   return {
     // Drop the connection so the next call opens a fresh one. A connection
     // whose storage process went away can hang every request without an
     // error or onclose (WebKit; the Mac app logged 1,331 upload-list timeouts
     // in a day, every outbox pass after the first one on the same handle).
-    reset: (reason) => {
-      const had = !!db;
-      try { if (db) db.close(); } catch (_) {}
-      db = null;
-      try { fetch('/api/client-debug', {method: 'POST', headers: {'Content-Type': 'application/json'}, keepalive: true,
-        body: JSON.stringify({kind: 'idb-reopened', verdict: 'idb_connection_reset', reason: String(reason || ''), had_connection: had, measured: true, n_considered: 1})}).catch(() => {}); } catch (_) {}
-      return had;
-    },
+    reset: resetDb,
     // Cache callers are best-effort; pending work uses the strict methods below.
     set: (key, val) => _CACHE_KEY.test(String(key)) ? setCache(String(key), val)
       : transaction('kv', os => os.put(val, key)).catch(error => _uploadStorageError('cache-write', error)),
@@ -52009,12 +53906,8 @@ const _idb = (() => {
       tx.oncomplete = () => resolve(request.result);
       tx.onabort = tx.onerror = () => reject(tx.error || new Error('Attachment read aborted'));
     })),
-    get: (key) => cachePending.has(key) ? Promise.resolve(cachePending.get(key)) : withDb(d => new Promise((resolve) => {
-      const tx = d.transaction('kv', 'readonly');
-      const req = tx.objectStore('kv').get(key);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
-    })).catch(() => null),
+    get: (key) => cachePending.has(key) ? Promise.resolve(cachePending.get(key))
+      : _CACHE_KEY.test(String(key)) ? readCache(key) : readKv(key),
     del: (key) => withDb(d => {
       const tx = d.transaction('kv', 'readwrite');
       tx.objectStore('kv').delete(key);
@@ -52361,9 +54254,16 @@ async function _cdcBoardUpdate() {
 let _verReloadWhenShown = '';
 function _reloadForServerVersion(v, delayMs) {
   if (document.hidden) { _verReloadWhenShown = v; return; }
-  const last = parseInt(sessionStorage.getItem('amux_ver_reload') || '0');
-  if (Date.now() - last <= 600000) return;
-  sessionStorage.setItem('amux_ver_reload', String(Date.now()));
+  // Throttled PER TARGET VERSION: the same version is tried at most once in
+  // 10 minutes (a reload that did not pick it up must not loop), but a newer
+  // deploy inside that window still reloads. A flat 10-minute throttle left a
+  // tab on old code after two deploys close together (implicit state
+  // machines inventory 2026-10-31, #34).
+  let last = {};
+  try { last = JSON.parse(sessionStorage.getItem('amux_ver_reload') || '{}') || {}; } catch (e) {}
+  if (typeof last !== 'object') last = {};
+  if (last.v === v && Date.now() - (last.at || 0) <= 600000) return;
+  sessionStorage.setItem('amux_ver_reload', JSON.stringify({ v, at: Date.now() }));
   console.warn('amux: server is v' + v + ', client is v' + APP_VER + ' — updating');
   // Nudge the SW first (it skipWaiting()s + claims on install), so the
   // reload serves the NEW shell in one cycle instead of two.
@@ -52421,7 +54321,9 @@ function connectSSE() {
           // it whenever SSE is down — the healthier your SSE, the staler your
           // list. The class test now forbids any bare `workers =` assignment in
           // client code.
-          sessions = msg.payload;
+          sessions = _applyLifecycleAcks(msg.payload);
+          _sessionsReadAt = Date.now();
+          _peekChatStateSync();
           _sessionsSnapshotEpoch++;
           // Quota-full store: drop the cache rather than let the throw break SSE handling
           try { localStorage.setItem('amux_sessions_cache', j); localStorage.setItem('amux_sessions_cache_at', String(Date.now())); }
@@ -52502,7 +54404,12 @@ function connectSSE() {
           if (key === 'board') {
             clearTimeout(_invBoardTimer);
             if (document.hidden) _boardChangesWhileHidden++;
-            else _invBoardTimer = setTimeout(_cdcBoardUpdate, 400);
+            // Re-checked when it fires: a tab hidden inside the 400 ms read
+            // anyway (nightly 41283498168, ios-safari).
+            else _invBoardTimer = setTimeout(() => {
+              if (document.hidden) _boardChangesWhileHidden++;
+              else _cdcBoardUpdate();
+            }, 400);
           }
           if (key === 'sessions') {
             _scheduleSessionInvalidation();
@@ -52671,6 +54578,11 @@ function _forceSseReconnect(reason) {
   if (_sse) { try { _sse.close(); } catch(e) {} _sse = null; }
   _sseRetries = 0;
   _liveSSE = false;
+  // connectSSE() returns at once while the polling fallback is on, so a
+  // forced reconnect during polling waited for the next 30 s poll retry. Try
+  // the stream now; polling keeps running until its first message stops it
+  // (implicit state machines inventory 2026-10-31, #32).
+  _sseFallback = false;
   updateConnectionStatus();
   connectSSE();
 }
@@ -52838,12 +54750,25 @@ let _storageEstimate = null;       // {usage, quota} from the browser, not our c
 _storagePersistEnsure();
 
 if ('serviceWorker' in navigator) {
+  let _swReloadWhenShown = false;
+  const _swReloadNow = () => {
+    // The draft in the open worker's composer survives the reload in the draft
+    // store, which the composer reads on open. (peekState.draft had no reader.)
+    try {
+      const inp = document.getElementById('peek-cmd-input');
+      if (typeof peekSession !== 'undefined' && peekSession && inp && inp.value.trim()) _draftSave(peekSession, inp.value);
+    } catch (e) { console.warn('[amux] draft not kept across the service worker reload', e); }
+    location.reload();
+  };
   // A first visit has no controller yet: the new worker claiming this page fires
   // controllerchange, and reloading then threw away whatever the visitor had started.
   // A new amux Cloud customer's "Sign in with Claude" click was lost to it about 5 s
   // into their first load (2026-10-19). Only a REPLACED worker means stale code.
   let _swHadController = !!navigator.serviceWorker.controller;
   navigator.serviceWorker.register('/sw.js').then(reg => {
+    // A registration that works clears an earlier failure, so a fixed
+    // origin stops being reported as broken (implicit state machines #34).
+    try { localStorage.removeItem('amux_sw_error'); } catch (e) {}
     // Store full page HTML in localStorage as fallback if iOS evicts SW cache
     if (navigator.onLine !== false) {
       fetch('/').then(r => r.text()).then(html => {
@@ -52859,17 +54784,22 @@ if ('serviceWorker' in navigator) {
       console.info('[amux] service worker installed on first visit; no reload needed');
       return;
     }
-    // Rescue in-progress peek input from the reload
-    try {
-      const inp = document.getElementById('peek-cmd-input');
-      if (typeof peekSession !== 'undefined' && peekSession && inp && inp.value.trim()) {
-        const st = JSON.parse(sessionStorage.getItem('peekState') || '{}');
-        st.session = st.session || peekSession;
-        st.draft = inp.value;
-        sessionStorage.setItem('peekState', JSON.stringify(st));
+    // One tab's update makes the new worker claim EVERY tab. A hidden tab waits
+    // until it is shown, as the version reload does, so a deploy does not reload
+    // every background tab at once (inventory follow-up to #34, 2026-11-06).
+    if (document.hidden) {
+      if (!_swReloadWhenShown) {
+        _swReloadWhenShown = true;
+        document.addEventListener('visibilitychange', function onShown() {
+          if (document.hidden) return;
+          document.removeEventListener('visibilitychange', onShown);
+          console.info('[amux] sw_reload_deferred_until_shown');
+          _swReloadNow();
+        });
       }
-    } catch (e) {}
-    location.reload();
+      return;
+    }
+    _swReloadNow();
   });
   }).catch(err => {
     // NEVER swallow this. A failed registration is the difference between a
@@ -56472,6 +58402,33 @@ async function _handleDeeplink(hash) {
     const m = location.search.match(/[?&]view=([^&]+)/);
     if (m) hash = '#view=' + m[1];
   }
+  // #reconnect=<family>:<account>: the link in a connector alert (Ethan,
+  // 2026-11-08: a grant that cannot refresh reaches the owner with one tap to
+  // re-consent; runtime_jobs/connector_maintenance.rs builds it). It opens
+  // Connectors and asks once, so a stray link never starts a grant unasked.
+  if (hash && hash.startsWith('#reconnect=')) {
+    const raw = hash.slice(11);
+    const at = raw.indexOf(':');
+    let family = '', account = '';
+    try { family = decodeURIComponent(raw.slice(0, at)); account = decodeURIComponent(raw.slice(at + 1)); } catch (_) { family = ''; }
+    if (at <= 0 || !/^[a-z0-9_-]+$/.test(family) || !account) {
+      amuxTrack('deeplink_reconnect', {verdict: 'malformed', measured: true, n_considered: 1});
+      return;
+    }
+    const tryReconnect = async (attempt) => {
+      if (!(document.getElementById('grid-view') && document.getElementById('tab-connectors'))) {
+        if (attempt < 25) setTimeout(() => tryReconnect(attempt + 1), 200);
+        return;
+      }
+      try { switchView('connectors'); } catch (e) { console.warn('reconnect deeplink: switchView', e); }
+      amuxTrack('deeplink_reconnect', {verdict: 'offered', family, measured: true, n_considered: 1});
+      if (await showConfirm('Reconnect ' + account + '? It can no longer be refreshed, so workers using it are failing. Google asks you to approve once.', 'Reconnect')) {
+        _connReconnect(family, account);
+      }
+    };
+    tryReconnect(0);
+    return;
+  }
   if (hash && hash.startsWith('#view=')) {
     // The view is up to the first '&': the rest are that view's own parameters
     // (#view=apps&open=<id>, &add-internal=<port>), read by the view itself.
@@ -56593,6 +58550,21 @@ async function _handleDeeplink(hash) {
       const b = await a.json().catch(() => ({}));
       showToast(a.ok ? 'Approved. It is being sent.' : ('Not sent: ' + (b.error || a.status)));
     } catch (e) { showToast('Could not reach the reply: ' + e.message); }
+    return;
+  }
+  // #digest-veto=<card> - the owner stops a card's digest default, from the
+  // link in the daily decision digest. Final; the POST carries the owner bearer.
+  if (hash && hash.startsWith('#digest-veto=')) {
+    const card = decodeURIComponent(hash.slice('#digest-veto='.length)).trim();
+    try { history.replaceState({}, '', location.pathname + location.search); } catch(e) { console.warn('digest-veto: could not clear the link hash', e); }
+    try {
+      if (!(await showConfirm('Veto ' + card + '? Its recommendation will not take effect, and the card stays with you.'))) return;
+      const a = await fetch(API + '/api/decision-digest/veto', { method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+        body: JSON.stringify({ card }) });
+      const b = await a.json().catch(() => ({}));
+      showToast(a.ok ? ('Vetoed ' + card) : ('Not vetoed: ' + (b.error || a.status)));
+    } catch (e) { showToast('Could not reach the veto: ' + e.message); }
     return;
   }
   if (hash && hash.startsWith('#land-approve=')) {
@@ -56742,6 +58714,11 @@ async function _handleDeeplink(hash) {
 // any open session peek. Bounded to 24h so a days-later open still lands on a
 // sane default rather than a stale heavy tab.
 const _UI_RESTORE_MAX_AGE = 24 * 3600 * 1000;
+// The hashes that name where to land. Restoring the last screen must not run
+// over any of them (both checks below read this one list). reconnect joined it
+// on 2026-11-08: a connector alert's link opened Connectors and its prompt,
+// then the restore reopened the last worker over them.
+const _DEEPLINK_HASH_RE = /^#(?:peek|issue|menu|view|path|edit|browser|bq|task|reconnect)=/;
 function _restoreScreen(bootHash) {
   // Must run AFTER the DOM is parsed: switchView touches #grid-view, which is
   // defined later in the HTML than this inline script — calling it during boot
@@ -56758,7 +58735,7 @@ function _restoreScreen(bootHash) {
   // peek over the view the link named. In the Mac app, where every window
   // shares localStorage, that peek was another window's worker (2026-10-21).
   const _bootHash = typeof bootHash === 'string' ? bootHash : location.hash;
-  const _hasDeeplink = /^#(?:peek|issue|menu|view|path|edit|browser|bq|task)=/.test(_bootHash)
+  const _hasDeeplink = _DEEPLINK_HASH_RE.test(_bootHash)
                      || /[?&]view=/.test(location.search);
   // 1. Restore the tab.
   if (!_hasDeeplink) {
@@ -56805,7 +58782,7 @@ function _restoreScreen(bootHash) {
     const restoreGeneration = _peekOpenGeneration;
     setTimeout(() => {
       if (peekSession || _peekOpenGeneration !== restoreGeneration
-          || /^#(?:peek|issue|menu|view|path|edit|browser|bq|task)=/.test(location.hash)) {
+          || _DEEPLINK_HASH_RE.test(location.hash)) {
         amuxTrack('peek_restore_superseded', {session:_ps.session, measured:true, n_considered:1});
         return;
       }
@@ -57672,12 +59649,17 @@ const _ASK_MAX_THREAD = 6;
 let _askThread = [];          // [{q, a}] for the global tab
 let _peekAskThread = [];      // [{q, a}] for the worker tab
 let _peekAskThreadFor = '';   // which worker _peekAskThread belongs to
+// One generation per panel. An answer takes up to 300 s; a new question, a new
+// thread or a switch of worker in that time makes it someone else's answer, so
+// it is dropped rather than pushed into the thread on screen.
+const _askGen = { global: 0, peek: 0 };
 function _askThreadFor(peek) {
   if (!peek) return _askThread;
   if (_peekAskThreadFor !== peekSession) { _peekAskThread = []; _peekAskThreadFor = peekSession; }
   return _peekAskThread;
 }
 function _askNewThread(peek) {
+  _askGen[peek ? 'peek' : 'global']++;
   if (peek) { _peekAskThread = []; _peekAskThreadFor = peekSession; } else { _askThread = []; }
   const ansEl = document.getElementById(peek ? 'peek-ask-answer' : 'ask-answer');
   const metaEl = document.getElementById(peek ? 'peek-ask-meta' : 'ask-meta');
@@ -57744,6 +59726,12 @@ async function _askRun(peek) {
   if (!question) { if (qEl) qEl.focus(); return; }
   const days = +(document.getElementById(peek ? 'peek-ask-days' : 'ask-days')?.value || 14);
   const session = peek ? peekSession : null;
+  const genKey = peek ? 'peek' : 'global';
+  const gen = ++_askGen[genKey];
+  const askedThread = _askThreadFor(peek);
+  // Still the question on screen: same panel generation, same worker, same thread.
+  const current = () => gen === _askGen[genKey] && (!peek || peekSession === session) && askedThread === _askThreadFor(peek);
+  const dropStale = (why) => { console.info('[amux] ask_answer_dropped', { session, why }); };
   if (metaEl) metaEl.textContent = 'Asking' + (session ? ' about ' + session : '') + '\u2026';
   if (ansEl) ansEl.innerHTML = '';
   let r, d;
@@ -57760,14 +59748,16 @@ async function _askRun(peek) {
       // The thread goes with the question so a follow-up ("why?", "which of
       // those...") is interpreted against what was already asked.
       body: JSON.stringify({ question, session, days,
-        history: _askThreadFor(peek).slice(-_ASK_MAX_THREAD).map(t => ({ question: t.q, answer: t.a })) }),
+        history: askedThread.slice(-_ASK_MAX_THREAD).map(t => ({ question: t.q, answer: t.a })) }),
       _skipOutbox: true, signal: AbortSignal.timeout(300000),
     });
     d = await r.json();
   } catch (e) {
+    if (!current()) { dropStale('superseded'); return; }
     if (metaEl) metaEl.textContent = 'Could not reach the server: ' + String(e && e.message || e);
     return;
   }
+  if (!current()) { dropStale('superseded'); return; }
   // A locally queued 202 never left the browser, so it is not an answer.
   if (_isLocallyQueued(r)) {
     if (metaEl) metaEl.textContent = 'Not sent: this client queued the request offline. Reconnect and ask again.';
@@ -57795,19 +59785,36 @@ async function _askRun(peek) {
   if (metaEl) metaEl.textContent = 'answered over ' + considered + ' of ' + available
     + ' message' + (d.n_available === 1 ? '' : 's') + ' from ' + scope
     + ', last ' + d.window_days + ' day' + (d.window_days === 1 ? '' : 's')
-    + (d.truncated ? ' (oldest dropped to fit)' : '')
+    + (d.truncated
+      ? (d.n_relevant ? ' (' + d.n_relevant.toLocaleString() + ' best matches plus the newest)' : ' (no close matches; the newest)')
+      : '')
     + (d.history_turns ? ' \u00b7 follow-up with ' + d.history_turns + ' earlier exchange' + (d.history_turns === 1 ? '' : 's') : '')
     + secs;
-  const thread = _askThreadFor(peek);
-  thread.push({ q: question, a: d.answer || '' });
+  askedThread.push({ q: question, a: d.answer || '' });
   if (qEl) qEl.value = '';   // the box is ready for the follow-up
-  const cites = Array.isArray(d.cited) && d.cited.length
+  // One row of message buttons: what the answer cited, and the closest
+  // matches by shared words, so a message the prose missed is still one tap away.
+  const idRow = (label, ids) => Array.isArray(ids) && ids.length
     ? '<div style="margin-top:var(--space-2-5);display:flex;gap:var(--space-1-5);flex-wrap:wrap;align-items:center;">'
-      + '<span style="font-size:var(--fs-xs);color:var(--dim);">cited:</span>'
-      + d.cited.map(id => '<button class="btn" style="font-size:var(--fs-xs);padding:var(--space-0-5) var(--space-2);" onclick="_askOpenCitation('
+      + '<span style="font-size:var(--fs-xs);color:var(--dim);">' + label + ':</span>'
+      + ids.map(id => '<button class="btn" style="font-size:var(--fs-xs);padding:var(--space-0-5) var(--space-2);" onclick="_askOpenCitation('
         + JSON.stringify(id) + ')">MSG-' + esc(id) + '</button>').join('') + '</div>'
     : '';
-  _askRenderThread(peek, '<div>' + _askFormat(d.answer || '') + '</div>' + cites);
+  const cited = Array.isArray(d.cited) ? d.cited : [];
+  // What the search found, shown whatever the prose concludes: the top
+  // matches with who, when and how each opens. One tap opens the message.
+  const best = Array.isArray(d.best_matches) ? d.best_matches : [];
+  const bestHtml = best.length
+    ? '<div class="ask-best">'
+      + '<div class="ask-best-label">closest matches:</div>'
+      + best.map(m => '<button class="btn ask-best-row" onclick="_askOpenCitation('
+        + JSON.stringify(m.id) + ')"><b>MSG-' + esc(m.id) + '</b> · ' + esc(m.session || '') + ' · ' + esc(m.at || '')
+        + '<br><span class="ask-best-snippet">' + esc(String(m.snippet || '').replace(/\s+/g, ' ').slice(0, 220)) + '</span></button>').join('')
+      + '</div>'
+    : '';
+  const shown = cited.concat(best.map(m => m.id));
+  const closest = (Array.isArray(d.matches) ? d.matches : []).filter(id => !shown.includes(id));
+  _askRenderThread(peek, '<div>' + _askFormat(d.answer || '') + '</div>' + idRow('cited', cited) + bestHtml + idRow('more', closest));
 }
 /// Open the message an answer cited, so a claim can be checked against the row.
 async function _askOpenCitation(id) {
@@ -57958,6 +59965,131 @@ function _costLoad() {
     })
     .catch(() => { body.innerHTML = '<div style="color:var(--dim);padding:var(--space-5);">Failed to load cost data.</div>'; });
 }
+// ── Scoreboard (Z14) ──
+// One read of GET /api/debug/scoreboard, drawn with the Metrics classes. It
+// refreshes from render(), which the SSE stream and the polling fallback both
+// call, so it needs no source of its own there; the 15 s timer covers a quiet
+// fleet, where neither repaints but CI, spend and the host still move. A field
+// the server could not read draws as the word "unmeasured" with its reason in
+// the list below the table, so no blank or zero stands in for a missing number.
+const _SB_MIN_GAP_MS = 5000;
+const _SB_POLL_MS = 15000;
+let _sbTimer = null, _sbInFlight = false, _sbLastAt = 0;
+
+function _sbStop() {
+  if (_sbTimer) { clearTimeout(_sbTimer); _sbTimer = null; }
+}
+function _sbLiveTick() {
+  if (activeView !== 'scoreboard' || document.hidden) return;
+  if (Date.now() - _sbLastAt >= _SB_MIN_GAP_MS) _sbLoad();
+}
+async function _sbLoad() {
+  _sbStop();
+  if (activeView !== 'scoreboard' || _sbInFlight) return;
+  _sbInFlight = true;
+  _sbLastAt = Date.now();
+  const up = document.getElementById('sb-updated');
+  try {
+    const r = await fetch(API + '/api/debug/scoreboard');
+    if (!r.ok) throw new Error('error ' + r.status);
+    const d = await r.json();
+    if (activeView === 'scoreboard') {
+      // A refresh replaces the tables, so keep the owner's sideways scroll.
+      const wrap = () => document.getElementById('sb-workers')?.parentElement;
+      const left = wrap()?.scrollLeft || 0;
+      document.getElementById('sb-body').innerHTML = _sbRender(d);
+      if (wrap()) wrap().scrollLeft = left;
+      if (up) up.textContent = 'Updated ' + new Date().toLocaleTimeString();
+    }
+  } catch (e) {
+    // The last good numbers stay on screen; the line says they are old.
+    if (up) up.textContent = 'Refresh failed: ' + (e.message || 'no answer');
+  } finally {
+    _sbInFlight = false;
+    if (activeView === 'scoreboard') _sbTimer = setTimeout(_sbLoad, _SB_POLL_MS);
+  }
+}
+function _sbMissing(why) {
+  return '<span class="sb-unmeasured" title="' + esc(why || 'not read') + '">unmeasured</span>';
+}
+function _sbGoalCell(p) {
+  if (!p || !p.measured) return _sbMissing(p && p.why_unmeasured);
+  const when = p.at ? new Date(p.at * 1000).toLocaleString() : '';
+  return '<span title="' + esc(when) + '">' + esc(String(p.done)) + (p.total != null ? '<span class="sb-of">/' + esc(String(p.total)) + '</span>' : '') + '</span>';
+}
+function _sbRateCell(r) {
+  if (!r || !r.measured) return _sbMissing(r && r.why_unmeasured);
+  return (r.per_h > 0 ? '+' : '') + esc(String(r.per_h)) + '<span class="sb-of">/h</span>';
+}
+function _sbCard(title, value, sub, section) {
+  const off = section && !section.measured;
+  const v = off ? _sbMissing(section.why_unmeasured) : (value == null ? _sbMissing('the source returned no value') : esc(String(value)));
+  return '<div class="metrics-card"><div class="metrics-card-title">' + esc(title) + '</div><div class="metrics-card-value">' + v + '</div><div class="metrics-card-sub">' + esc(off ? '' : (sub || '')) + '</div></div>';
+}
+function _sbMoney(v) { return v == null ? null : '$' + Number(v).toFixed(2); }
+function _sbStateBadge(w) {
+  const cls = { active: 'active', waiting: 'waiting', idle: 'idle' }[w.status] || 'idle';
+  return '<span class="status-badge ' + cls + '">' + esc(w.running ? (w.status || 'unknown') : 'stopped') + '</span>';
+}
+function _sbRow(w) {
+  const g = w.goal || {};
+  const cells = g.configured
+    ? [_sbGoalCell(g.now), _sbGoalCell(g.hour_ago), _sbGoalCell(g.today_start), _sbGoalCell(g.peak), _sbRateCell(g.rate_1h)]
+    : ['<td colspan="5" class="sb-nogoal">' + _sbMissing(g.why_unmeasured) + '</td>'];
+  const tds = g.configured ? cells.map(c => '<td>' + c + '</td>').join('') : cells[0];
+  const wait = w.waiting_on || {};
+  const spend = w.spend_today_usd == null ? _sbMissing('the spend section is unmeasured') : esc(_sbMoney(w.spend_today_usd));
+  return '<tr data-worker="' + esc(w.name) + '"><th scope="row" class="sb-name">' + esc(w.name) + (w.isolated ? ' <span class="sb-of">isolated</span>' : '') + '</th>'
+    + tds + '<td>' + _sbStateBadge(w) + '</td>'
+    + '<td class="sb-wait">' + (wait.measured ? esc(wait.detail) : _sbMissing(wait.why_unmeasured)) + '</td>'
+    + '<td>' + spend + '</td></tr>';
+}
+function _sbRender(d) {
+  const ra = d.rates || {}, ci = d.ci || {}, sp = d.spend || {}, ho = d.host || {}, ny = d.needsyou || {};
+  const workers = d.workers || [];
+  let h = '';
+  h += '<div class="metrics-section-title">Now</div><div class="metrics-cards" id="sb-cards">';
+  h += _sbCard('Needs you', ny.total, ny.overdue ? ny.overdue + ' overdue' : 'open cards', ny);
+  h += _sbCard('Cards done', ra.cards_done_1h, (ra.cards_done_24h ?? '?') + ' in 24 h, last hour shown', ra);
+  h += _sbCard('Spend today', _sbMoney(sp.today_usd), _sbMoney(sp.last_hour_usd) + ' in the last hour', sp);
+  h += _sbCard('Main CI', ci.tip_state, ci.summary || '', ci);
+  h += _sbCard('Commits behind', ci.behind, 'server behind main', ci);
+  h += _sbCard('CI pass rate', null, '', ci.pass_rate || { measured: false });
+  h += _sbCard('Host', ho.level, ho.reasons && ho.reasons.length ? ho.reasons.join('; ') : 'load ' + (ho.load1 ?? '?') + ' on ' + (ho.ncpu ?? '?') + ' cores', ho);
+  h += _sbCard('Memory', ho.mem_percent == null ? null : ho.mem_percent + '%', ho.mem_pressure ? ho.mem_pressure + ' pressure' : '', ho);
+  h += _sbCard('Disk free', ho.disk_free_gb == null ? null : Math.round(ho.disk_free_gb) + ' GB', '', ho);
+  h += '</div>';
+  (ci.workflows || []).forEach(w => {
+    h += '<div class="metrics-card-sub">' + esc(w.name) + ': ' + (w.commits_since_green == null ? _sbMissing('git could not count from the last green commit') : esc(String(w.commits_since_green)) + ' commit(s) since last green') + '</div>';
+  });
+  h += '<div class="metrics-section-title">Workers (' + workers.length + ')</div>';
+  if (d.measured === false) {
+    h += '<div class="reclaim-warn">Workers ' + _sbMissing(d.why_unmeasured) + ': ' + esc(d.why_unmeasured || '') + '</div>';
+  } else {
+    h += '<div class="metrics-table-wrap"><table class="metrics-table sb-table" id="sb-workers"><thead><tr><th scope="col">Worker</th><th scope="col">Goal</th><th scope="col">1 h ago</th><th scope="col">Today start</th><th scope="col">Peak</th><th scope="col">Rate</th><th scope="col">State</th><th scope="col">Waiting on</th><th scope="col">Spend</th></tr></thead><tbody>'
+      + workers.map(_sbRow).join('') + '</tbody></table></div>';
+  }
+  h += '<div class="metrics-section-title">Needs you (' + (ny.measured ? esc(String(ny.total)) : 'unmeasured') + ')</div>';
+  if (!ny.measured) {
+    h += '<div class="metrics-card-sub">' + esc(ny.why_unmeasured || '') + '</div>';
+  } else if (!(ny.queue || []).length) {
+    h += '<div class="metrics-card-sub">Nothing is waiting on you.</div>';
+  } else {
+    h += '<div class="metrics-table-wrap"><table class="metrics-table" id="sb-needsyou"><thead><tr><th scope="col">Card</th><th scope="col">Worker</th><th scope="col">Age</th></tr></thead><tbody>'
+      + ny.queue.map(c => '<tr><td>' + esc(c.id) + ' ' + esc(c.title || '') + '</td><td>' + esc(c.session || '') + '</td><td>' + esc(String(c.age_days ?? '')) + ' d</td></tr>').join('')
+      + '</tbody></table></div>';
+    if (ny.hidden) h += '<div class="metrics-card-sub">' + esc(String(ny.hidden)) + ' more on the Board.</div>';
+  }
+  const un = d.unmeasured || [];
+  if (un.length) {
+    h += '<div class="metrics-section-title" id="sb-why">Unmeasured, and why</div><ul class="sb-why-list">'
+      + un.map(u => '<li><b>' + esc(u.field) + '</b>: ' + esc(u.why || 'no reason recorded')
+        + (u.workers && u.workers.length ? ' <span class="sb-of">(' + esc(u.workers.join(', ')) + ')</span>' : '') + '</li>').join('')
+      + '</ul>';
+  }
+  return h;
+}
+
 function _costOpenSession(name) {
   if (!name) return;
   switchView('sessions');
@@ -58549,18 +60681,49 @@ function _metricsSetMode(mode) {
 // fleet list first; a row opens that worker's breakdown and projection.
 let _velocityWorker = null;
 
+// The Usage tab (docs/design/usage-optimization.md): Metrics in its Usage mode.
+function openUsage() {
+  switchView('metrics');
+  _metricsSetMode('velocity');
+}
+
+// Usage & Optimization summary above the worker list: spend, what it produced,
+// and each opportunity with its evidence, $/month and who can act on it.
+function _usageSummaryHtml(o) {
+  if (!o || !o.totals) return '';
+  const t = o.totals, money = v => v == null ? '–' : '$' + Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  const tile = (id, label, value, sub) => `<div class="metrics-card" id="${id}" style="flex:1 1 140px;min-width:0;"><div class="reclaim-safe-text" style="color:var(--dim);">${label}</div><div class="reclaim-safe-head" style="font-size:var(--fs-2xl);">${value}</div><div class="reclaim-safe-text" style="color:var(--dim);">${sub}</div></div>`;
+  const tiles = `<div style="display:flex;flex-wrap:wrap;gap:var(--space-2);">${
+    tile('usage-spend', 'Spend', money(t.spend_usd), 'last ' + o.window_days + ' days')}${
+    tile('usage-finished', 'Cards finished', t.finished_cards, t.success_rate + '% of ' + t.cards + ' attempted')}${
+    tile('usage-cps', 'Cost per success', money(t.cost_per_success_usd), 'per finished card')}${
+    tile('usage-savings', 'Potential savings', money(t.potential_savings_usd_month), 'a month, estimated')}</div>`;
+  const max = Math.max(1, ...(o.by_group || []).map(g => g.spend_usd));
+  const groups = (o.by_group || []).slice(0, 8).map(g => `<div class="reclaim-safe-text" style="display:flex;align-items:center;gap:var(--space-2);"><span style="flex:0 0 38%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(g.group)}</span><span style="flex:1;height:8px;border-radius:var(--radius-sm);background:var(--border);"><span style="display:block;height:8px;border-radius:var(--radius-sm);background:var(--accent);width:${Math.round(100 * g.spend_usd / max)}%;"></span></span><span>${money(g.spend_usd)}</span></div>`).join('');
+  const opps = (o.opportunities || []).slice(0, 6).map(x => `<div class="reclaim-safe-text usage-opportunity" data-kind="${esc(x.kind)}" data-owner="${esc(String(x.owner || ''))}" style="margin-bottom:var(--space-2);overflow-wrap:anywhere;"><b>${money(x.est_usd_month)}/mo</b> · ${esc(x.kind === 'background_spend' ? 'Background spend' : 'Unfinished attempts')} · fix: ${esc(String(x.owner || '–'))}<br>${esc(x.evidence || '')}<br><span style="color:var(--dim);">${esc(String(x.action || ''))}</span></div>`).join('');
+  return `<div class="metrics-section-title">Usage & optimization, last ${o.window_days} days</div>${tiles}
+    <div class="metrics-section-title">Where the spend goes</div><div class="metrics-card">${groups || '<div class="reclaim-safe-text">No spend recorded.</div>'}<div class="reclaim-safe-text" style="color:var(--dim);">${esc(o.spend_note || '')}</div></div>
+    <div class="metrics-section-title">Optimization opportunities (${(o.opportunities || []).length})</div><div class="metrics-card" id="usage-opportunities">${opps || '<div class="reclaim-safe-text">None found.</div>'}</div>`;
+}
+
 function _velocityLoad() {
   const el = document.getElementById('velocity-content');
   if (!el) return;
   if (_velocityWorker) return _velocityShowWorker(_velocityWorker);
-  el.innerHTML = '<div style="color:var(--dim);font-size:var(--fs-lg);padding:var(--space-10);text-align:center;">Loading velocity…</div>';
+  el.innerHTML = '<div style="color:var(--dim);font-size:var(--fs-lg);padding:var(--space-10);text-align:center;">Loading usage…</div>';
+  // The workers render as soon as they arrive; the Usage summary fills in
+  // above them when /optimize answers (it reads 7 days of attribution and
+  // took 8-27 s on a loaded Mac, 2026-10-31).
+  const opt = fetch(API + '/api/velocity/optimize?days=30').then(r => r.ok ? r.json() : null).catch(() => null);
   fetch(API + '/api/velocity?days=30').then(r => r.ok ? r.json() : null).then(d => {
+    const o = null;
+    opt.then(x => { const s = document.getElementById('usage-summary'); if (s && x && !_velocityWorker) s.innerHTML = _usageSummaryHtml(x); });
     if (!d || !Array.isArray(d.workers)) { el.innerHTML = '<div style="color:var(--red);padding:var(--space-5);">Velocity did not load.</div>'; return; }
     const rows = d.workers.map(w => `<div class="metrics-card velocity-row" data-velocity-worker="${esc(w.worker)}" onclick="_velocityShowWorker(this.dataset.velocityWorker)" style="cursor:pointer;">
         <div class="reclaim-safe-head">${esc(w.worker)}</div>
         <div class="reclaim-safe-text">${w.finished_cards} finished (${w.finished_per_day}/day) · ${w.finished_share_of_time}% of time on finished work · ${w.wasted_hours} h wasted · top: ${esc(w.top_bottleneck || '–')}</div>
       </div>`).join('');
-    el.innerHTML = `<div class="metrics-section-title">Velocity, last ${d.window_days} days · most wasted hours first</div>${rows || '<div class="metrics-card reclaim-safe-text">No worker has enough history yet.</div>'}`;
+    el.innerHTML = `<div id="usage-summary">${_usageSummaryHtml(o) || '<div class="metrics-section-title">Usage & optimization: loading…</div>'}</div><div class="metrics-section-title">Workers, last ${d.window_days} days · most wasted hours first</div>${rows || '<div class="metrics-card reclaim-safe-text">No worker has enough history yet.</div>'}`;
   }).catch(() => { el.innerHTML = '<div style="color:var(--red);padding:var(--space-5);">Velocity did not load.</div>'; });
 }
 
@@ -60900,6 +63063,20 @@ function _msgSelToggle(key, ev) {
 function _msgSelAll(visibleKeys) { visibleKeys.forEach(k => _msgSel.add(k)); _messagesRender(); }
 function _msgSelNone() { _msgSel.clear(); _messagesRender(); }
 
+// The Messages lists re-render on every poll and SSE event. A rewrite replaced
+// the button under a finger and closed the row menu mid-tap, so skip one that
+// changes nothing and put an open menu back after one that does.
+function _msgListWrite(list, html) {
+  if (list._msgListHtml === html && list.firstChild === list._msgListFirst) return;
+  const openKey = list.querySelector('.msg-menu.open')?.closest('[data-msg-key]')?.dataset.msgKey;
+  list.innerHTML = html;
+  list._msgListHtml = html;
+  list._msgListFirst = list.firstChild;
+  if (openKey == null) return;
+  const row = list.querySelector('[data-msg-key="' + CSS.escape(openKey) + '"]');
+  row?.querySelector('.msg-menu')?.classList.add('open');
+}
+
 // The per-row overflow menu. One open at a time; click anywhere closes it.
 function _msgMenu(btn, ev) {
   if (ev) ev.stopPropagation();
@@ -61053,7 +63230,7 @@ function _messagesRender() {
   // (sticky, one per calendar day) is the review-by-calendar pattern (Ethan):
   // rows are newest-first, so each header labels the day of the messages below
   // it; `data-day` lets the date picker scroll straight to a day.
-  list.innerHTML = rows.map(m => {
+  _msgListWrite(list, rows.map(m => {
     const _ts = m.time || m.ts;
     let dateHdr = '';
     const _day = _msgDayKey(_ts);
@@ -61067,7 +63244,7 @@ function _messagesRender() {
     }
     _prevTs = _ts;
     return dateHdr + burst + _cmdHistItemHTML(m, _msgCtxMessages());
-  }).join('');
+  }).join(''));
   _msgTaskChipsFill(list);
 }
 
@@ -61746,6 +63923,39 @@ function _pagesHostReady() {
     document.head.appendChild(s);
   });
 }
+// The Photos tab (Ethan, 2026-11-08) lives in photos.js and photos.css,
+// loaded the first time the tab opens so the rest of the dashboard does not
+// carry it. window.AmuxPhotos.mount(el) renders it into #photos-view.
+let _photosLoading = null;
+function _photosAssets() {
+  if (window.AmuxPhotos) return Promise.resolve();
+  if (_photosLoading) return _photosLoading;
+  // Both files before the first paint: the grid sizes itself from its
+  // scroll box, and without the stylesheet that box has no height, so every
+  // one of 10,000 rows read as on screen and was drawn.
+  const load = (el, what) => new Promise((resolve, reject) => {
+    el.onload = resolve;
+    el.onerror = () => reject(new Error(what + ' did not load'));
+    document.head.appendChild(el);
+  });
+  const css = document.createElement('link');
+  css.rel = 'stylesheet'; css.href = '/photos.css?v=' + APP_VER;
+  const js = document.createElement('script');
+  js.src = '/photos.js?v=' + APP_VER;
+  _photosLoading = Promise.all([load(css, 'photos.css'), load(js, 'photos.js')])
+    .catch((e) => { _photosLoading = null; throw e; });
+  return _photosLoading;
+}
+async function _photosEnter() {
+  const el = document.getElementById('photos-view');
+  if (!el) return;
+  try { await _photosAssets(); window.AmuxPhotos.mount(el); }
+  catch (e) {
+    el.innerHTML = '<div class="ph-fatal">Photos could not load. <button class="btn" onclick="_photosEnter()">Try again</button></div>';
+    console.warn('photos:', e);
+  }
+}
+function _photosLeave() { if (window.AmuxPhotos) window.AmuxPhotos.leave(); }
 async function _pagesEnter() {
   const h = window._viewParams || location.hash;
   window._viewParams = null;
@@ -61756,7 +63966,7 @@ async function _pagesEnter() {
   // Deep links: #view=apps&open=<id> (or the older #view=pages&open=<id>) opens
   // an app inside amux; a worker's link to localhost:<port> arrives as
   // &add-internal=<port>, which opens that app when it is already in Apps and offers to add it otherwise.
-  const open = /[#&]open=([0-9a-f]{32})(?:&|$)/.exec(h);
+  const open = /[#&]open=([a-z0-9-]{3,64})(?:&|$)/.exec(h);
   const add = /[#&]add-internal=(\d{1,5})(?:&|$)/.exec(h);
   await _pubList();
   // &at=<path> opens it at that page: an app page opened in a tab of its own
@@ -61869,6 +64079,7 @@ function _pubMenu(e, id) {
   m.className = 'card-menu open'; m.id = 'pub-menu'; m.setAttribute('role', 'menu');
   m.innerHTML = item('open', '&#x2197;', internal ? 'Open' : 'Open link')
     + (internal ? '' : item('copy', '&#x2398;', 'Copy link'))
+    + item('rename', '&#x270E;', 'Rename address')
     + '<div class="card-menu-sep"></div>' + item('remove', '&#x2715;', internal ? 'Remove from Apps' : 'Turn off');
   m.addEventListener('click', ev => {
     const it = ev.target.closest('[data-act]');
@@ -61876,6 +64087,7 @@ function _pubMenu(e, id) {
     ev.stopPropagation(); _pubMenuClose();
     if (it.dataset.act === 'open') { if (internal) _pubOpenInternal(id); else window.open(l.url || l.path, '_blank', 'noopener'); }
     else if (it.dataset.act === 'copy') _copyTextWithToast(l.url || l.path, 'Link copied');
+    else if (it.dataset.act === 'rename') _pubRename(id);
     else if (it.dataset.act === 'remove') _pubRevoke(id);
   });
   document.body.appendChild(m);
@@ -61916,6 +64128,40 @@ function _pagesFilter(q) {
     el.classList.toggle('pages-hidden', !!t && !el.dataset.search.includes(t));
   });
 }
+// A change only a person may make (approve, rename). It takes the owner's
+// session cookie, which only a sign-in sets: a worker can hold the bearer,
+// never the cookie. A browser on this Mac gets the bearer in the page and no
+// cookie, so the owner's own click was refused. Sign in once with the page's
+// owner token (same origin), then try again.
+async function _pubAsPerson(what, call) {
+  try { return await call(); }
+  catch (e) {
+    if (!(_authToken && /signed in/i.test(e.message || ''))) throw e;
+    const s = await fetch(location.origin + '/api/connection/session', { method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: _authToken }) });
+    window._clientDebug && window._clientDebug('pages-' + what, { verdict: s.ok ? 'owner_session_established_for_' + what : 'owner_session_sign_in_refused', status: s.status, measured: true, n_considered: 1 });
+    if (!s.ok) throw e;
+    return await call();
+  }
+}
+// Give a link the name its address shows (public_links.rs rename). The old
+// name keeps working: it redirects to the new one.
+async function _pubRename(id) {
+  const l = _pubLinks.find(x => x.id === id);
+  if (!l) return;
+  const internal = l.kind === 'internal';
+  const name = await showPrompt((internal ? 'Name for this app\'s address' : 'Name for this link')
+    + ' (lowercase letters, digits and hyphens). The old address keeps working.'
+    + (internal ? '' : ' Anyone who can guess a public link\'s name can open it.'), 'my-app', id);
+  if (name == null) return;
+  const want = String(name).trim().toLowerCase();
+  if (!want || want === id) return;
+  try {
+    const d = await _pubAsPerson('rename', () => _pubFetch('/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ id: want }) }));
+    showToast('Renamed: ' + (internal ? (d.app_path || d.id) : (d.url || d.path)));
+  } catch (e) { showToast('Not renamed: ' + e.message); }
+  _pubList();
+}
 async function _pubApprove(id) {
   const l = _pubLinks.find(x => x.id === id);
   const what = l && l.file ? 'the file or folder ' + l.file : 'the app on port ' + (l ? l.port : '');
@@ -61924,25 +64170,8 @@ async function _pubApprove(id) {
       : 'Open ' + what + ' inside amux? It runs with your amux access, so approve only an app you trust.')
     : 'Make ' + what + ' public? Anyone with the link can open it, without signing in, until you turn it off.';
   if (!(await showConfirm(ask, 'Approve', true))) return;
-  const approve = () => _pubFetch('/' + encodeURIComponent(id) + '/approve', { method: 'POST' });
-  try { await approve(); showToast('Public link approved'); }
-  catch (e) {
-    // Approval takes the owner's session cookie, which only a sign-in sets: a
-    // worker can hold the bearer, never the cookie. A browser on this Mac gets
-    // the bearer in the page and no cookie, so the owner's own click was
-    // refused. Sign in once with the page's owner token (same origin), then
-    // try again.
-    let retried = false;
-    if (_authToken && /signed in/i.test(e.message || '')) {
-      try {
-        const s = await fetch(location.origin + '/api/connection/session', { method: 'POST', credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: _authToken }) });
-        if (s.ok) { await approve(); retried = true; showToast('Public link approved'); }
-        window._clientDebug && window._clientDebug('pages-approve', { verdict: s.ok ? 'owner_session_established_for_approve' : 'owner_session_sign_in_refused', status: s.status, measured: true, n_considered: 1 });
-      } catch (e2) { e = e2; }
-    }
-    if (!retried) showToast('Not approved: ' + e.message);
-  }
+  try { await _pubAsPerson('approve', () => _pubFetch('/' + encodeURIComponent(id) + '/approve', { method: 'POST' })); showToast('Public link approved'); }
+  catch (e) { showToast('Not approved: ' + e.message); }
   _pubList();
 }
 async function _pubList() {
@@ -62144,12 +64373,13 @@ window.addEventListener('message', (e) => {
 function _appUrlAt(url, at) {
   if (!_appPathOk(at) || at === '/') return url;
   const u = new URL(url);
-  const m = /^\/app\/[0-9a-f]{32}/.exec(u.pathname);
-  if (!m) return url;
+  // An app on a port of its own (app_ports.rs) is at `/`; otherwise under /app/<name>.
+  const m = /^\/app\/[a-z0-9-]{3,64}(?=\/|$)/.exec(u.pathname);
+  if (!m && u.pathname !== '/') return url;
   const t = new URL(at, 'https://x.invalid');
   const q = new URLSearchParams(t.search);
   for (const [k, v] of u.searchParams) q.set(k, v);
-  u.pathname = m[0] + t.pathname;
+  u.pathname = (m ? m[0] : '') + t.pathname;
   u.search = q.toString();
   u.hash = t.hash;
   return u.toString();
@@ -66296,7 +68526,45 @@ function _nativeRecorderAvailable() {
 }
 function _nativeRecorderActive() { return !!_nativeRec && ['recording', 'paused'].includes(_nativeRec.state); }
 function _nativeRecorderPost(msg) {
-  try { window.webkit.messageHandlers.amuxRecorder.postMessage(msg); } catch (e) { _recorderStatus('The app did not answer: ' + e.message); }
+  try { window.webkit.messageHandlers.amuxRecorder.postMessage(msg); } catch (e) { _recorderStatus('The app did not answer: ' + e.message); _recorderBeacon('native_post_failed', { op: msg && msg.op, error: e.message }); return; }
+  if (msg && (msg.op === 'start' || msg.op === 'stop')) {
+    // Start and stop must come back as a status; silence means the app never acted.
+    const sent = Date.now();
+    clearTimeout(_nativeRecWaitT);
+    _nativeRecWaitT = setTimeout(() => {
+      if (_nativeRec && _nativeRec._at >= sent) return;
+      _recorderStatus('The amux app did not answer the ' + msg.op + '. Update the app if this keeps happening.');
+      _recorderBeacon('native_no_status', { op: msg.op, wait_ms: 4000 });
+    }, 4000);
+  }
+}
+let _nativeRecWaitT = 0, _nativeRecPollT = 0;
+// What the server hears of the app's recorder: every change of state and every
+// new error, so a recording that fails on a phone is in the server log.
+function _nativeRecorderTrack(prev, st) {
+  const a = prev && prev.state || 'none', b = st && st.state || 'none';
+  const err = st && st.error || '';
+  if (a !== b) _recorderBeacon('native_state', { from: a, to: b, id: st && st.id || '', segments: st && st.segments || 0, pending_upload: st && st.pending_upload || 0, gaps: st && st.gaps || 0, error: err });
+  else if (err && err !== (prev && prev.error)) _recorderBeacon('native_error', { state: b, error: err });
+}
+function _nativeRecorderPollSync() {
+  const want = !!_nativeRec && _nativeRec.state === 'recording' && !document.hidden;
+  if (want && !_nativeRecPollT) {
+    _nativeRecPollT = setInterval(() => {
+      const st = _nativeRec;
+      if (!st || st.state !== 'recording' || document.hidden) { clearInterval(_nativeRecPollT); _nativeRecPollT = 0; return; }
+      if (!st._slow && Date.now() - (st._at || 0) < 1500) return;
+      if (!st._slow) { st._slow = true; _recorderBeacon('native_push_quiet', { id: st.id || '' }); }
+      try { window.webkit.messageHandlers.amuxRecorder.postMessage({op: 'status'}); } catch (e) {}
+    }, 250);
+  } else if (!want && _nativeRecPollT) { clearInterval(_nativeRecPollT); _nativeRecPollT = 0; }
+}
+document.addEventListener('visibilitychange', () => { if (_nativeRec) _nativeRecorderPollSync(); if (!document.hidden) _recWaveDraw(); });
+function _recorderBeacon(verdict, extra) {
+  try {
+    fetch(API + '/api/client-debug', { method: 'POST', _skipOutbox: true, keepalive: true, headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ kind: 'recorder', verdict, measured: true, n_considered: 1, native: _nativeRecorderAvailable() ? 1 : 0, ver: APP_VER }, extra || {})) }).catch(() => {});
+  } catch (e) {}
 }
 function _recorderPauseToggle() {
   if (_nativeRecorderActive()) _nativeRecorderPost({op: _nativeRec.state === 'paused' ? 'resume' : 'pause'});
@@ -66312,8 +68580,23 @@ function _recorderSetMeeting(mode) {
   if (_nativeRecorderAvailable()) _nativeRecorderPost({op: 'settings', meeting: mode});
 }
 window._nativeRecorderStatus = function(st) {
-  const was = _nativeRec && _nativeRec.state;
+  const prev = _nativeRec;
+  const was = prev && prev.state;
+  const now = Date.now();
+  if (st) {
+    // The iOS app pushed only on a change (about every 10 s segment), so the
+    // clock, the meter and the live panel looked frozen and a recording that
+    // worked read as "nothing happened" (owner, 2026-10-31). A recording whose
+    // pushes go quiet for 1.5 s is asked for its status while this page is
+    // visible (_nativeRecorderPollSync); the Mac app pushes every second and
+    // is never asked.
+    st._at = now;
+    st._slow = !!(prev && prev._slow && prev.id === st.id);
+  }
   _nativeRec = st || null;
+  _nativeRecorderTrack(prev, st);
+  _nativeRecorderPollSync();
+  if (st && st.state === 'recording' && st.levels) _recWavePush(Math.min(1, Math.max(0, ...Object.values(st.levels).map(Number)) * 4));
   _nativeRecorderPaint();
   // Just stopped: the app uploads the last segments; show the filed recording when it lands.
   if (was && was !== 'idle' && st && st.state === 'idle') setTimeout(() => _recorderLoadServer().then(_recorderRender), 5000);
@@ -66358,11 +68641,7 @@ function _nativeRecorderPaint() {
   if (sys) { try { sys.checked = localStorage.getItem('amux_recorder_system') === '1'; } catch (e) {} }
   const el = document.getElementById('recorder-elapsed');
   if (el) el.textContent = _recorderClock(on ? Number(st.elapsed_ms || 0) : 0);
-  const fill = document.getElementById('recorder-level-fill');
-  if (fill) {
-    const lv = Math.max(0, ...Object.values(st.levels || {}).map(Number));
-    fill.style.width = (on ? Math.min(100, Math.round(lv * 400)) : 0) + '%';
-  }
+  if (!on && _recWave.levels.length) _recWaveClear();
   const tracks = (st.tracks || []).map(t => t === 'mic' ? 'microphone' : t === 'system' ? "the Mac's sound" : t).join(' and ');
   let text;
   if (st.state === 'recording') {
@@ -66390,6 +68669,7 @@ async function _recorderStart() {
   } catch (e) {
     _recorderStarting = false;
     _recorderStatus('Microphone unavailable: ' + ((e && (e.message || e.name)) || 'permission denied'));
+    _recorderBeacon('mic_unavailable', { error: String((e && (e.name || e.message)) || '') });
     return;
   }
   const release = () => { try { stream.getTracks().forEach(t => t.stop()); } catch (e) {} };
@@ -66431,6 +68711,7 @@ async function _recorderStart() {
     return;
   }
   _recorderStarting = false;
+  _recorderBeacon('started', { id: meta.id, mime: meta.mime });
   _recorderWakeLock();
   _recorderStartMeter();
   clearInterval(_recorderTimer);
@@ -66502,6 +68783,7 @@ async function _recorderFinalize(id) {
   _recorderStream = null; _recorderMedia = null;
   await _recorderWrites;   // the last dataavailable fires before stop, so every chunk is queued here
   const reason = _recorderStopReason || 'stopped';
+  _recorderBeacon('stopped', { id, reason });
   let m = null;
   try { m = await _recorderGet(id); } catch (e) {}
   const endedAt = Date.now();
@@ -66560,25 +68842,66 @@ function _recorderStartMeter() {
     src.connect(_recorderAnalyser);
   } catch (e) { return; }   // the meter is cosmetic; recording never depends on it
   const data = new Uint8Array(_recorderAnalyser.fftSize);
-  const fill = document.getElementById('recorder-level-fill');
-  const draw = () => {
+  // One bar every 80 ms is enough to read as live; measuring every frame
+  // costs the battery and adds nothing. A hidden page gets no frames at all.
+  let last = 0;
+  const draw = (t) => {
     if (!_recorderLive || !_recorderAnalyser) return;
-    _recorderAnalyser.getByteTimeDomainData(data);
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
-    const level = Math.min(1, Math.sqrt(sum / data.length) * 4);
-    if (fill) fill.style.transform = 'scaleX(' + Math.max(0.02, level).toFixed(3) + ')';
+    if (!t || t - last >= _REC_WAVE_MS) {
+      last = t || 0;
+      _recorderAnalyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+      _recWavePush(Math.min(1, Math.sqrt(sum / data.length) * 4));
+    }
     _recorderRaf = requestAnimationFrame(draw);
   };
-  draw();
+  draw(0);
 }
 function _recorderStopMeter() {
   if (_recorderRaf) cancelAnimationFrame(_recorderRaf);
   _recorderRaf = 0; _recorderAnalyser = null;
   try { if (_recorderAudioCtx) _recorderAudioCtx.close(); } catch (e) {}
   _recorderAudioCtx = null;
-  const fill = document.getElementById('recorder-level-fill');
-  if (fill) fill.style.transform = 'scaleX(0.02)';
+  _recWaveClear();
+}
+
+// ── The waveform (owner, 2026-10-31: "put the audio wave thing to indicate
+// sound recording. like a quick feedback thing") ──
+// The last few seconds of sound level as bars, newest on the right, for the
+// page's own recorder and the app's. Drawn only when a level arrives, never on
+// a loop, and a level is measured at most every _REC_WAVE_MS.
+const _REC_WAVE_MS = 80, _REC_WAVE_BARS = 56;
+const _recWave = { levels: [], color: '' };
+function _recWavePush(level) {
+  const w = _recWave.levels;
+  w.push(Math.max(0, Math.min(1, Number(level) || 0)));
+  if (w.length > _REC_WAVE_BARS) w.splice(0, w.length - _REC_WAVE_BARS);
+  _recWaveDraw();
+}
+function _recWaveClear() { _recWave.levels = []; _recWaveDraw(); }
+function _recWaveDraw() {
+  const c = document.getElementById('recorder-wave');
+  if (!c || !c.isConnected || document.hidden) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const W = c.clientWidth, H = c.clientHeight;
+  if (!W || !H) return;
+  if (c.width !== Math.round(W * dpr) || c.height !== Math.round(H * dpr)) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
+  const g = c.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const lv = _recWave.levels;
+  // Quiet for the last second: dim bars, so silence reads as silence rather than as broken.
+  const recent = lv.slice(-Math.round(1000 / _REC_WAVE_MS));
+  c.classList.toggle('quiet', !recent.some(v => v > 0.06));
+  g.fillStyle = getComputedStyle(c).color;
+  const step = W / _REC_WAVE_BARS, bw = Math.max(1.5, step * 0.6), mid = H / 2;
+  for (let i = 0; i < _REC_WAVE_BARS; i++) {
+    const v = lv[lv.length - _REC_WAVE_BARS + i];
+    const h = Math.max(2, (v == null ? 0 : Math.sqrt(v)) * (H - 2));
+    const x = i * step + (step - bw) / 2;
+    g.fillRect(x, mid - h / 2, bw, h);
+  }
 }
 function _recorderTick() {
   const el = document.getElementById('recorder-elapsed');
@@ -67003,6 +69326,7 @@ function _recSetSide(t) {
 }
 function _recBack() { document.getElementById('record-view').classList.remove('rec-open'); }
 async function _recSelect(id) {
+  if (id !== _recSel) _recLineQuery = '';
   _recSel = id;
   document.getElementById('record-view').classList.add('rec-open');
   document.querySelectorAll('#recorder-list .recorder-item').forEach(e => e.classList.toggle('selected', e.dataset.recId === id));
@@ -67078,8 +69402,14 @@ function _recRenderDetail() {
       body.innerHTML = '<div class="recorder-empty">' + esc(_recorderTranscriptWords(row) || 'No transcript yet.') + '</div>';
       return;
     }
+    const searching = document.activeElement && document.activeElement.classList.contains('rec-tsearch');
     body.innerHTML = '<input class="input rec-tsearch" type="search" placeholder="Search transcript" aria-label="Search transcript" oninput="_recFilterLines(this.value)">'
       + '<div id="rec-lines" class="rec-lines">' + segs.map(_recLineHtml).join('') + '</div>';
+    // A re-render keeps the search someone is typing, and the lines it hides.
+    const search = body.querySelector('.rec-tsearch');
+    search.value = _recLineQuery;
+    if (searching) search.focus();
+    _recFilterLines(_recLineQuery);
   } else if (_recTab === 'notes') {
     const n = d.notes || {};
     let h = '';
@@ -67102,8 +69432,10 @@ function _recRenderDetail() {
     body.innerHTML = '<table class="rec-details">' + rows.filter(r => r[1]).map(r => '<tr><th>' + esc(r[0]) + '</th><td>' + esc(String(r[1])) + '</td></tr>').join('') + '</table>';
   }
 }
+let _recLineQuery = '';
 function _recFilterLines(q) {
-  q = (q || '').toLowerCase();
+  _recLineQuery = q || '';
+  q = _recLineQuery.toLowerCase();
   document.querySelectorAll('#rec-lines .rec-line').forEach(e => { e.hidden = !!q && !e.textContent.toLowerCase().includes(q); });
 }
 function _recSeek(ms) {
@@ -67695,7 +70027,7 @@ document.addEventListener('keydown', e => {
 // ── Messages: conversations (server: api/conversations.rs) ──────────────────
 // Channels are groups; People are direct messages; Workers are each worker's
 // shared thread. "All messages" is the original message log, unchanged.
-const _cv = { list: null, sel: null, posts: [], lastId: 0, info: null, pollT: null, pending: [], history: [],
+const _cv = { list: null, sel: null, posts: [], lastId: 0, info: null, pollT: null, pending: [], history: [], pin: null,
   listT: null, typingAt: 0, ac: { items: [], i: 0, open: false }, loading: false };
 function _cvViewOn() { const v = document.getElementById('messages-view'); return !!v && v.style.display !== 'none'; }
 function _cvMobile() { return window.matchMedia && window.matchMedia('(max-width: 600px)').matches; }
@@ -67777,6 +70109,8 @@ function _cvFindName(conv) {
   const w = (L.workers || []).find(x => x.conv === conv); if (w) return w.name;
   if (conv && conv.indexOf('g:') === 0) return '#' + conv.slice(2);
   if (conv && conv.indexOf('w:') === 0) return conv.slice(2);
+  // A worker's direct message with you (`d:<worker>|<you>`): the worker.
+  if (conv && conv.indexOf('d:') === 0) return conv.slice(2).split('|')[0];
   // A direct message the list has not named (not loaded yet, or not in it):
   // the other person, never the raw id. "p:doron@z.com|ethan@x.com" was the
   // composer's placeholder on a phone and wrapped it to three rows.
@@ -67822,7 +70156,8 @@ function _cvNewCandidates() {
   const L = _cv.list || {};
   return [
     ...(L.channels || []).map(c => ({ conv: c.conv, label: '#' + (c.title || c.name), kind: 'channel', ico: '<span class="cv-ico">#</span>' })),
-    ...(L.people || []).filter(p => !p.me && p.conv).map(p => ({ conv: p.conv, label: p.name, kind: 'person', ico: _cvAvatar(p.name, false, p.email) })),
+    ...(L.people || []).filter(p => p.conv).map(p => ({ conv: p.conv, label: p.me ? p.name + ' (you)' : p.name, kind: 'person', ico: _cvAvatar(p.name, false, p.email) })),
+    ...(L.direct || []).map(d => ({ conv: d.conv, label: d.worker, kind: 'direct message', ico: _cvAvatar(d.worker, true) })),
     ...(L.workers || []).map(w => ({ conv: w.conv, label: w.name, kind: 'worker', ico: _cvAvatar(w.name, true) })),
   ];
 }
@@ -67869,11 +70204,15 @@ function _cvRenderSide() {
     // Owners and admins manage channels from here (AA-52). The server refuses
     // everyone else, so this only hides a button nobody else could use.
     + (admin ? '<button type="button" class="cv-item" id="cv-manage-channels" onclick="_cvManageChannels()"><span class="cv-ico">+</span><span class="cv-lbl">Manage channels</span></button>' : '');
-  const ppl = (L.people || []);
-  document.getElementById('cv-people-sec').style.display = ppl.length ? '' : 'none';
-  document.getElementById('cv-people').innerHTML = ppl.map(p => p.me
+  const ppl = (L.people || []), dms = (L.direct || []);
+  document.getElementById('cv-people-sec').style.display = ppl.length || dms.length ? '' : 'none';
+  // Your own entry opens your notes to yourself, as in Slack (Ethan,
+  // 2026-11-06: "i should also be able to open my own"). A worker that wrote
+  // to you directly is listed here too, as its 1:1 with you.
+  document.getElementById('cv-people').innerHTML = ppl.map(p => p.me && !p.conv
     ? '<div class="cv-item" style="cursor:default">' + _cvAvatar(p.name, false, p.email) + '<span class="cv-lbl">' + esc(p.name) + ' (you)</span><span class="cv-dot on"></span></div>'
-    : _cvItem(p.conv, _cvAvatar(p.name, false, p.email), p.name, p.unread, p.mentions, '<span class="cv-dot' + (p.online ? ' on' : '') + '" title="' + (p.online ? 'online' : 'away') + '"></span>')).join('');
+    : _cvItem(p.conv, _cvAvatar(p.name, false, p.email), p.me ? p.name + ' (you)' : p.name, p.unread, p.mentions, '<span class="cv-dot' + (p.me || p.online ? ' on' : '') + '" title="' + (p.me || p.online ? 'online' : 'away') + '"></span>')).join('')
+    + dms.map(d => _cvItem(d.conv, _cvAvatar(d.worker, true), d.worker, d.unread, d.mentions, '<span class="cv-dm-tag" title="A direct message from this worker">DM</span>')).join('');
   const sess = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
   document.getElementById('cv-workers').innerHTML = (L.workers || []).map(w => {
     const s = sess.find(x => x.name === w.name); const act = s && /active|working|running/i.test(String(s.status || ''));
@@ -68056,11 +70395,12 @@ function _cvEnter() {
     _cvSelect(sel, true);
   });
 }
-function _cvBack() { document.getElementById('messages-view').classList.remove('cv-open'); _cv.sel = null; _cvRenderSide(); }
+function _cvBack() { document.getElementById('messages-view').classList.remove('cv-open'); _cv.sel = null; clearInterval(_cv.pollT); _cv.pollT = null; _cvRenderSide(); }
 function _cvSelect(sel, auto) {
   setTimeout(_whereSoon, 0);
   if (_cv.thread && _cv.thread.conv !== sel) _cvCloseThread();
   if (_cv.sel !== sel) _cv.editing = null;
+  if (_cv.sel && _cv.sel !== sel) _cvSavePosition(document.getElementById('cv-posts'), true);
   _cv.sel = sel; try { localStorage.setItem('amux_cv_sel', sel); } catch (e) {}
   if (!auto) _cv.picked = true;
   if (!auto || !_cvMobile()) document.getElementById('messages-view').classList.add('cv-open');
@@ -68069,16 +70409,17 @@ function _cvSelect(sel, auto) {
   if (sel === '@all') { _cvShowPane('log'); return; }
   _cvShowPane('conv');
   _cvFit();
-  const compose = document.getElementById('cv-compose'), hint = document.getElementById('cv-hint');
-  const isConv = sel[0] !== '@';
-  compose.style.display = isConv ? '' : 'none'; hint.style.display = isConv ? '' : 'none';
+  document.getElementById('cv-compose').style.display = sel[0] !== '@' ? '' : 'none';
   document.getElementById('cv-typing').textContent = '';
   document.getElementById('cv-head-people').innerHTML = '';
+  { const pb = document.getElementById('cv-pins-btn'); if (pb) pb.hidden = true; }
   if (sel === '@mentions') return _cvLoadFeed('/api/conversations/mentions', 'Mentions', 'Messages that mention you');
   if (sel === '@unread') return _cvRenderUnread();
-  if (sel.indexOf('@search:') === 0) return _cvLoadFeed('/api/conversations/search?q=' + encodeURIComponent(sel.slice(8)), 'Search: ' + sel.slice(8), 'Messages you can read that contain this text');
+  if (sel.indexOf('@search:') === 0) return _cvSearchPage(sel.slice(8));
   _cv.posts = []; _cv.lastId = 0; _cv.readId = 0; _cv.info = null; _cv.history = [];
-  _cv.restoreScroll = true; _cv.unreadFrom = null;
+  _cv.restoreScroll = true; _cv.unreadFrom = null; _cv.pin = null;
+  _cv.gen = (_cv.gen || 0) + 1;   // a page in flight for an earlier open of any conversation is dropped
+  _cvRenderPinsBtn();
   if (sel.indexOf('w:') === 0) _cvLoadWorkerHistory(sel);
   document.getElementById('cv-title').textContent = _cvFindName(sel);
   document.getElementById('cv-meta').textContent = '';
@@ -68090,7 +70431,16 @@ function _cvSelect(sel, auto) {
   // fallback for a stream that is down (and for invited members, who get the
   // wake-up but not the event).
   _cv.pollT = setInterval(() => { if (_cvViewOn() && _cv.sel === sel && (!_liveSSE || Date.now() - (_cv.liveAt || 0) > 15000)) _cvPoll(false); }, 2500);
-  if (!_cvMobile()) setTimeout(() => inp.focus(), 50);
+  if (!_cvMobile()) _cvFocusSoon(inp);
+}
+// The message box takes focus when a conversation opens, unless you already
+// went somewhere to type (the search box): it used to take the focus back
+// 50 ms later, and what you typed went into the message box.
+function _cvFocusSoon(el) {
+  setTimeout(() => {
+    const a = document.activeElement;
+    if (el && (!a || a === document.body || a === el || !a.matches('input, textarea, select, [contenteditable="true"]'))) el.focus();
+  }, 50);
 }
 function _cvFit() {
   const view = document.getElementById('messages-view'); if (!view) return;
@@ -68101,7 +70451,223 @@ function _cvFit() {
   });
 }
 window.addEventListener('resize', () => { if (_cvViewOn()) _cvFit(); });
-function _cvSearch(q) { q = (q || '').trim(); if (q) _cvSelect('@search:' + q); }
+function _cvSearch(q) { q = (q || '').trim(); if (!q) return; _cvSqRemember(q); _cvSqClose(); _cvSelect('@search:' + q); }
+
+// ── SEARCH AND DISCOVERY (owner, 2026-11-05: "improve the chat ux, we need
+// better search/discovery") ──
+// The sidebar box searches as you type. Its panel offers filters as chips
+// (From, In, Time, Has), which write the same operators the server reads
+// (conversations.rs SearchFilters: from:, in:, after:, has:), so a typed
+// query and a clicked one are the same thing. Results come grouped:
+// conversations whose name matches, then messages with the words marked.
+// Empty, it shows your recent searches. ↑ ↓ Enter Esc work; "/" focuses it.
+const _cvSq = { seq: 0, t: 0, sel: -1, items: [], menu: null, res: null, q: '' };
+const _CV_SQ_TIME = [['24h', 'Past 24 hours'], ['7d', 'Past week'], ['30d', 'Past 30 days'], ['365d', 'Past year']];
+const _CV_SQ_HAS = [['file', 'A file'], ['link', 'A link'], ['thread', 'A thread']];
+function _cvSqInput() { return document.getElementById('cv-search'); }
+function _cvSqPanel() { return document.getElementById('cv-sq'); }
+// The words of a query that are not operators.
+function _cvSqText(q) { return String(q || '').split(/\s+/).filter(w => w && !/^[a-z]+:/.test(w)).join(' '); }
+function _cvSqTok(q, op) { const m = String(q || '').match(new RegExp('(?:^|\\s)' + op + ':(\\S+)')); return m ? m[1] : ''; }
+function _cvSqSetTok(op, v) {
+  const inp = _cvSqInput();
+  let q = inp.value.replace(new RegExp('(^|\\s)' + op + ':\\S+', 'g'), ' ').replace(/\s+/g, ' ').trim();
+  if (v) q = (q ? q + ' ' : '') + op + ':' + v;
+  inp.value = q + (q ? ' ' : '');
+  _cvSq.menu = null;
+  inp.focus();
+  _cvSqRun();
+}
+function _cvSqRecent() { try { return JSON.parse(localStorage.getItem('amux_cv_recent_search') || '[]'); } catch (e) { return []; } }
+function _cvSqRemember(q) {
+  const list = [q].concat(_cvSqRecent().filter(x => x !== q)).slice(0, 8);
+  try { localStorage.setItem('amux_cv_recent_search', JSON.stringify(list)); } catch (e) { console.warn('recent searches not saved', e); }
+}
+function _cvSqOpen() {
+  const pan = _cvSqPanel(), inp = _cvSqInput(); if (!pan || !inp) return;
+  const r = inp.getBoundingClientRect();
+  const w = Math.min(560, window.innerWidth - Math.max(8, r.left) - 8);
+  pan.style.left = Math.max(8, r.left) + 'px';
+  pan.style.top = (r.bottom + 4) + 'px';
+  pan.style.width = Math.max(r.width, w) + 'px';
+  pan.style.maxHeight = Math.max(200, window.innerHeight - r.bottom - 16) + 'px';
+  pan.hidden = false;
+  inp.setAttribute('aria-expanded', 'true');
+  _cvSqRun(true);
+}
+function _cvSqClose() {
+  const pan = _cvSqPanel(); if (pan) pan.hidden = true;
+  const inp = _cvSqInput(); if (inp) inp.setAttribute('aria-expanded', 'false');
+  _cvSq.menu = null; _cvSq.sel = -1;
+}
+// Debounced: each keystroke restarts the wait, and an answer to an older
+// query is dropped (seq), so the list never shows results for text you deleted.
+function _cvSqRun(now) {
+  clearTimeout(_cvSq.t);
+  const q = _cvSqInput().value.trim();
+  _cvSq.q = q;
+  if (!q) { _cvSq.res = null; _cvSqRender(); return; }
+  _cvSqRender();
+  const seq = ++_cvSq.seq;
+  _cvSq.t = setTimeout(async () => {
+    try {
+      const r = await fetch(API + '/api/conversations/search?limit=8&q=' + encodeURIComponent(q));
+      const d = await r.json();
+      if (seq !== _cvSq.seq) return;
+      _cvSq.res = r.ok ? d : { error: d.error || ('HTTP ' + r.status) };
+    } catch (e) {
+      if (seq !== _cvSq.seq) return;
+      _cvSq.res = { error: String((e && e.message) || e) };
+    }
+    _cvSqRender();
+  }, now ? 0 : 180);
+}
+function _cvSqConvs() {
+  const L = _cv.list || {};
+  return [].concat(
+    (L.channels || []).map(c => ({ conv: c.conv, name: '#' + (c.title || c.name), kind: 'Channel', key: c.name, ico: '<span class="cv-ico">' + (c.private ? '&#x1F512;' : '#') + '</span>' })),
+    (L.people || []).filter(p => !p.me).map(p => ({ conv: p.conv, name: p.name, kind: 'Person', key: String(p.email || p.name).split('@')[0], ico: _cvAvatar(p.name, false, p.email) })),
+    (L.direct || []).map(d => ({ conv: d.conv, name: d.worker, kind: 'Direct message', key: d.worker, ico: _cvAvatar(d.worker, true) })),
+    (L.workers || []).map(w => ({ conv: w.conv, name: w.name, kind: 'Worker', key: w.name, ico: _cvAvatar(w.name, true) })));
+}
+function _cvSqWhen(ts) {
+  const d = new Date(ts);
+  return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric', year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric' });
+}
+function _cvSqChip(op, label, shown) {
+  const v = _cvSqTok(_cvSq.q, op);
+  const on = !!v;
+  return '<button type="button" class="cv-sq-chip' + (on ? ' on' : '') + (_cvSq.menu === op ? ' open' : '') + '" data-op="' + op + '" onmousedown="event.preventDefault()" onclick="'
+    + (on ? '_cvSqSetTok(this.dataset.op, \'\')' : '_cvSq.menu = _cvSq.menu === this.dataset.op ? null : this.dataset.op; _cvSqRender()')
+    + '" aria-pressed="' + on + '">' + esc(on ? label + ': ' + (shown ? shown(v) : v) + ' ×' : label + ' ▾') + '</button>';
+}
+function _cvSqRender() {
+  const pan = _cvSqPanel(); if (!pan || pan.hidden) return;
+  const q = _cvSq.q, text = _cvSqText(q).toLowerCase();
+  const items = [];   // what ↑ ↓ Enter move through: {run, html}
+  const add = (html, run) => { items.push(run); return html.replace('<button ', '<button data-i="' + (items.length - 1) + '" '); };
+  const convs = _cvSqConvs();
+  const convName = v => { const c = convs.find(x => x.conv === v || x.conv === 'g:' + v.replace(/^#/, '')); return c ? c.name : v; };
+  const timeName = v => (_CV_SQ_TIME.find(t => t[0] === v) || [v, v])[1];
+  let h = '<div class="cv-sq-chips" role="toolbar" aria-label="Filters">' + _cvSqChip('from', 'From') + _cvSqChip('in', 'In', convName)
+    + _cvSqChip('after', 'Time', timeName) + _cvSqChip('has', 'Has') + '</div>';
+  const opt = (label, ico, run) => add('<button type="button" class="cv-sq-row" role="option" onmousedown="event.preventDefault()">' + (ico || '') + '<span class="cv-sq-main">' + label + '</span></button>', run);
+  if (_cvSq.menu) {
+    const m = _cvSq.menu;
+    const list = m === 'from' ? convs.filter(c => c.kind !== 'Channel').map(c => [c.key, c.name, c.ico, c.kind])
+      : m === 'in' ? convs.map(c => [c.conv.indexOf('g:') === 0 ? '#' + c.conv.slice(2) : c.conv, c.name, c.ico, c.kind])
+      : (m === 'after' ? _CV_SQ_TIME : _CV_SQ_HAS).map(t => [t[0], t[1], '', '']);
+    h += '<div class="cv-sq-sec">' + esc({ from: 'Messages from', in: 'Messages in', after: 'Messages sent in the', has: 'Messages that have' }[m]) + '</div>'
+      + list.map(([v, name, ico, kind]) => opt(esc(name) + (kind ? '<small>' + esc(kind) + '</small>' : ''), ico, () => _cvSqSetTok(m, v))).join('');
+  } else if (!q) {
+    const recent = _cvSqRecent();
+    if (recent.length) h += '<div class="cv-sq-sec">Recent searches</div>' + recent.map(r => opt(esc(r), '<span class="cv-ico">&#x1F552;</span>', () => { _cvSqInput().value = r; _cvSearch(r); })).join('');
+    h += '<div class="cv-sq-tip">Type to search every conversation you can read. Filters: <code>from:doron</code> <code>in:#amux</code> <code>after:7d</code> <code>has:file</code></div>';
+  } else {
+    const hitConvs = text ? convs.filter(c => c.name.toLowerCase().replace(/^#/, '').includes(text.replace(/^#/, ''))).slice(0, 5) : [];
+    if (hitConvs.length) h += '<div class="cv-sq-sec">Conversations</div>' + hitConvs.map(c => opt(esc(c.name) + '<small>' + esc(c.kind) + '</small>', c.ico, () => { _cvSqClose(); _cvSqInput().blur(); _cvSelect(c.conv); })).join('');
+    const d = _cvSq.res;
+    h += '<div class="cv-sq-sec">Messages' + (d && d.total ? ' <span class="cv-sq-n">' + d.total + '</span>' : '') + '</div>';
+    if (!d) h += '<div class="cv-sq-tip">Searching…</div>';
+    else if (d.error) h += '<div class="cv-sq-tip">Search failed: ' + esc(d.error) + '</div>';
+    else {
+      const bad = ((d.filters || {}).unknown || []);
+      if (bad.length) h += '<div class="cv-sq-tip cv-sq-warn">Not a filter, ignored: ' + bad.map(esc).join(', ') + '</div>';
+      if (!(d.posts || []).length) h += '<div class="cv-sq-tip">No messages match.</div>';
+      h += (d.posts || []).map(p => {
+        const snip = p.snippet ? esc(p.snippet).replace(/\[\[/g, '<mark>').replace(/\]\]/g, '</mark>') : esc(String(p.body || '').slice(0, 160));
+        return add('<button type="button" class="cv-sq-row cv-sq-hit" role="option" onmousedown="event.preventDefault()">' + _cvAvatar(p.author_name, p.author_key.indexOf('worker:') === 0, p.author_key)
+          + '<span class="cv-sq-main"><span class="cv-sq-head"><b>' + esc(p.author_name) + '</b><span>' + esc(_cvFindName(p.conv)) + (p.parent_id ? ' · thread' : '') + '</span><span class="cv-sq-ts">' + esc(_cvSqWhen(p.ts)) + '</span></span>'
+          + '<span class="cv-sq-snip">' + snip + '</span></span></button>',
+          () => { _cvSqRemember(q); _cvSqClose(); _cvSqInput().blur(); _cvOpenThreadOrScroll(p.conv, p.parent_id || p.id); });
+      }).join('');
+      if ((d.posts || []).length) h += add('<button type="button" class="cv-sq-row cv-sq-all" role="option" onmousedown="event.preventDefault()"><span class="cv-sq-main">See all ' + (d.total || '') + ' results for “' + esc(q) + '” <small>Enter</small></span></button>', () => _cvSearch(q));
+    }
+  }
+  pan.innerHTML = h;
+  _cvSq.items = items;
+  if (_cvSq.sel >= items.length) _cvSq.sel = -1;
+  pan.querySelectorAll('[data-i]').forEach(b => {
+    b.classList.toggle('sel', +b.dataset.i === _cvSq.sel);
+    b.onclick = () => (_cvSq.items[+b.dataset.i] || (() => {}))();
+  });
+}
+function _cvSqKey(e) {
+  const pan = _cvSqPanel();
+  if (e.key === 'Escape') { if (_cvSq.menu) { _cvSq.menu = null; _cvSqRender(); } else { _cvSqClose(); e.target.blur(); } e.preventDefault(); return; }
+  if (pan && pan.hidden && e.key !== 'Enter') _cvSqOpen();
+  const n = _cvSq.items.length;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (!n) return;
+    _cvSq.sel = e.key === 'ArrowDown' ? (_cvSq.sel + 1) % n : (_cvSq.sel <= 0 ? n - 1 : _cvSq.sel - 1);
+    pan.querySelectorAll('[data-i]').forEach(b => b.classList.toggle('sel', +b.dataset.i === _cvSq.sel));
+    pan.querySelector('[data-i="' + _cvSq.sel + '"]')?.scrollIntoView({ block: 'nearest' });
+    return;
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (_cvSq.sel >= 0 && _cvSq.items[_cvSq.sel]) _cvSq.items[_cvSq.sel]();
+    else _cvSearch(e.target.value);
+  }
+}
+document.addEventListener('mousedown', e => {
+  const pan = _cvSqPanel();
+  if (pan && !pan.hidden && !pan.contains(e.target) && e.target !== _cvSqInput()) _cvSqClose();
+});
+document.addEventListener('keydown', e => {
+  if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey || !_cvViewOn()) return;
+  const a = document.activeElement;
+  if (a && (a.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) return;
+  const inp = _cvSqInput(); if (!inp || !inp.offsetParent) return;
+  e.preventDefault(); inp.focus(); _cvSqOpen();
+});
+// THE RESULTS PAGE: every match, how many in each conversation (click one to
+// narrow to it), and which filters the server understood.
+async function _cvSearchPage(q) {
+  const inp = _cvSqInput(); if (inp && inp.value.trim() !== q) inp.value = q;
+  document.getElementById('cv-title').textContent = 'Search: ' + q;
+  document.getElementById('cv-meta').textContent = 'Searching…';
+  const box = document.getElementById('cv-posts'); box.innerHTML = '<div class="cv-empty">Loading…</div>';
+  let d;
+  try {
+    const r = await fetch(API + '/api/conversations/search?limit=200&q=' + encodeURIComponent(q));
+    d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  } catch (e) { box.innerHTML = '<div class="cv-empty">Could not search: ' + esc(e.message) + '</div>'; document.getElementById('cv-meta').textContent = ''; return; }
+  if (_cv.sel !== '@search:' + q) return;
+  const posts = d.posts || [], by = Object.entries(d.by_conv || {}).sort((a, b) => b[1] - a[1]);
+  document.getElementById('cv-meta').textContent = (d.total || 0) + (d.total === 1 ? ' result' : ' results') + ' in ' + by.length + (by.length === 1 ? ' conversation' : ' conversations')
+    + (posts.length < (d.total || 0) ? ' (newest ' + posts.length + ' shown by best match)' : '');
+  const scoped = _cvSqTok(q, 'in');
+  const bar = '<div class="cv-sr-bar" role="toolbar" aria-label="Narrow to a conversation">'
+    + (scoped ? '<button type="button" class="cv-sq-chip on" onclick="_cvSearch(' + esc(JSON.stringify(q.replace(/(^|\s)in:\S+/, ' ').trim())) + ')">In: ' + esc(_cvFindName(scoped.indexOf(':') > 0 ? scoped : 'g:' + scoped.replace(/^#/, ''))) + ' ×</button>'
+      : by.slice(0, 10).map(([c, n]) => '<button type="button" class="cv-sq-chip" data-cv="' + esc(c) + '" onclick="_cvSearch(' + esc(JSON.stringify(q)) + ' + \' in:\' + (this.dataset.cv.indexOf(\'g:\') === 0 ? \'#\' + this.dataset.cv.slice(2) : this.dataset.cv))">' + esc(_cvFindName(c)) + ' <span class="cv-sq-n">' + n + '</span></button>').join(''))
+    + (((d.filters || {}).unknown || []).length ? '<span class="cv-sq-warn">Not a filter, ignored: ' + d.filters.unknown.map(esc).join(', ') + '</span>' : '')
+    + '</div>';
+  // The words are marked in the message itself, not in a snippet repeated under it.
+  box.innerHTML = bar + (posts.length ? posts.map(p => _cvPostHtml(Object.assign({}, p, { snippet: '' }), true)).join('') : '<div class="cv-empty">No messages match. Try fewer words, or remove a filter.</div>');
+  _cvMarkTerms(box, d.terms);
+}
+// Wraps each word that starts with a searched term (the server matches
+// prefixes: "clio" finds "Clio's") in <mark>, in text only, never in a tag.
+function _cvMarkTerms(box, fts) {
+  const words = String(fts || '').match(/"([^"]+)"/g);
+  if (!words) return;
+  const re = new RegExp('(^|[^\\p{L}\\p{N}])((?:' + words.map(w => w.slice(1, -1).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')[\\p{L}\\p{N}_-]*)', 'giu');
+  box.querySelectorAll('.cv-post-body').forEach(body => {
+    const walk = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    const nodes = []; while (walk.nextNode()) nodes.push(walk.currentNode);
+    for (const n of nodes) {
+      if (!re.test(n.nodeValue)) { re.lastIndex = 0; continue; }
+      re.lastIndex = 0;
+      const span = document.createElement('span');
+      span.innerHTML = esc(n.nodeValue).replace(re, '$1<mark class="cv-hl">$2</mark>');
+      n.replaceWith(...span.childNodes);
+    }
+  });
+}
 // One poll at a time. Posts arriving together each asked for an incremental
 // poll; overlapping ones answered out of order, a stale page moved lastId
 // backwards, and a post was fetched but never drawn (CI, 2026-10-27). A poll
@@ -68131,13 +70697,20 @@ async function _cvPollOnce(full) {
   // (after=) is usually empty and would say "nothing older", disarming
   // scroll-up loading.
   const hadMore = _cv.info && _cv.info.has_more;
+  const pinsWere = JSON.stringify(((_cv.info || {}).pins || []).map(x => x.id));
   _cv.info = d;
+  const pinsChanged = hadInfo && pinsWere !== JSON.stringify((d.pins || []).map(x => x.id));
   if (!full) _cv.info.has_more = hadMore;
   Object.assign(_cvProfiles, d.profiles || {});
   // Typing "@" before the member list arrived left the picker empty; offer
   // it again now that the names are here.
   if (!hadInfo) { const inp = document.getElementById('cv-input'); if (inp && /(^|\s)@[\w.\-]*$/.test(inp.value.slice(0, inp.selectionStart))) _cvOnInput(inp); }
-  if (full) _cv.posts = d.posts || [];
+  // A full refresh of a conversation already on screen MERGES (below): it used
+  // to replace the list, dropping the older pages scrolled in and the posts
+  // still waiting on the server (2026-11-06).
+  const hadPosts = _cv.posts.length > 0;
+  if (full && !hadPosts) _cv.posts = d.posts || [];
+  if (full && hadMore && _cv.posts.length && _cv.posts[0].id < ((d.posts || [])[0] || {}).id) _cv.info.has_more = hadMore;
   // The first post someone else wrote after your read mark, captured before
   // this load marks the conversation read (_cvMarkRead below).
   if (full && _cv.restoreScroll) {
@@ -68145,7 +70718,7 @@ async function _cvPollOnce(full) {
     const first = lr ? (d.posts || []).find(p => typeof p.id === 'number' && p.id > lr && p.author_key !== me) : null;
     _cv.unreadFrom = first ? first.id : null;
   }
-  else if ((d.posts || []).length) {
+  if ((hadPosts || !full) && (d.posts || []).length) {
     // Merged by id and kept in order; the optimistic pending posts stay last.
     const byId = new Map(_cv.posts.filter(p => typeof p.id === 'number').map(p => [p.id, p]));
     for (const np of d.posts) byId.set(np.id, np);
@@ -68164,7 +70737,14 @@ async function _cvPollOnce(full) {
   if (full) _cv.readId = 0;
   _cv.readId = Math.max(_cv.readId || 0, latest);
   _cvRenderHead(sel, d);
-  if (full || grew || pending.length) _cvRenderPosts(full || grew);
+  _cvRenderPinsBtn();
+  // A new post from someone else no longer pulls you down from where you are
+  // reading; one you sent still goes to the end (_cvRenderPosts keeps the end
+  // when you were already there). A full page merged into posts already on
+  // screen (the same conversation opened twice) keeps the place it restored.
+  const mineLast = grew && ((_cv.posts[_cv.posts.length - 1] || {}).author_key === _cvMeKey());
+  if (full || grew || pending.length || pinsChanged) _cvRenderPosts((full && !hadPosts) || mineLast);
+  if (pinsChanged && !full && !grew && _cv.thread) _cvRenderThread();
   document.getElementById('cv-typing').innerHTML = (d.typing || []).length
     ? '<span class="cv-dot on" style="display:inline-block;margin-right:var(--space-1-5)"></span>' + esc(d.typing.join(', ')) + (d.typing.length > 1 ? ' are' : ' is') + ' typing…' : '';
   if (grew || full || readGrew) _cvMarkRead();
@@ -68193,8 +70773,12 @@ function _cvRenderHead(sel, d) {
         + 'data-key="' + esc(wkey) + '" onchange="_cvSetAvatar(this.dataset.key, this.files[0]); this.value=\'\'"></label>';
       return;
     }
+  } else if (sel.indexOf('d:') === 0) {
+    const w = sel.slice(2).split('|')[0];
+    meta.textContent = 'Direct message with ' + w + '. Only you and ' + w + ' can read this; messages here go to it.';
   } else {
-    meta.textContent = 'Direct message';
+    const ends = sel.slice(2).split('|');
+    meta.textContent = ends.length === 2 && ends[0] === ends[1] ? 'Your notes to yourself. Only you can read this.' : 'Direct message';
   }
   document.getElementById('cv-head-people').innerHTML = (on ? '<span style="margin-right:var(--space-2)"><span class="cv-dot on" style="display:inline-block;margin-right:var(--space-1)"></span>' + on + ' online</span>' : '') +
     ppl.slice(0, 4).map(p => _cvAvatar(p.name, false, p.key)).join('');
@@ -68219,17 +70803,55 @@ function _cvBodyHtml(p) {
     const k = names[tok.replace(/\.$/, '').toLowerCase()];
     return k ? pre + '<span class="cv-mention' + (k === me ? ' me' : '') + '">@' + tok + '</span>' : m;
   });
-  const imgs = [];
-  body.replace(/(?:^|[\s(\[>"'`,;=@])((?:~\/|\/)[^\s'"`<>()]+\.(?:png|jpe?g|gif|webp))(?=$|[\s,;:)\].])/gim, (m, path) => {
-    if (!imgs.includes(path) && imgs.length < 4) imgs.push(path);
-    return m;
-  });
+  const imgs = _cvImageRefs(body);
   if (imgs.length) {
-    h += '<div class="cv-thumbs">' + imgs.map(path => '<img class="cv-thumb" loading="lazy" alt="' + esc(path.split('/').pop())
-      + '" title="Open ' + esc(path) + '" data-path="' + esc(path) + '" src="'
-      + esc(_authUrl(API + '/api/file/raw?path=' + encodeURIComponent(path))) + '" onclick="openFilePreview(this.dataset.path)">').join('') + '</div>';
+    h += '<div class="cv-thumbs">' + imgs.map(r => r.path
+      ? '<img class="cv-thumb" loading="lazy" alt="' + esc(r.name) + '" title="Open ' + esc(r.path) + '" data-path="' + esc(r.path) + '" src="'
+        + esc(_authUrl(API + '/api/file/raw?path=' + encodeURIComponent(r.path))) + '" onclick="openFilePreview(this.dataset.path)" onerror="_cvThumbFailed(this)">'
+      : '<img class="cv-thumb" loading="lazy" referrerpolicy="no-referrer" alt="' + esc(r.name) + '" title="Open ' + esc(r.url) + '" data-url="' + esc(r.url)
+        + '" src="' + esc(r.url) + '" onclick="window.open(this.dataset.url,\'_blank\',\'noopener\')" onerror="_cvThumbFailed(this)">').join('') + '</div>';
   }
   return h;
+}
+// INLINE IMAGE PREVIEWS, like Slack (Ethan, 2026-11-06: "make sure any image
+// links have an inline preview", screenshot of an `@.../IMG_5708.tiff` post
+// shown as a bare link). A local image path (absolute or ~/, with or without
+// the @ an attachment rides on) previews through /api/file/raw; a web link to
+// an image previews from its URL, this server's /f/ links included. The list
+// used to stop at png/jpg/gif/webp, so a phone's .tiff or .heic never showed.
+const _CV_IMG_EXT = 'png|jpe?g|gif|webp|svg|bmp|avif|heic|heif|tiff?';
+function _cvImageRefs(body) {
+  const out = [], seen = new Set();
+  const add = r => { const k = r.path || r.url; if (!seen.has(k) && out.length < 4) { seen.add(k); out.push(r); } };
+  String(body || '').replace(new RegExp('(?:^|[\\s(\\[>"\'`,;=@])((?:~\\/|\\/)[^\\s\'"`<>()]+\\.(?:' + _CV_IMG_EXT + '))(?=$|[\\s,;:)\\].])', 'gim'), (m, path) => {
+    // A copied file link (`/f/<path>`, api/deep_links.rs) names the file on
+    // disk; the link itself redirects to the dashboard, so preview the file.
+    if (path.indexOf('/f/') === 0) path = path.slice(2);
+    add({ path, name: path.split('/').pop() }); return m;
+  });
+  String(body || '').replace(new RegExp('https?:\\/\\/[^\\s<>()"\']+\\.(?:' + _CV_IMG_EXT + ')(?:\\?[^\\s<>()"\']*[^\\s<>()"\'.,;:!?])?(?=$|[\\s,;:!?)\\].])', 'gim'), url => {
+    const name = url.split('?')[0].split('/').pop();
+    try {
+      const u = new URL(url);
+      if (typeof location !== 'undefined' && u.host === location.host && u.pathname.indexOf('/f/') === 0) {
+        add({ path: decodeURIComponent(u.pathname.slice(2)), name }); return url;
+      }
+    } catch (e) {}
+    add({ url, name }); return url;
+  });
+  return out;
+}
+// A browser that cannot draw the format (Chrome and Firefox have no TIFF or
+// HEIC; Safari and the amux apps do) gets a file chip that opens it instead of
+// a broken image.
+function _cvThumbFailed(img) {
+  const chip = document.createElement('button');
+  chip.type = 'button';
+  chip.className = 'cv-thumb-chip';
+  chip.textContent = '\u{1F5BC} ' + (img.alt || 'image') + ' (no preview in this browser; open)';
+  const path = img.dataset.path, url = img.dataset.url;
+  chip.onclick = () => path ? openFilePreview(path) : window.open(url, '_blank', 'noopener');
+  img.replaceWith(chip);
 }
 // PATHS IN A POST ARE LINKS (AA-51, Ethan 2026-10-28). _linkifyPaths needs a
 // file extension, so a folder such as /home/amux/wexus/runs/x/for-elliot was
@@ -68329,6 +70951,7 @@ function _cvPostHtml(p, showConv, inThread) {
   const mine = p.author_key === _cvMeKey();
   const owner = _cvMeKey() === 'person:owner';
   const real = typeof p.id === 'number';
+  const pinned = real && _cvPinnedIds().has(p.id);
   const body = p.deleted ? '<div class="cv-deleted">This message was deleted.</div>'
     : _cv.editing && _cv.editing.id === p.id ? '<div class="cv-post-body" data-body-id="' + esc(String(p.id)) + '">' + _cvEditHtml(p.id) + '</div>'
     : '<div class="cv-post-body cv-md" data-body-id="' + esc(String(p.id)) + '">' + _cvBodyHtml(p) + '</div>' + _cvAttachHtml(p) + _cvPreviewHtml(p);
@@ -68342,6 +70965,8 @@ function _cvPostHtml(p, showConv, inThread) {
     + _CV_QUICK.slice(0, 3).map(e => '<button type="button" title="React ' + e + '" aria-label="React ' + e + '" onclick="_cvReact(' + p.id + ',\'' + e + '\')">' + e + '</button>').join('')
     + (!inThread ? '<button type="button" title="Reply in thread" aria-label="Reply in thread" onclick="_cvOpenThread(' + p.id + ')">&#x1F4AC;</button>' : '')
     + '<button type="button" title="Copy link" aria-label="Copy link" onclick="_cvCopyLink(' + p.id + ',' + (p.parent_id || 0) + ')">&#x1F517;</button>'
+    + (pinned ? '<button type="button" title="Unpin" aria-label="Unpin" onclick="_cvPin(' + p.id + ',false)">&#x1F4CC;&#xFE0E;</button>'
+      : '<button type="button" title="Pin to this conversation" aria-label="Pin" onclick="_cvPin(' + p.id + ',true)">&#x1F4CC;</button>')
     + (mine ? '<button type="button" title="Edit" aria-label="Edit" onclick="_cvEdit(' + p.id + ')">&#x270F;&#xFE0F;</button>' : '')
     + (mine || owner ? '<button type="button" title="Delete" aria-label="Delete" onclick="_cvDelete(' + p.id + ')">&#x1F5D1;&#xFE0F;</button>' : '')
     + '</div><button type="button" class="cv-more" aria-label="More actions" onclick="_cvMore(this)">&#x22EF;</button>' : '';
@@ -68349,6 +70974,7 @@ function _cvPostHtml(p, showConv, inThread) {
     '<span class="cv-post-who">' + esc(p.author_name) + (mine ? ' <span style="color:var(--dim);font-weight:400">(you)</span>' : '') + '</span>' +
     '<span class="cv-post-ts" title="' + esc(t.toLocaleString()) + '">' + t.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + '</span>' +
     (p.edited_at && !p.deleted ? '<span class="cv-edited" title="' + esc(new Date(p.edited_at).toLocaleString()) + '">(edited)</span>' : '') +
+    (pinned && !p.deleted ? '<span class="cv-post-pinned" title="' + esc(_cvPinTitle(p.id)) + '">&#x1F4CC; Pinned</span>' : '') +
     (showConv ? '<span class="cv-post-conv" data-cv="' + esc(p.conv) + '" onclick="_cvOpenThreadOrScroll(this.dataset.cv,' + (p.parent_id || p.id) + ')">in ' + esc(_cvFindName(p.conv)) + (p.parent_id ? ' (thread)' : '') + '</span>' : '') +
     (p.pending ? '<span class="cv-post-tag">Queued: sends when you are back online</span>' : p.tag ? '<span class="cv-post-tag">' + esc(p.tag) + '</span>' : '') +
     '</div>' + body + (p.snippet ? '<div class="cv-snippet">' + esc(p.snippet).replace(/\[\[/g, '<mark>').replace(/\]\]/g, '</mark>') + '</div>' : '')
@@ -68404,6 +71030,48 @@ async function _cvMore(btn) {
 }
 function _cvFindPost(id) {
   return _cv.posts.find(p => p.id === id) || (_cv.thread && (_cv.thread.posts || []).find(p => p.id === id));
+}
+// Pinned messages: the conversation's pins come with every page of posts
+// (`pins`), so a pin made in another tab or by someone else shows on the next
+// poll, and a page of older posts still knows which of its posts are pinned.
+function _cvPinnedIds() { return new Set(((_cv.info || {}).pins || []).map(x => x.id)); }
+function _cvPinTitle(id) {
+  const x = ((_cv.info || {}).pins || []).find(y => y.id === id);
+  return x ? 'Pinned by ' + String(x.pinned_by || '').replace(/^(person|worker):/, '') + ' ' + timeAgo(x.pinned_at / 1000) : 'Pinned';
+}
+function _cvRenderPinsBtn() {
+  const btn = document.getElementById('cv-pins-btn'); if (!btn) return;
+  const n = ((_cv.info || {}).pins || []).length;
+  btn.hidden = !n;
+  document.getElementById('cv-pins-n').textContent = n ? String(n) : '';
+}
+async function _cvPin(id, on) {
+  try {
+    const r = await fetch(API + '/api/conversations/posts/' + id + '/pin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pinned: on }) });
+    const d = await r.json();
+    if (!r.ok) { showToast(d.error || 'Not saved', 'error'); return; }
+    (_cv.info = _cv.info || {}).pins = d.pins || [];
+    _cvRenderPinsBtn();
+    _cvRenderPosts(false); if (_cv.thread) _cvRenderThread();
+    showToast(on ? 'Pinned' : 'Unpinned');
+  } catch (e) { showToast('Not saved: ' + e.message, 'error'); }
+}
+// The pinned list opens from the 📌 count in the header (one control in the
+// header row, no new bar). Choosing one goes to it: in the list when it is a
+// top-level post, in its thread when it is a reply.
+async function _cvShowPins() {
+  const pins = (_cv.info || {}).pins || [];
+  if (!pins.length) return;
+  const html = '<div class="cv-pins-list">' + pins.map((x, i) => '<button type="button" class="btn cv-pin-item" data-i="' + i + '">'
+    + '<span class="cv-pin-who">' + esc(x.author_name) + ' <span class="cv-pin-when">' + esc(new Date(x.ts).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })) + '</span></span>'
+    + '<span class="cv-pin-body">' + esc(String(x.body || '').replace(/\s+/g, ' ').slice(0, 200)) + '</span></button>').join('') + '</div>';
+  const chosen = new Promise(resolve => {
+    setTimeout(() => document.querySelectorAll('.cv-pin-item').forEach(el => el.onclick = () => { resolve(Number(el.dataset.i)); _modalClose(false); }), 0);
+    showFormModal('Pinned messages', html, 'Close').then(() => resolve(-1));
+  });
+  const i = await chosen;
+  const x = pins[i]; if (!x) return;
+  if (x.parent_id) _cvOpenThread(x.parent_id); else _cvOpenThreadOrScroll(_cv.sel, x.id);
 }
 async function _cvReact(id, emoji) {
   try {
@@ -68472,7 +71140,7 @@ function _cvOpenThread(root) {
   document.getElementById('messages-view').classList.add('cv-thread-open');
   document.getElementById('cv-thread-posts').innerHTML = '<div class="cv-empty">Loading…</div>';
   _cvLoadThread();
-  if (!_cvMobile()) setTimeout(() => document.getElementById('cv-thread-input').focus(), 50);
+  if (!_cvMobile()) _cvFocusSoon(document.getElementById('cv-thread-input'));
 }
 function _cvCloseThread() {
   _cv.thread = null;
@@ -68528,20 +71196,23 @@ async function _cvOpenThreadOrScroll(conv, id) {
   const top = _cv.posts.find(p => p.id === id);
   if (top && !top.reply_count) {
     const el = document.querySelector('#cv-posts .cv-post[data-id="' + id + '"]');
-    if (el) { el.scrollIntoView({ block: 'center' }); el.classList.add('cv-flash'); setTimeout(() => el.classList.remove('cv-flash'), 1600); }
+    if (el) { _cv.pin = null; el.scrollIntoView({ block: 'center' }); el.classList.add('cv-flash'); setTimeout(() => el.classList.remove('cv-flash'), 1600); }
     return;
   }
   _cvOpenThread(id);
 }
 // ── Older history: scrolling to the top loads the page before it ──
 async function _cvOnScroll(box) {
+  // Any scroll the hold did not make is yours, and ends the hold.
+  if (_cv.pin && Math.abs(box.scrollTop - (_cv.pin.top ?? box.scrollTop)) > 2) _cv.pin = null;
   if (!_cv.restoreScroll) _cvSavePosition(box);
   if (box.scrollTop > 60 || _cv.loadingOlder || !_cv.info || !_cv.info.has_more || !_cv.posts.length || _cv.sel[0] === '@') return;
   _cv.loadingOlder = true;
-  const sel = _cv.sel, first = _cv.posts[0].id, h0 = box.scrollHeight;
+  const sel = _cv.sel, gen = _cv.gen, first = _cv.posts[0].id, h0 = box.scrollHeight;
   try {
     const d = await (await fetch(API + '/api/conversations/' + encodeURIComponent(sel) + '/posts?before=' + first + '&limit=100')).json();
-    if (sel !== _cv.sel) return;
+    // The same conversation reopened (A, B, A) is a fresh list: same sel, new gen.
+    if (sel !== _cv.sel || gen !== _cv.gen) return;
     _cv.posts = (d.posts || []).concat(_cv.posts);
     _cv.info.has_more = d.has_more;
     Object.assign(_cvProfiles, d.profiles || {});
@@ -68654,7 +71325,7 @@ async function _cvLoadWorkerHistory(sel) {
       author_name: h.author_name || (h.type === 'session' && h.origin ? h.origin : (h.type === 'schedule' ? 'scheduler' : (h.origin || 'owner'))),
       tag: h.type === 'schedule' ? 'scheduled' : h.type === 'session' ? 'from a worker' : 'sent from its page',
       mentions: [], deliveries: [] }));
-    _cvRenderPosts(true);
+    _cvRenderPosts(false);
   } catch (e) {}
 }
 function _cvRenderPosts(scroll) {
@@ -68670,7 +71341,7 @@ function _cvRenderPosts(scroll) {
     _cv.restoreScroll = false;
     const sel = _cv.sel || '';
     box.innerHTML = '<div class="cv-empty">' + (sel.indexOf('w:') === 0 ? 'Send ' + esc(sel.slice(2)) + ' a message. It will reply here.'
-      : sel.indexOf('p:') === 0 ? 'Start a direct message.' : 'No messages yet. Say hello, or @mention a worker to give it a task.') + '</div>';
+      : sel.indexOf('p:') === 0 || sel.indexOf('d:') === 0 ? 'Start a direct message.' : 'No messages yet. Say hello, or @mention a worker to give it a task.') + '</div>';
     return;
   }
   let html = '', day = '';
@@ -68679,11 +71350,17 @@ function _cvRenderPosts(scroll) {
     if (_cv.unreadFrom && p.id === _cv.unreadFrom) html += '<div class="cv-unread-line" role="separator"><span>New</span></div>';
     html += _cvPostHtml(p, false);
   }
+  // The post at the top of the view before this render, so a re-render (a
+  // reaction, an edit, a preview arriving) leaves you on the same post.
+  const keep = !scroll && !nearBottom && !_cv.restoreScroll ? _cvTopPost(box) : null;
   _cvEditBeforeRender();
   box.innerHTML = html;
   _cvEditAfterRender(box);
-  if (_cv.restoreScroll) { _cv.restoreScroll = false; _cvRestoreScroll(box); return; }
-  if (scroll || nearBottom) box.scrollTop = box.scrollHeight;
+  // The place is chosen once the conversation's page is in (_cv.info): a
+  // worker's history can arrive first and would spend it on half the posts.
+  if (_cv.restoreScroll && _cv.info) { _cv.restoreScroll = false; _cvRestoreScroll(box); return; }
+  if (scroll || nearBottom) _cvPinTo(box, { bottom: true });
+  else if (keep) _cvPinTo(box, keep);
 }
 // WHERE YOU LEFT OFF (Ethan, 2026-10-29: "when i open messages it should scroll
 // to where i left off"). Opening a conversation goes, in order, to the first
@@ -68694,28 +71371,79 @@ function _cvPositions() { try { return JSON.parse(localStorage.getItem('amux_cv_
 function _cvRestoreScroll(box) {
   const pos = _cvPositions()[_cv.sel];
   const at = id => box.querySelector('.cv-post[data-id="' + CSS.escape(String(id)) + '"]');
-  const unread = _cv.unreadFrom && at(_cv.unreadFrom);
-  if (unread) { box.scrollTop += unread.getBoundingClientRect().top - box.getBoundingClientRect().top - 48; return; }
-  const el = pos && !pos.bottom && at(pos.id);
-  if (el) { box.scrollTop += el.getBoundingClientRect().top - box.getBoundingClientRect().top - (pos.off || 0); return; }
-  box.scrollTop = box.scrollHeight;
+  let verdict;
+  if (_cv.unreadFrom && at(_cv.unreadFrom)) { verdict = 'unread'; _cvPinTo(box, { id: String(_cv.unreadFrom), off: 48 }); }
+  else if (pos && !pos.bottom && pos.id && at(pos.id)) { verdict = 'anchor'; _cvPinTo(box, { id: String(pos.id), off: pos.off || 0 }); }
+  else { verdict = pos && !pos.bottom ? 'anchor_missing' : 'bottom'; _cvPinTo(box, { bottom: true }); }
+  if (typeof window._clientDebug === 'function') window._clientDebug('messages-scroll-restored', { verdict, conv: String(_cv.sel || '').slice(0, 2), saved: !!pos, measured: true, n_considered: 1 });
+}
+// The first post whose bottom is inside the view, and how far its top sits
+// below the view's top: a place that survives posts landing above or below.
+function _cvTopPost(box) {
+  const top = box.getBoundingClientRect().top;
+  const el = [...box.querySelectorAll('.cv-post[data-id]')].find(e => e.getBoundingClientRect().bottom > top + 4);
+  return el ? { id: el.dataset.id, off: Math.round(el.getBoundingClientRect().top - top) } : null;
+}
+// HELD WHILE IT SETTLES (Ethan, 2026-11-08: "it just scrolls to the bottom and
+// cuts off some shit"). Image previews and link cards get their height after
+// the posts are placed, so a conversation opened at its end showed the last
+// post half hidden behind the composer, and one opened at a saved post
+// drifted. The place chosen (the end, or a post at an offset) is put back each
+// time an image loads or the view resizes, until you scroll or 8 s pass.
+function _cvApplyPin(box) {
+  const p = _cv.pin; if (!p) return;
+  if (p.bottom) box.scrollTop = box.scrollHeight;
+  else {
+    const el = box.querySelector('.cv-post[data-id="' + CSS.escape(p.id) + '"]');
+    if (!el) { _cv.pin = null; return; }
+    box.scrollTop += el.getBoundingClientRect().top - box.getBoundingClientRect().top - p.off;
+  }
+  p.top = box.scrollTop;
+}
+function _cvPinTo(box, pin) {
+  _cv.pin = { ...pin, until: Date.now() + 8000 };
+  _cvApplyPin(box);
+  if (box._cvPinWired) return;
+  box._cvPinWired = true;
+  const release = () => { _cv.pin = null; };
+  ['wheel', 'touchstart', 'pointerdown', 'keydown'].forEach(t => box.addEventListener(t, release, { passive: true }));
+  // A frame later, so an image that failed has become its file chip first.
+  const hold = () => requestAnimationFrame(() => { if (_cv.pin && Date.now() < _cv.pin.until) _cvApplyPin(box); else _cv.pin = null; });
+  ['load', 'error', 'loadedmetadata'].forEach(t => box.addEventListener(t, e => { if (e.target !== box) hold(); }, true));
+  if (window.ResizeObserver) new ResizeObserver(hold).observe(box);
 }
 let _cvPosT = 0;
-function _cvSavePosition(box) {
+// `now` writes at once: leaving a conversation, or the page going away. The
+// conversation is read when the save is asked for, not when the timer fires:
+// a timer from the one you left used to store its place under the one you
+// opened. A hidden view has no geometry and is never saved.
+function _cvSavePosition(box, now) {
   clearTimeout(_cvPosT);
-  _cvPosT = setTimeout(() => {
-    const sel = _cv.sel; if (!sel || sel[0] === '@') return;
-    const top = box.getBoundingClientRect().top;
-    const el = [...box.querySelectorAll('.cv-post[data-id]')].find(e => e.getBoundingClientRect().bottom > top + 4);
+  // The conversation this scroll happened in. A switch inside the debounce
+  // used to save the old list's place under the new conversation's name, so it
+  // reopened at the bottom (CI, ios-safari, 2026-11-08).
+  const sel = _cv.sel, gen = _cv.gen;
+  const write = () => {
+    if (!now && (_cv.sel !== sel || _cv.gen !== gen)) {
+      if (window._clientDebug) window._clientDebug('cv-position', { verdict: 'stale_save_dropped', measured: true, n_considered: 1 });
+      return;
+    }
+    if (!box || !sel || sel[0] === '@' || _cv.restoreScroll || !box.clientHeight) return;
+    const t = _cvTopPost(box);
     const all = _cvPositions();
-    all[sel] = { id: el ? el.dataset.id : null, off: el ? Math.round(el.getBoundingClientRect().top - top) : 0,
+    all[sel] = { id: t ? t.id : null, off: t ? t.off : 0,
       bottom: box.scrollHeight - box.scrollTop - box.clientHeight < 80, at: Date.now() };
     // Keep the 200 most recent conversations.
     const keys = Object.keys(all).sort((a, b) => (all[b].at || 0) - (all[a].at || 0));
     for (const k of keys.slice(200)) delete all[k];
     try { localStorage.setItem('amux_cv_pos', JSON.stringify(all)); } catch (e) {}
-  }, 300);
+  };
+  if (now) write(); else _cvPosT = setTimeout(write, 300);
 }
+['pagehide', 'visibilitychange'].forEach(ev => (ev === 'pagehide' ? window : document).addEventListener(ev, () => {
+  if (ev === 'visibilitychange' && document.visibilityState !== 'hidden') return;
+  if (_cvViewOn()) _cvSavePosition(document.getElementById('cv-posts'), true);
+}));
 async function _cvMarkRead() {
   if (!_cv.sel || _cv.sel[0] === '@' || document.hidden) return;
   try { await fetch(API + '/api/conversations/' + encodeURIComponent(_cv.sel) + '/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ last_id: Math.max(_cv.lastId, _cv.readId || 0) }) }); } catch (e) {}
@@ -68735,7 +71463,7 @@ function _cvRenderUnread() {
   document.getElementById('cv-title').textContent = 'Unread';
   document.getElementById('cv-meta').textContent = 'Conversations with messages you have not opened';
   const L = _cv.list || {};
-  const rows = [...(L.channels || []).map(c => [c, '#' + c.name]), ...(L.people || []).filter(p => !p.me).map(p => [p, p.name]), ...(L.workers || []).map(w => [w, w.name])]
+  const rows = [...(L.channels || []).map(c => [c, '#' + c.name]), ...(L.people || []).filter(p => !p.me).map(p => [p, p.name]), ...(L.direct || []).map(d => [d, d.worker]), ...(L.workers || []).map(w => [w, w.name])]
     .filter(([x]) => x.unread).sort((a, b) => b[0].last_ts - a[0].last_ts);
   document.getElementById('cv-posts').innerHTML = rows.length ? '<div class="cv-nav">' + rows.map(([x, n]) => _cvItem(x.conv, '', n, x.unread, x.mentions)).join('') + '</div>'
     : '<div class="cv-empty">You are all caught up.</div>';
@@ -68858,7 +71586,7 @@ function _cvOnLive(ev) {
   _cv.liveListT = setTimeout(_cvLoadList, 300);
   if (ev.op === 'created') _cvMaybeNotify(ev);
   if (_cvViewOn() && _cv.sel === ev.conv) {
-    if (ev.op === 'created' && !ev.parent_id) _cvPoll(false);
+    if ((ev.op === 'created' && !ev.parent_id) || ev.op === 'pinned' || ev.op === 'unpinned') _cvPoll(false);
     else _cvRefreshPost(ev.parent_id || ev.id);
   }
   if (_cv.thread && _cv.thread.conv === ev.conv && (ev.parent_id === _cv.thread.root || ev.id === _cv.thread.root)) _cvLoadThread();
@@ -68890,7 +71618,7 @@ async function _cvMaybeNotify(ev) {
   } catch (e) { return; }
   if (!p || p.author_key === _cvMeKey()) return;
   const me = _cvMeKey();
-  const addressed = (p.mentions || []).includes(me) || ev.conv.indexOf('w:') === 0 || ev.conv.indexOf('p:') === 0 || !!ev.parent_id;
+  const addressed = (p.mentions || []).includes(me) || ev.conv.indexOf('w:') === 0 || ev.conv.indexOf('p:') === 0 || ev.conv.indexOf('d:') === 0 || !!ev.parent_id;
   if (!addressed) return;
   _cvNotified.add(ev.id);
   const title = (p.author_name || 'Someone') + (ev.parent_id ? ' replied in ' : ' in ') + _cvFindName(ev.conv);
@@ -72559,12 +75287,13 @@ function _drawRtAfterDiskReload(text, etag) {
 // the kind of thing, active work, where you are, and what you open often.
 // Archived and discarded things stay out until "Show archived" is on.
 const _cmdk = { q: '', sel: 0, rows: [], lists: null, listsAt: 0, failed: [], server: [], serverMeta: null, seq: 0, timer: 0,
-  more: false, hidden: false, moved: false, selKey: '', hiddenLocal: 0 };
+  more: false, hidden: false, moved: false, selKey: '', hiddenLocal: 0, open: {}, openToken: '' };
 const _CMDK_SHOW = 8;
 const _CMDK_USAGE_KEY = 'amux-cmdk-usage';
 const _CMDK_KIND = {
   worker: 'Worker', group: 'Group', card: 'Card', schedule: 'Schedule', view: 'Tab',
   action: 'Action', pin: 'Pin', secret: 'Vault', payment: 'Vault', connector: 'Connector', skill: 'Skill',
+  file: 'File',
 };
 // Families weighted so a worker or group outranks a card that matched as
 // well: an open card fresh today reaches 60 + 80 + 60 (+60 for a prefix) on
@@ -72748,7 +75477,8 @@ function _cmdkStartRows() {
     if (recent.length >= 5) break;
     const kind = k.split(':')[0], id = k.slice(kind.length + 1);
     if (kind === 'action') continue;
-    const it = byKey.get(k) || ((kind === 'card' || kind === 'schedule') ? { kind, id, title: e[2] || id, sub: id } : null);
+    const it = byKey.get(k) || ((kind === 'card' || kind === 'schedule') ? { kind, id, title: e[2] || id, sub: id }
+      : kind === 'file' ? { kind, id, title: e[2] || id.replace(/^.*\//, ''), sub: id.replace(/\/[^/]*$/, '').replace(/^\/Users\/[^/]+/, '~') } : null);
     if (it && !it.archived) recent.push({ ...it, section: 'Recent' });
   }
   const seen = new Set(recent.map(_cmdkKey));
@@ -72776,11 +75506,17 @@ function _cmdkCompute() {
       scored.push([{ ...it, tier: m.tier, match: m.match,
         snippet: m.match === 'body' ? _cmdkSnippet(String(it.body), toks) : '' }, m.tier * 10000 + _cmdkBoost(it, m, u)]);
     }
+    // A file you pinned shows once, as the pin.
+    const pinned = new Set(scored.filter(([it]) => it.kind === 'pin' && it.body).map(([it]) => it.body));
     for (const h of (_cmdk.server || [])) {
+      if (h.kind === 'file' && pinned.has(h.id)) continue;
       // An older server answers without tier/boost: read the tier off its score.
       const tier = h.tier || (h.score >= 1000 ? 5 : h.score >= 200 ? 4 : 3);
-      const it = { kind: h.kind, id: h.id, title: h.title, status: h.status, session: h.session, archived: h.archived,
-        sub: [h.id, h.status, h.session].filter(Boolean).join(' · ') + (h.archived ? ' · archived' : ''),
+      // A file's sub line is its folder; its status is the visit count.
+      const sub = h.kind === 'file' ? String(h.id).replace(/\/[^/]*$/, '').replace(/^\/Users\/[^/]+/, '~')
+        : [h.id, h.status, h.session].filter(Boolean).join(' · ') + (h.archived ? ' · archived' : '');
+      const it = { kind: h.kind, id: h.id, title: h.title, status: h.kind === 'file' ? '' : h.status, session: h.session, archived: h.archived,
+        sub,
         tier, match: h.match || '', snippet: h.snippet || '' };
       scored.push([it, tier * 10000 + (h.boost || 0) + _cmdkContext(it) + _cmdkFrecency(u, it)]);
     }
@@ -72805,6 +75541,31 @@ function _cmdkCompute() {
   if (_cmdk.sel >= rows.length) _cmdk.sel = Math.max(0, rows.length - 1);
 }
 
+// Which workers and tabs are already open, by place ("peek=<worker>",
+// "view=<tab>"): 'here' for the one on this page, 'elsewhere' for another tab
+// or pane of the Mac app, which says so when asked (owner, 2026-11-07: "for
+// each worker in the list if its already open it says it"). Choosing one goes
+// to it rather than opening it again (_cmdkRun).
+function _cmdkPlace(r) {
+  return r.kind === 'worker' ? 'peek=' + r.id : r.kind === 'view' && r.id !== 'sessions' ? 'view=' + _viewHashName(r.id) : '';
+}
+function _cmdkAskOpen() {
+  const open = {};
+  if (peekSession && document.getElementById('peek-overlay')?.classList.contains('active')) open['peek=' + peekSession] = 'here';
+  else if (typeof activeView !== 'undefined' && activeView && activeView !== 'sessions') open['view=' + _viewHashName(activeView)] = 'here';
+  _cmdk.open = open;
+  const h = _nativePaneBridge();
+  if (!h) return;
+  _cmdk.openToken = Math.random().toString(36).slice(2, 10);
+  try { h.postMessage({ op: 'places', token: _cmdk.openToken }); } catch (e) { console.warn('[amux] palette could not ask which places are open', e); }
+}
+function _cmdkPlacesAck(token, places) {
+  if (token !== _cmdk.openToken || !Array.isArray(places)) return;
+  places.forEach(p => { if (typeof p === 'string' && !_cmdk.open[p]) _cmdk.open[p] = 'elsewhere'; });
+  if (typeof amuxTrack === 'function') amuxTrack('palette_open_places', { n: places.length, measured: true, n_considered: places.length });
+  if (document.getElementById('cmdk-overlay')?.classList.contains('active')) _cmdkRender();
+}
+
 function _cmdkRowHtml(r, i, toks, q) {
   const meta = r.kind === 'more' || r.kind === 'hidden';
   const head = '<div class="cmdk-row' + (i === _cmdk.sel ? ' sel' : '') + (meta ? ' cmdk-meta' : '') + '" role="option" aria-selected="' + (i === _cmdk.sel) + '" data-i="' + i + '"'
@@ -72813,8 +75574,11 @@ function _cmdkRowHtml(r, i, toks, q) {
   const fz = r.match === 'fuzzy' ? q : '';
   const sub = r.snippet ? '<span class="cmdk-sub cmdk-snippet">' + _cmdkMark(r.snippet, toks, '') + '</span>'
     : r.sub ? '<span class="cmdk-sub">' + _cmdkMark(r.sub, fz ? [] : toks, '') + '</span>' : '';
+  const open = _cmdk.open[_cmdkPlace(r)];
+  const badge = open ? '<span class="status-badge background cmdk-open" title="' + (open === 'here' ? 'Showing on this page' : 'Open in another tab or pane: choosing it goes there') + '">'
+    + (open === 'here' ? 'Open here' : 'Open') + '</span>' : '';
   return head + '<span class="cmdk-kind">' + esc(_CMDK_KIND[r.kind] || r.kind) + '</span>'
-    + '<span class="cmdk-text"><span class="cmdk-title">' + _cmdkMark(r.title, toks, fz) + '</span>' + sub + '</span></div>';
+    + '<span class="cmdk-text"><span class="cmdk-title">' + _cmdkMark(r.title, toks, fz) + '</span>' + sub + '</span>' + badge + '</div>';
 }
 
 function _cmdkRender() {
@@ -72858,10 +75622,18 @@ function _cmdkToggleHidden() {
   document.getElementById('cmdk-input')?.focus();
 }
 
-function _cmdkQueryServer() {
+// A stale answer came from the previous index while the server rebuilds it
+// behind the reply, so a card made a moment ago is missing until the next
+// keystroke. Ask again, a few times, until an answer comes from an index
+// built after the first stale one. "stale" alone is not the stop: on a busy
+// board the fingerprint moves during every 1-2 s rebuild, so even a 70 ms old
+// index reads stale (live, 2026-10-31), and any index built after the first
+// stale answer already holds what was made before the search.
+const CMDK_STALE_RETRIES = 6;
+function _cmdkQueryServer(retry = 0, firstStaleAt = 0) {
   clearTimeout(_cmdk.timer);
   const q = _cmdk.q.trim();
-  const seq = ++_cmdk.seq;
+  const seq = retry ? _cmdk.seq : ++_cmdk.seq;
   if (!q) { _cmdk.server = []; _cmdk.serverMeta = null; return; }
   _cmdk.timer = setTimeout(async () => {
     try {
@@ -72870,12 +75642,14 @@ function _cmdkQueryServer() {
       if (seq !== _cmdk.seq) return;
       _cmdk.server = r.ok ? (d.hits || []) : [];
       _cmdk.serverMeta = r.ok ? d : { measured: false };
+      const rebuiltSince = firstStaleAt && typeof d.index_age_ms === 'number' && d.index_age_ms < Date.now() - firstStaleAt;
+      if (r.ok && d.stale && !rebuiltSince && retry < CMDK_STALE_RETRIES) { _cmdkRender(); _cmdkQueryServer(retry + 1, firstStaleAt || Date.now()); return; }
     } catch (e) {
       if (seq !== _cmdk.seq) return;
       _cmdk.server = []; _cmdk.serverMeta = { measured: false };
     }
     _cmdkRender();
-  }, 90);
+  }, retry ? 500 : 90);
 }
 
 function openCmdk() {
@@ -72903,6 +75677,7 @@ function openCmdk() {
   const inp = document.getElementById('cmdk-input');
   inp.value = _cmdk.q = ''; _cmdk.sel = 0; _cmdk.server = []; _cmdk.serverMeta = null;
   _cmdk.moved = false; _cmdk.more = false; _cmdk.selKey = '';
+  _cmdkAskOpen();
   _cmdkRender();
   inp.focus();
   _cmdkLoadLists().then(() => { if (ov.classList.contains('active')) _cmdkRender(); });
@@ -72944,7 +75719,7 @@ function _cmdkRun(i) {
   // and select something for which a tab is already open it goes to that
   // tab"). The app answers within a moment; with no answer (an older app) or
   // no such tab, it opens here as before.
-  const place = r.kind === 'worker' ? '#peek=' + r.id : r.kind === 'view' && r.id !== 'sessions' ? '#view=' + _viewHashName(r.id) : '';
+  const place = _cmdkPlace(r) ? '#' + _cmdkPlace(r) : '';
   if (place && _cmdkFocusElsewhere(place, () => _cmdkOpen(r))) return;
   _cmdkOpen(r);
 }
@@ -72981,6 +75756,7 @@ function _cmdkOpen(r) {
       break;
     case 'card': openBoardDetail(r.id); break;
     case 'schedule': switchView('scheduler'); _cmdkOpenSchedule(r.id, 0); break;
+    case 'file': openFilePreview(r.id); break;
     case 'pin':
       // The Mac app opens pins as its own floating panels.
       if (typeof _nativeTabs !== 'undefined' && _nativeTabs) location.href = 'amux://pin/' + r.id;
@@ -73041,6 +75817,7 @@ const _HK_BUILTIN = [
 const _HK_DEFAULTS = [
   { id: 'hk-dictate-text', action: 'dictate', type: 'text', trigger: '##', enabled: true, remove: true, indicator: false },
   { id: 'hk-dictate-keys', action: 'dictate', type: 'keys', trigger: 'Alt+Shift+M', enabled: true, remove: true, indicator: false },
+  { id: 'hk-dictate-globe', action: 'dictate', type: 'keys', trigger: 'Globe Globe', enabled: true, remove: true, indicator: false },
   { id: 'hk-new-task', action: 'new_task', type: 'keys', trigger: 'Alt+Shift+N', enabled: true, remove: true, indicator: false },
   { id: 'hk-new-task-text', action: 'new_task', type: 'text', trigger: '!!', enabled: false, remove: true, indicator: true },
   { id: 'hk-draw', action: 'open_draw', type: 'keys', trigger: 'Alt+Shift+D', enabled: true, remove: true, indicator: false },
@@ -73108,7 +75885,7 @@ function _hkComboFromEvent(e) {
 }
 function _hkKeyChips(combo) {
   const glyph = { Mod: _HK_IS_MAC ? '⌘' : 'Ctrl', Ctrl: _HK_IS_MAC ? '⌃' : 'Ctrl', Alt: _HK_IS_MAC ? '⌥' : 'Alt', Shift: '⇧', Enter: '↵', Space: 'Space', Globe: '🌐' };
-  return '<span class="hk-keys">' + String(combo || '').split('+').filter(Boolean)
+  return '<span class="hk-keys">' + String(combo || '').split(/[+ ]/).filter(Boolean)
     .map(k => '<kbd class="hk-kbd">' + esc(glyph[k] || k) + '</kbd>').join('') + '</span>';
 }
 function _hkTriggerHtml(h) {
@@ -73124,7 +75901,7 @@ function _hkConflict(h, list) {
   } else {
     const parts = t.split('+');
     // 🌐 works alone or with a key (the Mac app hands it over: _hkNativeKey).
-    if (t !== 'Globe' && (parts.length < 2 || !parts.some(p => p === 'Mod' || p === 'Ctrl' || p === 'Alt' || p === 'Globe')))
+    if (t !== 'Globe' && t !== 'Globe Globe' && (parts.length < 2 || !parts.some(p => p === 'Mod' || p === 'Ctrl' || p === 'Alt' || p === 'Globe')))
       return 'A shortcut needs ⌘, ⌥, ⌃ or 🌐 (⇧ alone is how capitals are typed)';
     const b = _HK_BUILTIN.find(x => x.combo === t);
     if (b) return 'amux already uses this for ' + b.label;
@@ -73144,7 +75921,9 @@ function _hkTextField(el) {
 function _hkRun(h, el) {
   const a = _HK_ACTIONS[h.action];
   try {
-    if (h.action === 'dictate') _hkDictate(el && document.contains(el) ? el : null);
+    // The same hotkey finishes a take it started, like the popup's Done.
+    if (h.action === 'dictate' && _dictRecording) _dictStopRec();
+    else if (h.action === 'dictate') _hkDictate(el && document.contains(el) ? el : null);
     else if (h.action === 'new_task') {
       const text = el && el.value ? el.value.trim() : '';
       openBoardAdd();
@@ -73217,14 +75996,22 @@ document.addEventListener('keydown', e => {
 // THE GLOBE KEY (owner, 2026-10-29: "i want to use the globe button on my
 // keyboard as a hotkey too"). A page never sees 🌐: macOS keeps it from the
 // browser. The Mac app watches it and calls this with "Globe" (pressed and
-// released alone) or "Globe+R" (held with a key). A recording takes it like
-// any combination; otherwise the hotkey bound to it runs.
-window._hkNativeKey = function (combo) {
+// released alone), "Globe Globe" (tapped twice) or "Globe+R" (held with a
+// key). A recording takes it like any combination; otherwise the hotkey bound
+// to it runs. `info.mac_dictation` is true when macOS also starts its own
+// dictation on 🌐🌐, which the owner is told once.
+let _hkMacDictWarned = false;
+window._hkNativeKey = function (combo, info) {
   combo = String(combo || '');
-  if (!/^Globe(\+[A-Z0-9]|\+Space)?$/.test(combo)) return 'not_globe';
+  if (!/^Globe( Globe|\+[A-Z0-9]|\+Space)?$/.test(combo)) return 'not_globe';
   if (_hkRecording && _hkRecordTake) { _hkRecordTake(combo); return 'recorded'; }
   const h = _hkList.find(x => !x.deleted && x.enabled && x.type === 'keys' && x.trigger === combo);
   if (!h) { _hkBeacon('hotkey_globe_unbound', { trigger: combo }); return 'unbound'; }
+  if (combo === 'Globe Globe' && info && info.mac_dictation && !_hkMacDictWarned) {
+    _hkMacDictWarned = true;
+    showToast('macOS also starts its own dictation on 🌐🌐. To leave it to amux: System Settings → Keyboard → "Press 🌐 key to" → Do Nothing.');
+    _hkBeacon('hotkey_globe_double_mac_dictation_on', { trigger: combo });
+  }
   _hkRun(h, _hkTextField(document.activeElement) ? document.activeElement : null);
   return 'ran';
 };

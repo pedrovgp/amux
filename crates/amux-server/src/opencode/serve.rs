@@ -476,9 +476,34 @@ impl ServeClient {
     /// Create a session scoped to `cwd`, pinned to `model` when one is given.
     /// Returns the `ses_…` id — persist it as the conversation ref.
     pub async fn create_session(&self, cwd: &Path, model: Option<&str>) -> Result<String> {
+        self.create_session_with_permissions(cwd, model, None).await
+    }
+
+    /// Create a session that also carries a **permission ruleset** (M9).
+    ///
+    /// MEASURED 2026-11-03 on 2.2.4: `POST /api/session` accepts
+    /// `permissions: [{action, resource, effect}]` where effect is
+    /// `allow|deny|ask`, and an `ask` rule is what makes a tool call produce a
+    /// permission request at all. Without it opencode auto-approves, so a
+    /// boundary policy has nothing to answer — which is why boundary
+    /// enforcement for opencode workers was inert before this.
+    ///
+    /// The action vocabulary is opencode's, not ours: `shell` (not "bash"),
+    /// `edit` (covers write), `external_directory` (a path outside the
+    /// workspace). `resource: "*"` applies the effect to every target; the
+    /// decision is amux's policy, per call, with the reason logged.
+    pub async fn create_session_with_permissions(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+        permissions: Option<&Value>,
+    ) -> Result<String> {
         let mut body = json!({"location": {"directory": cwd.to_string_lossy()}});
         if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
             body["model"] = model_ref(model);
+        }
+        if let Some(p) = permissions.filter(|p| p.as_array().is_some_and(|a| !a.is_empty())) {
+            body["permissions"] = p.clone();
         }
         let v = self
             .send_json(reqwest::Method::POST, "/api/session", Some(body))
@@ -573,6 +598,62 @@ impl ServeClient {
             Ok(())
         } else {
             Err(serve_failure("POST", &endpoint, status, &text))
+        }
+    }
+
+    /// Give THIS session its own instructions — the per-worker scoped context,
+    /// on a server whose config was loaded before the worker existed.
+    ///
+    /// Why this endpoint exists at all: `OPENCODE_CONFIG_CONTENT` is a
+    /// per-PROCESS launch env, and the shared `opencode serve --service` read
+    /// its config long before this worker was created (measured 2026-10-16 —
+    /// that is why TUI lanes are forced onto `--standalone`). A shared serve
+    /// is exactly what decision D1 wants, so the context has to travel with
+    /// the SESSION instead of the process.
+    ///
+    /// MEASURED on the live shared server, opencode 2.2.5, 2026-11-08:
+    /// `PUT /api/experimental/session/{id}/instructions/entries/{key}` with
+    /// `{"value": "<text>"}` answers **204** (empty body, so this path checks
+    /// the status like [`ServeClient::reply_permission`]); `GET …/entries`
+    /// then answers `{"data":[{"key","value"}]}`; and the model ANSWERS FROM
+    /// IT — a session given only `ZUCCHINI-7731` replied with that word.
+    ///
+    /// Worth knowing: an entry is readable by anything holding this server's
+    /// password. Today that is every worker on this Mac, which can already read
+    /// `~/.amux/rules/`, so nothing new is exposed — it would matter if one
+    /// serve were ever shared across machines or users.
+    pub async fn set_session_instructions(
+        &self,
+        session_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        let endpoint =
+            format!("/api/experimental/session/{session_id}/instructions/entries/{key}");
+        let body = json!({"value": value});
+        let (status, text) = self
+            .request(reqwest::Method::PUT, &endpoint, Some(body))
+            .await?;
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(serve_failure("PUT", &endpoint, status, &text))
+        }
+    }
+
+    /// Drop one instruction entry. Used when a worker's scope is cleared: the
+    /// session (and its `ses_` ref) survives, the stale context does not.
+    pub async fn clear_session_instructions(&self, session_id: &str, key: &str) -> Result<()> {
+        let endpoint =
+            format!("/api/experimental/session/{session_id}/instructions/entries/{key}");
+        let (status, text) = self
+            .request(reqwest::Method::DELETE, &endpoint, None)
+            .await?;
+        // 404 = already absent, which is the state the caller asked for.
+        if (200..300).contains(&status) || status == 404 {
+            Ok(())
+        } else {
+            Err(serve_failure("DELETE", &endpoint, status, &text))
         }
     }
 
@@ -942,6 +1023,21 @@ impl ServeSession {
         model: Option<&str>,
         resume: Option<&str>,
     ) -> Result<(Self, Opened)> {
+        Self::open_with_permissions(client, cwd, model, resume, None).await
+    }
+
+    /// [`ServeSession::open`], plus the permission ruleset the session should be
+    /// created with (see [`ServeClient::create_session_with_permissions`]). A
+    /// resumed session keeps the ruleset it was created with — opencode has no
+    /// per-session ruleset update, so continuity of policy rides continuity of
+    /// the session.
+    pub async fn open_with_permissions(
+        client: ServeClient,
+        cwd: &Path,
+        model: Option<&str>,
+        resume: Option<&str>,
+        permissions: Option<&Value>,
+    ) -> Result<(Self, Opened)> {
         let mut out = Opened::default();
         if let Some(id) = resume.map(str::trim).filter(|s| !s.is_empty()) {
             match client.session_exists(id).await {
@@ -969,7 +1065,9 @@ impl ServeSession {
                 Err(e) => return Err(e),
             }
         }
-        let session_id = client.create_session(cwd, model).await?;
+        let session_id = client
+            .create_session_with_permissions(cwd, model, permissions)
+            .await?;
         tracing::info!(session = %session_id, cwd = %cwd.display(),
             resumed = out.resumed, "serve session created");
         out.session_id = session_id.clone();
@@ -993,6 +1091,22 @@ impl ServeSession {
     /// The durable history of this session (the reconciliation path).
     pub async fn messages(&self) -> Result<Value> {
         self.client.messages(&self.session_id).await
+    }
+
+    /// Give this session its own instructions (see
+    /// [`ServeClient::set_session_instructions`]) — how a worker keeps its
+    /// scoped context while sharing one server with the whole fleet.
+    pub async fn set_instructions(&self, key: &str, value: &str) -> Result<()> {
+        self.client
+            .set_session_instructions(&self.session_id, key, value)
+            .await
+    }
+
+    /// Drop this session's instruction entry (scope cleared).
+    pub async fn clear_instructions(&self, key: &str) -> Result<()> {
+        self.client
+            .clear_session_instructions(&self.session_id, key)
+            .await
     }
 
     /// Deliver `text` INSIDE this session's running turn — the case ACP
@@ -1150,6 +1264,31 @@ pub struct PermissionRequest {
 /// is exactly the failure mode this transport exists to avoid. The server's
 /// `message` text becomes [`PermissionAsk::title`], which is where ACP keeps
 /// its human title.
+/// The written content of an `edit` ask, out of `metadata.files[].patch`.
+///
+/// MEASURED 2026-11-03 on 2.2.4: the patch is a unified diff whose added lines
+/// are the text about to be written —
+/// `"@@ -0,0 +1,1 @@\n+TOP-SECRET\n"`. Joining every file's patch keeps a
+/// multi-file edit accountable file by file, and the `+`/context markers are
+/// left in: a rule that matches a secret matches it either way, and stripping
+/// markers would be a second parser to get wrong.
+fn edit_patch(row: &Value) -> Option<String> {
+    let files = row
+        .get("metadata")
+        .and_then(|m| m.get("files"))
+        .and_then(Value::as_array)?;
+    let mut out = String::new();
+    for f in files {
+        if let Some(p) = f.get("patch").and_then(Value::as_str) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(p);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 pub fn permission_requests(body: &Value) -> Vec<PermissionRequest> {
     let Some(rows) = body.get("data").and_then(Value::as_array) else {
         return Vec::new();
@@ -1172,6 +1311,20 @@ pub fn permission_requests(body: &Value) -> Vec<PermissionRequest> {
                 id,
                 session_id,
                 ask: PermissionAsk {
+                    // The INPUT the policy needs, extracted per measured action
+                    // (2026-11-03, real asks on 2.2.4):
+                    //  - `shell`  → `resources[0]` IS the command;
+                    //  - `edit`   → `metadata.files[].patch` IS the diff,
+                    //               written content included;
+                    //  - anything else → the paths in `locations` are the
+                    //               whole predicate.
+                    // This is what makes match_all/match_none/content_any
+                    // decidable instead of structurally impossible.
+                    input: match action.as_str() {
+                        "shell" => resources.first().cloned(),
+                        "edit" => edit_patch(row),
+                        _ => None,
+                    },
                     tool: action,
                     title: row
                         .get("message")
@@ -2353,6 +2506,63 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}"), seen)
+    }
+
+    /// The scoped context rides the SESSION: `PUT …/instructions/entries/{key}`
+    /// with a `{"value": text}` body, MEASURED on the live shared server
+    /// (opencode 2.2.5, 2026-11-08: 204, and a session given only
+    /// `ZUCCHINI-7731` replied with that word). A cleared scope DELETEs it, and
+    /// an entry that is already gone is not an error.
+    #[tokio::test]
+    async fn a_session_carries_its_own_instructions_and_clears_them() {
+        use axum::response::IntoResponse;
+        use serde_json::{json, Value};
+
+        let writes: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let writes = Arc::clone(&writes);
+            let app = axum::Router::new()
+                .route(
+                    "/api/experimental/session/{id}/instructions/entries/{key}",
+                    axum::routing::put(
+                        move |axum::extract::Path((id, key)): axum::extract::Path<(String, String)>,
+                              axum::Json(body): axum::Json<Value>| {
+                            let writes = Arc::clone(&writes);
+                            async move {
+                                writes.lock().unwrap().push((id, key, body));
+                                axum::http::StatusCode::NO_CONTENT.into_response()
+                            }
+                        },
+                    )
+                    .delete(|axum::extract::Path((_id, _key)): axum::extract::Path<(String, String)>| async {
+                        // 404 is the "already absent" answer an API may give.
+                        axum::http::StatusCode::NOT_FOUND.into_response()
+                    }),
+                )
+                .with_state(());
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+        }
+        let client = ServeClient::connect(format!("http://{addr}"), PW).unwrap();
+        client
+            .set_session_instructions("ses_x", "amux-scoped", "the owner's rules")
+            .await
+            .expect("204 is success");
+        {
+            let w = writes.lock().unwrap();
+            assert_eq!(w.len(), 1);
+            assert_eq!(w[0].0, "ses_x");
+            assert_eq!(w[0].1, "amux-scoped");
+            assert_eq!(w[0].2["value"], json!("the owner's rules"));
+        }
+        // Already absent is the state the caller asked for, not a failure.
+        client
+            .clear_session_instructions("ses_x", "amux-scoped")
+            .await
+            .expect("404 on DELETE means gone, which is what was wanted");
     }
 
     #[tokio::test]
@@ -3680,6 +3890,7 @@ mod tests {
                 title: None,
                 kind: Some("tool".into()),
                 locations: vec!["/tmp/ws/perm.txt".into()],
+                input: None,
                 // An ask that only ever offered "reject".
                 option_ids: vec!["reject".to_string()],
             },

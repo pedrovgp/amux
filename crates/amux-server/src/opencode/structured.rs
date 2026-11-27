@@ -324,6 +324,11 @@ pub trait ConversationSink: Send + Sync {
     fn forget(&self, worker: &WorkerId);
 }
 
+/// The instruction-entry key a serve session carries its scoped context
+/// under. ONE key, so a recomposition REPLACES the entry instead of
+/// accumulating one per launch.
+const SCOPED_CONTEXT_KEY: &str = "amux-scoped";
+
 /// Per-worker spawn configuration, registered once per worker.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -1142,11 +1147,39 @@ impl StructuredCliProtocol {
         let hub = self.serve_hub()?;
         let resume = shared.conversation.lock().unwrap().clone();
         let model = shared.effective_model_now();
-        let (session, opened) = serve::ServeSession::open(
+        // M9: a session is created with the permission ruleset that makes
+        // boundary enforcement possible at all. Without an `ask` rule opencode
+        // auto-approves and the policy never sees a call — measured 2026-11-03.
+        let permissions = boundary_policy::session_permission_ruleset();
+        let actions: Vec<&str> = permissions
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| r.get("action").and_then(|v| v.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if actions.is_empty() {
+            tracing::warn!(
+                worker = %shared.worker,
+                verdict = "boundary_ruleset_empty",
+                "no enabled boundary names a tool, so this session asks for nothing and \
+                 boundaries are NOT enforced for it",
+            );
+        } else {
+            tracing::info!(
+                worker = %shared.worker,
+                asks = ?actions,
+                verdict = "boundary_ruleset_applied",
+                "permission ruleset applied to the new session",
+            );
+        }
+        let (session, opened) = serve::ServeSession::open_with_permissions(
             client,
             &shared.config.cwd,
             model.as_deref(),
             resume.as_deref(),
+            Some(&permissions),
         )
         .await?;
         tracing::info!(
@@ -1163,6 +1196,20 @@ impl StructuredCliProtocol {
                 sink.forget(&shared.worker);
             }
         }
+        // THE WORKER'S SCOPED CONTEXT rides the SESSION: `OPENCODE_CONFIG_CONTENT`
+        // is a per-process launch env, so a shared serve — whose config was
+        // loaded before this worker existed — cannot receive it that way (the
+        // 2026-10-16 measurement that forced `--standalone` onto TUI lanes).
+        // opencode exposes per-session instruction entries and a live probe on
+        // 2.2.5 (2026-11-08) showed the model answering from one.
+        let isolation = crate::api::session_verbs::session_is_isolated(shared.worker.as_str());
+        deliver_scoped_context(
+            &session,
+            shared.worker.as_str(),
+            serve_scoped_context(shared.worker.as_str(), isolation),
+            opened.resumed,
+        )
+        .await;
         // Continuity, same shape as the ACP arm: the session id IS the ref.
         *shared.conversation.lock().unwrap() = Some(opened.session_id.clone());
         if let Some(sink) = &shared.sink {
@@ -1417,6 +1464,98 @@ fn serve_turn_timeout() -> std::time::Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or(acp::DEFAULT_TURN_TIMEOUT)
+}
+
+/// What a serve session should carry.
+///
+/// Split out from the composition so the ISOLATED branch is a pure answer: an
+/// isolated worker gets an EMPTY scope — no boundaries block, no roster, no
+/// Messages guide — which is the same contract the TUI path enforces by
+/// withholding `OPENCODE_CONFIG_CONTENT` (`rules_withheld_isolated`).
+fn serve_scoped_context(worker: &str, isolated: bool) -> ScopedContext {
+    if isolated {
+        return ScopedContext::Withheld;
+    }
+    let composed = crate::api::session_verbs::compose_worker_context(worker, false);
+    if composed.trim().is_empty() {
+        ScopedContext::Empty
+    } else {
+        ScopedContext::Text(composed)
+    }
+}
+
+/// The scope a serve session should carry, or the reason it carries none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScopedContext {
+    /// The worker's composed context, written to the session.
+    Text(String),
+    /// Nothing to deliver: the worker has no scope.
+    Empty,
+    /// An isolated worker: the contract says no injected prompts, so nothing is
+    /// written AND any earlier entry is removed.
+    Withheld,
+}
+
+/// Give one serve session its worker's scope, or clear it.
+///
+/// Split out so it is testable WITHOUT reading the real home: the caller
+/// composes (or withholds) the text, this decides what the session does with it.
+async fn deliver_scoped_context(
+    session: &serve::ServeSession,
+    worker: &str,
+    scope: ScopedContext,
+    resumed: bool,
+) {
+    let text = match &scope {
+        ScopedContext::Text(text) => Some(text.as_str()),
+        ScopedContext::Empty | ScopedContext::Withheld => None,
+    };
+    let (delivered, chars) = match text {
+        Some(text) if !text.trim().is_empty() => {
+            let chars = text.chars().count();
+            match session.set_instructions(SCOPED_CONTEXT_KEY, text).await {
+                Ok(()) => (true, chars),
+                Err(e) => {
+                    // Say so, and name the consequence: the worker runs with the
+                    // model's own defaults, not the owner's rules.
+                    tracing::warn!(worker, measured = true, n_considered = chars, error = %e,
+                        verdict = "opencode_scoped_context_not_delivered",
+                        "the shared serve would not take this session's scoped context; \
+                         the worker runs without its rules");
+                    (false, 0)
+                }
+            }
+        }
+        // Scope removed — or withheld from an isolated worker: drop the entry so
+        // a stale context cannot keep steering the model. The `ses_` ref and the
+        // session's history survive; only the guidance goes.
+        _ => match session.clear_instructions(SCOPED_CONTEXT_KEY).await {
+            Ok(()) => (false, 0),
+            Err(e) => {
+                tracing::warn!(worker, measured = true, n_considered = 0, error = %e,
+                    verdict = "opencode_scoped_context_clear_failed",
+                    "could not clear the session's scoped context");
+                (false, 0)
+            }
+        },
+    };
+    let verdict = match (&scope, delivered) {
+        (ScopedContext::Withheld, _) => "opencode_scoped_context_withheld_isolated",
+        (_, true) => "opencode_scoped_context_delivered",
+        _ => "opencode_scoped_context_absent",
+    };
+    tracing::info!(
+        worker,
+        session = session.session_id(),
+        resumed,
+        delivered,
+        chars,
+        isolated = matches!(scope, ScopedContext::Withheld),
+        measured = true,
+        n_considered = chars,
+        verdict,
+        "serve session scoped context"
+    );
 }
 
 /// Find a serve turn's END without inventing one.
@@ -1979,7 +2118,7 @@ impl AgentProtocol for StructuredCliProtocol {
     /// The override always wins over the registered model, and the log says
     /// which of the two happened, because "the model is still the old one" must
     /// be answerable from the log alone.
-    async fn set_model(&self, worker: &WorkerId, model: &str) -> Result<()> {
+    async fn set_model(&self, worker: &WorkerId, model: &str) -> Result<bool> {
         let model = model.trim();
         if model.is_empty() {
             return Err(ProtocolError::Rejected(
@@ -2002,7 +2141,7 @@ impl AgentProtocol for StructuredCliProtocol {
                 verdict = "model switched on the live session; subsequent turns use it",
                 "worker model switched"
             );
-            return Ok(());
+            return Ok(true);
         }
         if let Some(session) = acp_session {
             session.set_model(model).await?;
@@ -2014,7 +2153,7 @@ impl AgentProtocol for StructuredCliProtocol {
                 verdict = "model switched on the live session; subsequent turns use it",
                 "worker model switched"
             );
-            return Ok(());
+            return Ok(true);
         }
         tracing::info!(
             worker = %shared.worker,
@@ -2024,7 +2163,7 @@ impl AgentProtocol for StructuredCliProtocol {
             verdict = "no live session; the override applies when the next one is created",
             "worker model switched"
         );
-        Ok(())
+        Ok(false)
     }
 
     async fn resume(&self, worker: &WorkerId) -> Result<()> {
@@ -3623,10 +3762,14 @@ mod tests {
         proto.send_prompt(&w, prompt("m7-1")).await.expect("admit");
         let _ = collect_until_terminal(&mut rx, Duration::from_secs(20)).await;
 
-        proto
+        let live = proto
             .set_model(&w, "opencode-go/deepseek-v4.1-flash")
             .await
             .expect("a live session must accept a model switch");
+        assert!(
+            live,
+            "a switch that reached a live session must report live=true — the HTTP door              answers `live` from exactly this value"
+        );
 
         let seen = models.lock().unwrap().clone();
         assert_eq!(seen.len(), 1, "exactly one switch on the wire: {seen:?}");
@@ -3660,10 +3803,14 @@ mod tests {
                 conversation: None,
             },
         );
-        proto
+        let live = proto
             .set_model(&w, "opencode-go/deepseek-v4.1-flash")
             .await
             .expect("no session yet is not an error");
+        assert!(
+            !live,
+            "with no live session the switch is only RECORDED; reporting live=true here was              the bug this fixes"
+        );
 
         let mut rx = proto.events(&w);
         proto.send_prompt(&w, prompt("m7-2")).await.expect("admit");
@@ -3683,8 +3830,283 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // M8 — a restarted server: fail fast, then reconnect and RESUME
+    // ------------------------------------------------------------------
+
+    /// Spawn a dedicated `opencode serve` whose password and port are chosen
+    /// here, so a test can restart it on a DIFFERENT port without touching the
+    /// fleet's shared service. `OPENCODE_PASSWORD` is honoured (measured
+    /// 2026-10-30), which is why no startup log has to be parsed.
+    fn spawn_serve(port: u16, password: &str) -> std::process::Child {
+        std::process::Command::new("opencode")
+            .env("OPENCODE_PASSWORD", password)
+            .args(["serve", "--hostname", "127.0.0.1", "--port", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a dedicated opencode serve")
+    }
+
+    async fn wait_until_listening(port: u16) {
+        for _ in 0..60 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        panic!("dedicated serve on :{port} never started listening");
+    }
+
+    /// Point the registry opencode would write at OUR server. This is the same
+    /// file the production path reads, so the test exercises discovery — not a
+    /// pinned client, which could never notice the endpoint moving.
+    fn write_registry(path: &std::path::Path, port: u16, password: &str) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"id":"test","version":"test","url":"http://127.0.0.1:{port}","pid":0,"password":"{password}"}}"#
+            ),
+        )
+        .expect("write the registry the discovery path reads");
+    }
+
+    /// The one behaviour never run live before this test: the server the worker
+    /// is talking to RESTARTS mid-turn. Two things must be true, and only one of
+    /// them is obvious:
+    ///
+    /// 1. the turn must END — fast, with a retryable failure. Polling a dead
+    ///    endpoint until the 30-minute turn timeout would report "turn exceeded
+    ///    30m", which blames the model for a dead process;
+    /// 2. the NEXT turn must work, on the SAME `ses_`. The cached session is
+    ///    bound to the old endpoint, so this is the reopen-by-ref path: refs are
+    ///    portable between serve instances (measured), so continuity survives a
+    ///    restart instead of forking the conversation.
+    ///
+    /// Caller sets `AMUX_OPENCODE_SERVICE_STATE` (the registry to own) and
+    /// `AMUX_SMOKE_MODEL` (a paid model; the fleet default's free quota runs
+    /// out). `#[ignore]`d because it spawns processes and spends tokens.
+    #[tokio::test]
+    #[ignore = "live: spawns and restarts a dedicated `opencode serve`"]
+    async fn a_serve_turn_fails_fast_then_resumes_after_the_server_restarts() {
+        let (Ok(state), Ok(model)) = (
+            std::env::var("AMUX_OPENCODE_SERVICE_STATE"),
+            std::env::var("AMUX_SMOKE_MODEL"),
+        ) else {
+            eprintln!(
+                "RESTART SMOKE NOT RUN: set AMUX_OPENCODE_SERVICE_STATE and AMUX_SMOKE_MODEL"
+            );
+            return;
+        };
+        let state = std::path::PathBuf::from(state);
+        let (port1, port2) = (49_971u16, 49_972u16);
+        let (pw1, pw2) = (
+            "restart-smoke-pw-one-0123456789abcdefg",
+            "restart-smoke-pw-two-0123456789abcdefg",
+        );
+
+        let mut first = spawn_serve(port1, pw1);
+        wait_until_listening(port1).await;
+        write_registry(&state, port1, pw1);
+
+        // NO transport pin, NO pinned client: an un-pinned worker discovers the
+        // registry, which is exactly the production shape.
+        let proto = StructuredCliProtocol::new();
+        let w = worker_id("RS001");
+        proto.register(
+            w.clone(),
+            WorkerConfig {
+                provider: CliProvider::OpenCode,
+                cwd: std::env::temp_dir(),
+                binary: None,
+                model: Some(model),
+                conversation: None,
+            },
+        );
+        let mut rx = proto.events(&w);
+
+        // Long enough to still be running when the restart lands.
+        proto
+            .send_prompt(
+                &w,
+                Prompt {
+                    text: "Write a 1200-word essay about tides into essay.txt. Do not stop early."
+                        .to_string(),
+                    idempotency_key: "restart-smoke-1".to_string(),
+                },
+            )
+            .await
+            .expect("admit the long turn");
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        // --- the restart: kill it, bring one up on a DIFFERENT port, rewrite the
+        // registry the way opencode would.
+        first.kill().ok();
+        let _ = first.wait();
+        let mut second = spawn_serve(port2, pw2);
+        wait_until_listening(port2).await;
+        write_registry(&state, port2, pw2);
+        let restarted_at = std::time::Instant::now();
+        eprintln!("smoke: server restarted on :{port2} (was :{port1})");
+
+        // 1. The turn must END quickly. 90s is generous for 3 strikes at a 1s
+        // poll; the failure this guards against takes 30 MINUTES.
+        let evs = collect_until_terminal(&mut rx, Duration::from_secs(90)).await;
+        let took = restarted_at.elapsed();
+        let kinds: Vec<_> = evs.iter().map(kind).collect();
+        let outcome = evs.iter().find_map(|e| match e {
+            WorkerEvent::TurnCompleted(t) => Some(t.outcome.clone()),
+            _ => None,
+        });
+        eprintln!("smoke: turn ended after {:.1}s, outcome = {outcome:?}", took.as_secs_f64());
+        eprintln!("smoke: events = {kinds:?}");
+        assert!(
+            outcome.is_some(),
+            "the turn must CLOSE after the server vanished, not hang: {kinds:?}"
+        );
+        assert!(
+            took < Duration::from_secs(90),
+            "the turn must fail fast on a dead endpoint, took {took:?}"
+        );
+        let settled = wait_for_state(&proto, &w, |s| *s == AgentState::Idle).await;
+        assert_eq!(settled, AgentState::Idle, "{kinds:?}");
+
+        // 2. The NEXT turn works, on the SAME conversation.
+        proto
+            .send_prompt(
+                &w,
+                Prompt {
+                    text: "Reply with exactly: RESUMED-OK".to_string(),
+                    idempotency_key: "restart-smoke-2".to_string(),
+                },
+            )
+            .await
+            .expect("the recovered worker must admit a new turn");
+        let evs2 = collect_until_terminal(&mut rx, Duration::from_secs(120)).await;
+        let kinds2: Vec<_> = evs2.iter().map(kind).collect();
+        let outcome2 = evs2.iter().find_map(|e| match e {
+            WorkerEvent::TurnCompleted(t) => Some(t.outcome.clone()),
+            _ => None,
+        });
+        eprintln!("smoke: post-restart outcome = {outcome2:?}");
+        assert_eq!(
+            outcome2.as_deref(),
+            Some("succeeded"),
+            "the turn after the restart must succeed: {kinds2:?}"
+        );
+
+        let shared = proto.shared(&w).expect("registered worker");
+        let session = shared.conversation.lock().unwrap().clone();
+        let session = session.expect("a session ref must exist after the restart");
+        assert!(session.starts_with("ses_"), "{session}");
+        eprintln!("smoke: RESUMED on {session}");
+
+        second.kill().ok();
+        let _ = second.wait();
+        let _ = std::fs::remove_file(&state);
+        eprintln!(
+            "LIVE SMOKE VERDICT: restart recovery proven — failed fast, then resumed the same session"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // M6 — boundaries.toml answers a serve permission ask
     // ------------------------------------------------------------------
+
+    /// A serve worker keeps its own scoped context on a SHARED server: the
+    /// entry is written to the session, an emptied scope removes it, and an
+    /// ISOLATED worker gets none — the same contract the TUI path enforces by
+    /// withholding `OPENCODE_CONFIG_CONTENT` (`rules_withheld_isolated`).
+    ///
+    /// This is the piece that makes one `opencode serve` usable by the whole
+    /// fleet; without it a worker on the shared server runs on the model's
+    /// defaults, and an isolated worker would receive the fleet's context.
+    #[tokio::test]
+    async fn a_serve_session_carries_the_workers_scoped_context() {
+        use axum::response::IntoResponse;
+        use serde_json::{json, Value};
+
+        const PW: &str = "test-password-43-chars-test-password-43";
+        let puts: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let deletes: Arc<std::sync::atomic::AtomicU32> =
+            Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let puts = Arc::clone(&puts);
+            let deletes = Arc::clone(&deletes);
+            let app = axum::Router::new()
+                .route(
+                    "/api/session",
+                    axum::routing::post(|| async {
+                        axum::Json(json!({"data": {"id": "ses_scoped"}})).into_response()
+                    }),
+                )
+                .route(
+                    "/api/experimental/session/{id}/instructions/entries/{key}",
+                    axum::routing::put(
+                        move |axum::extract::Path((id, key)): axum::extract::Path<(String, String)>,
+                              axum::Json(body): axum::Json<Value>| {
+                            let puts = Arc::clone(&puts);
+                            async move {
+                                puts.lock().unwrap().push((format!("{id}/{key}"), body));
+                                axum::http::StatusCode::NO_CONTENT.into_response()
+                            }
+                        },
+                    )
+                    .delete(move || {
+                        let deletes = Arc::clone(&deletes);
+                        async move {
+                            deletes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            axum::http::StatusCode::NO_CONTENT.into_response()
+                        }
+                    }),
+                )
+                .with_state(());
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+        }
+
+        let client = serve::ServeClient::connect(format!("http://{addr}"), PW).unwrap();
+        let (session, _) = serve::ServeSession::open(client, std::path::Path::new("/tmp"), None, None)
+            .await
+            .unwrap();
+
+        let rules = ScopedContext::Text("# the owner's rules\n".to_string());
+        deliver_scoped_context(&session, "wrk_test", rules, false).await;
+        {
+            let p = puts.lock().unwrap();
+            assert_eq!(p.len(), 1, "one entry, not one per launch: {p:?}");
+            assert_eq!(p[0].0, "ses_scoped/amux-scoped");
+            assert_eq!(p[0].1["value"], json!("# the owner's rules\n"));
+        }
+
+        // Scope removed: the entry is deleted, and the session (its `ses_` ref
+        // and history) is untouched.
+        deliver_scoped_context(&session, "wrk_test", ScopedContext::Empty, false).await;
+        assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(puts.lock().unwrap().len(), 1, "nothing re-PUT for an empty scope");
+
+        // An ISOLATED worker: no injected prompts, so no entry — and any earlier
+        // one is removed. This is the blocker the review found: the serve path
+        // must ask the isolation question the TUI path asks.
+        deliver_scoped_context(&session, "wrk_test", ScopedContext::Withheld, false).await;
+        assert_eq!(
+            puts.lock().unwrap().len(),
+            1,
+            "an isolated worker must never receive the fleet's context"
+        );
+        assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The isolation decision itself is PURE: an isolated worker's scope is
+    /// withheld without touching the real home, so this test means the same
+    /// thing on every machine.
+    #[test]
+    fn an_isolated_worker_gets_no_serve_scope() {
+        assert_eq!(serve_scoped_context("wrk_isolated", true), ScopedContext::Withheld);
+    }
 
     /// The chain M6 exists for, end to end over the WIRE: a running serve turn
     /// polls its permission asks, the pinned policy consults `boundaries.toml`,

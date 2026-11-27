@@ -322,3 +322,40 @@ grep -a 'steering_own_stale_draft_cleared\|idle_stop_skipped_pending' ~/.amux/lo
   which were not touched.
 - The two stuck `steering_queue` rows were gone at the final read-only check
   (cleared by another worker), so the immediate incident is resolved.
+
+## Merge `origin/main` into `feat/telegram-gateway` (2026-11-27)
+
+- Owner asked to pull `origin/main` into `main`, merge `main` into `feat/`, and
+  show the conflict plan first. Plan shown; owner then said to wait for the
+  peer and sync once it was done.
+- **Peer check:** the shared checkout still had `UU` in `amux.py`/`bot.py` and
+  `AA` in `activeContext.md`, all dated 2026-11-26 15:07 -03, with no
+  MERGE_HEAD/rebase state. Its workers no longer exist (`amux peek` → worker
+  not found). The conflict markers showed the abandoned cherry-pick was
+  `f8cf229ad` — a commit already an ancestor of the feat tip — and the `HEAD`
+  side was the newer, fuller version in all three files. Evidence preserved at
+  `/tmp/opencode/peer-conflict-evidence/2026-11-26T15-07/` before restoring the
+  three files to `HEAD`. No peer work was discarded.
+- `amux sync-checkout` then advanced the shared checkout `d5fcfb26f →
+  b404df409`; `main` was already current at `3b5918368` (= `origin/main`).
+- Merge executed in a clean detached worktree at `origin/feat/telegram-gateway`,
+  `git merge --no-edit origin/main`. Exactly the 6 predicted files conflicted
+  (40 hunks). All 6 were resolved to the `origin/main` version by
+  `git checkout origin/main -- <paths>`: the feat versions are the pre-#408
+  implementation of the opencode provider, which main upstreamed and then
+  improved (M9/M10/M11, `set_model -> Result<bool>`, kind-based boundary rules).
+  Verified: zero markers, zero unmerged, and `git diff --exit-code origin/main`
+  clean for all 6.
+- Anti-silent-drop checks on the merged tree: 59 gateway files present, 21
+  steering-fix references in `session_verbs.rs`, 2 in `pane_prompts.rs`,
+  `git diff --check` clean. `cargo check -p amux-server --lib` and
+  `cargo clippy -p amux-server --all-targets -- -D warnings` both passed;
+  gateway `pytest -q` → 422 passed. Full `amux-server --lib` suite via
+  `scripts/test-contended.sh` → exit 0 (`test receipt: test exit 0 retained`);
+  targeted modules: `opencode` 133 passed / 7 ignored, `session_verbs` 551
+  passed / 3 ignored, 0 failures in both.
+- **Deploy note:** `/health` still reports `commit=abfba334d` even though the
+  `gate` workflow passed for `3b5918368` (the `e2e` job failed, `checks` shards
+  passed). `/api/pull` reports `measured=false, repo=null, state=unmeasured`
+  and the builder timer/service are inactive — so this box cannot currently
+  explain or drive activation. Reported to the owner; not changed here.

@@ -1466,6 +1466,14 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/board-groom/staleness",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board-groom/{lane}",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/debug/send-profile",
         methods: &["GET"],
     },
@@ -1499,6 +1507,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/debug/needsyou-digest",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/scoreboard",
         methods: &["GET"],
     },
     RouteEntry {
@@ -2217,6 +2229,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/velocity/optimize",
+        methods: &["GET"],
+    },
+    RouteEntry {
         path: "/api/velocity/{worker}",
         methods: &["GET"],
     },
@@ -2304,6 +2320,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/email/approvals",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/email/approvals/{id}/attachments/{index}",
         methods: &["GET"],
     },
     // AMUX-3998: email_intel's routes, merged into email::routes() so they
@@ -2396,7 +2416,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/page-links/{id}",
-        methods: &["DELETE"],
+        methods: &["DELETE", "PATCH"],
     },
     RouteEntry {
         path: "/api/page-links/{id}/approve",
@@ -2736,6 +2756,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: ANY,
     },
     RouteEntry {
+        path: "/api/file/preview-image",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/archive",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/sqlite",
+        methods: ANY,
+    },
+    RouteEntry {
         path: "/api/file/transcode",
         methods: ANY,
     },
@@ -2983,6 +3015,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["POST"],
     },
     RouteEntry {
+        path: "/api/outcome/plan",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/tmux-sessions",
         methods: &["GET"],
     },
@@ -3022,6 +3058,11 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         path: "/api/sessions/{name}/task-history",
         methods: &["GET"],
     },
+    // -- retired worker names and the worker each became (session_verbs::session_renames)
+    RouteEntry {
+        path: "/api/session-renames",
+        methods: &["GET"],
+    },
     // -- a worker's plan window and limit-killed agents (agent_limit_resume::worker_quota)
     RouteEntry {
         path: "/api/sessions/{name}/quota",
@@ -3053,6 +3094,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/conversations/{conv}/typing", methods: &["POST"] },
     RouteEntry { path: "/api/conversations/posts/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/conversations/posts/{id}/reactions", methods: &["POST"] },
+    RouteEntry { path: "/api/conversations/posts/{id}/pin", methods: &["POST"] },
     RouteEntry { path: "/api/conversations/unfurl", methods: &["GET"] },
     RouteEntry { path: "/api/conversations/channels", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/conversations/channels/{name}", methods: &["PATCH"] },
@@ -3287,6 +3329,32 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         path: "/api/needs-input/auto/sweep",
         methods: &["POST"],
     },
+    // A named sender's interrupting instruction, which the worker has to answer.
+    RouteEntry {
+        path: "/api/sessions/{name}/directive",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/directives",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/directives/{id}/ack",
+        methods: &["POST"],
+    },
+    // Z15 daily decision digest.
+    RouteEntry {
+        path: "/api/decision-digest",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/decision-digest/veto",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/decision-digest/recommendation",
+        methods: &["PUT"],
+    },
     RouteEntry {
         path: "/api/connectors",
         methods: &["GET", "POST"],
@@ -3302,6 +3370,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/connectors/maintenance",
         methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/photos/mixpeek",
+        methods: &["GET", "POST", "DELETE"],
     },
     RouteEntry {
         path: "/api/connectors/{id}/credentials",
@@ -3749,7 +3821,19 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // route.callers_have_routes census read the TABLE and reported them unrouted.
     // Caught by tests/route_table.rs's completeness scan (both were named).
     RouteEntry {
+        path: "/api/history/pins",
+        methods: &["GET"],
+    },
+    RouteEntry {
         path: "/api/history/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/history/{id}/pin",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/history/{id}/reply",
         methods: &["GET"],
     },
     RouteEntry {

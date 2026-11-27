@@ -57,8 +57,20 @@ fn activation_ref() -> String {
 pub(crate) fn gate_state() -> Option<serde_json::Value> {
     let path = std::env::var("AMUX_ACTIVATION_GATE_STATE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| crate::api::session_verbs::home().join(".amux/activation-gate.json"));
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+        // home() is already ~/.amux (AF-1127). This joined ".amux/" onto it, so
+        // it read ~/.amux/.amux/activation-gate.json, which nothing writes, and
+        // the deploy invariant and Settings never saw a CI hold.
+        .unwrap_or_else(|_| crate::api::session_verbs::home().join("activation-gate.json"));
+    let state = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    if state.is_none() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(path = %path.display(), measured = false, n_considered = 0,
+                verdict = "activation_gate_unread",
+                "the activation gate's state could not be read; deploy lag cannot tell a CI hold from a stalled builder");
+        });
+    }
+    state
 }
 
 fn short(sha: &str) -> &str {
@@ -100,8 +112,8 @@ pub(crate) fn deploy_summary(
     ("held", format!("Server runs {}, the newest main commit that passed CI. main is {behind} commit(s) ahead; they deploy once they pass CI ({why}).", short(live)))
 }
 
-async fn deploy_status(dir: Option<&Path>) -> serde_json::Value {
-    let full = env!("AMUX_BUILD_COMMIT_FULL");
+pub(crate) async fn deploy_status(dir: Option<&Path>) -> serde_json::Value {
+    let full = crate::activation::served().full.as_str();
     let live = full.trim_end_matches("-dirty");
     let gate = gate_state();
     let mut tip: Option<String> = None;
@@ -273,6 +285,15 @@ async fn pull() -> Response {
         v["contribute"] = contribute;
     }
     (parts.status, Json(v)).into_response()
+}
+
+/// Commits in `from..to`, or None when git could not say.
+pub(crate) async fn commits_between(dir: &Path, from: &str, to: &str) -> Option<u64> {
+    let out = git(dir, &["rev-list", "--count", &format!("{from}..{to}")], GIT_TIMEOUT).await?;
+    if !out.status.success() {
+        return None;
+    }
+    out_of(&out).parse().ok()
 }
 
 async fn git(dir: &Path, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
@@ -667,6 +688,17 @@ mod deploy_summary_tests {
 
 #[cfg(test)]
 mod tests {
+    /// AF-1127: through the real default path, with nothing injected. The
+    /// builder writes $HOME/.amux/activation-gate.json and home() is $HOME/.amux.
+    #[test]
+    fn gate_state_reads_the_file_the_builder_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::write(dir.path().join("activation-gate.json"), r#"{"verdict":"ci_gate_held_back","target":"abc"}"#).unwrap();
+        let gate = gate_state().expect("the gate state is read from home()");
+        assert_eq!(gate["verdict"], "ci_gate_held_back");
+    }
+
     #[test]
     fn a_retired_package_install_is_pointed_at_the_installer() {
         for channel in ["brew", "pip"] {

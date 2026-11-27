@@ -68,6 +68,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/brex", "tokenized card issuance, webhook budget checks and credential health; disabled until configured (api/brex.rs)"),
     ("/api/_clear_sw", "service-worker cache reset landing page"),
     ("/api/audit", "one worker's browser verbs, tool calls and API calls as a timeline (api/audit.rs)"),
+    ("/api/board-groom", "stale board cards per lane, and the grooming turn a worker gets for its own (api/board_groom.rs)"),
     ("/api/social", "publish to social platforms and read each post's results at 24h, 72h and 7d (api/social.rs)"),
     ("/health", "health + build discriminator"),
     // The /api-prefixed alias for the same handler. Lanes guess this path
@@ -120,6 +121,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/task-history", "fleet-wide task list for the Tasks tab (api/sessions_legacy.rs task_list)"),
     ("/api/sessions", "python-SHAPE session list (rust-derived) + per-name verbs — peek/send/config/start/stop/… native over the fleet substrate (api/session_verbs.rs, AMUX-2598)"),
     ("/api/identity", "cloud user + auth-config introspection over server.env/.claude.json (mod.rs)"),
+    ("/api/session-renames", "old worker name -> the name it became, so a client holding the old name follows a rename (api/session_verbs.rs session_renames)"),
     ("/api/sessions-git", "bulk {session: {branch, repo}} map for the session cards — REUSES the session list's branch (one answer, not two) and adds repo, one rev-parse per DISTINCT dir, 30s TTL (api/sessions_git.rs, AMUX-2599)"),
     ("/api/offline-origin", "which origin can run a service worker — answers from the TLS dir we ACTUALLY serve, and gives no cert advice on a proxied origin (api/offline_origin.rs, AMUX-2599)"),
     ("/api/git", "POST /api/git/staged-guard — the shared-checkout staged-state guard the installed .git/hooks/amux-staged-guard calls on every commit. UNROUTED from the cutover until 2026-08-09 (405 x ~1,147/hr, swallowed by the hook's fail-open), so the guard was silently off fleet-wide (api/git_guard.rs, AMUX-1730)"),
@@ -174,6 +176,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/git-branches", "existing branches for the create modal's chip row (api/worker_create.rs)"),
     ("/api/worktree-profiles", "sparse worktree profiles from the repo's scripts/worktree.sh, for the create modal (api/worker_create.rs, AMUX-5341)"),
     ("/api/suggest-branch", "branch-name suggestions; deterministic with no goal text, helper CLI with one (api/worker_create.rs)"),
+    ("/api/outcome/plan", "name, directory and groups for a described outcome, from its text and attachments (api/outcome_plan.rs)"),
     ("/api/tmux-sessions", "tmux sessions amux does not already own, for Connect (api/worker_create.rs)"),
     ("/api/iterm2", "open iTerm2 panes, for Connect-a-pane (api/worker_create.rs)"),
     ("/api/saved-messages", "peek composer's reusable snippets, per worker (api/saved_messages.rs, AMUX-2871)"),

@@ -1,5 +1,6 @@
 import Cocoa
 import ServiceManagement
+import WebKit
 
 // The workspace: where every amux window lives and what it shows, kept across
 // quits, crashes, reboots and display changes.
@@ -447,6 +448,12 @@ extension AppDelegate {
         let want = config.openAtLogin ?? true
         let svc = SMAppService.mainApp
         guard Bundle.main.bundleURL.pathExtension == "app" else { return }
+        // Only the installed app opens at login. A test copy or an Amux Dev
+        // build registered itself, so a copy in a worktree could start at login.
+        if desktopTestMode || Bundle.main.bundleIdentifier != "com.amux.desktop" {
+            NSLog("amux-desktop: verdict=login_item_skipped reason=%@", desktopTestMode ? "test_copy" : "dev_build")
+            return
+        }
         do {
             if want, svc.status != .enabled { try svc.register() }
             if !want, svc.status == .enabled { try svc.unregister() }
@@ -488,6 +495,60 @@ enum Pointer {
     }
 }
 let desktopTestMode = ProcessInfo.processInfo.environment["AMUX_DESKTOP_TEST"] == "1"
+
+// A test copy stays out of the owner's way (owner, 2026-11-09: "when u do work
+// related to the amux mac app / ux you open up new amux apps and it disrupts my
+// experience"). It has no Dock icon or menu bar, never comes to the front,
+// posts no notifications, and its windows are invisible and let every click
+// through to whatever is under them. AMUX_DESKTOP_TEST_VISIBLE=1 shows them,
+// for a test that screenshots its own windows.
+let desktopTestQuiet = desktopTestMode && ProcessInfo.processInfo.environment["AMUX_DESKTOP_TEST_VISIBLE"] != "1"
+
+/// A test names a tab by its page's title. A page can add a count to it
+/// ("Messages216", its unread messages), which the test cannot know.
+func testTitleMatches(_ title: String?, _ want: String) -> Bool {
+    guard let t = title else { return false }
+    return t == want || (t.hasPrefix(want) && !t.dropFirst(want.count).isEmpty && t.dropFirst(want.count).allSatisfy(\.isNumber))
+}
+
+/// Brings amux to the front, unless this is a quiet test copy.
+func activateApp() {
+    if desktopTestQuiet { return }
+    NSApp.activate(ignoringOtherApps: true)
+}
+
+enum QuietTestCopy {
+    static func start() {
+        guard desktopTestQuiet else { return }
+        NSLog("amux-desktop: verdict=test_copy_quiet dock=0 windows=invisible")
+        NotificationCenter.default.addObserver(forName: NSApplication.didUpdateNotification, object: nil, queue: .main) { _ in hide() }
+        hide()
+    }
+    /// Every window, each pass of the event loop: windows are made in many places.
+    /// Floating too: a copy that never comes to the front would sit under the
+    /// owner's windows, and its own drag code finds the window under the
+    /// pointer from the window server. Invisible and click-through, it covers nothing.
+    static func hide() {
+        for w in NSApp.windows where w.alphaValue != 0 || !w.ignoresMouseEvents || w.level == .normal {
+            w.alphaValue = 0
+            w.ignoresMouseEvents = true
+            if w.level == .normal { w.level = .floating }
+        }
+    }
+    /// An invisible window reads as covered, and WebKit stops drawing and
+    /// throttles the page of a covered window. A test page has to keep running.
+    static func keepRendering(_ v: WKWebView) {
+        guard desktopTestQuiet else { return }
+        let sel = NSSelectorFromString("_setWindowOcclusionDetectionEnabled:")
+        // The setter itself, not KVC: KVC cannot find this name and throws,
+        // which aborted the window restore it was called from.
+        guard v.responds(to: sel), let imp = v.method(for: sel) else {
+            NSLog("amux-desktop: verdict=test_copy_occlusion_unavailable"); return
+        }
+        typealias SetBool = @convention(c) (AnyObject, Selector, Bool) -> Void
+        unsafeBitCast(imp, to: SetBool.self)(v, sel, false)
+    }
+}
 
 let gridColumns: CGFloat = 12
 let gridRows: CGFloat = 8
@@ -653,7 +714,7 @@ extension AppDelegate {
                     self.globeUsed = false
                 } else if self.globeDown {
                     self.globeDown = false
-                    if !self.globeUsed { self.sendGlobe("Globe") }
+                    if !self.globeUsed { self.globeTapped() }
                 }
                 return e
             }
@@ -673,11 +734,23 @@ extension AppDelegate {
         }
     }
 
+    /// A second tap within 0.45 s is "Globe Globe" (owner, 2026-11-03: "make
+    /// hot key for starting dictation pressing globe twice"). The first tap
+    /// still goes out at once as "Globe", so a single tap never waits.
+    func globeTapped() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastGlobeTap < 0.45 { lastGlobeTap = 0; sendGlobe("Globe Globe") }
+        else { lastGlobeTap = now; sendGlobe("Globe") }
+    }
+
     func sendGlobe(_ combo: String) {
         guard let c = focusedPage() else { return }
         let lit = String(data: (try? JSONSerialization.data(withJSONObject: [combo])) ?? Data(), encoding: .utf8)?.dropFirst().dropLast() ?? ""
-        c.webView.evaluateJavaScript("typeof window._hkNativeKey === 'function' ? window._hkNativeKey(\(lit)) : 'no_hook'") { r, _ in
-            dlog("verdict=globe_key combo=\(combo) page=\(c.viewHash) result=\(r ?? "-")")
+        // macOS starts its own dictation on 🌐🌐 when Keyboard > "Press 🌐 key to"
+        // is Start Dictation (AppleFnUsageType 3); the page says so once.
+        let macDictation = UserDefaults(suiteName: "com.apple.HIToolbox")?.integer(forKey: "AppleFnUsageType") == 3
+        c.webView.evaluateJavaScript("typeof window._hkNativeKey === 'function' ? window._hkNativeKey(\(lit), {mac_dictation: \(macDictation)}) : 'no_hook'") { r, _ in
+            dlog("verdict=globe_key combo=\(combo) mac_dictation=\(macDictation) page=\(c.viewHash) result=\(r ?? "-")")
         }
     }
 
@@ -690,11 +763,13 @@ extension AppDelegate {
 
     func startTabDragTracking() {
         tabDragMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] e in
+            if self?.frozenTabPress(e) == true { return nil }
             self?.tabPressed(e)
             return e
         }
         tabMenuMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] e in
-            (self?.tabRightClicked(e) ?? false) ? nil : e
+            if self?.frozenTabMenu(e) == true { return nil }
+            return (self?.tabRightClicked(e) ?? false) ? nil : e
         }
         // The fallback that needs no press: a window that leaves a tab group
         // while the button is down is a tab being dragged out, however AppKit
@@ -714,6 +789,8 @@ extension AppDelegate {
             if let was = tabGroupSeen[id], was.tabs > 1, n == 1 { leavers.append((w, was.frame)) }
         }
         tabGroupSeen = now
+        // A drag AppKit ran without giving the press monitor the press got past the freeze.
+        if !leavers.isEmpty, isFrozen, Pointer.buttonDown { dlog("verdict=frozen_tab_escaped left_alone=\(leavers.count)") }
         guard !leavers.isEmpty, !(tabDragTimer?.isValid ?? false), Date().timeIntervalSince(lastTabPlaced) > 2,
               snapEnabled, !NSEvent.modifierFlags.contains(.option) else { return }
         // Which of the windows left alone is the torn tab is decided at the
@@ -855,11 +932,11 @@ extension AppDelegate {
         return true
     }
     @objc func renameTargetTab(_ sender: Any?) { if let c = tabMenuTarget { promptRename(c, wholeTab: true) } }
-    @objc func clearTargetTabName(_ sender: Any?) { tabMenuTarget?.renameTab(nil) }
-    @objc func moveTargetTab(_ sender: Any?) { tabMenuTarget?.window?.moveTabToNewWindow(nil) }
+    @objc func clearTargetTabName(_ sender: Any?) { if !frozen("rename") { tabMenuTarget?.renameTab(nil) } }
+    @objc func moveTargetTab(_ sender: Any?) { if !frozen("tab_moved") { tabMenuTarget?.window?.moveTabToNewWindow(nil) } }
     @objc func closeTargetTab(_ sender: Any?) { tabMenuTarget?.window?.performClose(nil) }
     @objc func closeOtherTabs(_ sender: Any?) {
-        guard let w = tabMenuTarget?.window else { return }
+        guard !frozen("close_tab"), let w = tabMenuTarget?.window else { return }
         for o in (w.tabbedWindows ?? []) where o !== w { o.performClose(nil) }
     }
 
@@ -867,6 +944,7 @@ extension AppDelegate {
     /// From the window's tab bar (`wholeTab`), a tab split into panes is
     /// named as a whole; from a pane's own tab strip, only that page.
     func promptRename(_ c: DashboardWindowController, wholeTab: Bool = false) {
+        if frozen("rename") { return }
         let whole = wholeTab && c.grid != nil
         let a = NSAlert()
         a.messageText = "Rename Tab"
@@ -952,18 +1030,24 @@ extension AppDelegate {
             var p = inTabBar ? NSPoint(x: cv.frame.midX, y: cv.frame.maxY + 8) : NSPoint(x: cv.frame.midX, y: cv.frame.midY)
             // ?title= presses that tab's own button in AppKit's tab bar.
             if inTabBar, let t = q.first(where: { $0.name == "title" })?.value, let group = w.tabbedWindows,
-               let i = group.firstIndex(where: { tw in controllers.first { $0.window === tw }?.pageTitle == t }) {
+               let i = group.firstIndex(where: { tw in testTitleMatches(controllers.first { $0.window === tw }?.pageTitle, t) }) {
                 let b = tabButtonFrames(in: w)
                 if b.count == group.count { p = NSPoint(x: b[i].midX, y: b[i].midY) }
                 dlog("verdict=test_press_tab title=\(t) buttons=\(b.count) tabs=\(group.count)")
             }
             if let e = NSEvent.mouseEvent(with: .leftMouseDown, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
-                                          windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) { tabPressed(e) }
+                                          windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) {
+                // As the press monitor does: a frozen tab bar picks the tab and stops there.
+                if frozenTabPress(e) { dlog("verdict=test_press_tab_frozen") } else { tabPressed(e) }
+            }
         }
         switch url.path {
         case "/pointer": Pointer.testOverride = (NSPoint(x: num("x"), y: num("y")), q.contains { $0.name == "down" && $0.value == "1" })
         case "/pointer-clear": Pointer.testOverride = nil
         case "/recorder": recorderTestHook(q)
+        // A sideways scroll over the focused pane's tab strip (?dx= in points).
+        case "/pane-strip-scroll":
+            if let g = arrangeTarget.flatMap({ w in controllers.first { $0.window === w } })?.grid, let f = g.focused { g.views[f]?.scrollStrip(by: num("dx")) }
         case "/press-tab": press(true)          // the mouse-down that starts a tab drag
         case "/press-content": press(false)     // a click in the page, which must not
         // What AppKit does with a tab dropped outside every tab bar.
@@ -978,7 +1062,7 @@ extension AppDelegate {
         case "/drop-tab":
             if let o = Pointer.testOverride { Pointer.testOverride = (o.at, false) }
             let want = q.first { $0.name == "title" }?.value
-            let tab = want.flatMap { t in (arrangeTarget?.tabbedWindows ?? []).first { tw in controllers.first { $0.window === tw }?.pageTitle == t } }
+            let tab = want.flatMap { t in (arrangeTarget?.tabbedWindows ?? []).first { tw in testTitleMatches(controllers.first { $0.window === tw }?.pageTitle, t) } }
             if let t = want, tab == nil {
                 // Dropping the showing tab instead would pass a test about a different tab.
                 dlog("verdict=test_drop_tab_title_missing title=\(t) tabs=\((arrangeTarget?.tabbedWindows ?? []).compactMap { tw in controllers.first { $0.window === tw }?.pageTitle })")
@@ -988,7 +1072,7 @@ extension AppDelegate {
         // own: macOS no longer lets a background app activate itself, and the
         // owner's real amux window covered the test window (2026-10-23).
         case "/activate":
-            NSApp.activate(ignoringOtherApps: true)
+            activateApp()
             for c in controllers { c.window?.level = .floating }
             arrangeTarget?.orderFrontRegardless()
         // What AppKit does with a tab dropped on another window's tab bar.
@@ -1105,6 +1189,11 @@ extension AppDelegate {
             if let w = q.first(where: { $0.name == "worker" })?.value { openNotificationTab("#peek=" + w, why: "worker") }
             else if let h = q.first(where: { $0.name == "hash" })?.value { openNotificationTab(h, why: "message") }
         case "/hide": NSApp.hide(nil)
+        // Workspaces > Freeze Workspace, and the menu and close paths it guards.
+        case "/freeze": if isFrozen != (q.first { $0.name == "on" }?.value != "0") { toggleFreeze(nil) }
+        case "/menu-move-tab": arrangeTarget?.moveTabToNewWindow(NSMenuItem())
+        case "/close-tab": arrangeTarget?.performClose(nil)
+        case "/new-window": newWindow(nil)
         // View > Reload Pane Ignoring Cache, as ⌘⇧R reaches it.
         case "/reload-ignoring-cache": reloadIgnoringCache(nil)
         // Run a script in the shown tab's page (download-e2e.py starts a page
@@ -1174,7 +1263,8 @@ extension AppDelegate {
                 var d: [String: Any] = ["title": w.title, "frame": NSStringFromRect(w.frame), "tabs": (w.tabbedWindows ?? [w]).count, "key": w.isKeyWindow, "number": w.windowNumber,
                                         "view": c.viewHash, "selected": (w.tabGroup?.selectedWindow ?? w) === w, "tooltip": w.tab.toolTip ?? "",
                                         "connection": w.tab.accessoryView?.toolTip ?? "",
-                                        "server": c.serverOrigin?.absoluteString ?? "", "saved": c.savedURL() ?? ""]
+                                        "server": c.serverOrigin?.absoluteString ?? "", "saved": c.savedURL() ?? "",
+                                        "subtitle": w.subtitle]
                 if let g = c.grid {
                     d["grid"] = g.readingOrder
                     d["panes"] = g.tree.leaves.compactMap { g.members[$0]?.pageTitle }
@@ -1198,10 +1288,17 @@ extension AppDelegate {
                     d["pane_shown"] = g.tree.leaves.map { g.views[$0]?.window != nil }
                     d["focused"] = g.focused.flatMap { g.tree.leaves.firstIndex(of: $0) } ?? -1
                     d["zoomed"] = g.zoomed.flatMap { g.tree.leaves.firstIndex(of: $0) } ?? -1
+                    // Per pane, the header buttons showing (amux-panes.swift), by their tooltips' first word.
+                    // Per pane, its strip: visible width, and each tab's x and width in it.
+                    d["pane_strips"] = g.tree.leaves.map { id in g.views[id]?.stripState ?? [:] }
+                    d["pane_buttons"] = g.tree.leaves.map { id in g.views[id]?.header.subviews.compactMap { v -> String? in
+                        guard let b = v as? NSButton, !b.isHidden else { return nil }
+                        return b.toolTip?.split(separator: " ").first.map(String.init)
+                    }.sorted() ?? [] }
                 }
                 return d
             }
-            let st: [String: Any] = ["preview": snapPreview.panel.isVisible,
+            let st: [String: Any] = ["preview": snapPreview.panel.isVisible, "frozen": isFrozen,
                                      "hidden_panes": controllers.filter { $0.paneHost != nil && $0.window?.isVisible == false }.count,
                                      // What a drop at the pointer hits: the window server's front window there.
                                      "pointer_window": NSWindow.windowNumber(at: Pointer.location, belowWindowWithWindowNumber: 0),
@@ -1405,4 +1502,97 @@ func globeKeyName(_ e: NSEvent) -> String? {
     guard let ch = e.charactersIgnoringModifiers?.uppercased(), ch.count == 1,
           let u = ch.unicodeScalars.first, CharacterSet.alphanumerics.contains(u), u.isASCII else { return nil }
     return ch
+}
+
+// ── Freeze Workspace ──
+// A frozen workspace keeps what it shows (owner, 2026-11-03: "freeze a
+// workspace, so i can't change the tabs, names of tabs, workers etc but i can
+// make them bigger/smaller"). Refused while frozen: new, closed, renamed,
+// moved, dragged, docked or split tabs, windows and panes, and a page leaving
+// the worker it shows (app.js _frozenWorker). Still free: window size and
+// place, dividers, pane zoom, page zoom, focus, and picking which tab shows.
+// Each refusal beeps and logs verdict=frozen_refused. Kept per workspace by
+// name in this Mac's config; "" is the unsaved set open when none is.
+extension AppDelegate {
+    var freezeKey: String { config.activeWorkspace ?? "" }
+    var isFrozen: Bool { (config.frozenWorkspaces ?? []).contains(freezeKey) }
+
+    @objc func toggleFreeze(_ sender: Any?) {
+        var c = loadConfig()
+        let k = c.activeWorkspace ?? ""
+        var set = c.frozenWorkspaces ?? []
+        if set.contains(k) { set.removeAll { $0 == k } } else { set.append(k) }
+        c.frozenWorkspaces = set.isEmpty ? nil : set
+        saveConfig(c)
+        config = c
+        dlog("verdict=\(isFrozen ? "workspace_frozen" : "workspace_unfrozen") workspace=\(k.isEmpty ? "unsaved" : k)")
+        applyFreeze()
+        rebuildLayoutsMenu()
+    }
+
+    func applyFreeze() { controllers.forEach { $0.applyFreeze() } }
+
+    /// True, with a beep and a log line, when the workspace is frozen and
+    /// `what` must not happen.
+    func frozen(_ what: String) -> Bool {
+        guard isFrozen else { return false }
+        NSSound.beep()
+        dlog("verdict=frozen_refused what=\(what) workspace=\(freezeKey.isEmpty ? "unsaved" : freezeKey)")
+        return true
+    }
+
+    /// The y-range of `w`'s tab bar, in window coordinates: AppKit's tab
+    /// buttons, else the strip just above the page.
+    func tabBarBand(_ w: NSWindow) -> ClosedRange<CGFloat>? {
+        let frames = tabButtonFrames(in: w)
+        if let lo = frames.map({ $0.minY }).min(), let hi = frames.map({ $0.maxY }).max() { return lo...hi }
+        guard let top = w.contentView?.frame.maxY else { return nil }
+        return top...(top + 30)
+    }
+
+    /// A press in a frozen window's tab bar picks the tab under it and goes no
+    /// further, so AppKit never starts a drag, a close or a new tab.
+    func frozenTabPress(_ e: NSEvent) -> Bool {
+        guard isFrozen, let w = e.window, controllers.contains(where: { $0.window === w }),
+              let group = w.tabbedWindows, group.count > 1, !w.styleMask.contains(.fullScreen),
+              let band = tabBarBand(w), band.contains(e.locationInWindow.y) else { return false }
+        if let tw = tabWindow(at: e.locationInWindow, in: w, group: group), tw !== w {
+            w.tabGroup?.selectedWindow = tw
+            tw.makeKeyAndOrderFront(nil)
+        }
+        return true
+    }
+
+    /// A right-click on a frozen tab bar offers only Unfreeze.
+    func frozenTabMenu(_ e: NSEvent) -> Bool {
+        guard isFrozen, let w = e.window, controllers.contains(where: { $0.window === w }),
+              (w.tabbedWindows?.count ?? 1) > 1, let band = tabBarBand(w), band.contains(e.locationInWindow.y),
+              let v = w.contentView?.superview ?? w.contentView else { return false }
+        let m = NSMenu()
+        let i = NSMenuItem(title: "Unfreeze Workspace", action: #selector(toggleFreeze(_:)), keyEquivalent: "")
+        i.target = self
+        m.addItem(i)
+        NSMenu.popUpContextMenu(m, with: e, for: v)
+        return true
+    }
+}
+
+extension DashboardWindowController {
+    /// Tells the page and the pane strips whether the workspace is frozen, and
+    /// says so under the window's title.
+    func applyFreeze() {
+        let on = app?.isFrozen ?? false
+        webView.evaluateJavaScript("window.__amuxFrozen = \(on); 0", completionHandler: nil)
+        updateTitle()
+    }
+}
+
+/// A dashboard window. Window > Merge All Windows and Move Tab to New Window
+/// are AppKit's own; from the menu, a frozen workspace refuses them.
+final class AmuxWindow: NSWindow {
+    private func refused(_ sender: Any?, _ what: String) -> Bool {
+        sender is NSMenuItem && ((NSApp.delegate as? AppDelegate)?.frozen(what) ?? false)
+    }
+    override func moveTabToNewWindow(_ sender: Any?) { if !refused(sender, "tab_moved") { super.moveTabToNewWindow(sender) } }
+    override func mergeAllWindows(_ sender: Any?) { if !refused(sender, "tabs_merged") { super.mergeAllWindows(sender) } }
 }
