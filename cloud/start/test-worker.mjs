@@ -69,6 +69,10 @@ function world() {
         return ok({ data: Object.keys(w.appleLinks || {}).filter(c => w.appleLinks[c] === sub).map(id => ({ id })) });
       }
       let cm;
+      if ((cm = p.match(/^\/v1\/customers\/([^/]+)$/)) && m === 'GET') {
+        const s = Object.values(w.subs).find(s => s.customer_id === cm[1]);
+        return s ? ok({ id: cm[1], email: s.email }) : Response.json({ error: { message: 'No such customer' } }, { status: 404 });
+      }
       if ((cm = p.match(/^\/v1\/customers\/([^/]+)$/)) && m === 'POST') {
         (w.appleLinks ||= {})[cm[1]] = f.get('metadata[apple_sub]'); return ok({ id: cm[1] });
       }
@@ -230,6 +234,22 @@ await test('ops audit: a server left behind by a deleted account is erased with 
   const rep = await (await call(w, () => worker.fetch(new Request('https://w.test/api/ops', { headers: { 'x-ops-key': 'ops' } }), w.env))).json();
   eq(rep.fixed, [`leftover: account was deleted, server ${w.logs.find(l => l.event === 'provision.created').server} erased`], 'fixed');
   eq([w.servers.length, w.dns.length, w.images.length], [0, 0, 0], 'servers, records, snapshots');
+});
+
+await test('signups: every order for the CRM, behind the ops key, and it changes nothing', async () => {
+  const w = world(); w.env.OPS_KEY = 'ops';
+  const sub = paid(w, 'crmone'); await webhook(w, sub);
+  const unfinished = paid(w, 'crmtwo');
+  const before = JSON.stringify([w.servers, w.subs]);
+  const r = await call(w, () => worker.fetch(new Request('https://w.test/api/signups', { headers: { 'x-ops-key': 'ops' } }), w.env));
+  const rep = await r.json();
+  eq([r.status, rep.measured, rep.n_considered], [200, true, 2], 'listed');
+  const one = rep.signups.find(s => s.sub === sub), two = rep.signups.find(s => s.sub === unfinished);
+  eq([one.slug, one.email, one.status, one.finished, one.url], ['crmone', 'hello+crmone@amux.io', 'active', true, 'https://crmone.amux.io'], 'a finished order');
+  eq([two.finished, two.ready], [false, false], 'an order whose server is not built yet');
+  eq(JSON.stringify([w.servers, w.subs]), before, 'read only');
+  const no = await call(w, () => worker.fetch(new Request('https://w.test/api/signups', { headers: { 'x-ops-key': 'wrong' } }), w.env));
+  eq(no.status, 404, 'a wrong key gets nothing');
 });
 
 await test('forged webhook refused', async () => {
@@ -514,6 +534,21 @@ await test('C10/C13 resubscribing within 30 days restores the last server, under
   eq(w.images.length, 0, 'snapshot deleted once the restored server is ready');
   const mail = w.mail.map(x => Buffer.from(x.raw, 'base64').toString()).find(t => /server is ready/.test(t)) || '';
   eq(/restored from your previous server/.test(mail), true, 'ready email says it was restored');
+});
+
+await test('a snapshot from before the Stripe account move is restored through its customer', async () => {
+  const w = world(); const old = paid(w, 'moved1');
+  await webhook(w, old); await ended(w, old); await cron(w);
+  const img = w.images[0];
+  // The new account never had the old subscription: only the customer (same id after the copy) exists.
+  const cust = w.subs[old].customer_id, email = w.subs[old].email;
+  delete w.subs[old];
+  img.labels['amux-cust'] = cust;
+  const again = paid(w, 'moved2'); w.subs[again].email = email; w.subs[again].metadata.email = email;
+  w.subs.cust_only = { id: 'cust_only', status: 'canceled', customer_id: cust, email, metadata: {} };
+  await webhook(w, again);
+  eq(w.servers[0].image, img.id, 'booted from the old snapshot');
+  eq(w.logs.some(l => l.event === 'restore.by_customer' && l.found), true, 'logged');
 });
 
 await test('C10 another email never gets someone else\'s snapshot', async () => {

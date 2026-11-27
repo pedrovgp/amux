@@ -36,7 +36,7 @@ turns that off; AMUX_SKIP_LAND_GATE=1 with AMUX_SKIP_LAND_GATE_REASON skips it
 once, logged). Log: ~/.amux/logs/land-gate.log.
 """
 import argparse, glob, hashlib, json, os, random, re, shutil, ssl, subprocess, sys, tempfile, time
-import urllib.request
+import urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -179,10 +179,72 @@ def api(method, path, body=None):
         return 0, {"error": str(e)}
 
 
+# Owner approval of [owner]-tier diffs is on unless the owner turns it off.
+# Ethan, 2026-11-13: "I dont want to approve PRs, thats not the purpose of
+# amux", and "maybe you make that a group wide thing or even global wide".
+# AMUX_LAND_OWNER_APPROVAL=0 in the Scope tab at global or group level turns
+# it off. Only those two layers count: a worker may write its own worker layer
+# and its own shell, so a value there would let it waive its own gate. The
+# boundary registry and its guard stay gated either way: boundaries are the
+# owner's to change by rule, and a land is how a repo change reaches them.
+OWNER_APPROVAL_KEY = "AMUX_LAND_OWNER_APPROVAL"
+# From the account, never from $HOME or another variable: a worker sets its own
+# environment, and a redirected home would let it write the "global" file
+# itself (land review F1).
+import pwd
+SCOPE_HOME = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".amux")
+ALWAYS_OWNER = ("boundaries.toml", "scripts/hooks/boundary-guard.py")
+_OFF = ("0", "false", "off", "no")
+
+
+def _env_value(path, key):
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        return None
+    val = None
+    for l in lines:
+        l = l.strip()
+        if l.startswith("export "):
+            l = l[len("export "):].strip()
+        if l.startswith(key + "="):
+            val = l[len(key) + 1:].strip().strip("'\"")
+    return val
+
+
+def owner_approval_setting(worker):
+    """(required, where it was decided). Group beats global; when the worker's
+    groups disagree, required wins."""
+    home = SCOPE_HOME
+    groups = []
+    if worker:
+        code, body = api("GET", "/api/scope?level=worker&name=" + urllib.parse.quote(worker))
+        groups = (body.get("groups") or []) if code == 200 else []
+    gv = {g: _env_value(os.path.join(home, "env", g + ".env"), OWNER_APPROVAL_KEY) for g in groups}
+    gv = {g: v for g, v in gv.items() if v not in (None, "")}
+    if gv:
+        on = [g for g, v in gv.items() if v.lower() not in _OFF]
+        if on:
+            return True, "group:" + on[0]
+        return False, "group:" + sorted(gv)[0]
+    v = _env_value(os.path.join(home, "amux.env"), OWNER_APPROVAL_KEY)
+    if v not in (None, ""):
+        return v.lower() not in _OFF, "global"
+    return True, "default"
+
+
 def owner_leg(repo, base, head, tiers, request=True):
     files = [f for f in git(repo, "diff", "--name-only", base, head).splitlines() if in_tier(tiers, "owner", f)]
     if not files:
         return {"verdict": "owner_not_needed"}
+    required, source = owner_approval_setting(lane())
+    if not required:
+        waived = [f for f in files if f not in ALWAYS_OWNER]
+        files = [f for f in files if f in ALWAYS_OWNER]
+        log("verdict=owner_approval_off source=%s waived=%s still_gated=%s lane=%s" % (
+            source, ",".join(waived) or "-", ",".join(files) or "-", lane() or "human"))
+        if not files:
+            return {"verdict": "owner_not_required", "source": source, "waived": waived}
     pid = patch_id(repo, base, head, "--", *files)
     code, body = api("GET", "/api/land/approvals?patch_id=" + pid)
     if code == 200 and body.get("approved"):
@@ -227,7 +289,14 @@ def gate_tree(name, suffix=""):
 def checkout(repo, tree, ref):
     if not os.path.isdir(os.path.join(tree, ".git")) and not os.path.isfile(os.path.join(tree, ".git")):
         os.makedirs(os.path.dirname(tree), exist_ok=True)
-        git(repo, "worktree", "add", "-q", "--detach", tree, ref, timeout=600)
+        # -f: a cleanup that deleted this folder left git's registration of it
+        # behind, and a plain add refused ("missing but already registered
+        # worktree"), so the gate errored before checking anything
+        # (2026-10-28). -f overrides only for this path.
+        listed = sh(["git", "-C", repo, "worktree", "list", "--porcelain"]).stdout
+        if ("worktree " + os.path.realpath(tree)) in listed or ("worktree " + tree) in listed:
+            print("land gate: its scratch checkout %s had been deleted; re-created it" % tree, file=sys.stderr)
+        git(repo, "worktree", "add", "-f", "-q", "--detach", tree, ref, timeout=600)
     git(tree, "reset", "-q", "--hard", ref, timeout=600)
     git(tree, "clean", "-fdq", "-e", "node_modules", "-e", "target", timeout=600)
 
@@ -280,12 +349,41 @@ SLOW_BINARIES = [b for b in os.environ.get(
     "diagnostic_contract,restart_persistence,dead_pub_api,move_bundle,public_links,board_api").split(",") if b]
 
 
-def rust_filter(files, pkgs):
+def readers(tree, pkgs, crate_dir, sub):
+    """Test binaries and modules in OTHER crates whose source names
+    `<crate_dir>/<sub>`, as nextest clauses. dashboard_assets.rs lives in
+    amux-server and reads amux-dashboard/static, so a static/ change has to
+    select it: 2eb8f94ce changed app.js, the gate ran amux-dashboard's tests
+    only, and main's rust was red for 15h51m (velocity audit 2026-11-14)."""
+    needle, out = "%s/%s" % (crate_dir, sub), set()
+    for d, pkg in pkgs.items():
+        if d == crate_dir:
+            continue
+        for path in glob.glob(os.path.join(tree, "crates", d, "tests", "*.rs")):
+            if needle in open(path, errors="replace").read():
+                out.add("(package(=%s) & binary(=%s))" % (pkg, os.path.basename(path)[:-3]))
+        src = os.path.join(tree, "crates", d, "src")
+        for path in glob.glob(os.path.join(src, "**", "*.rs"), recursive=True):
+            if needle in open(path, errors="replace").read():
+                parts = os.path.relpath(path, src)[:-3].split(os.sep)
+                if parts[0] == "bin":
+                    out.add("(package(=%s) & kind(bin))" % pkg)
+                    continue
+                if parts[-1] in ("mod", "lib", "main"):
+                    # A module root's own tests, as rust_filter selects them.
+                    parts = parts[:-1] + ["tests"]
+                out.add("(package(=%s) & kind(lib) & test(/^%s::/))" % (pkg, "::".join(parts)))
+    return out
+
+
+def rust_filter(files, pkgs, tree=None):
     """Unit tests of each changed module, and the integration test binaries of
     each changed crate (the tree-walking contract tests that redden main live
     there and take under a second each), except SLOW_BINARIES. A changed test
     file always runs. A change to Cargo files or a build script runs the
-    crate's whole unit suite. Returns (filterset, skipped binary names)."""
+    crate's whole unit suite. A change to a crate's non-Rust files (static/,
+    templates) also runs the tests in other crates that read that directory,
+    found by scanning `tree`. Returns (filterset, skipped binary names)."""
     clauses, crates, edited = set(), set(), set()
     for f in files:
         m = re.match(r"^crates/([^/]+)/(.*)$", f)
@@ -312,6 +410,8 @@ def rust_filter(files, pkgs):
             clauses.add("(package(=%s) & binary(=%s))" % (pkg, tm.group(1)))
         elif not rest.endswith(".md"):
             clauses.add("(package(=%s) & kind(lib))" % pkg)
+            if tree and "/" in rest and not rest.startswith("src/"):
+                clauses |= readers(tree, pkgs, m.group(1), rest.split("/", 1)[0])
     skipped = sorted(b for b in SLOW_BINARIES if b not in edited)
     not_slow = "".join(" & !binary(=%s)" % b for b in skipped)
     for pkg in crates:
@@ -322,10 +422,14 @@ def rust_filter(files, pkgs):
 NEXTEST_FAIL = re.compile(r"^\s+(?:FAIL|SIGSEGV|SIGABRT|TIMEOUT) \[[^\]]*\] (?:\([^)]*\) )?(\S+) (\S+)\s*$", re.M)
 
 
+SAFE_CARGO = os.path.join(HERE, "safe-cargo.sh")
+
+
 def nextest(tree, expr, extra=(), timeout=RUST_TIMEOUT_S):
     env = dict(os.environ, CARGO_TARGET_DIR=os.path.expanduser(
         os.environ.get("AMUX_LAND_GATE_TARGET", "~/.amux/rust-build-target")))
-    cmd = ["cargo", "nextest", "run", "--workspace", "--no-fail-fast", "--no-tests=pass", "-E", expr, *extra]
+    cargo = [SAFE_CARGO] if os.path.isfile(SAFE_CARGO) else ["cargo"]
+    cmd = [*cargo, "nextest", "run", "--workspace", "--no-fail-fast", "--no-tests=pass", "-E", expr, *extra]
     t0 = time.time()
     try:
         r = sh(cmd, cwd=tree, env=env, timeout=timeout)
@@ -347,7 +451,7 @@ def by_test_expr(names):
 
 def rust_leg(repo, tree, files, base_tree_fn):
     pkgs = crate_pkgs(tree)
-    expr, skipped = rust_filter(files, pkgs)
+    expr, skipped = rust_filter(files, pkgs, tree)
     if not expr:
         return {"verdict": "rust_not_affected"}
     fails, detail, secs = nextest(tree, expr)
@@ -380,6 +484,40 @@ def affected(tree, base):
         return json.loads(r.stdout)
     except ValueError:
         return None
+
+
+def rank_specs(tree, base, specs, min_score=0):
+    """Order specs by how many of the change's own identifiers they name.
+
+    The local run keeps only MAX_LOCAL_SPECS, and the rest first run on main
+    after the push. Selection order put the spec that would have failed past
+    the cut twice on 2026-11-25 (49fbf33b3: settings-layout 17th of 23;
+    25b70cf05: local-multiplayer outside a smoke-only run of 45 route matches).
+    Tokens are string literals and identifiers of six or more characters from
+    the diff's changed lines; a token found in more than a quarter of the
+    candidates says nothing about any one of them and is not counted. With
+    min_score, a spec that names fewer of them is dropped."""
+    diff = git(tree, "diff", base, "HEAD", "--", "crates", "e2e")
+    toks = set()
+    for ln in diff.splitlines():
+        if ln[:1] not in "+-" or ln.startswith(("+++", "---")):
+            continue
+        ln = ln[1:]
+        if re.match(r"\s*(//|#|\*|/\*)", ln):
+            continue
+        toks.update(re.findall(r"[\"'`]([^\"'`\s]{4,80})[\"'`]", ln))
+        toks.update(re.findall(r"[#.]?[A-Za-z_][\w-]{5,}", ln))
+    texts = {}
+    for sp in specs:
+        try:
+            with open(os.path.join(tree, "e2e", sp)) as f:
+                texts[sp] = f.read()
+        except OSError:
+            texts[sp] = ""
+    common = max(3, len(specs) // 4)
+    hits = {t: sum(1 for sp in specs if t in texts[sp]) for t in toks}
+    score = {sp: sum(1 for t in toks if hits[t] <= common and t in texts[sp]) for sp in specs}
+    return sorted((sp for sp in specs if score[sp] >= min_score), key=lambda sp: -score[sp])
 
 
 def playwright(tree, specs, timeout=E2E_TIMEOUT_S):
@@ -423,7 +561,14 @@ def playwright(tree, specs, timeout=E2E_TIMEOUT_S):
         walk(s, [])
     stats = data.get("stats", {})
     if not res["expected"] and not res["unexpected"] and not res["flaky"]:
-        return None, "playwright ran no tests: %s" % json.dumps(stats), time.time() - t0
+        # Say WHY: a run of zero tests is usually a web server that never came
+        # up or a config error, and the stats alone ("expected": 0) said
+        # neither (2026-10-28: 358 s, no tests, no reason).
+        errs = [((e.get("message") or "") + " " + (e.get("location", {}) or {}).get("file", "")).strip()
+                for e in data.get("errors", [])][:3]
+        tail = (r.stderr or r.stdout or "")[-800:]
+        return None, "playwright ran no tests: %s%s%s" % (json.dumps(stats), (" errors: " + " | ".join(errs)) if errs else "",
+                                                          (" output: " + tail) if not errs and tail.strip() else ""), time.time() - t0
     return res, stats, time.time() - t0
 
 
@@ -442,15 +587,26 @@ def e2e_leg(repo, tree, base, base_tree_fn):
     changed += [f[len("e2e/"):] for f in git(tree, "diff", "--name-only", base, "HEAD").splitlines()
                 if f.startswith("e2e/") and f.endswith(".spec.ts") and os.path.exists(os.path.join(tree, f))]
     changed = list(dict.fromkeys(changed))
+    # A full CI run still names the specs that touch the change (a route of the
+    # changed API module, a changed file); run the closest of those here
+    # rather than only the smoke set.
+    matched = [sp for sp, why in (e.get("selected") or {}).items() if why != "smoke"]
+    n_selected = len(specs) if specs else len(matched)
     if e.get("full") or not specs:
-        specs = list(dict.fromkeys(changed + SMOKE_FALLBACK))
-        note = "CI runs every spec for this change; this runs its changed specs and the smoke set"
+        ranked = rank_specs(tree, base, [sp for sp in matched if sp not in changed], min_score=1)
+        keep = max(MAX_LOCAL_SPECS, len(changed) + len(SMOKE_FALLBACK))
+        specs = list(dict.fromkeys(changed + SMOKE_FALLBACK + ranked))[:keep]
+        note = ("CI runs every spec for this change; this runs its changed specs, the smoke set "
+                "and the %d of %d matched specs that name the most of the change"
+                % (len([sp for sp in specs if sp in ranked]), len(ranked)))
     elif len(specs) > MAX_LOCAL_SPECS:
-        specs = (changed + [s for s in specs if s not in changed])[:max(MAX_LOCAL_SPECS, len(changed))]
-        note = "%d specs selected; the first %d run here (changed specs first), CI runs the rest" % (
-            len(e.get("specs")), MAX_LOCAL_SPECS)
+        ranked = rank_specs(tree, base, [sp for sp in specs if sp not in changed])
+        specs = (changed + ranked)[:max(MAX_LOCAL_SPECS, len(changed))]
+        note = "%d specs selected; the %d that name the most of the change run here (changed specs first), CI runs the rest" % (
+            n_selected, len(specs))
     res, stats, secs = playwright(tree, specs)
-    out = {"specs": specs, "secs": round(secs), "note": note}
+    out = {"specs": specs, "secs": round(secs), "note": note,
+           "n_selected": n_selected, "n_run": len(specs)}
     if res is None:
         return dict(out, verdict="e2e_unmeasured", detail=stats)
     out.update(passed=res["expected"], flaky=res["flaky"])
@@ -611,6 +767,8 @@ def render(legs):
                        req.get("link") or "#land-approve=" + o["patch_id"]))
     else:
         out.append("owner: %s%s" % (o["verdict"], " " + str(o.get("detail", "")) if o.get("detail") else ""))
+        if o.get("waived"):
+            out.append("  %s=0 (%s): %s land without the owner" % (OWNER_APPROVAL_KEY, o["source"], ", ".join(o["waived"])))
     r = legs["revert"]
     out.append("revert: %s" % r["verdict"])
     for m in r.get("missing", []):

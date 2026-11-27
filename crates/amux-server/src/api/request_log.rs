@@ -116,6 +116,11 @@ pub(crate) fn caller_from_headers(h: &axum::http::HeaderMap) -> String {
     if let Some(actor) = super::org::local_member_actor(h) {
         return actor.to_string();
     }
+    // A published app proved by its own credential (app_identity.rs), which
+    // also dropped any worker header it sent.
+    if let Some(app) = super::app_identity::actor(h) {
+        return app.to_string();
+    }
     for k in ["x-amux-worker", "x-amux-session"] {
         if let Some(v) = h.get(k).and_then(|v| v.to_str().ok()) {
             let v = v.trim();
@@ -239,6 +244,13 @@ impl RequestLogger {
                                 (SELECT id FROM _amux_interactions WHERE updated_at < ?1)", [(cutoff * 1000.0) as i64])?;
                             let receipts = conn.execute("DELETE FROM _amux_interactions WHERE updated_at < ?1", [(cutoff * 1000.0) as i64])?;
                             if receipts > 0 { tracing::info!(verdict="interaction_retention", n_considered=receipts, "Expired interaction receipts removed"); }
+                            // The ledger keeps its own window (AMUX_LEDGER_RETAIN_DAYS,
+                            // default a year): the interaction rows above are working
+                            // state, the ledger rows written from them are the record.
+                            let ledger_cutoff = ((unix_now() - super::ledger::retain_days() * 86400.0) * 1000.0) as i64;
+                            if let Err(e) = super::ledger::prune(conn, ledger_cutoff) {
+                                tracing::warn!(verdict="ledger_retention_failed", error=%e, "ledger retention prune failed; rows kept");
+                            }
                             // CAPPED (AMUX-4750). This was an unbounded DELETE
                             // over a 3.2M-row table, so the size of one writer
                             // hold was however many rows happened to age out at
@@ -258,9 +270,17 @@ impl RequestLogger {
                             // The COUNT is the point (mandate: "count logged"):
                             // a sweep whose effect is invisible is a sweep
                             // nobody can verify fired.
+                            // `batch_full` says a backlog is draining across
+                            // sweeps (AMUX-4750's cap), not that retention
+                            // stopped at what it found.
                             tracing::info!(
+                                verdict = "request_log_retention",
                                 deleted,
                                 retain_days,
+                                batch_cap = RETENTION_BATCH_ROWS,
+                                batch_full = deleted as i64 >= RETENTION_BATCH_ROWS,
+                                measured = true,
+                                n_considered = deleted,
                                 "request-log retention sweep"
                             );
                             // Worker tool calls (audit.rs) keep the same window
@@ -1510,10 +1530,6 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
-        path: "/api/debug/scoreboard",
-        methods: &["GET"],
-    },
-    RouteEntry {
         path: "/api/system-jobs",
         methods: &["GET"],
     },
@@ -1816,24 +1832,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET", "PATCH", "DELETE"],
     },
     RouteEntry {
-        path: "/api/messages",
-        methods: &["GET", "POST"],
-    },
-    RouteEntry {
         path: "/api/messages/accountability",
         methods: &["GET"],
-    },
-    RouteEntry {
-        path: "/api/messages/{id}",
-        methods: &["GET"],
-    },
-    RouteEntry {
-        path: "/api/messages/{id}/ack",
-        methods: &["POST"],
-    },
-    RouteEntry {
-        path: "/api/messages/{id}/acted",
-        methods: &["POST"],
     },
     RouteEntry {
         path: "/api/schedules",
@@ -1883,6 +1883,14 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/subscriptions/fires",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/subscriptions/catalog",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/subscriptions/events",
         methods: &["GET"],
     },
     RouteEntry {
@@ -2047,6 +2055,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/palette",
         methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/palette/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/palette/visit",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/palette/history/import",
+        methods: &["POST"],
     },
     RouteEntry {
         path: "/api/pinned",
@@ -2423,6 +2443,14 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["POST"],
     },
     RouteEntry {
+        path: "/api/page-links/{id}/api",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/page-links/{id}/app-token",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/page-links/{id}/open",
         methods: &["POST"],
     },
@@ -2455,6 +2483,15 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/audit",
+        methods: &["GET"],
+    },
+    // -- compliance (governance PR 21)
+    RouteEntry {
+        path: "/api/compliance/access-review",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/compliance/timeline",
         methods: &["GET"],
     },
     // -- browser
@@ -2675,6 +2712,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["POST"],
     },
     RouteEntry {
+        path: "/api/browser/watch",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/watch/start",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/watch/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/computer/start",
         methods: &["POST"],
     },
@@ -2720,6 +2769,30 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/computer/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/tools",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/call",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/activity",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/broker/next",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/broker/result",
         methods: &["POST"],
     },
     // -- file viewer / files / fs
@@ -2788,44 +2861,44 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["POST"],
     },
     RouteEntry {
-        path: "/api/files/mdai",
+        path: "/api/debug/legacy-routes",
         methods: &["GET"],
     },
     RouteEntry {
-        path: "/api/files/mdai/run",
+        path: "/api/mdai",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/mdai/run",
         methods: &["POST"],
     },
     RouteEntry {
-        path: "/api/files/mdai/history",
+        path: "/api/mdai/history",
         methods: &["GET"],
     },
     RouteEntry {
-        path: "/api/files/mdai/graph",
+        path: "/api/mdai/graph",
         methods: &["GET"],
     },
     RouteEntry {
-        path: "/api/files/mdai/chat",
+        path: "/api/mdai/chat",
         methods: &["GET", "POST"],
     },
     RouteEntry {
-        path: "/api/files/mdai/connect",
+        path: "/api/mdai/connect",
         methods: &["POST"],
     },
     RouteEntry {
-        path: "/api/files/mdai/active",
+        path: "/api/mdai/active",
         methods: &["GET"],
     },
     RouteEntry {
-        path: "/api/files/mdai/cancel",
+        path: "/api/mdai/cancel",
         methods: &["POST"],
     },
     RouteEntry {
-        path: "/api/files/mdai/doc",
+        path: "/api/mdai/doc",
         methods: &["GET", "PUT"],
-    },
-    RouteEntry {
-        path: "/api/files/mdai/chat",
-        methods: &["GET", "POST"],
     },
     RouteEntry {
         path: "/api/fs/mkdir",
@@ -2990,6 +3063,14 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["POST"],
     },
     RouteEntry {
+        path: "/api/social/queue/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/social/queue/{id}/reject",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/social/queue/{id}/reschedule",
         methods: &["POST"],
     },
@@ -3016,6 +3097,78 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/outcome/plan",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/plan",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/outcomes",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/outcomes/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/outcomes/{id}/change",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/stats",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/home",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/helpers",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/tidy",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/ideas",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/ideas/refresh",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/ideas/{id}/start",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/ideas/{id}/dismiss",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/goals",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/goals/{id}",
+        methods: &["PATCH"],
+    },
+    RouteEntry {
+        path: "/api/intent/goals/{id}/check",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/goals/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/reminders",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/todos",
         methods: &["POST"],
     },
     RouteEntry {
@@ -3154,6 +3307,13 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/bridge/outbound/{id}/approve", methods: &["POST"] },
     RouteEntry { path: "/api/bridge/hook/whatsapp", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/bridge/hook/slack", methods: &["POST"] },
+    // Outbound phone calls (api/calls.rs).
+    RouteEntry { path: "/api/calls", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/calls/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/calls/{id}/approve", methods: &["POST"] },
+    RouteEntry { path: "/api/calls/{id}/decline", methods: &["POST"] },
+    RouteEntry { path: "/api/calls/{id}/events", methods: &["POST"] },
+    RouteEntry { path: "/api/calls/{id}/result", methods: &["POST"] },
     // The owner's approval of an owner-gated change (scripts/land_gate.py).
     RouteEntry {
         path: "/api/land/approvals",
@@ -3246,6 +3406,118 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/crm/followups",
         methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/accounts",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/accounts/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/accounts/{id}/interactions",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/deals",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/deals/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/lookalikes",
+        methods: &["POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/summary",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels/due",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels/{id}/observed",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches/{id}",
+        methods: &["PATCH"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches/{id}/done",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences/{id}/enroll",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences/{id}/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/contacts/{id}/brief",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/voices",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/voices/{id}",
+        methods: &["GET", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/crm/voices/{id}/check",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/activity",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/funnel",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/replies/{id}/intent",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/deals/{id}/stages",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/contacts/{id}/check-email",
+        methods: &["POST"],
     },
     // Speedtest (AMUX-2890): the Metrics tab's Run-speed-test button, unrouted
     // since the python retirement — clicks errored against the SPA catch-all.
@@ -3402,14 +3674,6 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/telegram/status",
         methods: &["GET"],
-    },
-    RouteEntry {
-        path: "/api/telegram/mappings",
-        methods: &["GET", "POST"],
-    },
-    RouteEntry {
-        path: "/api/telegram/mappings/{chat_id}",
-        methods: &["DELETE"],
     },
     RouteEntry {
         path: "/api/telegram/send",
@@ -3971,6 +4235,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: ANY,
     },
     RouteEntry {
+        path: "/api/dictation/settings",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
         path: "/api/dictate",
         methods: &["POST"],
     },
@@ -4152,6 +4420,178 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/debug/storage",
         methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/ledger",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/ledger/verify",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/audit/export",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/audit/holds",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/audit/holds/{id}/lift",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/audit/person",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/audit/person/erase",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/audit/kill-switch",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/mfa/enroll",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/enroll/confirm",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/verify",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/step-up",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/recovery-codes",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/reset",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/sso/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/scim/tokens",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/scim/tokens/{id}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/trace/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/otel/v1/logs",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/otel/v1/metrics",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/ledger/checkpoints",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/ledger/checkpoints/key",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/ledger/at/{seq}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{name}/capabilities",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/approvals/decide",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/outbound",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/outbound/feed",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/outbound/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/outbound/check",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/outbound/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/outbound/{id}/reject",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/outbound/{id}/done",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/approvals/cards",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/land/approvals/reject",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/schedules/{id}/reown",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{name}/sponsor",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/org/members/{email}/offboard",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{name}/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{name}/sandbox",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{name}/isolation",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/security/at-rest",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/security/at-rest/decrypt",
+        methods: &["POST"],
     },
 ];
 
@@ -4354,7 +4794,14 @@ pub(crate) fn nearest_routes(path: &str, n: usize) -> Vec<&'static str> {
 /// sample choice) must be order-independent, or flipping the scan direction
 /// creates the inverse defect — see the min/max and sample_ts rules in the
 /// group assembly.
+#[cfg(not(test))]
 const ANALYZE_SCAN_CAP: i64 = 200_000;
+// The over-cap test crosses this cap with 2.6k rows instead of 260k: inserting
+// those through a debug SQLite with five indexes took 227 to 280 s, the whole
+// tail of the lib suite (docs/design/cicd-two-minutes.md, Z8). Every behaviour
+// it pins is relative to the cap, so a hundredth of it pins the same edges.
+#[cfg(test)]
+const ANALYZE_SCAN_CAP: i64 = 2_000;
 /// Groups returned by /analyze (sorted by count desc before the cut).
 const ANALYZE_GROUP_CAP: usize = 200;
 /// slow_outliers cap in /stats.
@@ -7021,9 +7468,9 @@ mod tests {
     async fn over_cap_stats_samples_the_window_while_analyze_truncates_and_both_report_it() {
         let (store, _dir) = store();
         let now = unix_now();
-        // 50k "old-era" rows around 90-80h ago, then 210k "new-era" rows in
-        // the last 70h — 260k total against the 200k cap, so a truthful
-        // truncation contains ZERO old-era rows.
+        // 500 "old-era" rows around 90-83h ago, then 2100 "new-era" rows over
+        // the last 70h — 2.6k total against the 2k test cap (ANALYZE_SCAN_CAP),
+        // so a truthful truncation contains ZERO old-era rows.
         store
             .write(move |conn| {
                 let tx_like = conn; // Store::write is already one transaction
@@ -7033,12 +7480,12 @@ mod tests {
                       amux_session, worker, answered_by, error_body) \
                      VALUES (?1,'GET',?2,?3,500,1.0,'127.0.0.1','lane',NULL,'native',NULL)",
                 )?;
-                for i in 0..50_000 {
-                    let ts = now - 90.0 * 3600.0 + i as f64 * 0.5;
+                for i in 0..500 {
+                    let ts = now - 90.0 * 3600.0 + i as f64 * 50.0;
                     stmt.execute(rusqlite::params![ts, "/api/old-era", "old-era"])?;
                 }
-                for i in 0..210_000 {
-                    let ts = now - 70.0 * 3600.0 + i as f64;
+                for i in 0..2_100 {
+                    let ts = now - 70.0 * 3600.0 + i as f64 * 100.0;
                     stmt.execute(rusqlite::params![ts, "/api/new-era", "new-era"])?;
                 }
                 Ok(crate::db::WriteOutcome {
@@ -7085,9 +7532,9 @@ mod tests {
         );
         assert_eq!(
             v["sampled"], true,
-            "260k rows over a 200k cap must sample: {v}"
+            "2.6k rows over a 2k test cap must sample: {v}"
         );
-        assert_eq!(v["window_rows"], 260_000, "the true pre-sample count: {v}");
+        assert_eq!(v["window_rows"], 2_600, "the true pre-sample count: {v}");
         let fam_n = |name: &str| -> f64 {
             v["families"]
                 .as_array()
@@ -7102,11 +7549,11 @@ mod tests {
             new_n > 0.0 && old_n > 0.0,
             "both eras must survive sampling: {v}"
         );
-        // Seeded 210k new : 50k old = 4.2. A uniform sample preserves the ratio.
+        // Seeded 2100 new : 500 old = 4.2. A uniform sample preserves the ratio.
         let ratio = new_n / old_n;
         assert!(
             (ratio - 4.2).abs() < 0.3,
-            "the sample must be UNIFORM across the window — seeded 210k:50k = 4.2, \
+            "the sample must be UNIFORM across the window — seeded 2100:500 = 4.2, \
              got {new_n}:{old_n} = {ratio}. A skew here means the read is biased \
              toward one end of the window, which is AF-131's bug in either direction: {v}"
         );
@@ -7140,10 +7587,10 @@ mod tests {
             .find(|g| g["family"] == "new-era")
             .expect("new-era group");
         let last = new_era["last_ts"].as_f64().unwrap();
-        // The fixture's newest new-era row is at now - (70h - 209,999s), i.e.
+        // The fixture's newest new-era row is at now - (70h - 209,900s), i.e.
         // ~11.67h ago; a positional overwrite under the DESC scan would land
         // ~70h ago instead.
-        let expected_newest = now - 70.0 * 3600.0 + 209_999.0;
+        let expected_newest = now - 70.0 * 3600.0 + 209_900.0;
         assert!(
             (last - expected_newest).abs() < 5.0,
             "last_ts must be the group's NEWEST hit — a positional overwrite under the \

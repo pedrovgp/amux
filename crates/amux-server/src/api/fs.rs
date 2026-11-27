@@ -1,10 +1,11 @@
 //! /api/fs — the SPA's Files surface, NATIVE (AMUX-2597 boundary work).
 //!
 //! Ported from the Python owner's handlers so the wire contract is
-//! byte-compatible (statuses, error strings, field names). This is a
-//! DIFFERENT contract from the modern `/api/files` (raw-body upload,
-//! `?path=` relative to a root) — both stay mounted; see
-//! docs/rust-migration/server-boundary.md.
+//! byte-compatible (statuses, error strings, field names). This is the one
+//! browse API: the legacy `/api/files?path=` (relative to a root) resolves
+//! its path and serves [`list_dir_at`] (api/files.rs), and every upload,
+//! including `/api/fs/upload` below, is written by `upload::publish`
+//! (primitive integrity audit 2026-11-26, P1).
 //!
 //! Ported from the deleted Python server (historical amux-server.py, deleted at 792ce1f; line refs are into git history):
 //! - path containment  `_is_path_allowed`      py:93-121  (deny sets py:82-91)
@@ -1425,6 +1426,16 @@ fn decode_cte(cte: &str, data: &[u8]) -> Vec<u8> {
 /// module (compat32) yields for browser/curl bodies. Returns None when the
 /// body does not decompose into parts (Python's "invalid multipart" 400:
 /// `msg.get_payload()` not a list).
+/// The folder a multipart upload targets (its `dir` field), for the capability
+/// gate, which must see the same target the upload handler writes to.
+pub(crate) fn multipart_dir(ctype: &str, body: &[u8]) -> Option<String> {
+    parse_multipart(ctype, body)?
+        .into_iter()
+        .find(|p| p.name.as_deref() == Some("dir"))
+        .map(|p| String::from_utf8_lossy(&p.data).trim().to_string())
+        .filter(|d| !d.is_empty())
+}
+
 fn parse_multipart(ctype: &str, body: &[u8]) -> Option<Vec<MPart>> {
     let boundary = boundary_of(ctype)?;
     let delim: Vec<u8> = [b"--", boundary.as_bytes()].concat();
@@ -1535,6 +1546,16 @@ async fn upload(req: Request) -> Response {
     if req.method() != Method::POST {
         return not_found().await;
     }
+    // Legacy single-request upload (primitive integrity audit P1). It keeps
+    // answering for outside callers (cloud/seed.py, cloud/desktop/remote.py,
+    // docs that taught the curl), and each hit is counted so a sweep can tell
+    // when it is unused. The dashboard uses the chunked /api/upload.
+    super::legacy_routes::record(
+        "/api/fs/upload",
+        "/api/upload",
+        req.uri().path(),
+        &super::legacy_routes::caller_of(req.headers()),
+    );
     let ctype = req
         .headers()
         .get("content-type")
@@ -1589,7 +1610,7 @@ async fn upload(req: Request) -> Response {
             continue;
         };
         let safe_name = sanitize_upload_name(filename);
-        let mut dest = dest_dir.join(&safe_name);
+        let dest = dest_dir.join(&safe_name);
         // Refuse code-execution-vector uploads (launch agents, shell rc,
         // .plist/.command/.desktop) — uploads have no extension allowlist.
         if is_dangerous_write(&dest) {
@@ -1598,25 +1619,21 @@ async fn upload(req: Request) -> Response {
         }
         // Never clobber by default — a person dragging a file into the
         // dashboard must not lose the one already there; `overwrite=1` is
-        // the declarative opt-in (py:68414-68424, the re-seed lesson).
-        if dest.exists() && !overwrite {
-            let stem = dest
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let suffix = dest
-                .extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
-                .unwrap_or_default();
-            let mut i = 1;
-            while dest.exists() {
-                dest = dest_dir.join(format!("{stem}_{i}{suffix}"));
-                i += 1;
-            }
-        }
-        if let Err(e) = std::fs::write(&dest, &part.data) {
-            return j(500, json!({"error": e.to_string()}));
-        }
+        // the declarative opt-in (py:68414-68424, the re-seed lesson). The
+        // write itself is the chunked upload's writer, so the two paths
+        // cannot disagree about atomicity or collision names.
+        let on_existing = if overwrite {
+            super::upload::OnExisting::Replace
+        } else {
+            super::upload::OnExisting::Suffix
+        };
+        let written = super::upload::publish(&dest_dir, &safe_name, on_existing, |f| {
+            std::io::Write::write_all(f, &part.data)
+        });
+        let dest = match written {
+            Ok(p) => p,
+            Err(e) => return j(500, json!({"error": e.to_string()})),
+        };
         let final_name = dest
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -2068,10 +2085,17 @@ async fn list_dir(method: Method, RawQuery(q): RawQuery) -> Response {
     }
     let qs = parse_qs(q.as_deref().unwrap_or(""));
     let target_path = qs_get(&qs, "path").unwrap_or("").trim().to_string();
+    list_dir_at(&target_path)
+}
+
+/// The `/api/fs/list` listing for one path. The legacy `/api/files?path=`
+/// adapter (files.rs) resolves its rooted path and serves this, so there is
+/// one browse implementation.
+pub(crate) fn list_dir_at(target_path: &str) -> Response {
     if target_path.is_empty() {
         return j(400, json!({"error": "missing 'path'"}));
     }
-    let target = expanduser(&target_path);
+    let target = expanduser(target_path);
     if !is_path_allowed(&target) {
         return j(403, json!({"error": "access denied"}));
     }

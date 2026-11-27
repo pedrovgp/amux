@@ -49,7 +49,7 @@ test('## in any input starts dictation there, and the transcript lands in that i
     // Playwright's WebKit never delivers MediaRecorder data for a synthesized
     // WebAudio stream, so the round trip is proven on Chromium. Here: Cancel
     // leaves the input as it was and the recorder closes.
-    await pop.getByRole('button', { name: 'Cancel' }).click();
+    await pop.getByRole('button', { name: 'Discard' }).click();
     await expect(input).toHaveValue('note ');
   } else {
     await page.route('**/api/dictate?**', route => route.fulfill({ json: { text: 'hello world', id: 1 } }));
@@ -82,9 +82,11 @@ test('🌐🌐 starts dictation even when storage hangs, and 🌐🌐 again fini
   expect(await page.evaluate(() => (window as any)._hkNativeKey('Globe Globe', { mac_dictation: false }))).toBe('ran');
   const pop = page.locator('#dict-popup');
   await expect(pop).toHaveClass(/open/);
-  await expect(page.locator('#dict-popup-status')).toHaveText(/^Listening/, { timeout: 4000 });
+  // The pill shows bars and a clock while it listens, no words.
+  await expect.poll(() => page.evaluate(() => (globalThis as any).eval('_dictRecording && !!_dictRecorder && _dictRecorder.state === "recording"')), { timeout: 4000 }).toBe(true);
   expect(await page.evaluate(() => (globalThis as any).eval('_dictRecording'))).toBe(true);
-  expect(await page.evaluate(() => (window as any)._hkNativeKey('Globe Globe'))).toBe('ran');
+  // 🌐 during a take finishes it directly (2026-11-17), so this says 'stopped'.
+  expect(await page.evaluate(() => (window as any)._hkNativeKey('Globe Globe'))).toBe('stopped');
   expect(await page.evaluate(() => (globalThis as any).eval('_dictRecording'))).toBe(false);
   await page.evaluate(() => { (globalThis as any).eval('_idb').set = (window as any).__realSet; (window as any)._dictClosePopup(true); });
   // The row shows as 🌐🌐, not as a name.
@@ -118,7 +120,7 @@ test('once storage has hung, a take is transcribed from memory without waiting o
     await input.fill('');
     await input.click();
     await page.evaluate(() => (window as any)._hkNativeKey('Globe Globe'));
-    await expect(page.locator('#dict-popup-status')).toHaveText(/^Listening/, { timeout: 4000 });
+    await expect.poll(() => page.evaluate(() => (globalThis as any).eval('_dictRecording && !!_dictRecorder && _dictRecorder.state === "recording"')), { timeout: 4000 }).toBe(true);
     await page.waitForTimeout(1500);
     const t0 = Date.now();
     await page.evaluate(() => (window as any)._hkNativeKey('Globe Globe'));

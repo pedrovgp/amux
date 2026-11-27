@@ -451,7 +451,7 @@ response says how many moved.</p>
 <tr><td>GET</td><td><code>/api/skills</code></td><td>List available skills</td></tr>
 <tr><td>GET</td><td><code>/api/logs</code></td><td>Query the request log</td></tr>
 <tr><td>GET</td><td><code>/api/metrics</code></td><td>Token usage metrics</td></tr>
-<tr><td>GET</td><td><code>/api/channels</code></td><td>List inter-session channels</td></tr>
+<tr><td>GET</td><td><code>/api/conversations</code></td><td>List Messages conversations, including two workers' direct messages (<code>ww:a|b</code>)</td></tr>
 <tr><td>GET</td><td><code>/api/memory/global</code></td><td>Read global shared memory</td></tr>
 <tr><td>POST</td><td><code>/api/memory/global</code></td><td>Write global shared memory</td></tr>
 <tr><td>GET</td><td><code>/api/calendar.ics</code></td><td>iCal feed of board items with due dates</td></tr>
@@ -588,6 +588,21 @@ curl -sk -X POST -H 'Content-Type: application/json' \
 
 <p>Skills can contain any logic &mdash; shell scripts, Python code, or complex multi-step workflows. They're the primary way to teach agents project-specific operations like &ldquo;deploy to staging&rdquo; or &ldquo;run the test suite.&rdquo;</p>
 
+<h3 id="agent-plugins">Use amux from Claude Code, Codex or Gemini CLI</h3>
+
+<p>The <a href="https://github.com/mixpeek/amux-plugins" target="_blank" rel="noopener">amux plugins</a> add three skills to the agent you already use: <code>setup</code> installs or connects amux, <code>delegate</code> starts a background worker on your repo and hands it a task, and <code>status</code> reports which workers are waiting on you. They work through the <code>amux</code> CLI on your machine and ask before installing anything or starting a worker.</p>
+
+<pre><code># Claude Code
+/plugin marketplace add mixpeek/amux-plugins
+/plugin install amux@amux
+
+# Codex
+codex plugin marketplace add mixpeek/amux-plugins
+codex plugin add amux@amux
+
+# Gemini CLI
+gemini extensions install https://github.com/mixpeek/amux-plugins</code></pre>
+
 <h2 id="channels">Channels</h2>
 
 <p>1:1 inter-session messaging with @mentions. Sessions can send messages to each other for real-time coordination.</p>
@@ -650,7 +665,7 @@ curl -sk -X POST -F "file=@local.txt" https://localhost:8824/api/fs/upload</code
 
 <h2 id="auth">Authentication</h2>
 
-<p>amux mints a bearer token at <code>~/.amux/auth_token</code> on first run. Requests from localhost are exempt; every other request needs the token, and requests from other websites are refused.</p>
+<p>amux mints a bearer token at <code>~/.amux/auth_token</code> on first run. Requests from localhost are exempt; every other request needs the token, and requests from other websites are refused. That covers anything that forwards to amux from the same machine, such as <code>tailscale serve</code> or a reverse proxy, so do not put one in front of amux: reach it over Tailscale with <code>tailscale cert</code> instead.</p>
 
 <pre><code># Read the token on the server
 cat ~/.amux/auth_token

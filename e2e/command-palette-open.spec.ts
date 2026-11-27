@@ -54,10 +54,19 @@ test('Cmd-K marks the worker open here and the ones open in other tabs', async (
     await page.locator('#cmdk-input').fill('cmdkopen-');
     await expect(row(closed).locator('.cmdk-open')).toHaveCount(0);
 
-    // The badge stays inside the row on a phone.
-    const box = await row(other).boundingBox();
-    const badge = await row(other).locator('.cmdk-open').boundingBox();
-    expect(badge!.x + badge!.width).toBeLessThanOrEqual(box!.x + box!.width + 1);
+    // The badge stays inside the row on a phone. The refill re-renders the
+    // list and the badge returns with the next places answer (async), so wait
+    // for it: measuring at once read a null box on iOS Safari (AMUX-6838).
+    await expect(row(other).locator('.cmdk-open')).toHaveText('Open');
+    // Both boxes from one read of the page: two locator reads let a places
+    // answer re-render the row between them (null box, AMUX-6838 again).
+    await expect.poll(() => page.evaluate((n) => {
+      const r = [...document.querySelectorAll('#cmdk-list .cmdk-row')].find(e => e.textContent!.includes(n));
+      const b = r?.querySelector('.cmdk-open');
+      if (!r || !b) return 'missing';
+      const rb = r.getBoundingClientRect(), bb = b.getBoundingClientRect();
+      return bb.width > 0 && bb.right <= rb.right + 1 ? 'inside' : `outside ${bb.right} > ${rb.right}`;
+    }, other)).toBe('inside');
   } finally {
     for (const name of [here, other, closed]) {
       await cleanup('delete fixture worker', () => request.post(`/api/sessions/${encodeURIComponent(name)}/delete`, { headers: auth }));

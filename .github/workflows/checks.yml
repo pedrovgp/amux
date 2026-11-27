@@ -107,6 +107,14 @@ jobs:
         run: python3 scripts/test-ci-checks.py
       - name: the shared-checkout guard's own matrix
         run: python3 ./scripts/git-hooks/test_git_shared_guard.py
+      # A public repo: no job a pull request can trigger may run on a self-hosted
+      # runner (docs/design/cicd-two-minutes.md, Z9).
+      - name: no self-hosted job is reachable from a pull request
+        run: python3 scripts/ci-self-hosted-guard.py --self-test && python3 scripts/ci-self-hosted-guard.py
+      # A tag is a pointer its owner can move; a workflow holding a real secret
+      # pins third-party actions to a commit sha (red-team run 7, class g).
+      - name: a secret-bearing workflow pins third-party actions to a sha
+        run: python3 scripts/ci-action-pin-guard.py --self-test && python3 scripts/ci-action-pin-guard.py
       - name: a land's push keeps its connection alive through a long hook
         run: bash scripts/test-land-ssh-keepalive.sh
       - name: Rust-input cache key (scripts/ci-rust-key.mjs)
@@ -131,6 +139,11 @@ jobs:
       # gateway handler against fake workspaces: no cloud, Clerk or Docker.
       - name: Cloud gateway ChatGPT front door (tenant rules)
         run: python3 cloud/tests/test_chatgpt_front.py
+      # The amux Cloud Stripe account move (cloud/start/STRIPE-ACCOUNT-MOVE.md):
+      # the real CLI against fake Stripe and Hetzner. Mixpeek's subscriptions are
+      # never written, and no customer is billed twice.
+      - name: Cloud Stripe account move (dry run, apply, rollback)
+        run: python3 -W ignore cloud/tests/test_stripe_account_move.py
       # The dashboard version is DERIVED (amux-dashboard build.rs hashes
       # static/ and the server stamps it into app.js and sw.js at serve time).
       # This replaced a "both version lines moved" diff guard (AF-148): the
@@ -364,6 +377,12 @@ jobs:
           python3 scripts/git-hooks/test_pre_push_spa_gates.py
       # AF-1073: pre-push runs the checks.yml shell tests that name a changed
       # script, on the pushed commit, since land_gate.py runs none of them.
+      # Governance PR 19: the owner's kill switch stops a worker's push, from
+      # the file the server writes, with no override.
+      - name: the pre-push hook refuses a worker's push while the kill switch is engaged
+        run: |
+          set -euo pipefail
+          python3 scripts/git-hooks/test_pre_push_kill_switch.py
       - name: the pre-push script tests refuse a script red, and only this push's (AF-1073)
         run: |
           set -euo pipefail
@@ -515,7 +534,7 @@ jobs:
       - name: The Cloud sign-in door queues a page load's burst instead of dropping it
         run: python3 cloud/desktop/test_door_backlog.py
       - name: The sign-in door throttles password guessing and enforces the owner's address allowlist
-        run: python3 -m unittest cloud/desktop/test_door_throttle.py cloud/desktop/test_door_allowlist.py
+        run: python3 -m unittest cloud/desktop/test_door_throttle.py cloud/desktop/test_door_allowlist.py cloud/desktop/test_door_owner_proof.py cloud/desktop/test_door_totp.py
       - name: Python reading a shared site-packages defaults grpc to fork-safe (Mac crashes RCA 20261018-105230)
         run: |
           set -uo pipefail
@@ -640,6 +659,13 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-cli-stop-recorded.sh
+      # The server's stop keeps the pane (a bare shell), so `amux start` must
+      # tell an empty pane from a live worker. Real tmux on a private socket.
+      - name: amux start relaunches a stopped worker whose pane is still open
+        run: |
+          set -uo pipefail
+          command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; } || exit 1
+          bash scripts/test-cli-start-after-stop.sh
       - name: the commit-intent manifest round-trips
         run: |
           set -uo pipefail
@@ -738,11 +764,13 @@ jobs:
           # unless it is the last line, so this test could fail and the step pass.
           bash scripts/test-land-regenerate.sh
           NO_REGEN=1 bash scripts/test-land-regenerate.sh
+          bash scripts/test-land-regenerate-delete.sh
+          bash scripts/test-grep-all-pipefail.sh
           bash scripts/test-land-regenerate-always.sh && bash scripts/test-land-regenerate-always.sh "" conflict && bash scripts/test-land-regenerate-always.sh "" failing && bash scripts/test-land-regenerate-always.sh "" worktree
       - name: land precheck verdict and attributed cancel (1/8)
         run: |
           set -uo pipefail
-          bash scripts/test-land-gate-capped.sh && bash scripts/test-land-precheck-verdict.sh && bash scripts/test-land-cancel-for.sh && bash scripts/test-land-blame.sh && bash scripts/test-land-cancel-holder.sh
+          bash scripts/test-land-gate-capped.sh && python3 scripts/test-land-gate-rank.py && bash scripts/test-land-precheck-verdict.sh && bash scripts/test-land-cancel-for.sh && bash scripts/test-land-blame.sh && bash scripts/test-land-cancel-holder.sh && bash scripts/test-land-cancel-in-batch.sh
       - name: land precheck verdict and attributed cancel (2/8)
         run: |
           set -uo pipefail
@@ -750,19 +778,43 @@ jobs:
       - name: land precheck verdict and attributed cancel (3/8)
         run: |
           set -uo pipefail
-          bash scripts/test-land-resume-place.sh && bash scripts/test-land-shared-config-guard.sh && bash scripts/test-land-heal-core-worktree.sh && bash scripts/test-land-already-landed.sh && bash scripts/test-land-fast-gate.sh && bash scripts/test-land-remote-lease.sh
+          bash scripts/test-land-resume-place.sh && bash scripts/test-land-shared-config-guard.sh && bash scripts/test-land-heal-core-worktree.sh && bash scripts/test-land-already-landed.sh && bash scripts/test-land-shared-clone-remote.sh && bash scripts/test-land-fast-gate.sh && bash scripts/test-land-stale-hooks.sh
+      - name: two machines share one remote land lease (1/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-remote-lease.sh "" a
+      - name: two machines share one remote land lease (2/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-remote-lease.sh "" b
       - name: land precheck verdict and attributed cancel (4/8)
         run: |
           set -uo pipefail
-          bash scripts/test-land-merge-queue.sh && bash scripts/test-land-fix-forward.sh && bash scripts/test-land-net-retry.sh && bash scripts/test-land-regenerate-scoped.sh && bash scripts/test-land-regenerate-reuse.sh
+          bash scripts/test-land-fix-forward.sh && bash scripts/test-land-priority-before-gate.sh && bash scripts/test-land-net-retry.sh && bash scripts/test-land-regenerate-scoped.sh && bash scripts/test-land-regenerate-reuse.sh && bash scripts/test-land-gate-slots.sh
+      - name: a land through the merge queue (1/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-merge-queue.sh "" a
+      - name: a land through the merge queue (2/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-merge-queue.sh "" b
       - name: land precheck verdict and attributed cancel (5/8)
         run: |
           set -uo pipefail
-          bash scripts/test-land-leg-summary.sh && bash scripts/test-land-window.sh && bash scripts/test-land-inflight-fixes.sh && bash scripts/test-lane-efficiency.sh && bash scripts/test-land-precheck-base.sh
+          bash scripts/test-land-leg-summary.sh && bash scripts/test-land-window.sh && bash scripts/test-land-wait-report.sh && bash scripts/test-land-inflight-fixes.sh && bash scripts/test-lane-efficiency.sh && bash scripts/test-land-precheck-base.sh && bash scripts/test-land-precheck-first.sh && bash scripts/test-land-sha-gate.sh && bash scripts/test-land-recheck-head.sh
       - name: land precheck verdict and attributed cancel (6/8)
         run: |
           set -uo pipefail
-          bash scripts/test-land-guards.sh && bash scripts/test-land-queue-policy.sh && bash scripts/test-ci-wait.sh && bash scripts/test-board-close-tracking.sh && bash scripts/test-cli-stale-url.sh
+          bash scripts/test-land-queue-policy.sh && bash scripts/test-ci-wait.sh && bash scripts/test-board-close-tracking.sh && bash scripts/test-cli-stale-url.sh
+      - name: the land guards (freeze, reused message, --json, config, regenerate) hold (1/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-guards.sh "" a
+      - name: the land guards (freeze, reused message, --json, config, regenerate) hold (2/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-guards.sh "" b
       - name: land precheck verdict and attributed cancel (7/8)
         run: |
           set -uo pipefail
@@ -1006,6 +1058,7 @@ jobs:
           ./scripts/test-build-disk-clear.sh
           python3 scripts/test-cargo-target-guard.py
           python3 scripts/test-cargo-budget.py
+          bash scripts/test-safe-cargo-sizing.sh
           ./scripts/test-build-activation-authority.sh
           ./scripts/test-build-restamp.sh || exit 1
           ./scripts/test-build-activation-launcher.sh

@@ -187,7 +187,10 @@ impl Client {
             .unwrap_or_else(|_| {
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
             })
-            .join("auth-token")
+            // `auth_token`, underscore: the server's file (api/auth.rs). This
+            // read `auth-token` and so never sent the owner credential, which
+            // only worked while loopback counted as one (governance PR 3).
+            .join("auth_token")
             .pipe(|p| std::fs::read_to_string(p).ok())
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
@@ -211,6 +214,12 @@ impl Client {
         }
         if let Some(s) = &self.session {
             r = r.header("X-Amux-Session", s);
+        }
+        // Inside a worker, its minted identity (contract rule 10).
+        if let Ok(t) = std::env::var("AMUX_WORKER_TOKEN") {
+            if !t.trim().is_empty() {
+                r = r.header("X-Amux-Worker-Token", t.trim());
+            }
         }
         r
     }
@@ -372,10 +381,12 @@ fn run(cmd: &Cmd, c: &Client) -> anyhow::Result<i32> {
                     buf
                 }
             };
+            // The ordinary send, the same route the bash `amux send` uses
+            // (`/api/messages` was removed, primitive integrity audit 2026-11-26).
             let (status, v) = c.send_json(
                 reqwest::Method::POST,
-                "/api/messages",
-                json!({"target": {"worker_name": worker}, "body": body_text}),
+                &format!("/api/sessions/{worker}/send"),
+                json!({"text": body_text}),
             )?;
             if (200..300).contains(&status) {
                 println!("sent to {worker}");

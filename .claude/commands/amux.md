@@ -327,14 +327,15 @@ last-poll time/error and routing counts), **outbound** via
 - From Telegram itself: send `/link <session-name>` to the bot in that chat.
   The bot validates the session exists (against the live lane list) and
   confirms in-chat.
-- From the API — e.g. pre-linking a `chat_id` found via Telegram's own
-  `getUpdates` before the bot has received anything from it:
-  `POST /api/telegram/mappings`.
+- From the API (owner only), e.g. pre-linking a `chat_id` found via
+  Telegram's own `getUpdates` before the bot has received anything from it:
+  `POST /api/bridge/links` with `{"platform":"telegram","conversation":"<chat_id>","target":"<worker>"}`.
 
-Once linked, any other text sent to the bot in that chat is routed into the
-mapped session, stamped `[from Telegram @username]: ...` so the session can
-tell a Telegram message apart from other input arriving in its pane. A chat
-that sends text before linking gets a one-line nudge back (`/link
+A link is a chat bridge link (`bridge_links`, the same table every chat
+platform uses; `GET /api/bridge` lists them). Once linked, any other text
+sent to the bot in that chat is posted in the worker's thread, which
+delivers it, and the worker's answer is sent back to the chat. A chat that
+sends text before linking gets a one-line nudge back (`/link
 <session-name>` first), never silently dropped.
 
 **Routing to a specific lane from Telegram** — start a message with `@lane_name` to
@@ -348,12 +349,12 @@ rather than silently landing in the wrong place with no signal (fixed 2026-08-30
 found via a real typo'd message during testing).
 
 ```bash
-curl -sk $AMUX_URL/api/telegram/status                          # bot_token_set, mapping_count, last_poll_at, last_error, messages_routed/unlinked
-curl -sk $AMUX_URL/api/telegram/mappings                        # list chat<->session links
+curl -sk $AMUX_URL/api/telegram/status                          # bot_token_set, mapping_count (Telegram links), last_poll_at, last_error, messages_routed/unlinked
+curl -sk $AMUX_URL/api/bridge                                   # every chat link, Telegram's included
 curl -sk -X POST -H 'Content-Type: application/json' \
-  -d '{"chat_id":123456,"session":"SESSION_NAME"}' \
-  $AMUX_URL/api/telegram/mappings                                # manually link a chat_id to a session
-curl -sk -X DELETE $AMUX_URL/api/telegram/mappings/CHAT_ID        # unlink
+  -d '{"platform":"telegram","conversation":"123456","target":"SESSION_NAME"}' \
+  $AMUX_URL/api/bridge/links                                     # manually link a chat_id to a session (owner only)
+curl -sk -X DELETE $AMUX_URL/api/bridge/links/telegram/CHAT_ID    # unlink (owner only)
 
 # Outbound: session -> Telegram. Exactly one of session (resolved to its
 # most-recently-linked chat) or chat_id.
@@ -368,10 +369,9 @@ if two chats `/link` the same session, the newer link wins for
 regardless). Pass `chat_id` directly in `/send` to disambiguate or to reach
 a chat that never linked a session at all.
 
-There is no automatic "every session message also goes to Telegram" wiring —
-`POST /api/telegram/send` is an explicit call a session or hook makes, not a
-background forwarder (ethos rule 8: which events go to which chat is the
-operator's call, not a default this connector should assume).
+The worker's answer to a message from a linked chat goes back by the chat
+bridge on its own. `POST /api/telegram/send` is for anything else a session
+or hook chooses to send.
 
 **Any worker can reply to Telegram** — the connector is available to all sessions
 equally. If you want your session to send replies back to Telegram (e.g., in response
@@ -499,26 +499,30 @@ curl -sk -X DELETE $AMUX_URL/api/journal/media/MEDIA_ID     # hard delete (file 
 
 ---
 
-## Files — two DIFFERENT contracts, both intentionally mounted
+## Files — one browse API, one upload path
 
-`/api/fs/*` and `/api/files/*` are NOT duplicates — different roots,
-different upload shapes, kept side by side on purpose
-(`docs/rust-migration/server-boundary.md`). Pick by shape, not habit.
+Browse with `/api/fs` (absolute paths, deny-set checked) and fetch bytes with
+`/api/file/raw`. Upload with the chunked `/api/upload` protocol, which streams,
+resumes and never overwrites. The `.mdai` engine lives at `/api/mdai`.
 
 ```bash
-# /api/fs — Python-parity, path-containment-checked, MULTIPART upload
-curl -sk "$AMUX_URL/api/fs/list?path=."
+curl -sk "$AMUX_URL/api/fs/list?path=$HOME/some/dir"
+curl -sk "$AMUX_URL/api/file/raw?path=$HOME/some/file&download=1" -o out
 curl -sk -X POST -H 'Content-Type: application/json' -d '{"path":"..."}' $AMUX_URL/api/fs/mkdir
-curl -sk -X POST -F "file=@local.txt" -F "dir=/some/dir" $AMUX_URL/api/fs/upload
-curl -sk -X POST -H 'Content-Type: application/json' -d '{"path":"..."}' $AMUX_URL/api/fs/open
 curl -sk -X POST -H 'Content-Type: application/json' -d '{"from":"a","to":"b"}' $AMUX_URL/api/fs/rename
 
-# /api/files — rooted at $HOME (override AMUX_FILES_ROOT), RAW BODY upload,
-# 50MB cap both ways (413 beyond)
-curl -sk "$AMUX_URL/api/files?path=some/dir"                       # listing
-curl -sk "$AMUX_URL/api/files/download?path=some/file" -o out      # raw bytes
-curl -sk -X POST --data-binary @local.txt "$AMUX_URL/api/files/upload?path=dir/file"
+# Upload: start, PUT each 5 MB chunk, finish into a folder
+id=$(curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"name":"local.txt","size":'"$(wc -c < local.txt)"',"chunks":1}' $AMUX_URL/api/upload/start | jq -r .id)
+curl -sk -X PUT --data-binary @local.txt "$AMUX_URL/api/upload/$id/chunk/0"
+curl -sk -X POST "$AMUX_URL/api/upload/$id/finish?dir=$HOME/some/dir&name=local.txt"   # -> {path, name, url}
 ```
+
+Retired spellings still answer and are counted (`GET /api/debug/legacy-routes`
+says who still calls them): `/api/files?path=` (= `/api/fs/list`),
+`/api/files/download` (= `/api/file/raw?download=1`), `/api/files/upload` and
+`/api/fs/upload` (written by the chunked path's writer), `/api/files/mdai/*`
+(= `/api/mdai/*`). Do not write new callers against them.
 
 ---
 
@@ -701,7 +705,7 @@ Parse the arguments to determine what the user wants:
 - **`calendar`** or **`cal`** → list/create/update/delete a standalone event via `/api/cal-events`
 - **`telegram`** → Telegram bot status / link a chat to a session / send a message via `/api/telegram`
 - **`journal`** → journal entries via `/api/journal`
-- **`files`** → browse/upload/download via `/api/fs` or `/api/files` (see Files section for which)
+- **`files`** → browse via `/api/fs`, download via `/api/file/raw`, upload via chunked `/api/upload` (see Files section)
 - **`org`** → org/team/members/invites via `/api/org`
 - **`groups`** → fleet group list/config via `/api/groups`
 - **`torrents`** → torrent status/add/control via `/api/torrents` (needs aria2c running)

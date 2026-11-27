@@ -123,6 +123,7 @@ pub fn routes() -> Router<AppState> {
         .route("/save-profile", post(save_profile))
         .route("/agent", post(agent))
         .nest("/import", super::browser_import::routes())
+        .nest("/watch", super::browser_watch::routes())
         // Unknown /api/browser paths answer the route CATALOG (ported from
         // Python). EXPLICIT wildcard routes, not `.fallback()`: in the full
         // composition the static SPA catch-all (`/{*path}`) out-competes a
@@ -2566,15 +2567,7 @@ pub(crate) fn profile_jar(dir: &std::path::Path) -> Option<crate::integrations::
 /// AMUX_BROWSER_DEFAULT_PROFILE (process env, then worker > group > global),
 /// else the registry's primary profile, else `default`.
 pub(crate) fn default_browser_profile(worker: &str) -> (String, &'static str) {
-    let scoped = std::env::var("AMUX_BROWSER_DEFAULT_PROFILE").ok().filter(|v| !v.trim().is_empty()).or_else(|| {
-        (!worker.is_empty()).then(|| {
-            crate::api::session_verbs::scoped_setting_in(
-                &crate::api::session_verbs::home(),
-                worker,
-                "AMUX_BROWSER_DEFAULT_PROFILE",
-            )
-        }).flatten()
-    });
+    let scoped = crate::environment::resolve(crate::environment::Scope::Lane(worker), "AMUX_BROWSER_DEFAULT_PROFILE");
     let reg = chrome::registry_load(&chrome::amux_home());
     crate::integrations::browser_logins::default_profile_for(scoped, &reg)
 }
@@ -2699,11 +2692,17 @@ async fn profile_for(headers: HeaderMap, Query(q): Query<ProfileForQuery>) -> Re
                     "hint": format!("Do not substitute another identity. Ask the owner to sync or sign in {names} (amux browser create {} <url>), then retry.", unsynced[0]),
                     "measured": true, "n_considered": n, "choices": cards, "unsynced": unsynced}));
             }
+            let api = bl::amux_api_for(&host);
             tracing::info!(target: "amux::browser", site = %site, worker = %worker, profile = %choice.profile,
-                signed_in = choice.signed_in, measured = true, n_considered = n,
-                verdict = "browser_profile_resolved", "browser profile chosen for a site");
+                signed_in = choice.signed_in, measured = true, n_considered = n, amux_api = api.map(|a| a.0).unwrap_or(""),
+                verdict = if api.is_some() { "browser_profile_resolved_api_named" } else { "browser_profile_resolved" },
+                "browser profile chosen for a site");
             let mut v = serde_json::to_value(&choice).unwrap_or(Value::Null);
             if let Some(o) = v.as_object_mut() {
+                if let Some((product, call)) = api {
+                    o.insert("amux_api".into(), json!({"product": product, "use": call}));
+                    o.insert("why".into(), json!(format!("{product} needs no browser: use {call}. {}", choice.why)));
+                }
                 o.insert("selection".into(),cards.iter().find(|c|c["name"]==choice.profile).cloned().unwrap_or(Value::Null));
                 o.insert("choices".into(),json!(cards));
                 o.insert("verified_live".into(),json!(false));
@@ -3953,11 +3952,22 @@ pub(crate) async fn drive(state: &AppState, session: &str, verb: &str, body: Val
     drive_status(state, session, verb, body).await.map_err(|(_, e)| e)
 }
 
+tokio::task_local! {
+    /// Set while the server drives the browser itself ([`drive_status`]), so
+    /// the outbound gate can tell its own publishers from a worker's request.
+    static SERVER_DRIVE: ();
+}
+
 /// [`drive`] with the reply's status kept beside the error, so a caller can
 /// pass a refusal on as one (a 409 for a profile another session holds)
 /// instead of reporting it as amux failing (AF-1065). A failure before any
 /// reply carries 502.
 pub(crate) async fn drive_status(state: &AppState, session: &str, verb: &str, body: Value)
+    -> Result<Value, (StatusCode, String)> {
+    SERVER_DRIVE.scope((), drive_status_inner(state, session, verb, body)).await
+}
+
+async fn drive_status_inner(state: &AppState, session: &str, verb: &str, body: Value)
     -> Result<Value, (StatusCode, String)> {
     let bad = |e: String| (StatusCode::BAD_GATEWAY, e);
     let mut headers = HeaderMap::new();
@@ -4133,6 +4143,16 @@ async fn action_inner(
         Ok(x) => x,
         Err(r) => return r,
     };
+    // A worker's write into a site that messages people outside needs the
+    // owner's approval of that message first (api/outbound.rs). The server's
+    // own publishers (drive) hold their own approval.
+    if SERVER_DRIVE.try_with(|_| ()).is_err() {
+        if let Some(worker) = headers.get("x-amux-session").and_then(|v| v.to_str().ok()).map(str::trim).filter(|w| !w.is_empty()) {
+            if let Some(refused) = super::outbound::browser_gate(&state, worker, &page.url, &action, &body) {
+                return refused;
+            }
+        }
+    }
     crate::integrations::browser::touch_verb_for_session(&session);
     let ten = Duration::from_secs(10);
     let mut audit = action_audit_fields(&body, &page.url);

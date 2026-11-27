@@ -6271,3 +6271,108 @@ CARD: none (amux-frustrations has every board switch off; reported to it by mess
 SYMPTOM: `amux post p:owner --file /path/report.txt` posted the literal text "--file /path/report.txt" and printed "posted to d:...|owner (your direct message with owner)". amux post had no --file, read --stdin only as the first argument, and took any other argument after <conv> as the text. The server refused a body of only `--thread N`, but not `--file <path>`.
 COST: 21 of mixpeek-meta-worker's posts to the owner (11-09 03:3xZ to 11-10 16:2xZ) arrived as bare paths, among them two daily reports, decision asks, a capacity ask and a date-slip notice. The owner found out by asking where the DM was. The fix could not be sent back to the reporter: `amux send` refused amux-frustrations [amux] -> mixpeek-meta-worker [admin, infra] at the worker group boundary, though the report came the other way.
 FIX: 8b71e3e62 (CLI: --file and --stdin, an unknown --flag refused, `--` ends the flags; tests/cli_post.py, in checks) and 9a89b6420 (server: a body of only `amux post` flags, --file included, is refused with verdict conversation_post_stale_cli).
+
+## The resource guard refuses heavy commands on pinned swap while memory pressure is low
+AREA: resources
+SEVERITY: slows
+STATUS: open
+DATE: 2026-11-11
+SESSION: amux-security
+CARD: none (amux-security has every board switch off)
+SYMPTOM: from about 18:10 to 19:40 the boundary guard refused a one-crate cargo test at -j 2, the land gate, a `git worktree add` and even a heredoc append to this file with "the machine is critical (swap 97% used)". Over the same window `memory_pressure` reported 68% of memory free, load was 0.34 per core, and `amux resources` printed `level ok`. macOS keeps pages in swap until they are touched again, so swap use can sit near full for hours after the pressure that put it there has gone. The guard and `amux resources` disagreed about the same machine at the same time, and the guard's notion of "heavy" caught commands that use no memory to speak of.
+COST: a security fix (4b7c85965, test servers bind loopback only) waited about 70 minutes and two scheduled resumes, each a full model turn, while three more network-watch alerts fired for the exposure it fixes. It landed only with AMUX_RESOURCES_ACK. The override is recorded, but while swap stays pinned it is the routine path for every heavy command.
+FIX: judge "critical" on current pressure (the kernel memory-pressure level, or free plus compressible memory) rather than on swap used; treat swap as critical only while it is growing. `amux resources` and the guard should read the same verdict.
+
+## A failing merge-queue batch holds the land lease for every machine while checks that take seconds could have refused it at enqueue
+AREA: land
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-11-12
+SESSION: mixpeek-meta-worker
+CARD: none (amux-frustrations has every board switch off; reported to it by message)
+SYMPTOM: from 18:08Z to 19:40Z on 11-12 eight Mixpeek merge-queue candidates from the Mac failed on checks that run in seconds on the landing machine: a generator's --check (a commit without its render, four times), ruff on the diff (twice; the latest an unsorted import in 5cc03c7354c) and one rust test. Each failing batch kept the lease through its bisect, so main did not move from 18:47:57Z until after 19:40Z, with 13 lanes waiting here and the VM's lands waiting too.
+COST: about 50 minutes with no landing for every lane on both machines, during GS-12's last days.
+MECHANISM (read by amux-frustrations from the committed bytes; the report's "amux land skips its local precheck" is not what happens): `amux land` does run the repository's `.githooks/land-precheck` at enqueue, before the lease (`_land_precheck`, amux ~line 8137, called from cmd_land). Mixpeek's `.githooks/land-precheck` runs only `ci/tip/proven_paths.py --warn` and never refuses, and its `.githooks/pre-push` (the fast gate's push hook) only waits on deployd. The ruff, generator --check and byte-compile legs exist only in the ci.yml candidate (`amux.landMergeQueue = enforce`), which runs while the lease is held. So the enqueue hook exists and runs; it checks nothing that fails here.
+FIX: (1) Mixpeek: add the seconds-cheap legs to `.githooks/land-precheck` on the lane's range, refusing with the failing line: ruff on the changed .py files, `py_compile` on them, and each landRegenerate generator in its --check form when its declared inputs changed. That puts the refusal before the lease with no amux change. (2) amux: a batch whose candidate fails should release the lease before it bisects, re-queueing its tickets singly, so one bad commit costs its own lane the bisect and not every lane.
+
+## The land review stops reviewing after three rounds of one owner request, so a fourth unrelated change lands unreviewed
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-11-13
+SESSION: amux-frustrations
+CARD: none (amux-frustrations has every board switch off)
+SYMPTOM: four separate changes, each citing the one goal request `Amux-Request: MSG-107374`, went through `amux land` on 11-12 and 11-13: #452's Codex limit fix, the OAuth restart rig (57b5fc6e6), the zombie pid fix (b96fac4ef) and the orchestration chaos case (b42e0a07a). The fourth printed `review: round 4. Three rounds are done, so it no longer hunts. Re-evaluate the approach rather than patching finding by finding.` with `verdict=review_capped`, and landed. Nothing had reviewed that diff.
+COST: a change to a recovery test landed with no fresh-context review; the gate passed it as reviewed. Any lane working a long owner request or a /goal hits the cap after its third change.
+MECHANISM: `scripts/land_review.py` `change_key` keys review state on the sorted `Amux-Request` ids of the range (`req:MSG-107374`), and falls back to the subject only when none is cited. The three-round cap is meant for one change reworked after findings; the key makes it one owner request instead.
+FIX: key the state on the request AND the changed paths (or the patch-id of the first round's diff), so a new change under the same request starts at round 1. A round whose diff shares no file with the earlier rounds is a new change.
+
+## A frustration report from an outside-group worker is delivered, but the answer to it is refused
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-11-15
+SESSION: amux-frustrations
+CARD: AF-1243
+SYMPTOM: mixpeek-research (groups infra, new-features, ops) sent amux-frustrations (group amux) a FRUSTRATION ending "ask: fix or decline", and it arrived. After the fix landed (5dbfb5370), `amux send mixpeek-research` answered "worker group boundary refused ... Do not retry or reroute to another outside-group worker".
+COST: the reporter cannot learn its ask was answered; the answer sits only on AF-1242, which it does not read. One more round trip for the owner to relay it, or a lost close.
+FIX: allow one reply to a message whose server-stamped origin is the recipient, or have an inbound report name the card where its answer will be written.
+
+## A cleanup deleted another lane's paused colima VM, because nothing says who owns a VM or why it is stopped
+AREA: resources
+SEVERITY: loses-work
+STATUS: open
+DATE: 2026-11-17
+SESSION: backend
+CARD: AF-1273
+SYMPTOM: At 20:00:05 ET the desktop worker ran `colima delete` on mixpeek-hikes, goal-shared and gs12-local to free disk (228G to 490G). mixpeek-hikes was backend's local Mixpeek stack, stopped about 3 minutes earlier to relieve memory. Its data volume (scratch namespaces of manifest-loop runs 1 to 8, plugin records), image and local registry were lost, and a later `colima start` recreated a default 2 CPU, 2 GiB VM.
+COST: about 30 minutes to rebuild, plus run state that cannot be recovered.
+MECHANISM: the desktop worker's own ask recommended only goal-shared and gs12-local, said it could not tell which worker owns each VM, and asked for a yes; the owner's reply named all three. No record links a VM to its lane or a stop to its reason, so neither the owner nor the worker could see mixpeek-hikes was backend's and paused, not abandoned. mac-cleanup-tick.sh never deletes a VM.
+FIX: record a VM's owning lane at creation and each stop's reason; before deleting a VM another lane owns, show its owner, last use and data size, and snapshot its data volume or ask that lane. A guard refusing `colima delete` of an owned VM is a boundaries.toml change for the owner.
+
+## A push outside amux land lands under another machine's remote land lease, and the holder loses its green candidate
+AREA: land
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-11-23
+SESSION: mxp-decomp
+CARD: AF-1356
+SYMPTOM: mixpeek-dev's mixpeek-cicd-lag held refs/amux/land-lock/main from about 03:31Z with a green merge-queue candidate (a4e3d1050f, run 45104512792). Its push spent 976 s in mixpeek's pre-push prejudge (studio gave no verdict in 960 s) and was rejected: "cannot lock ref 'refs/heads/main': is at d0dff040f6 but expected a8c98cee1a".
+COST: a green candidate thrown away, and about 2 h of no progress for four batched waiters on mixpeek-dev, the oldest at 114 min.
+MECHANISM: the lease is honoured only by `amux land`. d0dff040f6 was pushed at 03:36:37Z (GitHub activity: push a8c98cee1a..d0dff040f6) by the Mac's mixpeek-cicd lane through mixpeek's ci/tip/land.sh, a bare `git push -q origin HEAD:main`, and mixpeek's .githooks/pre-push reads no lease. The holder did hold the lease through its prejudge. The 46 and 20 min waits in the report are the 2026-11-22 handover taking turns as built: each turn is one land attempt, and the Mac's attempt ran a red batch, a bisect and an eject.
+FIX: `amux land --lease-check <remote>` refuses, from a pre-push hook, a push to a branch whose lease another live land holds (land's own push and an expired lease pass), and a held-lease push that loses now logs verdict=land_branch_moved_under_lease naming the commit. It reaches mixpeek once its .githooks/pre-push pipes its lines to that command, or ci/tip/land.sh lands with amux land.
+
+## A land held main 55 min after its batch was refused while 14 lands queued behind it
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-11-25
+SESSION: mxp-mongo-migration
+CARD: AF-1408
+SYMPTOM: decomp-platform's `amux land` on mixpeek-dev (pid 3822027) held the main lock 19:52Z to 20:47Z. After merge-queue run 45693595861 refused its batch, the process tree was only `sleep 20`, `--status` read "current attempt 0 min" on every read, and 14 lands queued behind it until the owner cancelled it. The holder's log shows the mechanism. Its bisect handed the lease to the Mac after a green step, the Mac landed, the 4-of-7 green prefix could not be carried onto the moved main (mq_carry_changes_members) and was dropped, and the holder handed over again and waited on the Mac's land.
+COST: about 55 min of main for every mixpeek-dev lane, 40 min of candidate runs that landed nothing, and a manual cancel by the owner.
+FIX: c45cdf3e5 (a bisect keeps the lease once a step ran green). The misleading --status is AF-1409.
+
+## amux land from a --shared scratch clone checks and pushes against the local checkout it was cloned from
+AREA: land
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-11-26
+SESSION: mxp-mongo-migration
+CARD: AF-1426
+SYMPTOM: `amux land --detach --sha` from a `git clone --shared ~/Dev/mixpeek` scratch clone refused with "conflicts with origin/main on: <files>" on commits built on GitHub's main. Three refusals on mixpeek-dev in one evening (mongo-harness ab2543c0f4 and 1f435aa413, mongo-store twice).
+COST: about 15 to 30 minutes per refusal on a critical-path harness fix, each spent rebasing and retrying.
+MECHANISM: the clone's origin is the local checkout, whose main lags GitHub's. The guards, the conflict check, the lease and the push all read $remote, and land_gate.py reads origin, so every step compared against the stale main. A land that passed the check would have pushed into the local checkout (git refuses that for a checked-out branch), never reaching GitHub.
+FIX: cmd_land points a clone's remote at the URL its local source uses for that remote (up to three hops) and logs verdict=land_remote_canonicalized; a bare local origin is left alone. AMUX_LAND_KEEP_LOCAL_REMOTE=1 opts out. scripts/test-land-shared-clone-remote.sh reproduces the false conflict before the fix and lands on the canonical remote after it.
+
+## amux land --cancel reports "cancelled" for a waiter whose commits a holder already put in its batch
+AREA: land
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-11-27
+SESSION: mxp-gs12
+CARD: AF-1435
+SYMPTOM: `amux land --cancel 3109689` printed "cancelled detached land pid 3109689 (process group)" at 17:55:22Z. mixpeek-cicd-lag's holder had composed its batch at 17:54:31Z with that ticket in it, and the five commits landed in 9accd0304a before 18:05:07Z. Neither the cancel nor `amux land --status` said the commits were in a batch in flight.
+COST: main red on ci/tests/test_nothing_reads_zb.py from the push until a fix landed, and a wrong "pulled before it landed" note to mixpeek-meta-worker.
+MECHANISM: the holder kept the tickets it batched only in a local variable (stack_in). The cancel kills the waiter's process group and removes its ticket. The holder never reads the ticket again before pushing, so nothing outside the holder knew the commits were committed to a push.
+FIX: the holder writes `<queue>/.inbatch-<ticket>` (holder lane, pid, composed time, sha) on every stack build and removes it when it tells the waiter. Every cancel path (`--cancel` detached, by waiter pid, unrecorded, and `--cancel-for`) reads it before the kill and prints and logs `WARN verdict=land_cancel_in_batch` naming the holder's batch and how to stop it. `--cancel-for`'s message to the lane no longer says "Nothing was pushed" in that case. `--status` lists "in <holder>'s batch in flight" tickets. The cancel still does not take commits out of a composed batch; it says they land unless the batch fails. scripts/test-land-cancel-in-batch.sh drives a real three-lane batch.

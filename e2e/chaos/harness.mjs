@@ -24,7 +24,7 @@ export function request(base, method, p, body, timeoutMs = 30000, extraHeaders =
     const r = https.request(base + p, { method, rejectUnauthorized: false, timeout: timeoutMs,
       headers: { 'Content-Type': 'application/json', ...(data ? { 'Content-Length': data.length } : {}), ...extraHeaders } }, res => {
       let buf = ''; res.on('data', c => buf += c);
-      res.on('end', () => { let j = {}; try { j = JSON.parse(buf || '{}'); } catch { j = { raw: buf }; } resolve({ status: res.statusCode, body: j }); });
+      res.on('end', () => { let j = {}; try { j = JSON.parse(buf || '{}'); } catch { j = { raw: buf }; } resolve({ status: res.statusCode, body: j, headers: res.headers }); });
     });
     r.on('timeout', () => r.destroy(new Error('timeout')));
     r.on('error', reject);
@@ -63,6 +63,8 @@ export async function startAmux({ binary, env: extra = {}, root } = {}) {
   const env = testServerEnv();
   Object.assign(env, {
     HOME: userHome, AMUX_HOME: home, AMUX_RS_PORT: String(port), TMUX_TMPDIR: tmuxDir,
+    // Loopback only: a throwaway server has no business on the LAN.
+    AMUX_RS_BIND: '127.0.0.1',
     AMUX_ISOLATED: '1', AMUX_NO_SELF_ADOPT: '1',
     // AMUX-4724 refuses spawns from a temp AMUX_HOME because a test usually
     // shares the REAL tmux server. This one does not: TMUX_TMPDIR above is a

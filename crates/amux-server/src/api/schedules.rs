@@ -25,7 +25,7 @@
 use super::AppState;
 use crate::db::{PendingEvent, WriteOutcome};
 use crate::runtime_jobs::scheduler::{
-    self, fmt_minute, get_schedule, insert_audit, insert_schedule, legacy_next_run, list_schedules,
+    self, fmt_minute, get_schedule, insert_schedule, legacy_next_run, list_schedules,
     mint_schedule_id, record_run, skip_next_run, soft_delete_schedule, update_schedule, Deliverer,
     DurableSchedule, LiveDeliverer, RunOutcome, ScheduleExpr, AUDIT_FIELDS,
 };
@@ -460,6 +460,21 @@ fn when_on_shell_refusal() -> Response {
         json!({
             "error": "when applies to kind 'tmux' schedules; a shell schedule's command can test the condition itself",
             "code": "when_on_shell",
+        }),
+    )
+}
+
+/// `critical` skips the host guard, so it is for a shell command, or a prompt
+/// schedule whose `when` check gates the turn. On a prompt schedule with no
+/// check it would carry a model turn past the guard on every fire.
+fn critical_not_shell_refusal() -> Response {
+    tracing::info!(verdict = "schedule_critical_refused", reason = "not_shell", measured = true, n_considered = 1,
+        "critical was set on a prompt schedule with no when check");
+    err(
+        StatusCode::BAD_REQUEST,
+        json!({
+            "error": "critical applies to kind 'shell' schedules, or a prompt schedule with a when check: it fires through a critical host, and a prompt schedule with no check would carry a model turn past the host guard on every fire",
+            "code": "critical_not_shell",
         }),
     )
 }
@@ -945,7 +960,9 @@ pub struct ScheduleBody {
     pub pass_fail: Option<i64>,
     /// Wake condition (runtime_jobs/schedule_wake.rs, stored as `when_check`):
     /// a shell command run before each scheduled fire of a tmux schedule.
-    /// Exit 0 delivers the prompt; anything else skips the fire. `null` or ""
+    /// Exit 0 delivers the prompt; exit 1 skips the fire. Any other exit or a
+    /// timeout skips it too and counts as a broken check (the owner is told
+    /// after six in a row). `null` or ""
     /// clears it.
     #[serde(default, deserialize_with = "de_present")]
     pub when: Option<Option<String>>,
@@ -954,6 +971,11 @@ pub struct ScheduleBody {
     /// time the check passes.
     #[serde(default, deserialize_with = "de_flag")]
     pub when_once: Option<i64>,
+    /// Fire on time while the host guard reads critical: a shell schedule, or a
+    /// prompt schedule with `when` (its check runs on time; the prompt goes
+    /// only when it passes). Refused on a prompt schedule with no check.
+    #[serde(default, deserialize_with = "de_flag")]
+    pub critical: Option<i64>,
     /// When set, the scheduler creates an ephemeral worktree session for each
     /// firing instead of sending the command to the named session directly.
     /// The worktree is torn down after the command completes and pushes.
@@ -1187,7 +1209,15 @@ pub async fn create(
     if matches!(when_in, Some(Some(_))) && body.kind.as_deref() == Some("shell") {
         return when_on_shell_refusal();
     }
+    if body.critical.unwrap_or(0) != 0 && body.kind.as_deref() != Some("shell") && !matches!(when_in, Some(Some(_))) {
+        return critical_not_shell_refusal();
+    }
     let by = mutation_by(&headers, body.by.as_deref());
+    let principal = super::ledger::principal(&crate::config::amux_home(), &headers);
+    // Governance PR 13: the creator the server PROVED, kept on the row so every
+    // firing can re-check that this principal still has authority (the audit's
+    // `by_who` above stays what it was: a name, which may only be claimed).
+    let creator = super::schedule_authority::creator_of(&crate::config::amux_home(), &headers);
     let now = Local::now();
     let now_ts = chrono::Utc::now().timestamp();
     let bounds_in = match parse_bounds(&body, now) {
@@ -1227,6 +1257,8 @@ pub async fn create(
 
     let mut m = Map::new();
     m.insert("title".into(), json!(title));
+    m.insert("created_by".into(), json!(creator.0));
+    m.insert("created_by_verified".into(), json!(i64::from(creator.1)));
     m.insert(
         "session".into(),
         json!(body.session.clone().unwrap_or_default()),
@@ -1334,6 +1366,7 @@ pub async fn create(
         m.insert("when_check".into(), json!(check));
     }
     m.insert("when_once".into(), json!(body.when_once.unwrap_or(1)));
+    m.insert("critical".into(), json!(body.critical.unwrap_or(0)));
     m.insert("created".into(), json!(now_ts));
     m.insert("updated".into(), json!(now_ts));
     m.insert("deleted".into(), Value::Null);
@@ -1370,7 +1403,7 @@ pub async fn create(
                 "until": row.raw().get("until").cloned().unwrap_or(Value::Null),
                 "max_runs": row.raw().get("max_runs").cloned().unwrap_or(Value::Null),
             });
-            insert_audit(
+            scheduler::insert_audit_as(
                 conn,
                 &id,
                 "created",
@@ -1378,6 +1411,7 @@ pub async fn create(
                 &summary.to_string(),
                 "api-create",
                 &by_w,
+                Some(&principal),
             )?;
             let events = vec![ev(&id, MutationKind::Created)];
             finish(
@@ -1440,6 +1474,67 @@ pub async fn create(
         }
         Err(e) => internal(e),
     }
+}
+
+// ---- Schedules a configuration key keeps in step (migration 0181) ---------
+
+/// The key that creates a managed schedule, and where the owner changes it.
+fn managed_key(managed_by: &str) -> &'static str {
+    match managed_by {
+        crate::runtime_jobs::goal_check::MANAGED_BY => "AMUX_GOAL_CHECK",
+        _ => "its configuration key",
+    }
+}
+
+/// The fields a PATCH would change on a managed schedule that the next
+/// reconcile would put back. Enabling, pausing, bounds and title stay editable.
+fn managed_edits(s: &DurableSchedule, body: &ScheduleBody) -> Vec<&'static str> {
+    let differs = |new: Option<&str>, col: &str| new.is_some_and(|v| v.trim() != s.str_field(col).trim());
+    let mut out = Vec::new();
+    if differs(body.command.as_deref(), "command") {
+        out.push("command");
+    }
+    if differs(body.schedule_expr.as_deref(), "schedule_expr") {
+        out.push("schedule_expr");
+    }
+    if differs(body.kind.as_deref(), "kind") {
+        out.push("kind");
+    }
+    if differs(body.session.as_deref(), "session") {
+        out.push("session");
+    }
+    let actions = body.exit_actions.as_ref().map(|v| match v {
+        Value::String(t) => t.clone(),
+        other => other.to_string(),
+    });
+    let same_actions = |a: &str| {
+        serde_json::from_str::<Value>(a).ok() == serde_json::from_str::<Value>(s.str_field("exit_actions")).ok()
+    };
+    if actions.as_deref().is_some_and(|a| !same_actions(a)) {
+        out.push("exit_actions");
+    }
+    if body.resurrect == Some(true) {
+        out.push("resurrect");
+    }
+    out
+}
+
+/// The 409 for a write the managing key would undo. Logged, so a sweep sees
+/// an owner trying to edit the wrong place.
+fn managed_refusal(id: &str, verb: &str, managed_by: &str, fields: &[&'static str]) -> Response {
+    let key = managed_key(managed_by);
+    tracing::info!(schedule = %id, verb, managed_by, fields = ?fields, measured = true, n_considered = 1,
+        verdict = "schedule_managed_edit_refused", "refused an edit to a schedule a configuration key keeps in step");
+    err(
+        StatusCode::CONFLICT,
+        json!({
+            "error": format!("{id} is kept in step with {key}: {verb} it by changing {key} in the worker's Scope tab (clear it to remove the schedule). You can still pause, resume or run it here."),
+            "code": "schedule_managed",
+            "managed_by": managed_by,
+            "key": key,
+            "fields": fields,
+        }),
+    )
 }
 
 // ---- PATCH /api/schedules/{id} --------------------------------------------
@@ -1525,6 +1620,7 @@ pub async fn patch(
         Err(r) => return *r,
     };
     let by = mutation_by(&headers, body.by.as_deref());
+    let principal = super::ledger::principal(&crate::config::amux_home(), &headers);
     let now = Local::now();
     let bounds_in = match parse_bounds(&body, now) {
         Ok(b) => b,
@@ -1544,6 +1640,8 @@ pub async fn patch(
         },
         Locked(DurableSchedule),
         WhenOnShell,
+        CriticalNotShell,
+        Managed(String, Vec<&'static str>),
         Applied(Value, Option<(DurableSchedule, String)>),
     }
     let slot: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
@@ -1556,6 +1654,13 @@ pub async fn patch(
             let Some(mut s) = get_schedule(conn, &id_w)? else {
                 return finish(&slot_w, Outcome::NotFound, no_write());
             };
+            let managed = s.str_field("managed_by").to_string();
+            if !managed.is_empty() {
+                let fields = managed_edits(&s, &body);
+                if !fields.is_empty() {
+                    return finish(&slot_w, Outcome::Managed(managed, fields), no_write());
+                }
+            }
             // A tombstone accepts NO ordinary write (AMUX-3431): the row will
             // never fire, so a 200 here is fictional coverage. The one honest
             // write is an EXPLICIT resurrect, audited as such.
@@ -1582,7 +1687,7 @@ pub async fn patch(
                 // clear is its own explicit statement, like the delete.
                 scheduler::resurrect_schedule(conn, s.id())?;
                 s.set("deleted", Value::Null);
-                insert_audit(conn, s.id(), "deleted", &old, "", "api-resurrect", &by)?;
+                scheduler::insert_audit_as(conn, s.id(), "deleted", &old, "", "api-resurrect", &by, Some(&principal))?;
             }
             // THE OWNER LOCK (GS-12 finding 5: the owner's disable of SCHED-173
             // was undone by a worker 70 minutes later, and the worker had no
@@ -1681,6 +1786,16 @@ pub async fn patch(
             }
             if s.str_field("kind") == "shell" && !s.str_field("when_check").trim().is_empty() {
                 return finish(&slot_w, Outcome::WhenOnShell, no_write());
+            }
+            if let Some(v) = body.critical {
+                s.set("critical", json!(v));
+            }
+            // Also refuses a kind change away from shell, or clearing `when`,
+            // on a critical row.
+            if s.str_field("kind") != "shell" && s.raw().get("critical").and_then(Value::as_i64).unwrap_or(0) != 0
+                && s.str_field("when_check").trim().is_empty()
+            {
+                return finish(&slot_w, Outcome::CriticalNotShell, no_write());
             }
             apply_bounds(&mut s, &bounds_in);
 
@@ -1790,7 +1905,7 @@ pub async fn patch(
                 let old = audit_str(old_vals.get(k));
                 let new = audit_str(s.raw().get(k));
                 if old != new {
-                    insert_audit(conn, s.id(), k, &old, &new, "api-patch", &by)?;
+                    scheduler::insert_audit_as(conn, s.id(), k, &old, &new, "api-patch", &by, Some(&principal))?;
                 }
             }
             if old_lock != s.str_field("locked_by") {
@@ -1799,7 +1914,7 @@ pub async fn patch(
                 } else {
                     format!("{} ({})", s.str_field("locked_by"), s.str_field("lock_reason"))
                 };
-                insert_audit(conn, s.id(), "locked_by", &old_lock, &new_lock, "api-patch", &by)?;
+                scheduler::insert_audit_as(conn, s.id(), "locked_by", &old_lock, &new_lock, "api-patch", &by, Some(&principal))?;
             }
             let events = vec![ev(s.id(), MutationKind::Updated)];
             let mut out = s.to_json();
@@ -1859,6 +1974,8 @@ pub async fn patch(
             Some(Outcome::NotFound) => not_found(),
             Some(Outcome::Locked(s)) => owner_lock_refusal(&id, "re-enable", &by_outer, &s),
             Some(Outcome::WhenOnShell) => when_on_shell_refusal(),
+            Some(Outcome::CriticalNotShell) => critical_not_shell_refusal(),
+            Some(Outcome::Managed(by_key, fields)) => managed_refusal(&id, "edit", &by_key, &fields),
             Some(Outcome::Tombstone {
                 deleted_at,
                 deleted_by,
@@ -1886,10 +2003,12 @@ pub async fn delete_schedule(
     headers: HeaderMap,
 ) -> Response {
     let by = mutation_by(&headers, p.by.as_deref());
+    let principal = super::ledger::principal(&crate::config::amux_home(), &headers);
     enum Outcome {
         NotFound,
         Already,
         Deleted,
+        Managed(String),
     }
     let slot: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -1904,6 +2023,10 @@ pub async fn delete_schedule(
                 // Idempotent re-delete: no duplicate audit row (Python parity).
                 return finish(&slot_w, Outcome::Already, no_write());
             }
+            let managed = s.str_field("managed_by").to_string();
+            if !managed.is_empty() {
+                return finish(&slot_w, Outcome::Managed(managed), no_write());
+            }
             let now_ts = chrono::Utc::now().timestamp();
             soft_delete_schedule(conn, s.id(), now_ts)?;
             // Deletes leave the same by_who trail as PATCHes (AMUX-1812: 8
@@ -1914,7 +2037,7 @@ pub async fn delete_schedule(
                 "enabled": s.i64_field("enabled", 0),
                 "expr": s.schedule_expr().unwrap_or(s.str_field("run_at")),
             });
-            insert_audit(
+            scheduler::insert_audit_as(
                 conn,
                 s.id(),
                 "deleted",
@@ -1922,6 +2045,7 @@ pub async fn delete_schedule(
                 &now_ts.to_string(),
                 "api-delete",
                 &by,
+                Some(&principal),
             )?;
             let events = vec![ev(s.id(), MutationKind::Deleted)];
             finish(
@@ -1941,6 +2065,7 @@ pub async fn delete_schedule(
                 Json(json!({ "deleted": id, "already": true })).into_response()
             }
             Some(Outcome::NotFound) => not_found(),
+            Some(Outcome::Managed(by_key)) => managed_refusal(&id, "delete", &by_key, &[]),
             None => internal("delete produced no outcome"),
         },
         Err(e) => internal(e),
@@ -1973,6 +2098,7 @@ pub async fn skip_next(
     headers: HeaderMap,
 ) -> Response {
     let by = mutation_by(&headers, None);
+    let principal = super::ledger::principal(&crate::config::amux_home(), &headers);
 
     enum Outcome {
         NotFound,
@@ -2025,7 +2151,7 @@ pub async fn skip_next(
             // Python skipped unattributed. Moving a fire time is exactly the
             // mutation AMUX-1812 was about ("why did this not run at 9?"), so
             // it leaves the same by_who trail as a PATCH.
-            insert_audit(
+            scheduler::insert_audit_as(
                 conn,
                 s.id(),
                 "next_run",
@@ -2033,6 +2159,7 @@ pub async fn skip_next(
                 &new_next,
                 "api-skip",
                 &by,
+                Some(&principal),
             )?;
             let ms = |v: &str| scheduler::parse_minute(v).map(|t| t.timestamp_millis());
             let body = json!({
@@ -2245,8 +2372,8 @@ pub async fn run_now(
             let source_bg = source.clone();
             let run_id = claim.run_id();
             crate::db::interactions::spawn(async move {
-                let outcome = LiveDeliverer::new(state_bg.clone())
-                    .deliver(&sched_bg, &source_bg)
+                let outcome = crate::runtime_jobs::shell_detached::SHELL_RUN_ID
+                    .scope(run_id, LiveDeliverer::new(state_bg.clone()).deliver(&sched_bg, &source_bg))
                     .await;
                 let status = outcome.status().to_string();
                 let sid_done = sched_bg.id().to_string();
@@ -2460,7 +2587,10 @@ pub async fn recent_runs(
 // ---- GET /api/schedules/audit ---------------------------------------------
 
 /// The attribution trail, reachable from the API (AMUX-2416: an audit
-/// nobody can find is the same failure as no audit). Unknown query params
+/// nobody can find is the same failure as no audit). Each row carries its
+/// `ledger` record (seq, proven actor, authority, sealed), joined by
+/// `event_id = schedaudit:<id>`; the values come from `schedule_audit`, the
+/// working view, because the ledger keeps only their hashes. Unknown query params
 /// are REJECTED, not ignored (AC-228: a filter that silently matches
 /// everything returns a confident wrong answer).
 pub async fn audit_trail(
@@ -2511,9 +2641,12 @@ pub async fn audit_trail(
         }
         params.push(rusqlite::types::Value::Integer(limit));
         let sql = format!(
-            "SELECT a.id, a.schedule_id, a.ts, a.field, a.old_value, a.new_value, a.source, a.by_who, s.title
+            "SELECT a.id, a.schedule_id, a.ts, a.field, a.old_value, a.new_value, a.source, a.by_who, s.title,
+                    l.seq, l.actor, l.claimed, l.authority, l.hash IS NOT NULL
              FROM schedule_audit a LEFT JOIN schedules s ON s.id = a.schedule_id
+             LEFT JOIN _amux_ledger l ON l.event_id = '{}' || a.id
              {} ORDER BY a.ts DESC LIMIT ?",
+            scheduler::SCHEDULE_AUDIT_EVENT_PREFIX,
             if wheres.is_empty() { String::new() } else { format!("WHERE {}", wheres.join(" AND ")) }
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -2539,6 +2672,20 @@ pub async fn audit_trail(
                 "source": r.get::<_, Option<String>>(6)?,
                 "by_who": r.get::<_, Option<String>>(7)?,
                 "title": r.get::<_, Option<String>>(8)?,
+                // The ledger record of this change (the fold, P2): who the
+                // server PROVED made it, beside `by_who`, which was only
+                // claimed. Null for a change recorded before the fold
+                // (2026-11-26) or while AMUX_LEDGER=off.
+                "ledger": match r.get::<_, Option<i64>>(9)? {
+                    Some(seq) => json!({
+                        "seq": seq,
+                        "actor": r.get::<_, Option<String>>(10)?,
+                        "claimed": r.get::<_, Option<String>>(11)?,
+                        "authority": r.get::<_, Option<String>>(12)?,
+                        "sealed": r.get::<_, Option<bool>>(13)?.unwrap_or(false),
+                    }),
+                    None => Value::Null,
+                },
             });
             if t1 || t2 {
                 v["truncated"] = json!(true);
@@ -2765,6 +2912,21 @@ mod tests {
         assert_eq!(row["by_who"], json!("tester-session"));
         assert_eq!(row["source"], json!("api-create"));
         assert!(row["new_value"].as_str().unwrap().contains("\"enabled\":1"));
+        // And it is in the ledger, joined to the row: the claimed session is
+        // kept as `claimed`, never promoted to the actor without proof.
+        let ledger = &row["ledger"];
+        assert!(ledger["seq"].as_i64().is_some(), "the change has a ledger record: {row}");
+        assert_eq!(ledger["actor"], json!("anonymous"), "{row}");
+        assert_eq!(ledger["claimed"], json!("worker:tester-session"), "{row}");
+
+        // A PATCH is recorded the same way, one ledger row per changed field.
+        let (st, _) = send(&app, "PATCH", "/api/schedules/SCHED-1", Some(json!({"enabled": 0})), &SES).await;
+        assert_eq!(st, StatusCode::OK);
+        let (_, audit) = send(&app, "GET", "/api/schedules/audit?id=SCHED-1&field=enabled", None, &[]).await;
+        let row = &audit.as_array().unwrap()[0];
+        assert_eq!(row["old_value"], json!("1"));
+        assert_eq!(row["new_value"], json!("0"));
+        assert!(row["ledger"]["seq"].as_i64().is_some(), "{row}");
     }
 
     /// Pass/fail cannot be on without a condition, the condition must parse,
@@ -2804,6 +2966,80 @@ mod tests {
         // On again without a check is refused on PATCH too.
         let (st, _) = send(&app, "PATCH", "/api/schedules/SCHED-1", Some(json!({ "pass_fail": 1 })), &SES).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    /// A goal-check schedule (managed_by, 0181) is kept in step with
+    /// AMUX_GOAL_CHECK. The API refuses the edits the next reconcile would
+    /// undo, and the delete, naming the key; pausing and resuming still work.
+    #[tokio::test]
+    async fn a_managed_schedule_refuses_edits_its_key_would_undo() {
+        let (app, dir) = app();
+        let conn = rusqlite::Connection::open(dir.path().join("sched-api-test.db")).unwrap();
+        let want = crate::runtime_jobs::goal_check::Want {
+            session: "lane".into(),
+            command: crate::runtime_jobs::goal_check::compose("./check.sh", ""),
+            expr: "every 10m".into(),
+            running: true,
+        };
+        crate::runtime_jobs::goal_check::reconcile(&conn, &[want], Local::now()).unwrap();
+        let id: String = conn.query_row("SELECT id FROM schedules WHERE managed_by='goal-check'", [], |r| r.get(0)).unwrap();
+        let (st, g) = send(&app, "GET", &format!("/api/schedules/{id}"), None, &[]).await;
+        assert_eq!((st, g["managed_by"].clone()), (StatusCode::OK, json!("goal-check")), "{g}");
+
+        for body in [json!({ "command": "true" }), json!({ "schedule_expr": "every 1m" }), json!({ "kind": "tmux" })] {
+            let (st, r) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(body.clone()), &SES).await;
+            assert_eq!((st, r["code"].clone(), r["key"].clone()), (StatusCode::CONFLICT, json!("schedule_managed"), json!("AMUX_GOAL_CHECK")), "{body} {r}");
+        }
+        // Sending the stored values back (an editor's full-form save) is no edit.
+        let same = json!({ "command": g["command"], "schedule_expr": "every 10m", "kind": "shell", "title": "Goal check: lane" });
+        let (st, r) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(same), &SES).await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        let (st, r) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "enabled": 0 })), &SES).await;
+        assert_eq!((st, r["enabled"].clone()), (StatusCode::OK, json!(0)), "{r}");
+        let (st, r) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "enabled": 1 })), &SES).await;
+        assert_eq!((st, r["enabled"].clone()), (StatusCode::OK, json!(1)), "{r}");
+        let (st, r) = send(&app, "DELETE", &format!("/api/schedules/{id}"), None, &SES).await;
+        assert_eq!((st, r["code"].clone()), (StatusCode::CONFLICT, json!("schedule_managed")), "{r}");
+        let live: i64 = conn.query_row("SELECT COUNT(*) FROM schedules WHERE id=?1 AND deleted IS NULL", [&id], |r| r.get(0)).unwrap();
+        assert_eq!(live, 1, "the refused delete left the row");
+    }
+
+    /// `critical` (0173) is accepted on a shell schedule and published, and
+    /// refused on a prompt schedule with no when check, on create, on PATCH,
+    /// on a PATCH that moves a critical shell schedule to tmux, and on one that
+    /// clears the check. A prompt schedule with a check may carry it.
+    #[tokio::test]
+    async fn critical_is_for_shell_schedules_only() {
+        let (app, _dir) = app();
+        let prompt = json!({ "title": "watch", "command": "is it done?", "schedule_expr": "every 2m", "session": "lane", "critical": true });
+        let (st, r) = send(&app, "POST", "/api/schedules", Some(prompt), &SES).await;
+        assert_eq!((st, r["code"].clone()), (StatusCode::BAD_REQUEST, json!("critical_not_shell")), "{r}");
+
+        let shell = json!({ "title": "watch", "kind": "shell", "command": "true", "schedule_expr": "every 2m", "session": "lane", "critical": true });
+        let (st, c) = send(&app, "POST", "/api/schedules", Some(shell), &SES).await;
+        assert_eq!((st, c["critical"].clone()), (StatusCode::CREATED, json!(1)), "{c}");
+        let id = c["id"].as_str().unwrap().to_string();
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "kind": "tmux" })), &SES).await;
+        assert_eq!((st, p["code"].clone()), (StatusCode::BAD_REQUEST, json!("critical_not_shell")), "{p}");
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "critical": false })), &SES).await;
+        assert_eq!((st, p["critical"].clone()), (StatusCode::OK, json!(0)), "{p}");
+
+        let plain = json!({ "title": "plain", "command": "go", "schedule_expr": "every 2m", "session": "lane" });
+        let (st, c) = send(&app, "POST", "/api/schedules", Some(plain), &SES).await;
+        assert_eq!((st, c["critical"].clone()), (StatusCode::CREATED, json!(0)), "{c}");
+        let id = c["id"].as_str().unwrap().to_string();
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "critical": 1 })), &SES).await;
+        assert_eq!((st, p["code"].clone()), (StatusCode::BAD_REQUEST, json!("critical_not_shell")), "{p}");
+
+        // A prompt schedule with a when check may carry it: the check gates the turn.
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "when": "test -e /tmp/x", "critical": 1 })), &SES).await;
+        assert_eq!((st, p["critical"].clone()), (StatusCode::OK, json!(1)), "{p}");
+        // Clearing the check on a critical row is refused.
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "when": null })), &SES).await;
+        assert_eq!((st, p["code"].clone()), (StatusCode::BAD_REQUEST, json!("critical_not_shell")), "{p}");
+        let gated = json!({ "title": "rare", "command": "look", "schedule_expr": "every 2m", "session": "lane", "when": "true", "critical": true });
+        let (st, c) = send(&app, "POST", "/api/schedules", Some(gated), &SES).await;
+        assert_eq!((st, c["critical"].clone()), (StatusCode::CREATED, json!(1)), "{c}");
     }
 
     /// `when` (0141): validated like a pass check, refused on a shell

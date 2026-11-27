@@ -744,6 +744,25 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
             wt.as_deref(),
             runtime,
         ));
+        // The gate that guard's tenant refusal names by path: missing is a fail.
+        const BAKED_TENANT_GATE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/tenant-gate.sh"
+        ));
+        let gate_path = amux_home.join("hooks/tenant-gate.sh");
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&gate_path).ok().map(|m| m.permissions().mode() & 0o111 != 0)
+        };
+        let head = read_head(checks::TENANT_GATE.committed_path);
+        let wt = read_worktree(checks::TENANT_GATE.committed_path);
+        out.extend(checks::tenant_gate_installed(
+            BAKED_TENANT_GATE,
+            head.as_deref(),
+            wt.as_deref(),
+            std::fs::read_to_string(&gate_path),
+            executable,
+        ));
 
         // -- the repo's pre-push hook, same rule (AF-1129). No repo, or a linked
         // worktree whose .git is a file, reads as unreadable: Unknown, not a pass.
@@ -954,6 +973,69 @@ fn f64_roundtrip_probes() -> Vec<(f64, f64)> {
         (wrote, read)
     })
     .collect()
+}
+
+#[cfg(test)]
+mod boot_arrival_window_tests {
+    use super::BootArrivalWindow;
+
+    fn log() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE _amux_request_log (ts REAL, boot_at REAL);").unwrap();
+        c
+    }
+
+    #[test]
+    fn later_passes_read_only_new_rows_and_old_rows_age_out() {
+        let c = log();
+        let mut w = BootArrivalWindow::default();
+        c.execute_batch("INSERT INTO _amux_request_log VALUES (100, 50), (110, 120), (120, NULL);")
+            .unwrap();
+        assert_eq!(w.advance(&c, 130.0, 100.0, 1000).unwrap(), Some((2, 1)));
+        let seen = w.last_rowid;
+        c.execute_batch("INSERT INTO _amux_request_log VALUES (200, 50);").unwrap();
+        // A row the window already counted is never read again: rewriting
+        // one behind the rowid mark changes nothing.
+        c.execute_batch("UPDATE _amux_request_log SET boot_at = 999 WHERE rowid = 1;").unwrap();
+        assert_eq!(w.advance(&c, 205.0, 100.0, 1000).unwrap(), Some((3, 1)));
+        assert!(w.last_rowid > seen);
+        // At now=299 the first bucket (newest ts 120) is older than 199 and
+        // leaves; the bucket holding ts 200 is still inside.
+        assert_eq!(w.advance(&c, 299.0, 100.0, 1000).unwrap(), Some((1, 0)));
+        assert_eq!(w.advance(&c, 301.0, 100.0, 1000).unwrap(), Some((0, 0)));
+    }
+
+    /// The first pass after a boot reads at most `chunk` rows, reports
+    /// unmeasured until it has caught up, and then reports the same counts a
+    /// single full scan would, starting at the window's first row.
+    #[test]
+    fn seeding_is_bounded_per_pass_and_ends_with_the_full_count() {
+        let c = log();
+        // Rows before the window (ts 10) must never be read or counted.
+        c.execute_batch("INSERT INTO _amux_request_log VALUES (10, 50), (10, 50);").unwrap();
+        for i in 0..10 {
+            let boot = if i % 2 == 0 { "50" } else { "NULL" };
+            c.execute_batch(&format!("INSERT INTO _amux_request_log VALUES ({}, {boot});", 100 + i))
+                .unwrap();
+        }
+        let mut w = BootArrivalWindow::default();
+        let mut passes = 0;
+        let got = loop {
+            passes += 1;
+            assert!(passes < 20, "seeding never caught up");
+            let before = w.last_rowid;
+            match w.advance(&c, 150.0, 100.0, 3).unwrap() {
+                Some(r) => break r,
+                None => {
+                    let read = w.last_rowid.unwrap() - before.unwrap_or(2);
+                    assert!(read <= 3, "a seeding pass read {read} rows, past its chunk");
+                }
+            }
+        };
+        assert_eq!(got, (5, 0), "five rows in the window carry a boot_at");
+        assert_eq!(w.seeded_rows, 10, "only the window's rows were read");
+        assert!(passes >= 4, "10 rows at 3 per pass take at least 4 passes, took {passes}");
+    }
 }
 
 #[cfg(test)]
@@ -2253,30 +2335,164 @@ async fn lsof_holder(path: &std::path::Path) -> checks::LockHolder {
 
 /// Gather what [`checks::request_arrival_follows_boot`] needs (AMUX-3647).
 ///
-/// ONE query, both numbers, over the indexed `ts` range. Counting the rows that
-/// CARRY a boot_at in the same pass is what lets the check distinguish "the
-/// invariant holds" from "the column stopped being written", which are the two
-/// states a bare violation count cannot tell apart.
+/// Both numbers come from one pass. Counting the rows that CARRY a boot_at
+/// beside the violations is what lets the check distinguish "the invariant
+/// holds" from "the column stopped being written", which are the two states a
+/// bare violation count cannot tell apart.
+///
+/// The pass is incremental (2026-11-26 cpu RCA). `boot_at` is not in the `ts`
+/// index, so the 24h query read the table page of every row: 1.2M rows, about
+/// 10s of pread, every TICK_SECS. That was the largest single consumer in a
+/// 2.3-core server on a 28-core Mac at 136% load. Now the first pass per
+/// process scans the window once and every later pass reads only the rows with
+/// a rowid above the last one seen, keeping 30s buckets that age out of the
+/// window. A bucket leaves when its newest row is older than 24h, so the window
+/// is 24h plus at most one tick.
 fn arrival_follows_boot_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "reqlog.arrival_follows_boot";
     const WINDOW_H: f64 = 24.0;
     let Ok(conn) = state.store.read() else {
         return vec![InvariantResult::unknown(ID, "store unreadable")];
     };
-    let cutoff = crate::runtime_jobs::registry::unix_now() - WINDOW_H * 3600.0;
-    match conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(ts < boot_at), 0) FROM _amux_request_log \
-         WHERE ts >= ?1 AND boot_at IS NOT NULL",
-        [cutoff],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-    ) {
-        Ok((with_boot, before)) => {
+    let now = crate::runtime_jobs::registry::unix_now();
+    static WINDOWS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, BootArrivalWindow>>,
+    > = std::sync::OnceLock::new();
+    let key = conn.path().unwrap_or("").to_string();
+    let mut windows = WINDOWS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let window = windows.entry(key).or_default();
+    match window.advance(&conn, now, WINDOW_H * 3600.0, BOOT_WINDOW_CHUNK) {
+        Ok(Some((with_boot, before))) => {
             checks::request_arrival_follows_boot(with_boot, before, WINDOW_H)
         }
+        Ok(None) => vec![InvariantResult::unknown(
+            ID,
+            format!(
+                "seeding the 24h request window: {} rows read so far",
+                window.seeded_rows
+            ),
+        )],
         Err(e) => vec![InvariantResult::unknown(
             ID,
             format!("request log unreadable: {e}"),
         )],
+    }
+}
+
+/// Rows one pass of [`BootArrivalWindow::advance`] reads at most. The first
+/// pass after a boot used to read the whole 24h window at once (~750k rows,
+/// 70s to 325s on the live Mac, 2026-11-26), holding the monitor tick and
+/// showing it hung after every deploy. A bounded pass keeps each tick short;
+/// the window catches up over the following ticks. Sized from the live run
+/// of the first version (20k rows a pass): 736,735 rows read in 12.7s of
+/// query time, about 17ms per 1,000 rows, but the monitor ticks every ~107s
+/// under load, so seeding took 67 minutes and the invariant read unmeasured
+/// for most of an hour after each deploy. 100k rows is ~2s a pass and ~8
+/// passes for a 24h window.
+const BOOT_WINDOW_CHUNK: i64 = 100_000;
+
+/// Rolling 24h counts for [`arrival_follows_boot_check`], fed by rowid.
+#[derive(Default)]
+struct BootArrivalWindow {
+    /// Highest rowid already counted; `None` until the window's first row is found.
+    last_rowid: Option<i64>,
+    /// True once a pass has read up to the table's newest row.
+    caught_up: bool,
+    /// Rows read while seeding, and how long seeding took in total.
+    seeded_rows: i64,
+    seed_ms: u128,
+    /// (newest ts in the bucket, rows with a boot_at, rows with ts < boot_at)
+    buckets: std::collections::VecDeque<(f64, i64, i64)>,
+}
+
+impl BootArrivalWindow {
+    /// Reads at most `chunk` rows past the last one counted. Returns `None`
+    /// while the window is still being seeded, so the invariant reads
+    /// unmeasured rather than a partial count.
+    fn advance(
+        &mut self,
+        conn: &rusqlite::Connection,
+        now: f64,
+        window_s: f64,
+        chunk: i64,
+    ) -> rusqlite::Result<Option<(i64, i64)>> {
+        let cutoff = now - window_s;
+        let t0 = std::time::Instant::now();
+        let start = match self.last_rowid {
+            Some(r) => r,
+            // The ts index finds the window's first row in milliseconds; a
+            // MIN(rowid) over the same predicate walks the table instead.
+            None => conn
+                .query_row(
+                    "SELECT rowid FROM _amux_request_log WHERE ts >= ?1 ORDER BY ts LIMIT 1",
+                    [cutoff],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|r| r - 1)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => conn.query_row(
+                        "SELECT COALESCE(MAX(rowid), 0) FROM _amux_request_log",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    ),
+                    e => Err(e),
+                })?,
+        };
+        let table_max: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM _amux_request_log",
+            [],
+            |r| r.get(0),
+        )?;
+        let hi = start.saturating_add(chunk.max(1)).min(table_max.max(start));
+        let (max_ts, with_boot, before): (Option<f64>, i64, i64) = conn.query_row(
+            "SELECT MAX(ts), COUNT(boot_at), \
+             COALESCE(SUM(boot_at IS NOT NULL AND ts < boot_at), 0) \
+             FROM _amux_request_log WHERE rowid > ?1 AND rowid <= ?2 AND ts >= ?3",
+            rusqlite::params![start, hi, cutoff],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        self.last_rowid = Some(hi);
+        if let Some(ts) = max_ts {
+            self.buckets.push_back((ts, with_boot, before));
+        }
+        while self.buckets.front().is_some_and(|b| b.0 < cutoff) {
+            self.buckets.pop_front();
+        }
+        let ms = t0.elapsed().as_millis();
+        if !self.caught_up {
+            self.seeded_rows += hi - start;
+            self.seed_ms += ms;
+            if hi >= table_max {
+                self.caught_up = true;
+                tracing::info!(
+                    verdict = "reqlog_boot_window_seeded",
+                    ms = self.seed_ms as u64,
+                    rows = self.seeded_rows,
+                    measured = true,
+                    n_considered = self.seeded_rows,
+                    "reqlog.arrival_follows_boot: 24h request window seeded in bounded passes"
+                );
+            }
+        }
+        if ms > 5000 {
+            tracing::info!(
+                verdict = "reqlog_boot_window_slow",
+                ms = ms as u64,
+                rows = hi - start,
+                "reqlog.arrival_follows_boot: one bounded pass was slow"
+            );
+        }
+        if !self.caught_up {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.buckets
+                .iter()
+                .fold((0, 0), |(w, b), x| (w + x.1, b + x.2)),
+        ))
     }
 }
 

@@ -20,9 +20,23 @@ pub(crate) mod send_profile;
 pub(crate) mod board_groom;
 pub mod prompt_block;
 pub mod land_approvals;
+pub mod calls;
 pub mod land_queue;
 pub mod land_red;
 pub mod worker_identity;
+pub mod app_identity;
+pub mod capabilities;
+pub mod cli_sandbox;
+pub mod customer_isolation;
+pub mod at_rest;
+pub mod approval_cards;
+pub mod outbound;
+pub mod outbound_feed;
+pub mod schedule_authority;
+pub mod connector_scope;
+pub mod email_scope;
+pub mod human_proof;
+pub mod loopback_trust;
 pub mod contract_fresh;
 pub mod prod_change;
 pub mod runner;
@@ -34,18 +48,19 @@ pub mod branding;
 pub mod brex;
 pub mod browser;
 pub mod browser_import;
+pub mod browser_watch;
 pub mod audit;
 pub mod browser_routing;
 pub mod cdp_proxy;
 pub mod browser_scope;
 pub mod calendar;
-pub mod channels;
 pub mod chat_stream;
 pub mod chat_delegate;
 pub mod chat_context;
 pub mod chat_worker;
 pub mod commit_mentions;
 pub mod computer;
+pub mod computer_mac;
 pub mod config_iac;
 pub mod move_bundle;
 pub mod connection;
@@ -53,11 +68,18 @@ pub mod gcal;
 pub mod connectors;
 pub mod criteria;
 pub mod crm;
+pub mod crm_accounts;
+pub mod crm_agent;
+pub mod crm_close;
+pub mod crm_outbound;
+pub mod crm_voice;
+pub mod crm_signups;
 pub mod deleted_substrate;
 pub mod dependency_audit;
 pub mod dictation;
 pub mod email;
 pub mod email_approval;
+pub mod email_links;
 pub mod email_intel;
 pub mod env_config;
 pub mod file_viewer;
@@ -84,6 +106,12 @@ pub mod history_ask;
 pub mod history_ask_rank;
 pub mod history_backfill;
 pub mod interactions;
+pub mod ledger;
+pub mod ledger_checkpoint;
+pub mod trace;
+pub mod instruction_provenance;
+pub mod agent_commit;
+pub mod cli_telemetry;
 pub mod invariants_api;
 pub mod journal;
 pub mod launch_context;
@@ -92,6 +120,12 @@ pub mod social;
 pub mod social_browser;
 pub mod social_devto;
 pub mod social_publish;
+pub mod governance;
+// Governance PR 21: access review and incident timeline for the compliance skill.
+pub mod compliance;
+pub mod mfa;
+pub mod scim;
+pub mod sso;
 pub mod log_search;
 pub mod lookup;
 pub mod location;
@@ -99,19 +133,20 @@ pub mod map;
 pub mod map_store;
 pub mod mcp;
 pub mod mdai;
+pub mod legacy_routes;
 pub mod measured;
 pub mod decision_digest;
 pub mod directive;
 pub mod needs_input;
 pub mod needs_input_auto;
 pub mod memories;
-pub mod messages;
+pub mod accountability;
 pub(crate) mod native_status;
+pub(crate) mod claude_config;
 pub(crate) mod cross_site;
 pub mod metrics;
 pub mod traces;
 pub mod observability;
-pub mod scoreboard;
 pub mod offline_origin;
 pub mod orchestrate;
 pub mod orchestrations;
@@ -120,6 +155,7 @@ pub(crate) mod pane_prompts;
 pub mod pages;
 pub mod photos;
 pub mod palette;
+pub mod palette_history;
 pub mod pinned;
 pub mod planning;
 pub mod policy;
@@ -147,11 +183,13 @@ pub(crate) mod send_probe;
 pub mod session_verbs;
 pub mod sessions_git;
 pub mod sessions_legacy;
+pub mod worker_projection;
 pub mod settings;
 pub mod simple;
 pub mod skill_examples;
 pub mod skills;
 pub mod signals;
+pub mod event_subs;
 pub mod standing_approvals;
 pub mod skin;
 pub mod speedtest;
@@ -160,6 +198,8 @@ pub mod sse;
 pub mod typing;
 pub mod rt;
 pub mod conversations;
+/// The one writer of `steering_queue` rows (primitive integrity audit 2026-11-26).
+pub(crate) mod steering_store;
 pub mod converse;
 pub mod static_files;
 pub mod stats;
@@ -181,6 +221,10 @@ pub mod verify;
 pub mod why;
 pub mod worker_create;
 pub mod outcome_plan;
+pub mod intent;
+pub mod intent_store;
+pub mod intent_items;
+pub mod intent_record;
 pub mod worker_exec;
 pub mod workers;
 mod worker_messaging;
@@ -232,6 +276,9 @@ pub fn router_with_connector_transport(
     // For the request-log layer below — `state` itself is consumed by
     // `.with_state` before the outermost wrap.
     let store_for_reqlog = state.store.clone();
+    capabilities::install_store(state.store.clone());
+    approval_cards::install_store(state.store.clone());
+    schedule_authority::install_store(state.store.clone());
     let state_for_member_identity = state.clone();
     let protected = Router::new()
         .route("/api/sync", axum::routing::get(sync::delta_sync))
@@ -260,7 +307,7 @@ pub fn router_with_connector_transport(
         .route("/api/scratchpad/config", axum::routing::get(scratchpad::get_config).put(scratchpad::put_config))
         .nest("/api/memories", memories::routes())
         .nest("/api/traces", traces::routes())
-        .nest("/api/messages", messages::routes())
+        .merge(accountability::routes())
         .nest("/api/schedules", schedules::routes())
         // AMUX-5237: named clearance signals. A card waits with
         // blocked_on="signal:<name>"; POST /api/signals/<name> raises it,
@@ -295,7 +342,6 @@ pub fn router_with_connector_transport(
         .nest("/api/usage", usage::routes())
         .nest("/api/velocity", velocity::routes())
         .nest("/api/review", review::routes())
-        .nest("/api/channels", channels::routes())
         .nest("/api/alert", alerts::routes())
         .route("/api/stats/daily", axum::routing::get(stats::daily))
         // The writer for the baseline `daily` already reads (AMUX-2871).
@@ -333,6 +379,7 @@ pub fn router_with_connector_transport(
         // The Photos tab's BYO Mixpeek connection (api/photos.rs).
         .merge(photos::routes())
         .merge(palette::routes())
+        .merge(palette_history::routes())
         .merge(session_verbs::routes())
         .merge(typing::routes())
         .merge(boundaries::routes())
@@ -371,17 +418,31 @@ pub fn router_with_connector_transport(
         // Ebook library index (calibre metadata.db / opf scan) — top-level
         // path in python, so top-level here.
         .route("/api/library", axum::routing::any(file_viewer::library))
+        // Legacy Files spellings (primitive integrity audit P1): the listing,
+        // download and raw-body upload are thin adapters onto /api/fs,
+        // /api/file/raw and the chunked upload's writer (api/files.rs).
         .nest("/api/files", files::routes())
         // The .mdai computed-file engine (AMUX-3240): run a node's upstream DAG,
-        // list nodes, browse run history, connect an edge. Nested one level
-        // deeper than /api/files above; files::routes() has no /mdai or wildcard,
-        // so the two prefixes do not conflict.
-        .nest("/api/files/mdai", mdai::routes())
+        // list nodes, browse run history, connect an edge. Its own family; the
+        // old /api/files/mdai/* spelling rewrites here (aliases.rs).
+        .nest("/api/mdai", mdai::routes())
+        // Who still calls a retired spelling, from the request log's raw paths
+        // (api/legacy_routes.rs). Protected: it names caller sessions.
+        .route(
+            "/api/debug/legacy-routes",
+            axum::routing::get(legacy_routes::debug),
+        )
         // /api/fs/* is the SPA's Files contract (multipart upload + dir
         // field, open/mkdir/rename/read/list/search/delete on ABSOLUTE
-        // paths) — a different contract from /api/files above. NATIVE port
-        // of the python handlers (api/fs.rs), same wire shapes.
-        .nest("/api/fs", fs::routes())
+        // paths), the one browse API. NATIVE port of the python handlers
+        // (api/fs.rs), same wire shapes.
+        .nest("/api/fs", fs::routes().layer(axum::middleware::from_fn(capabilities::fs_gate)))
+        .route("/api/workers/{name}/capabilities", axum::routing::get(capabilities::view))
+        .route("/api/workers/{name}/sandbox", axum::routing::get(cli_sandbox::view))
+        .route("/api/workers/{name}/isolation", axum::routing::get(customer_isolation::view))
+        .route("/api/security/at-rest", axum::routing::get(at_rest::view))
+        .route("/api/security/at-rest/decrypt", axum::routing::post(at_rest::decrypt))
+        .route("/api/workers/{name}/history", axum::routing::get(instruction_provenance::view))
         // The SPA Files BROWSER's listing + dir autocomplete — native, same
         // module (top-level paths in python, so top-level here).
         .route("/api/ls", axum::routing::any(fs::ls))
@@ -402,7 +463,7 @@ pub fn router_with_connector_transport(
         // CRM: a PORT of the python contract, not a new feature — the schema and
         // 308 live contacts survived the cutover with no routes to reach them
         // (AMUX-2929).
-        .nest("/api/crm", crm::routes())
+        .nest("/api/crm", crm::routes().merge(crm_accounts::routes()).merge(crm_agent::routes()).merge(crm_outbound::routes()).merge(crm_voice::routes()).merge(crm_close::routes()))
         .nest("/api/speedtest", speedtest::routes())
         .nest("/api/layout-presets", layout_presets::routes())
         // Social posting and results (AA-42): YouTube first, the rest report their gate.
@@ -411,11 +472,25 @@ pub fn router_with_connector_transport(
         // The New Worker / Connect modals' supporting reads (AMUX-2871).
         .merge(worker_create::routes())
         .merge(outcome_plan::routes())
+        .merge(intent::routes())
+        .merge(intent_store::routes())
+        .merge(intent_items::routes())
         .merge(worker_exec::routes())
         .nest("/api/saved-messages", saved_messages::routes())
         .merge(habits::routes())
         .merge(observability::routes())
-        .merge(scoreboard::routes())
+        // Writes that used to sit in the public debug routers below, where a LAN
+        // or tailnet peer reached them with no credential: the nudges switch sets
+        // CC_STANDING_ORDERS at any scope, and run ticks any system job.
+        .route(
+            "/api/board/nudges",
+            axum::routing::get(crate::runtime_jobs::board_drive::get_nudges)
+                .patch(crate::runtime_jobs::board_drive::patch_nudges),
+        )
+        .route(
+            "/api/system-jobs/{id}/run",
+            axum::routing::post(crate::runtime_jobs::registry::run_system_job),
+        )
         .merge(connectors::routes_with(connector_ctx.clone()))
         .nest("/api/telegram", telegram::routes_with(http))
         .merge(grants::routes())
@@ -428,6 +503,16 @@ pub fn router_with_connector_transport(
         .merge(directive::routes())
         .merge(contract::routes())
         .merge(land_approvals::routes())
+        // Outbound phone calls (calls.rs, docs/design/phone-calls.md).
+        .merge(calls::routes())
+        .merge(approval_cards::routes())
+        .merge(outbound::routes())
+        .merge(outbound_feed::routes())
+        .merge(schedule_authority::routes())
+        .merge(mfa::routes())
+        .merge(sso::routes())
+        .merge(scim::routes())
+        .merge(compliance::routes())
         .merge(bridge::routes())
         .merge(land_queue::routes())
         .merge(vault::routes())
@@ -469,6 +554,9 @@ pub fn router_with_connector_transport(
         // the structured request log + tracing tail (api/request_log.rs).
         .nest("/api/logs", request_log::routes())
         .merge(interactions::routes())
+        .merge(ledger::routes())
+        .merge(trace::routes())
+        .merge(cli_telemetry::routes())
         .nest("/api/settings", settings::routes())
         .nest("/api/push", crate::push::routes())
         // Record tab (AMUX-4624): device recordings synced into a folder and
@@ -632,6 +720,15 @@ pub fn router_with_connector_transport(
             "/api/page-links/{id}/approve",
             axum::routing::post(static_files::public_links::approve),
         )
+        // A published app's own amux access and credential (app_identity.rs).
+        .route(
+            "/api/page-links/{id}/api",
+            axum::routing::post(static_files::public_links::set_api),
+        )
+        .route(
+            "/api/page-links/{id}/app-token",
+            axum::routing::post(static_files::public_links::new_app_token),
+        )
         // A one-time link that opens an app inside amux on the apps origin.
         .route(
             "/api/page-links/{id}/open",
@@ -649,10 +746,17 @@ pub fn router_with_connector_transport(
             state.clone(),
             policy::enforce,
         ))
+        // The owner's kill switch (governance.rs): while engaged, no worker,
+        // app or policy publishes, sends email or mints a connector token.
+        .layer(axum::middleware::from_fn(governance::kill_gate))
         // Contract rule 10 (AH-387): a claimed worker identity carries that
         // worker's minted token. Inside require_bearer, so it sees only
         // admitted requests.
         .layer(axum::middleware::from_fn(worker_identity::enforce))
+        // The ledger's actor (ledger.rs): resolved just inside auth, so the
+        // owner proof it stamps is visible, and carried out to the interaction
+        // receipt on the response.
+        .layer(axum::middleware::from_fn(ledger::stamp))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
@@ -748,6 +852,12 @@ pub fn router_with_connector_transport(
         // a revocable member cookie; the outer identity layer below resolves
         // it before auth and request logging.
         .merge(org::public_routes())
+        // Single sign-on, the second-factor page and SCIM provisioning
+        // (governance PR 20): each authenticates for itself (single-use
+        // state + PKCE, the caller's own session, the provider's SCIM token).
+        .merge(sso::public_routes())
+        .merge(mfa::public_routes())
+        .merge(scim::public_routes())
         // Copied file links (/f/<path>) and the file that lets the iOS app
         // claim them; neither reveals anything (deep_links.rs).
         .merge(deep_links::public_routes())
@@ -804,6 +914,10 @@ pub fn router_with_connector_transport(
         store_for_reqlog.clone(),
         interactions::middleware,
     ));
+    // Every request runs inside its trace (trace.rs): inherited from its
+    // `traceparent`, else minted here at the origin. Outside the interaction
+    // receipt so the ledger row it writes carries the trace.
+    let app = app.layer(axum::middleware::from_fn(trace::layer));
 
     // Transparent gzip compression for every response whose client sends
     // Accept-Encoding: gzip. Board slim drops from 690KB to 162KB,
@@ -1678,5 +1792,50 @@ mod ui_stuck_hidden_tests {
             "after_reset": 0, "waited_ms": 5000, "hidden": 0})));
         assert!(super::counts_as_stuck(&json!({"verdict": "message_queue_stalled_sent_direct", "waited_ms": 3000})));
         assert!(super::counts_as_stuck(&json!({"verdict": "outbox_flight_stalled", "hidden": 0})));
+    }
+}
+
+#[cfg(test)]
+mod public_write_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// The routers merged beside the public debug reads carried two writes: the
+    /// nudges switch, which sets CC_STANDING_ORDERS at any scope, and the
+    /// on-demand system-job tick. Both answered a LAN or tailnet peer with no
+    /// credential. Pinned through the real router, with bodies the handlers
+    /// refuse before writing anything, so the old code answers 400/404 here
+    /// and never touches the amux home.
+    #[tokio::test]
+    async fn public_debug_routers_carry_no_unauthenticated_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("w.db")).unwrap();
+        let app = crate::api::router(super::AppState {
+            store: Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: Some("test-bearer".into()),
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+        let send = |method: &str, uri: &str, body: &str| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for (method, uri, body) in [
+            ("PATCH", "/api/board/nudges", r#"{"level":"worker","name":"","enabled":false}"#),
+            ("POST", "/api/system-jobs/no-such-job/run", "{}"),
+        ] {
+            let st = app.clone().oneshot(send(method, uri, body)).await.unwrap().status();
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{method} {uri} must need the bearer");
+        }
+        // The reads beside them stay public, as their comments promise.
+        let st = app.clone().oneshot(send("GET", "/api/system-jobs", "")).await.unwrap().status();
+        assert_ne!(st, StatusCode::UNAUTHORIZED, "GET /api/system-jobs stays public");
     }
 }

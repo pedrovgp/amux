@@ -2,6 +2,11 @@
 # AF-1129: the repo's installed git hooks follow the activated commit, so a
 # landed hook change reaches real pushes without a manual install.
 set -euo pipefail
+# The deploy target directory comes from the environment (server.env reaches
+# every process the server starts); a test's fake cargo must never write there.
+unset AMUX_DEPLOY_TARGET_DIR
+# Their fake cargo writes a few-byte stand-in; the builder refuses those by default.
+export AMUX_DEPLOY_MIN_BIN_BYTES=0
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILDER="$ROOT/scripts/rust-auto-build.sh"

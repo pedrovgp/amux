@@ -22,15 +22,74 @@ use std::sync::Arc;
 /// The L4 heartbeat: "is progress continuing?" answered as data, not
 /// inferred from scrollback. Published as a StateEvent so SSE clients and
 /// the dashboard status bar receive it like any other state change.
+///
+/// `live_leases` / `expired_leases` count the BOARD's leases (`issues.lease_*`,
+/// [`crate::db::board_store::board_lease_counts`]), the ones cards actually
+/// hold. They used to count `_amux_leases`, which only this planner writes and
+/// which reads 0 while dozens of cards hold leases (primitive integrity audit
+/// 2026-11-26, P0). `workers_*` and `reclaimed_last_tick` still describe this
+/// planner: rust-managed workers and its own lease table.
 #[derive(Debug, Clone, Serialize)]
 pub struct FleetProgress {
     pub at: DateTime<Utc>,
     pub workers_total: usize,
     pub workers_active: usize,
     pub live_leases: usize,
+    pub expired_leases: usize,
+    pub lease_source: &'static str,
     pub reclaimed_last_tick: usize,
     pub stall_violations: usize,
     pub quarantined_total: u64,
+}
+
+/// Where FleetProgress's lease counts come from, carried in the payload.
+pub const LEASE_SOURCE: &str = "issues";
+
+/// The switch for the orchestrator tick loop. The loop is OFF unless it is
+/// exactly `1`: it planned over rust-managed workers, of which none is live,
+/// while the board dispatcher (`runtime_jobs/board_drive.rs`) does the real
+/// dispatch (primitive integrity audit 2026-11-26, step 2). Kept for one
+/// release so an operator can turn it back on.
+pub const LOOP_SWITCH: &str = "AMUX_RS_ORCH";
+
+/// What boot decided about the loop, with the verdict it logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopDecision {
+    pub on: bool,
+    pub verdict: &'static str,
+    pub reason: String,
+}
+
+pub fn loop_decision(value: Option<&str>) -> LoopDecision {
+    let v = value.map(str::trim).unwrap_or("");
+    if v == "1" {
+        LoopDecision {
+            on: true,
+            verdict: "orchestrator_loop_on",
+            reason: format!("{LOOP_SWITCH}=1: the orchestrator tick loop runs (retiring; the board dispatcher is canonical)"),
+        }
+    } else {
+        let shown = if v.is_empty() { "unset".to_string() } else { format!("{v:?}") };
+        LoopDecision {
+            on: false,
+            verdict: "orchestrator_loop_off",
+            reason: format!("{LOOP_SWITCH} is {shown}: the orchestrator tick loop is off by default; set {LOOP_SWITCH}=1 in server.env and restart to run it"),
+        }
+    }
+}
+
+static LOOP_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record boot's decision so a view can say why the heartbeat is old.
+pub fn record_loop_decision(d: &LoopDecision) {
+    if LOOP_ON.set(d.on).is_err() {
+        tracing::debug!(verdict = "orchestrator_loop_decision_already_set", "loop decision recorded once per process");
+    }
+}
+
+/// Boot's decision, or None before boot made one (tests, a bare router).
+pub fn loop_running() -> Option<bool> {
+    LOOP_ON.get().copied()
 }
 
 /// Deterministic WorkerId for a Python-fleet owner name: matches no
@@ -669,12 +728,10 @@ impl Runtime {
             for assignment in plan.assignments.clone() {
                 let semantic =
                     crate::orchestrator::context::issue_by_internal_id(&conn, &assignment.task)?;
-                let limits = match semantic.as_ref() {
-                    Some(row) => crate::db::harness_store::get_budget(&conn, &row.id)?
-                        .map(|(limits, _)| limits)
-                        .unwrap_or_default(),
-                    None => amux_core::limits::ExecutionLimits::default(),
-                };
+                // Per-task budgets were retired with `_amux_task_budgets`
+                // (migration 0180; nothing ever set one), so every assignment
+                // runs under the default limits.
+                let limits = amux_core::limits::ExecutionLimits::default();
                 let depth: u32 = match semantic.as_ref() {
                     Some(row) => decomposition_depth(&conn, &row.id)?,
                     None => 0,
@@ -702,6 +759,10 @@ impl Runtime {
         }
 
         if heartbeat {
+            let board_leases = {
+                let conn = self.store.read()?;
+                crate::db::board_store::board_lease_counts(&conn, now.timestamp())?
+            };
             let progress = FleetProgress {
                 at: now,
                 workers_total: workers.len(),
@@ -709,7 +770,9 @@ impl Runtime {
                     .iter()
                     .filter(|w| matches!(w.state, amux_core::worker::WorkerState::Active { .. }))
                     .count(),
-                live_leases: leases.iter().filter(|l| !l.is_expired(now)).count(),
+                live_leases: board_leases.live,
+                expired_leases: board_leases.expired,
+                lease_source: LEASE_SOURCE,
                 reclaimed_last_tick: plan.reclaim.len(),
                 stall_violations: plan.stalls.len(),
                 quarantined_total,
@@ -1903,12 +1966,12 @@ impl Runtime {
             if let amux_core::protocol::WorkerCommand::DeliverMessage(message) = &cmd.command {
                 let refused = {
                     let conn = self.store.read()?;
-                    crate::api::messages::pending_receive_refusal(&conn, message.as_str(), &wid_str)?
+                    pending_receive_refusal(&conn, *message, &wid_str)?
                 };
                 if refused.is_some() {
-                    let (id, message, receiver) = (cmd.id.clone(), message.clone(), wid_str.clone());
+                    let (id, message, receiver) = (cmd.id.clone(), *message, wid_str.clone());
                     self.store.write_async(move |conn| {
-                        let Some(reason) = crate::api::messages::pending_receive_refusal(conn, message.as_str(), &receiver)? else {
+                        let Some(reason) = pending_receive_refusal(conn, message, &receiver)? else {
                             return Ok(WriteOutcome { applied: false, events: vec![] });
                         };
                         crate::db::commands::transition(conn, &id,
@@ -2017,16 +2080,16 @@ impl Runtime {
             let delivery = match &cmd.command {
                 amux_core::protocol::WorkerCommand::DeliverMessage(msg_id) => {
                     // RR-0066: the command carries only the REFERENCE
-                    // (Invariant 29); the durable body lives in
-                    // _amux_messages and is resolved here, at delivery. A
+                    // (Invariant 29); the durable body lives in its
+                    // cmd_history row and is resolved here, at delivery. A
                     // missing row is a delivery FAILURE, never an empty
                     // message — silently delivering "" would be the Python
                     // lost-steering-text bug wearing a Rust type.
                     let body: rusqlite::Result<String> = {
                         let conn = self.store.read()?;
                         conn.query_row(
-                            "SELECT body FROM _amux_messages WHERE id = ?1",
-                            params![msg_id.as_str()],
+                            "SELECT text FROM cmd_history WHERE id = ?1",
+                            params![msg_id.0],
                             |r| r.get(0),
                         )
                     };
@@ -2034,12 +2097,11 @@ impl Runtime {
                         Ok(body) => {
                             delivered_body = Some(body.clone());
                             protocol
-                                .deliver_message(&worker, msg_id.clone(), body)
+                                .deliver_message(&worker, *msg_id, body)
                                 .await
                         }
                         Err(e) => Err(crate::opencode::ProtocolError::Transport(format!(
-                            "message body lookup failed for {}: {e}",
-                            msg_id.as_str()
+                            "message body lookup failed for {msg_id}: {e}"
                         ))),
                     }
                 }
@@ -2126,34 +2188,28 @@ impl Runtime {
                                 "ledger capture failed for a delivered prompt");
                         }
                     }
-                    let mid = msg_id.to_string();
+                    // The message's own record moves forward too: its
+                    // cmd_history row is marked delivered, once (a row
+                    // already past queued, or already stamped, is left as it is).
+                    let (mid, at_ms) = (msg_id.0, now.timestamp_millis());
                     self.store
                         .write_async(move |conn| {
-                            // Through core's forward-only rule (advance_delivery),
-                            // and compare-and-swap on the stored value, instead of
-                            // hand-built JSON gated by `LIKE '%queued%'`
-                            // (implicit state machines inventory 2026-10-31, #12).
-                            let Some(mut msg) = crate::api::messages::message_by_id(conn, &mid)? else {
-                                return Ok(WriteOutcome { applied: false, events: vec![] });
-                            };
-                            let before: String = conn.query_row(
-                                "SELECT delivery FROM _amux_messages WHERE id = ?1", params![mid], |r| r.get(0))?;
-                            if let Err(e) = msg.advance_delivery(amux_core::message::DeliveryState::Delivered { at: now }) {
-                                tracing::info!(message = %mid, from = %e.from, verdict = "message_delivery_not_advanced",
-                                    "the message is already past queued; delivery left as it is");
-                                return Ok(WriteOutcome { applied: false, events: vec![] });
-                            }
-                            let after = serde_json::to_string(&msg.delivery).unwrap_or_default();
                             let n = conn.execute(
-                                "UPDATE _amux_messages SET delivery = ?2 WHERE id = ?1 AND delivery = ?3",
-                                params![mid, after, before],
+                                "UPDATE cmd_history SET delivered_at = ?2, \
+                                 delivery = CASE WHEN delivery IS NULL OR delivery = 'queued' THEN 'delivered' ELSE delivery END \
+                                 WHERE id = ?1 AND delivered_at IS NULL",
+                                params![mid, at_ms],
                             )?;
+                            if n == 0 {
+                                tracing::info!(message = mid, verdict = "message_delivery_not_advanced",
+                                    "the message's history row was already delivered; left as it is");
+                            }
                             Ok(WriteOutcome {
                                 applied: n > 0,
                                 events: if n > 0 {
                                     vec![PendingEvent {
                                         entity_type: EntityType::Message,
-                                        entity_id: mid.clone(),
+                                        entity_id: format!("MSG-{mid}"),
                                         mutation: MutationKind::StatusChanged {
                                             from: "queued".into(),
                                             to: "delivered".into(),
@@ -2322,6 +2378,33 @@ pub struct ReconcileReport {
     pub stale_backend: Vec<String>,
     /// Backends that could not be probed (their sessions were NOT judged).
     pub backend_probe_failures: Vec<String>,
+}
+
+/// Recheck, before a queued message is delivered, whether its sender may
+/// still reach the receiver. The sender is the message's `cmd_history.origin`;
+/// only a worker sender (a lane with an env file) is subject to the peer and
+/// group boundary, through the same check `amux send` uses
+/// (`session_verbs::peer_input_refusal`). A missing row is not refused here:
+/// the body lookup fails the delivery instead.
+fn pending_receive_refusal(
+    conn: &rusqlite::Connection,
+    message: amux_core::ids::HistoryId,
+    target: &str,
+) -> rusqlite::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let origin: Option<String> = conn
+        .query_row("SELECT origin FROM cmd_history WHERE id = ?1", params![message.0], |r| r.get(0))
+        .optional()?;
+    let Some(origin) = origin.map(|o| o.trim().to_string()).filter(|o| !o.is_empty()) else { return Ok(None) };
+    let receiver = crate::db::queries::get_worker(conn, target)?
+        .map(|w| w.display_name)
+        .unwrap_or_else(|| target.to_string());
+    let is_lane = crate::api::session_verbs::valid_session_name(&origin)
+        && crate::config::amux_home().join("sessions").join(format!("{origin}.env")).exists();
+    if !is_lane || origin == receiver {
+        return Ok(None);
+    }
+    Ok(crate::api::session_verbs::peer_input_refusal(&origin, &receiver).map(|r| r.reason))
 }
 
 #[cfg(test)]
@@ -2517,6 +2600,51 @@ mod tests {
             kinds.iter().any(|k| k.contains("fleet_progress")),
             "{kinds:?}"
         );
+    }
+
+    /// The heartbeat counts the leases cards hold on the board, not the
+    /// planner's own `_amux_leases` (audit P0: that read 0 beside 22 held cards).
+    #[tokio::test]
+    async fn heartbeat_counts_board_leases_from_issues() {
+        let store = store();
+        let now = Utc::now().timestamp();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO issues (id,title,created,updated,status,lease_owner,lease_expires_at)
+                     VALUES ('B-1','held',1,1,'doing','lane-a',?1), ('B-2','held',1,1,'doing','lane-b',?1),
+                            ('B-3','expired',1,1,'doing','lane-a',?2)",
+                    params![now + 600, now - 600],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let rt = test_runtime(store.clone(), vec![]);
+        let mut rx = store.subscribe();
+        rt.tick_once(true).await.unwrap();
+        let mut hb = None;
+        while let Ok(ev) = rx.try_recv() {
+            if format!("{:?}", ev.entity_type).contains("fleet_progress") {
+                hb = serde_json::from_str::<serde_json::Value>(&ev.entity_id).ok();
+            }
+        }
+        let hb = hb.expect("a heartbeat was published");
+        assert_eq!(hb["live_leases"], serde_json::json!(2), "{hb}");
+        assert_eq!(hb["expired_leases"], serde_json::json!(1), "{hb}");
+        assert_eq!(hb["lease_source"], serde_json::json!("issues"), "{hb}");
+    }
+
+    #[test]
+    fn the_loop_runs_only_when_the_switch_is_exactly_one() {
+        assert!(loop_decision(Some("1")).on);
+        assert!(loop_decision(Some(" 1 ")).on);
+        for off in [None, Some(""), Some("0"), Some("true"), Some("yes")] {
+            let d = loop_decision(off);
+            assert!(!d.on, "{off:?}");
+            assert_eq!(d.verdict, "orchestrator_loop_off");
+            assert!(d.reason.contains("AMUX_RS_ORCH=1"), "{}", d.reason);
+        }
+        assert_eq!(loop_decision(Some("1")).verdict, "orchestrator_loop_on");
     }
 }
 
@@ -2925,7 +3053,7 @@ mod adherence_tests {
     use crate::db::board_store as bs;
     use crate::opencode::mock::{MockProtocol, RecordedCall};
     use crate::opencode::AgentState;
-    use amux_core::ids::{CommandId, MessageId, WorkerId};
+    use amux_core::ids::{CommandId, WorkerId};
     use amux_core::limits::AttemptRecord;
     use amux_core::protocol::{DeliveryTiming, WorkerCommand};
     use amux_core::worker::{WorkerConfig, WorkerState};
@@ -3412,9 +3540,8 @@ mod adherence_tests {
         let protocol = Arc::new(MockProtocol::new());
         protocol.register(w.clone(), AgentState::Idle);
 
-        let msg = MessageId::from_ulid(ulid::Ulid::new());
         let body = "please fix the flaky auth test. It only fails on CI.";
-        seed_message(&store, &msg, body);
+        let msg = seed_message(&store, body);
         enqueue_deliver(&store, &w, &msg, "cap-k1");
 
         let rt = runtime(store.clone(), Some(protocol.clone()), false);
@@ -3526,10 +3653,7 @@ mod adherence_tests {
         let worker = seed_worker(&store, 4, "alpha");
         let protocol = Arc::new(MockProtocol::new());
         protocol.register(worker.clone(), AgentState::Idle);
-        let message = MessageId::from_ulid(ulid::Ulid::new());
-        seed_message(
-            &store,
-            &message,
+        let message = seed_message(&store,
             "What is the difference between todo and backlog? Please answer only; do not change anything.",
         );
         enqueue_deliver(&store, &worker, &message, "info-k1");
@@ -3550,15 +3674,15 @@ mod adherence_tests {
             "conversation-only answers must not consume a board id or WIP slot"
         );
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM _amux_messages"),
+            count(&store, "SELECT COUNT(*) FROM cmd_history"),
             1,
             "the source message remains durable when no task is minted"
         );
-        // Delivery advanced through core (#12): a parseable Delivered state.
-        let delivery: String = store.read().unwrap()
-            .query_row("SELECT delivery FROM _amux_messages", [], |r| r.get(0)).unwrap();
-        let parsed: amux_core::message::DeliveryState = serde_json::from_str(&delivery).unwrap();
-        assert!(matches!(parsed, amux_core::message::DeliveryState::Delivered { .. }), "{delivery}");
+        // The message's history row is marked delivered, once.
+        let (delivery, at): (String, Option<i64>) = store.read().unwrap()
+            .query_row("SELECT delivery, delivered_at FROM cmd_history", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(delivery, "delivered");
+        assert!(at.is_some(), "delivered_at is stamped");
     }
 
     /// AMUX-2613 E2E regression: the ledger card minted from a delivered
@@ -3574,10 +3698,7 @@ mod adherence_tests {
         protocol.register(w.clone(), AgentState::Idle);
         let rt = runtime(store.clone(), Some(protocol.clone()), false);
 
-        let msg = MessageId::from_ulid(ulid::Ulid::new());
-        seed_message(
-            &store,
-            &msg,
+        let msg = seed_message(&store,
             "please fix the flaky auth test. It only fails on CI.",
         );
         enqueue_deliver(&store, &w, &msg, "cap-k9");
@@ -3639,8 +3760,7 @@ mod adherence_tests {
         protocol.register(w.clone(), AgentState::Idle);
         let rt = runtime(store.clone(), Some(protocol.clone()), false);
 
-        let msg = MessageId::from_ulid(ulid::Ulid::new());
-        seed_message(&store, &msg, "this should be one row");
+        let msg = seed_message(&store, "this should be one row");
         enqueue_deliver(&store, &w, &msg, "cap-2604");
         rt.pump_commands(Utc::now(), &BTreeMap::new())
             .await
@@ -3697,8 +3817,7 @@ mod adherence_tests {
 
         // A SECOND capture for the same card cannot stack a second ask — the
         // guard replaces. (A worker is asked once, not every turn.)
-        let m2 = MessageId::from_ulid(ulid::Ulid::new());
-        seed_message(&store, &m2, "this should be one row");
+        let m2 = seed_message(&store, "this should be one row");
         enqueue_deliver(&store, &w, &m2, "cap-2604b");
         rt.pump_commands(Utc::now(), &BTreeMap::new())
             .await
@@ -3724,10 +3843,7 @@ mod adherence_tests {
         protocol.register(w.clone(), AgentState::Idle);
         let rt = runtime(store.clone(), Some(protocol.clone()), false);
 
-        let msg = MessageId::from_ulid(ulid::Ulid::new());
-        seed_message(
-            &store,
-            &msg,
+        let msg = seed_message(&store,
             "please fix the flaky auth test. It only fails on CI.",
         );
         enqueue_deliver(&store, &w, &msg, "cap-2604c");
@@ -3794,10 +3910,7 @@ mod adherence_tests {
         // Two intentional repeats still reach the model and remain durable
         // messages. Only the redundant board receipts are consolidated.
         for key in ["repeat-one", "repeat-two"] {
-            let message = MessageId::from_ulid(ulid::Ulid::new());
-            seed_message(
-                &store,
-                &message,
+            let message = seed_message(&store,
                 "also handle the retry path in the same module please",
             );
             enqueue_deliver(&store, &w, &message, key);
@@ -3834,7 +3947,7 @@ mod adherence_tests {
                 .count(),
             2
         );
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_messages"), 2);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM cmd_history"), 2);
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM issues"),
             2,
@@ -3850,36 +3963,34 @@ mod adherence_tests {
         );
     }
 
-    fn seed_message(store: &SharedStore, id: &MessageId, body: &str) {
-        let (id, body) = (id.to_string(), body.to_string());
+    /// A message to a worker is a cmd_history row; the command carries its id.
+    fn seed_message(store: &SharedStore, body: &str) -> amux_core::ids::HistoryId {
+        let body = body.to_string();
+        let id = Arc::new(std::sync::Mutex::new(0i64));
+        let id2 = id.clone();
         store
             .write(move |conn| {
                 conn.execute(
-                    "INSERT INTO _amux_messages (id, from_actor, target, body, thread, created_at, delivery)
-                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-                    params![
-                        id,
-                        serde_json::to_string(&amux_core::events::Actor::Human { name: "ethan".into() }).unwrap(),
-                        serde_json::to_string(&amux_core::message::MessageTarget::Worker(wid(1))).unwrap(),
-                        body,
-                        Utc::now().to_rfc3339(),
-                        r#"{"state":"queued"}"#
-                    ],
+                    "INSERT INTO cmd_history (text, type, session, ts, origin, delivery) VALUES (?1, 'user', 'alpha', ?2, '', 'queued')",
+                    params![body, Utc::now().timestamp_millis()],
                 )?;
+                *id2.lock().unwrap() = conn.last_insert_rowid();
                 Ok(WriteOutcome { applied: true, events: vec![] })
             })
             .unwrap();
+        let n = *id.lock().unwrap();
+        amux_core::ids::HistoryId(n)
     }
 
-    fn enqueue_deliver(store: &SharedStore, w: &WorkerId, msg: &MessageId, key: &str) {
-        let (w, msg, key) = (w.clone(), msg.clone(), key.to_string());
+    fn enqueue_deliver(store: &SharedStore, w: &WorkerId, msg: &amux_core::ids::HistoryId, key: &str) {
+        let (w, msg, key) = (w.clone(), *msg, key.to_string());
         store
             .write(move |conn| {
                 crate::db::commands::enqueue(
                     conn,
                     CommandId::from_ulid(ulid::Ulid::new()),
                     &w,
-                    &WorkerCommand::DeliverMessage(msg.clone()),
+                    &WorkerCommand::DeliverMessage(msg),
                     &key,
                     &DeliveryTiming::Immediate,
                     None,

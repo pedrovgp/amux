@@ -147,6 +147,17 @@ async fn serve_path(
         )
             .into_response();
     }
+    // The public-link namespace is never the dashboard shell. The routes above
+    // claim every canonical `/pub/{id}...`, so whatever reaches this fallback
+    // with that prefix (bare `/pub` or `/pub/`, or a case variant such as
+    // `/PUB/` or `/Pub/x` that a case-insensitive proxy rule lets through)
+    // is not a link. Serving the shell there put the dashboard, and on a
+    // tunnelled host the owner bearer, behind a path the owner had opened
+    // to anyone.
+    let lower = path.to_ascii_lowercase();
+    if lower == "pub" || lower.starts_with("pub/") {
+        return public_links::not_found();
+    }
     // Non-API, non-GET: 405 as before. The SPA shell is a GET-only artifact and
     // handing it back for a POST would be worse than the bare 405 this replaces
     // — the whole point of the JSON 404 above is that a caller can tell "no such
@@ -174,6 +185,7 @@ async fn serve_path(
     // app.js again in full (1MB gzipped, recompressed per request). The hash
     // covers all of static/, so any change moves every file's ETag.
     let etag = format!("\"d-{}\"", amux_dashboard::asset_version());
+    let cache = cache_control_for(uri.query());
     let fresh = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -181,20 +193,37 @@ async fn serve_path(
     if fresh && amux_dashboard::asset(path).is_some() {
         return (
             StatusCode::NOT_MODIFIED,
-            [(header::ETAG, etag), (header::CACHE_CONTROL, "no-cache".to_string())],
+            [(header::ETAG, etag), (header::CACHE_CONTROL, cache.to_string())],
         )
             .into_response();
     }
     match amux_dashboard::asset(path) {
         Some(content) => {
             let mime = mime_for(path);
-            let mut resp =
-                ([(header::CONTENT_TYPE, mime)], content.into_owned()).into_response();
+            // Compressed once per deploy, not per request: app.js is ~6 MB and
+            // gzipping it took ~55 ms of every cold page load, once for each
+            // of the Mac app's tabs. CompressionLayer leaves a response that
+            // already names its encoding alone.
+            let gz = accepts_gzip(&headers)
+                .then(|| gzipped(path, &content))
+                .flatten();
+            let mut resp = match gz {
+                Some(bytes) => (
+                    [
+                        (header::CONTENT_TYPE, mime),
+                        (header::CONTENT_ENCODING, "gzip"),
+                        (header::VARY, "accept-encoding"),
+                    ],
+                    bytes,
+                )
+                    .into_response(),
+                None => ([(header::CONTENT_TYPE, mime)], content.into_owned()).into_response(),
+            };
             if let Ok(v) = HeaderValue::from_str(&etag) {
                 resp.headers_mut().insert(header::ETAG, v);
             }
             resp.headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
             resp
         }
         // SPA fallback: unknown NON-API paths get the shell so client routing
@@ -389,6 +418,7 @@ pub(crate) mod app_ports;
 pub(crate) mod app_relay;
 pub(crate) mod apps_origin;
 pub(crate) mod public_links;
+pub(crate) mod public_origin;
 pub(crate) mod tailnet_auth;
 
 async fn serve_shell(
@@ -474,7 +504,8 @@ fn owner_bootstrap_allowed(
     // and its session cookie (desktop/test/split-button-e2e.py). It only
     // removes trust; the API's own check is AMUX_RS_NO_LOOPBACK_BYPASS.
     let local = super::fs::browser_is_on_this_machine(peer, authority.as_deref())
-        && !std::env::var("AMUX_RS_SHELL_AS_REMOTE").is_ok_and(|v| v == "1");
+        && !std::env::var("AMUX_RS_SHELL_AS_REMOTE").is_ok_and(|v| v == "1")
+        && !relayed_without_front_door(headers);
     if let Some((peer_field, authority_field)) = withheld_bootstrap_record(
         state.auth_token.is_some(),
         local,
@@ -503,6 +534,32 @@ fn owner_bootstrap_allowed(
         );
     }
     local
+}
+
+/// Proxy headers that mean the socket peer is a relay, not the browser.
+/// cloudflared sends `Cf-Connecting-Ip` and `X-Forwarded-For`; Caddy and
+/// nginx send `X-Forwarded-For` or `Forwarded`. A browser talking to this
+/// server directly sends none of them.
+const RELAY_HEADERS: &[&str] = &["forwarded", "x-forwarded-for", "x-real-ip", "cf-connecting-ip"];
+
+/// A request that came through a reverse proxy is not "this machine", even
+/// though the proxy connects from loopback.
+///
+/// A tunnel (cloudflared, ngrok, a local Caddy) connects to amux from
+/// 127.0.0.1, so before this every browser that reached the shell through one
+/// was handed the owner bearer. That was safe only while the proxy's own
+/// sign-in covered every path. A proxy rule that opens `/pub/*` to everyone
+/// for public links also opens the shell, because unknown paths fall back to
+/// it, and a case-insensitive rule opens `/PUB/` and `/Pub/x` too. The owner
+/// still gets in through a tunnel by signing in once (`?_token=`, which sets
+/// the HttpOnly owner session), the same way a remote browser does.
+///
+/// A host behind amux's own sign-in front door (loopback_trust.rs) keeps the
+/// old behaviour: its Caddy always forwards, and the door already stands in
+/// front of every path there.
+fn relayed_without_front_door(headers: &HeaderMap) -> bool {
+    RELAY_HEADERS.iter().any(|h| headers.contains_key(*h))
+        && !super::loopback_trust::front_door_active()
 }
 
 /// Whether this shell-serve is the withheld case, and the two fields the log
@@ -687,15 +744,75 @@ fn inject_bootstrap(
     // restart just like the python server") — a banner on backend-only
     // build changes was noise Python never showed, and the reload it
     // offered is now automatic when it matters (client code changed).
-    // CRM is removed from the Rust build (Ethan, 2026-08-09): hide its tab
-    // and view via the serve-time layer — the extracted SPA stays
-    // byte-identical, the decision lives HERE where it is one greppable
-    // line to reverse.
-    let crm_hide = r#"<style>/* AMUX-FEATURE-FLAGS (injected) */
-[onclick="switchView('crm')"], #crm-view { display: none !important; }
-</style>
-"#;
-    with_bootstrap.replacen("</body>", &format!("{crm_hide}</body>"), 1)
+    // The CRM tab was hidden here from 2026-08-09 (AMUX-2590) to 2026-11-23,
+    // when the owner asked for it back ("build the CRM tab", docs/design/crm.md).
+    with_bootstrap
+}
+
+/// A URL that names the dashboard's current content hash (`/app.js?v=<hash>`,
+/// stamped into index.html at serve time) can never change under that name:
+/// a deploy moves the hash and with it the URL. So it is cached for a year
+/// and a reload does not even ask (a WKWebView tab of the Mac app revalidated
+/// it on every load). Any other URL, and a stale `v`, revalidates as before.
+fn cache_control_for(query: Option<&str>) -> &'static str {
+    let current = amux_dashboard::asset_version();
+    let versioned = query.is_some_and(|q| {
+        q.split('&')
+            .any(|kv| kv.strip_prefix("v=").is_some_and(|v| v == current))
+    });
+    if versioned {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| {
+            let mut parts = t.trim().split(';');
+            parts.next().is_some_and(|n| n.trim().eq_ignore_ascii_case("gzip"))
+                && !parts.any(|p| {
+                    // q=0, q=0.0, Q=0.000: a weight of zero declines it.
+                    let p = p.trim();
+                    p.len() > 2
+                        && p[..2].eq_ignore_ascii_case("q=")
+                        && p[2..].trim().parse::<f32>().is_ok_and(|q| q == 0.0)
+                })
+        })
+}
+
+/// The gzip of one dashboard file at the current content hash, made the first
+/// time it is asked for. Only text worth compressing; `None` means send it
+/// as is (CompressionLayer may still compress it).
+fn gzipped(path: &str, content: &[u8]) -> Option<Vec<u8>> {
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static GZ: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+    let mime = mime_for(path);
+    let text = mime.starts_with("text/") || mime == "application/json" || mime == "image/svg+xml";
+    if content.len() < 1024 || !text {
+        return None;
+    }
+    let key = format!("{}:{path}", amux_dashboard::asset_version());
+    let map = GZ.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(b) = map.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return Some(b.clone());
+    }
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(content).ok()?;
+    let bytes = enc.finish().ok()?;
+    let mut m = map.lock().unwrap_or_else(|p| p.into_inner());
+    // A deploy moves the hash: drop the old version's entries.
+    let ver = format!("{}:", amux_dashboard::asset_version());
+    m.retain(|k, _| k.starts_with(&ver));
+    m.insert(key, bytes.clone());
+    Some(bytes)
 }
 
 fn mime_for(path: &str) -> &'static str {
@@ -719,6 +836,47 @@ fn mime_for(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_current_versioned_url_is_cached_for_a_year() {
+        let v = amux_dashboard::asset_version();
+        let year = "public, max-age=31536000, immutable";
+        assert_eq!(cache_control_for(Some(&format!("v={v}"))), year);
+        assert_eq!(cache_control_for(Some(&format!("x=1&v={v}"))), year);
+        assert_eq!(cache_control_for(Some("v=0000stale")), "no-cache");
+        assert_eq!(cache_control_for(Some(&format!("vv={v}"))), "no-cache");
+        assert_eq!(cache_control_for(None), "no-cache");
+    }
+
+    #[test]
+    fn gzip_is_sent_only_to_a_client_that_takes_it() {
+        let mut h = HeaderMap::new();
+        assert!(!accepts_gzip(&h));
+        h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("br, gzip, deflate"));
+        assert!(accepts_gzip(&h));
+        h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip;q=0, br"));
+        assert!(!accepts_gzip(&h));
+        h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("GZIP;q=0.5"));
+        assert!(accepts_gzip(&h));
+        for declined in ["gzip;q=0.0", "gzip; Q=0", "gzip;q=0.000"] {
+            h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(declined));
+            assert!(!accepts_gzip(&h), "{declined}");
+        }
+    }
+
+    #[test]
+    fn a_dashboard_file_is_gzipped_once_and_decodes_to_itself() {
+        use std::io::Read;
+        let body = "console.log('amux');\n".repeat(400);
+        let a = gzipped("probe-test.js", body.as_bytes()).expect("text over 1 KB is gzipped");
+        let b = gzipped("probe-test.js", body.as_bytes()).expect("cached");
+        assert_eq!(a, b);
+        let mut out = String::new();
+        flate2::read::GzDecoder::new(&a[..]).read_to_string(&mut out).unwrap();
+        assert_eq!(out, body);
+        assert!(gzipped("tiny.js", b"x").is_none(), "too small to bother");
+        assert!(gzipped("icon.png", &[0u8; 4096]).is_none(), "binary passes through");
+    }
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -970,8 +1128,9 @@ mod tests {
         let out = inject_bootstrap(html, &s, None, true);
         assert!(!out.contains("AMUX-UPDATE-WATCH"));
         assert!(!out.contains("amux-update-bar"));
-        // The CRM feature-flag layer still injects.
-        assert!(out.contains("AMUX-FEATURE-FLAGS"));
+        // The CRM tab is shown again (2026-11-23): nothing hides it.
+        assert!(!out.contains("switchView('crm')\"], #crm-view { display: none"));
+        assert!(!out.contains("AMUX-FEATURE-FLAGS"));
     }
 
     /// The migration signal must be ON only for documents actually served by
@@ -1169,6 +1328,65 @@ mod tests {
             StatusCode::METHOD_NOT_ALLOWED,
             "no SPA shell for a POST"
         );
+    }
+
+    /// A tunnel (cloudflared, ngrok, Caddy) connects from loopback. Its
+    /// forwarding headers say the browser is elsewhere, so the shell it
+    /// relays must not carry the owner bearer.
+    #[tokio::test]
+    async fn a_shell_relayed_through_a_loopback_proxy_withholds_the_owner_bearer() {
+        use tower::ServiceExt;
+        let app = routes().with_state(state(Some("tok123")));
+        for (name, value) in [
+            ("cf-connecting-ip", "203.0.113.7"),
+            ("x-forwarded-for", "203.0.113.7"),
+            ("x-real-ip", "203.0.113.7"),
+            ("forwarded", "for=203.0.113.7"),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .uri("https://amux.example.com/")
+                .header(name, value)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:50000".parse::<SocketAddr>().unwrap()));
+            let res = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{name}");
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(!body.contains("tok123"), "{name}: owner bearer leaked through a relay");
+            assert!(body.contains("window._AMUX_AUTH_WITHHELD=true;"), "{name}");
+        }
+        // The same loopback peer with no relay header is still this machine.
+        let local = shell(&app, "https://amux.example.com/", None, Some("127.0.0.1")).await;
+        assert!(local.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{local}");
+    }
+
+    /// Anything under the public-link prefix that is not a canonical link is a
+    /// 404, never the dashboard shell: a proxy that opens `/pub/*` to everyone
+    /// (case-insensitively, as Cloudflare Access does) must not open the shell.
+    #[tokio::test]
+    async fn non_link_paths_under_pub_are_404_not_the_shell() {
+        use tower::ServiceExt;
+        let app = routes().with_state(state(Some("tok123")));
+        for uri in ["/pub", "/pub/", "/PUB/", "/Pub", "/pUb/x/", "/PUB/0123456789abcdef0123456789abcdef/"] {
+            let mut request = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:50000".parse::<SocketAddr>().unwrap()));
+            let res = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(!body.contains("tok123") && !body.contains("<!DOCTYPE"), "{uri}: {body}");
+        }
+        // Paths that merely start with the letters are untouched.
+        let shell_page = shell(&app, "/public", None, Some("127.0.0.1")).await;
+        assert!(shell_page.contains("AMUX-BOOTSTRAP"), "/public still falls back to the shell");
     }
 
     #[tokio::test]

@@ -19,6 +19,11 @@
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
 set -euo pipefail
+# The deploy target directory comes from the environment (server.env reaches
+# every process the server starts); a test's fake cargo must never write there.
+unset AMUX_DEPLOY_TARGET_DIR
+# Their fake cargo writes a few-byte stand-in; the builder refuses those by default.
+export AMUX_DEPLOY_MIN_BIN_BYTES=0
 cd "$(dirname "$0")/.."
 HOOK="$(pwd)/.claude/session-freshness.sh"
 PASS=0; FAIL=0

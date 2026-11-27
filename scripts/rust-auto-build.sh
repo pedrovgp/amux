@@ -65,16 +65,34 @@ print(",".join(sorted(set(ids))))' "$window" 2>/dev/null || true
 }
 
 # Wait for the server to report $1 live, for $2 seconds; sets $waited and
-# returns 0 once it does. The server holds adoption of a new binary while a
+# returns 0 once it does. The server can hold adoption of a new binary while a
 # shell schedule run is in flight, for up to AMUX_ADOPT_SHELL_DEFER_MAX_S
-# (lib.rs SELF_ADOPT, default 900). Rolling back at $2 during that hold threw
+# (lib.rs SELF_ADOPT). That defaults to 0 since shell runs survive a restart
+# (runtime_jobs/shell_detached.rs, cicd-two-minutes item 1); this wait honours
+# whatever the server is set to. Rolling back at $2 during that hold threw
 # away good builds: 6 rollbacks from 2026-10-30 to 11-02, c71df3ef9 among
 # them while SCHED-662 ran. So past $2 the wait goes on while a shell run is
 # in flight, up to $2 plus the hold, and says so once.
+# Seconds since the push of $1, from the time the activation authority read off
+# its first workflow run (~/.amux/ci-pushed-at), or "unmeasured". push_to_live_s
+# counts from the commit, which is before the land gate ran.
+from_push_s() {
+  local at; at=$(cat "${AMUX_CI_PUSHED_AT_DIR:-$HOME/.amux/ci-pushed-at}/$1" 2>/dev/null)
+  case "$at" in ''|*[!0-9]*) echo unmeasured ;; *) echo $(( $(date +%s) - at )) ;; esac
+}
+
+# One JSON line per deploy for the server to report (GET /api/pull
+# push_to_live): the seconds from the push, or null when unmeasured.
+record_deploy_latency() { # <sha> <from_push_s> <kind: restamp|compiled|prebuilt>
+  local v="$2"; case "$v" in ''|*[!0-9]*) v=null ;; esac
+  printf '{"sha":"%s","at":%s,"from_push_s":%s,"kind":"%s"}\n' "$1" "$(date +%s)" "$v" "${3:-unknown}" \
+    >> "${AMUX_DEPLOY_LATENCY_LOG:-$HOME/.amux/deploy-latency.jsonl}" 2>/dev/null || true
+}
+
 wait_live_identity() {
-  local sha="$1" limit="$2" hold="${AMUX_ADOPT_SHELL_DEFER_MAX_S:-900}" said=0 runs="" released=0
+  local sha="$1" limit="$2" hold="${AMUX_ADOPT_SHELL_DEFER_MAX_S:-0}" said=0 runs="" released=0
   local grace="${AMUX_ADOPT_POST_HOLD_GRACE_S:-120}"
-  case "$hold" in ''|*[!0-9]*) hold=900 ;; esac
+  case "$hold" in ''|*[!0-9]*) hold=0 ;; esac
   case "$grace" in ''|*[!0-9]*) grace=120 ;; esac
   waited=0
   while :; do
@@ -461,7 +479,8 @@ PYSTAMP
     printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
     rm -f "${INSTALL}.identity.json.rollback"
     prune_dashboard_snapshots "$dash_dir"
-    echo "== ACTIVATION HEALTHY sha=$sha after ${waited}s push_to_live_s=$(( $(date +%s) - $(git -C "$REPO" log -1 --format=%ct "$sha" 2>/dev/null || date +%s) )) restamped=1 verdict=activation_healthy"
+    echo "== ACTIVATION HEALTHY sha=$sha after ${waited}s push_to_live_s=$(( $(date +%s) - $(git -C "$REPO" log -1 --format=%ct "$sha" 2>/dev/null || date +%s) )) from_push_s=$(from_push_s "$sha") restamped=1 verdict=activation_healthy"
+    record_deploy_latency "$sha" "$(from_push_s "$sha")" restamp
     return 0
   fi
   mv -f "${INSTALL}.identity.json.rollback" "${INSTALL}.identity.json"
@@ -573,17 +592,18 @@ if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
       exit 0
     fi
   fi
-  # A DEPLOY WAITS FOR AN IN-FLIGHT SHELL SCHEDULE (RCA self 20261015-182512).
-  # A restart closes a shell run's output pipes, and the scheduler records it
-  # as "server restarted before the shell result was recorded": 4 of
-  # SCHED-465's 25 runs in 24h died that way while deploys landed inside its
-  # up-to-10-minute window. Hold the rebuild while a shell run started in the
-  # last AMUX_RS_SHELL_DEFER_MAX_S is still running, for at most that long, so
-  # a busy scheduler can delay a deploy but never block it.
+  # A DEPLOY USED TO WAIT FOR AN IN-FLIGHT SHELL SCHEDULE (RCA self
+  # 20261015-182512): a restart closed a shell run's output pipes and the run
+  # was recorded "server restarted before the shell result was recorded". A
+  # shell run is now a detached process the next server adopts
+  # (runtime_jobs/shell_detached.rs), so the hold defaults to 0 and a deploy
+  # waits for nothing (cicd-two-minutes item 1: this held 16 of 109 deploys,
+  # up to 530s). AMUX_RS_SHELL_DEFER_MAX_S=<s> brings it back.
   if [ "$head" != "$last" ]; then
-    SHELL_DEFER_MAX_S="${AMUX_RS_SHELL_DEFER_MAX_S:-900}"
+    SHELL_DEFER_MAX_S="${AMUX_RS_SHELL_DEFER_MAX_S:-0}"
     SHELL_DEFER_FILE="${STAMP}.shell_defer_since"
-    in_flight=$(shell_runs_in_flight "$SHELL_DEFER_MAX_S")
+    in_flight=""
+    if [ "$SHELL_DEFER_MAX_S" -gt 0 ] 2>/dev/null; then in_flight=$(shell_runs_in_flight "$SHELL_DEFER_MAX_S"); fi
     if [ -n "$in_flight" ] && [ "$SHELL_DEFER_MAX_S" -gt 0 ] 2>/dev/null; then
       now_epoch=$(date +%s)
       since=$(cat "$SHELL_DEFER_FILE" 2>/dev/null || echo "$now_epoch")
@@ -807,6 +827,21 @@ fi
     echo "== cargo_build_backoff trigger=$head retry_in_s=$((retry_s - retry_now + failed_at))"
     exit 0
   fi
+  # WAIT FOR THE BINARY ANOTHER HOST IS BUILDING (Z4). With a prebuilt directory set,
+  # the build host is compiling this sha too, and a local compile here is the one that
+  # OOMs on the sandbox. Each pass that finds no binary yet comes back on the next one,
+  # for at most AMUX_DEPLOY_PREBUILT_WAIT_S (600); past that it compiles here and says so.
+  if [ -n "${AMUX_DEPLOY_PREBUILT_DIR:-}" ] && [ "${AMUX_RS_DISK_CLEAR_ONLY:-0}" != 1 ] \
+     && [ ! -s "$AMUX_DEPLOY_PREBUILT_DIR/$built_sha/amux-server" ]; then
+    _pw="${STAMP}.prebuilt_wait.$built_sha"
+    [ -f "$_pw" ] || date +%s > "$_pw"
+    _waited=$(( $(date +%s) - $(cat "$_pw" 2>/dev/null || date +%s) ))
+    if [ "$_waited" -lt "${AMUX_DEPLOY_PREBUILT_WAIT_S:-600}" ]; then
+      echo "== $(date '+%F %T') waiting ${_waited}s for the prebuilt binary of $built_sha verdict=deploy_prebuilt_waiting"
+      exit 0
+    fi
+    echo "== WARN no prebuilt binary for $built_sha after ${_waited}s; compiling here verdict=deploy_prebuilt_timeout"
+  fi
   echo "== $(date '+%F %T') building $built_sha (trigger: $head, previous stamp: ${last:-none})"
   if [ "$on_main" != "yes" ]; then
     echo "== !! OFF-MAIN: $built_sha is on '$head_ref', which is not contained in main."
@@ -928,10 +963,16 @@ fi
     done
     echo "== WARN cargo_reclaim_deferred DEFERRED path=$2 attempts=$tries waited_s=$((SECONDS-started)) verdict=cargo_reclaim_retry_exhausted last=${RECLAIM_LAST:-peer override}; the guard refused for the whole window, the next run retries."
   }
+  # The cap must sit ABOVE one workspace test build (33-36G measured
+  # 2026-11-14). At 32 every builder run after a land gate cleared it, the
+  # next gate rebuilt all of it cold, and the host's free space swung ~35G per
+  # cycle, which the disk tick escalated three times as an 18-20G/h burn
+  # (RCAs 20261114-032649, -122821). 44 keeps the warm build and stays under
+  # the 64G AMUX_CARGO_MAX_TARGET_GB with deploy/ and release/ beside it.
   DEBUG_DIR="$HOME/.amux/rust-build-target/debug"
   if [ -d "$DEBUG_DIR" ]; then
     DEBUG_GB=$(du -sk "$DEBUG_DIR" 2>/dev/null | awk '{print int($1/1048576)}')
-    if [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}" ]; then
+    if [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-44}" ]; then
       echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR. Clearing eligible artifacts only after the Cargo safety guard permits it."
       reclaim_debug_with_retries "$HOME/.amux/rust-build-target" "$DEBUG_DIR"
     fi
@@ -1001,7 +1042,13 @@ fi
   [ "$(git -C "$WORK" rev-parse HEAD)" = "$BUILD_SHA" ] || { echo "== build dir is not at $BUILD_SHA; refusing"; exit 1; }
   # The deploy profile's output. The remote-build path produces a release
   # binary at the release path, so it sets BUILT_BIN to that below.
-  BUILT_BIN="$HOME/.amux/rust-build-target/deploy/amux-server"
+  # The deploy build's own target directory, shared with rust-prebuild.sh,
+  # which already honoured AMUX_DEPLOY_TARGET_DIR while this hardcoded the
+  # fleet's directory: cargo locks a whole target directory, so a lane's
+  # `cargo test` there held a deploy compile (423 s against a usual 130 s,
+  # 2026-11-12). Default unchanged.
+  DEPLOY_TARGET="${AMUX_DEPLOY_TARGET_DIR:-$HOME/.amux/rust-build-target}"
+  BUILT_BIN="$DEPLOY_TARGET/deploy/amux-server"
   # CAPTURE THE WHOLE BUILD, THEN DECIDE WHAT TO KEEP (AMUX-2927).
   #
   # This was `cargo build ... 2>&1 | tail -3`, and on a FAILURE cargo's last
@@ -1072,11 +1119,31 @@ fi
     done ) &
   HB_PID=$!
   BUILD_OK=0
-  if [ -n "${AMUX_REMOTE_BUILD_HOST:-}" ]; then
+  # A BINARY ANOTHER HOST ALREADY BUILT FOR THIS COMMIT (docs/design/cicd-two-minutes.md,
+  # Z4). The sandbox cannot compile main at all: one rustc peaks at 6.8 GB against its
+  # 6.5 GB limit at any job count. mixpeek-dev builds each main commit from a warm cache
+  # (43 to 46 s) and pushes it here through scripts/amux-prebuilt-receive.sh. It is used
+  # only for this exact sha, only when it is a real executable, and it goes through the
+  # same install, identity stamp, health check and rollback as a local build. Absent, the
+  # build below runs as before.
+  PREBUILT="${AMUX_DEPLOY_PREBUILT_DIR:+$AMUX_DEPLOY_PREBUILT_DIR/$built_sha/amux-server}"
+  if [ -n "$PREBUILT" ] && [ -f "$PREBUILT" ] && [ -x "$PREBUILT" ] \
+     && [ "$(wc -c < "$PREBUILT" | tr -d ' ')" -gt 1048576 ]; then
+    mkdir -p "$DEPLOY_TARGET/deploy"
+    cp -f "$PREBUILT" "$DEPLOY_TARGET/deploy/amux-server.prebuilt.$$" \
+      && mv -f "$DEPLOY_TARGET/deploy/amux-server.prebuilt.$$" "$DEPLOY_TARGET/deploy/amux-server" \
+      && BUILD_OK=1 && BUILT_BIN="$DEPLOY_TARGET/deploy/amux-server" && DEPLOY_KIND=prebuilt
+    echo "== deploy build used the prebuilt binary for $built_sha ($(wc -c < "$PREBUILT" | tr -d ' ') bytes) ok=$BUILD_OK verdict=deploy_prebuilt_used" | tee -a "$BUILD_OUT"
+  elif [ -n "$PREBUILT" ]; then
+    echo "== deploy build: no prebuilt binary for $built_sha in $AMUX_DEPLOY_PREBUILT_DIR; compiling here verdict=deploy_prebuilt_missing"
+  fi
+  if [ "$BUILD_OK" = 1 ]; then
+    :
+  elif [ -n "${AMUX_REMOTE_BUILD_HOST:-}" ]; then
     if "$REPO/scripts/rust-remote-build.sh" "$WORK" \
-        "$HOME/.amux/rust-build-target/release/amux-server" > "$BUILD_OUT" 2>&1; then
+        "$DEPLOY_TARGET/release/amux-server" > "$BUILD_OUT" 2>&1; then
       BUILD_OK=1
-      BUILT_BIN="$HOME/.amux/rust-build-target/release/amux-server"
+      BUILT_BIN="$DEPLOY_TARGET/release/amux-server"
     else
       { echo "== remote build on '$AMUX_REMOTE_BUILD_HOST' failed, falling back to local:"; \
         cat "$BUILD_OUT"; } > "${BUILD_OUT}.remote" 2>&1
@@ -1085,12 +1152,12 @@ fi
       # this script's — this unit already gets one via systemd (defense in
       # depth for the case where rust-auto-build.sh is invoked directly
       # from an interactive pane instead of via the timer).
-      if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) >> "$BUILD_OUT" 2>&1; then
+      if (cd "$WORK" && CARGO_TARGET_DIR="$DEPLOY_TARGET" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) >> "$BUILD_OUT" 2>&1; then
         BUILD_OK=1
       fi
     fi
   else
-    if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) > "$BUILD_OUT" 2>&1; then
+    if (cd "$WORK" && CARGO_TARGET_DIR="$DEPLOY_TARGET" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) > "$BUILD_OUT" 2>&1; then
       BUILD_OK=1
     fi
   fi
@@ -1103,11 +1170,11 @@ fi
   # holds the target) and build once more; dependency caches stay.
   if [ "$BUILD_OK" = 0 ] && grep -aqE 'symbol\(s\) not found|Undefined symbols for architecture|undefined reference to' "$BUILD_OUT"; then
     echo "== WARN deploy link failed on unresolved symbols; clearing the amux_server incremental trees and retrying once verdict=deploy_incremental_link_retry"
-    for _inc in "$HOME/.amux/rust-build-target/deploy/incremental"/amux_server-*; do
+    for _inc in "$DEPLOY_TARGET/deploy/incremental"/amux_server-*; do
       [ -d "$_inc" ] || continue
-      python3 "$REPO/scripts/cargo-target-guard.py" clear --target "$HOME/.amux/rust-build-target" --path "$_inc" 2>&1 | sed 's/^/== /' || true
+      python3 "$REPO/scripts/cargo-target-guard.py" clear --target "$DEPLOY_TARGET" --path "$_inc" 2>&1 | sed 's/^/== /' || true
     done
-    if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) >> "$BUILD_OUT" 2>&1; then
+    if (cd "$WORK" && CARGO_TARGET_DIR="$DEPLOY_TARGET" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) >> "$BUILD_OUT" 2>&1; then
       BUILD_OK=1
     fi
     echo "== deploy_incremental_link_retry ok=$BUILD_OK"
@@ -1121,7 +1188,19 @@ fi
   # `wait` on a killed one returns 143. Either would abort the deploy itself.
   kill "$HB_PID" 2>/dev/null || true; wait "$HB_PID" 2>/dev/null || true; HB_PID=
   DEPLOY_ELAPSED=$(( $(date +%s) - DEPLOY_T0 ))
+  # NEVER INSTALL A STAND-IN. A real amux-server is over 100 MB; the builder tests'
+  # fake cargo writes a 35-byte script, and one landed in the Mac's real deploy
+  # directory on 2026-11-12 (3283eeb11). Anything under 1 MB is a failed build.
+  if [ "$BUILD_OK" = 1 ] && [ "$(wc -c < "$BUILT_BIN" 2>/dev/null | tr -d ' ' || echo 0)" -le "${AMUX_DEPLOY_MIN_BIN_BYTES:-1048576}" ]; then
+    echo "== ERROR deploy build produced $(wc -c < "$BUILT_BIN" 2>/dev/null | tr -d ' ' || echo 0) bytes at $BUILT_BIN, not a server; refusing to install it verdict=deploy_binary_too_small"
+    BUILD_OK=0
+  fi
   echo "== deploy build elapsed_s=$DEPLOY_ELAPSED ok=$BUILD_OK jobs=$DEPLOY_JOBS"
+  # Cargo says when another build holds the target directory; that wait is
+  # part of elapsed_s, and BUILD_OUT is deleted, so name it here.
+  if grep -q "Blocking waiting for file lock" "$BUILD_OUT" 2>/dev/null; then
+    echo "== WARN deploy build waited for another cargo on $DEPLOY_TARGET (set AMUX_DEPLOY_TARGET_DIR to give deploys their own) verdict=deploy_build_lock_wait"
+  fi
   # A slow build is the regression this block exists to prevent, and nothing
   # else would say so: the deploy still lands, just minutes late.
   if [ "$BUILD_OK" = 1 ] && [ "$DEPLOY_ELAPSED" -gt "${AMUX_DEPLOY_SLOW_S:-180}" ]; then
@@ -1132,7 +1211,7 @@ fi
   # trees, 9 GB of them dead). Drop the trees of crates this build rewrote.
   if [ "$BUILD_OK" = 1 ]; then
     bash "$REPO/scripts/prune-superseded-incremental.sh" \
-      "$HOME/.amux/rust-build-target/deploy/incremental" "$DEPLOY_T0" 2>&1 | sed 's/^/== /' || true
+      "$DEPLOY_TARGET/deploy/incremental" "$DEPLOY_T0" 2>&1 | sed 's/^/== /' || true
   fi
   if [ "$BUILD_OK" = 1 ]; then
     tail -3 "$BUILD_OUT"
@@ -1255,7 +1334,8 @@ PYIDENTITY
       case "$limit" in ''|*[!0-9]*) limit=300 ;; esac
       if wait_live_identity "$built_sha" "$limit"; then healthy=1; fi
       if [ "$healthy" = 1 ]; then
-        echo "== ACTIVATION HEALTHY sha=$built_sha after ${waited}s push_to_live_s=$(( $(date +%s) - $(git -C "$WORK" log -1 --format=%ct "$built_sha" 2>/dev/null || date +%s) )) verdict=activation_healthy"
+        echo "== ACTIVATION HEALTHY sha=$built_sha after ${waited}s push_to_live_s=$(( $(date +%s) - $(git -C "$WORK" log -1 --format=%ct "$built_sha" 2>/dev/null || date +%s) )) from_push_s=$(from_push_s "$built_sha") verdict=activation_healthy"
+        record_deploy_latency "$built_sha" "$(from_push_s "$built_sha")" "${DEPLOY_KIND:-compiled}"
         rm -f "${INSTALL}.rollback" "${INSTALL}.identity.json.rollback" "${STAMP}.rolled_back"
       else
         # Identity before the executable, the same order as the install.

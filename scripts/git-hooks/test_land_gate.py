@@ -19,7 +19,7 @@ fixtures, so the round logic is tested without a model:
 
 Run: python3 scripts/git-hooks/test_land_gate.py   (exit 0 = pass)
 """
-import http.server, json, os, shutil, subprocess, sys, tempfile, threading
+import http.server, json, os, shutil, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 HOOK = os.path.join(ROOT, "scripts", "git-hooks", "pre-push")
@@ -54,7 +54,11 @@ class Approvals(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    groups = []
+
     def do_GET(self):
+        if self.path.startswith("/api/scope"):
+            return self._send(200, {"level": "worker", "groups": Approvals.groups})
         pid = self.path.split("patch_id=", 1)[-1]
         self._send(200, {"patch_id": pid, "approved": pid in self.approved, "known": True})
 
@@ -62,6 +66,32 @@ class Approvals(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
         Approvals.requests.append(body)
         self._send(200, {"ok": True, "card": "AMUX-T1", "link": "/#land-approve=" + body.get("patch_id", "")})
+
+
+def deleted_scratch_checkout(tmp):
+    """The gate's scratch checkout deleted from disk (a cleanup) while git still
+    lists it: the gate re-creates it instead of erroring."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import land_gate
+    repo = os.path.join(tmp, "wt-repo")
+    os.makedirs(repo)
+    g = lambda *a: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.hooksPath=/dev/null", *a],
+                                  capture_output=True, text=True)
+    g("init", "-q")
+    with open(os.path.join(repo, "a.txt"), "w") as f:
+        f.write("a\n")
+    g("add", ".")
+    g("commit", "-qm", "a")
+    tree = os.path.join(tmp, "wt-scratch")
+    land_gate.checkout(repo, tree, "HEAD")
+    shutil.rmtree(tree)
+    try:
+        land_gate.checkout(repo, tree, "HEAD")
+        ok = os.path.isfile(os.path.join(tree, "a.txt"))
+    except Exception as e:  # the old behaviour: "missing but already registered worktree"
+        ok = False
+        print("   ", e)
+    check("a deleted scratch checkout git still lists is re-created, not an error", ok, True)
 
 
 def main():
@@ -196,15 +226,113 @@ def main():
         n = len(Approvals.requests)
         r = run(work, "push", "origin", "main", env=agent)
         check("a push cannot drop its own tier", r.returncode != 0, True)
-        check("and the ask lists both owner files", len(Approvals.requests) > n and
-              sorted(Approvals.requests[-1]["files"]) == ["boundaries.toml", "scripts/review-tiers.txt"], True)
+        # The pushed hook reads the account's real global scope, which this
+        # test cannot redirect by design. With the owner's approval off there,
+        # review-tiers.txt is waived and only the boundary registry is asked.
+        real_off = (land_gate._env_value(os.path.join(land_gate.SCOPE_HOME, "amux.env"),
+                                         land_gate.OWNER_APPROVAL_KEY) or "").lower() in land_gate._OFF
+        want = ["boundaries.toml"] if real_off else ["boundaries.toml", "scripts/review-tiers.txt"]
+        check("and the ask lists the owner files still gated", len(Approvals.requests) > n and
+              sorted(Approvals.requests[-1]["files"]) == want, True)
+
+        # AMUX_LAND_OWNER_APPROVAL: the owner turns his approval off at global
+        # or group scope (Ethan, 2026-11-13: "I dont want to approve PRs").
+        # The scope directory comes from the account, never from $HOME, so
+        # these call the gate's own functions with SCOPE_HOME pointed here.
+        run(work, "checkout", "-q", "-B", "main", "origin/main")
+        scope = os.path.join(tmp, "scope-home")
+        os.makedirs(os.path.join(scope, "env"))
+        os.makedirs(os.path.join(scope, "sessions"))
+        import pwd
+        got = subprocess.run([sys.executable, "-c", "import land_gate; print(land_gate.SCOPE_HOME)"],
+                             cwd=os.path.join(ROOT, "scripts"), capture_output=True, text=True,
+                             env=dict(base_env, AMUX_LAND_SCOPE_HOME=tmp)).stdout.strip()
+        check("the scope comes from the account, not $HOME or a variable",
+              got, os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".amux"))
+        land_gate.SCOPE_HOME = scope
+        os.environ["AMUX_URL"] = base_env["AMUX_URL"]
+        os.environ["HOME"] = tmp  # no endpoint.json here, so api() uses the fake server
+        os.environ["AMUX_SESSION"] = "lane-t"
+        tiers = land_gate.parse_tiers(open(os.path.join(work, "scripts/review-tiers.txt")).read())
+        key = "AMUX_LAND_OWNER_APPROVAL"
+
+        def leg(*paths):
+            for p_ in paths:
+                write(work, p_, "// %s\n" % time.time())
+            commit(work, "change", *paths)
+            base = land_gate.git(work, "rev-parse", "origin/main").strip()
+            cwd = os.getcwd()
+            os.chdir(work)
+            try:
+                return land_gate.owner_leg(work, base, "HEAD", tiers)
+            finally:
+                os.chdir(cwd)
+
+        auth = "crates/amux-server/src/api/auth.rs"
+        check("by default an owner-tier change waits on the owner", leg(auth)["verdict"], "owner_pending")
+        open(os.path.join(scope, "sessions", "lane-t.env"), "w").write(key + "=0\n")
+        os.environ[key] = "0"
+        fake = os.path.join(tmp, "fake-home", ".amux")
+        os.makedirs(fake)
+        open(os.path.join(fake, "amux.env"), "w").write(key + "=0\n")
+        os.environ["AMUX_LAND_SCOPE_HOME"] = os.path.dirname(fake)
+        check("a worker layer, a shell export or a moved home cannot waive it",
+              leg(auth)["verdict"], "owner_pending")
+        open(os.path.join(scope, "amux.env"), "w").write("OTHER=1\nexport %s='0'\n" % key)
+        o = leg(auth)
+        check("off at global scope, an owner-tier change needs no owner", o["verdict"], "owner_not_required")
+        check("and says where that was decided", o.get("source"), "global")
+        Approvals.groups = ["core"]
+        open(os.path.join(scope, "env", "core.env"), "w").write(key + "=1\n")
+        check("a group that keeps it on outranks global off", leg(auth)["verdict"], "owner_pending")
+        open(os.path.join(scope, "env", "core.env"), "w").write(key + "=off\n")
+        check("off at the group, it is not needed", leg(auth)["verdict"], "owner_not_required")
+        o = leg(auth, "boundaries.toml")
+        check("the boundary registry still waits on the owner", o["verdict"], "owner_pending")
+        check("and the ask names only it", o.get("files"), ["boundaries.toml"])
     finally:
         srv.shutdown()
 
+    static_readers(tmp)
     review_convergence(tmp)
+    deleted_scratch_checkout(tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     print("\nland gate: %d passed, %d failed" % (passed, failed))
     return 1 if failed else 0
+
+
+def static_readers(tmp):
+    """A change to one crate's static files selects the tests in other crates
+    that read them. 2eb8f94ce changed amux-dashboard/static/app.js, the gate
+    ran only amux-dashboard's tests, and amux-server's dashboard_assets.rs
+    turned main red for 15h51m (velocity audit 2026-11-14)."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import land_gate
+    tree = os.path.join(tmp, "readers")
+    files = {
+        "crates/dash/Cargo.toml": 'name = "dash"\n',
+        "crates/dash/static/app.js": "x\n",
+        "crates/srv/Cargo.toml": 'name = "srv"\n',
+        "crates/srv/tests/assets.rs": 'const P: &str = "../dash/static";\n',
+        "crates/srv/tests/unrelated.rs": "fn t() {}\n",
+        "crates/srv/src/api/files.rs": '// serves dash/static\n',
+        "crates/srv/src/api/other.rs": "fn f() {}\n",
+        "crates/srv/src/lib.rs": '// embeds dash/static\n',
+    }
+    for rel, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(tree, rel)), exist_ok=True)
+        open(os.path.join(tree, rel), "w").write(text)
+    pkgs = land_gate.crate_pkgs(tree)
+    expr, _ = land_gate.rust_filter(["crates/dash/static/app.js"], pkgs, tree)
+    check("a static change runs the other crate's test binary that reads it",
+          "(package(=srv) & binary(=assets))" in expr, True, expr)
+    check("and the unit tests of the module that reads it",
+          "(package(=srv) & kind(lib) & test(/^api::files::/))" in expr, True, expr)
+    check("a crate root that reads it runs its own tests",
+          "(package(=srv) & kind(lib) & test(/^tests::/))" in expr, True, expr)
+    check("a test that does not read it stays out", "unrelated" in expr or "api::other" in expr, False, expr)
+    expr, _ = land_gate.rust_filter(["crates/dash/src/lib.rs"], pkgs, tree)
+    check("a Rust change in that crate does not pull the readers in", "package(=srv)" in expr, False, expr)
 
 
 FAKE_CLAUDE = r'''#!/usr/bin/env python3

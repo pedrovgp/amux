@@ -4,6 +4,11 @@
 # exercises the shipped launcher and tiny fake builders rather than copying its
 # Git selection into a unit test.
 set -euo pipefail
+# The deploy target directory comes from the environment (server.env reaches
+# every process the server starts); a test's fake cargo must never write there.
+unset AMUX_DEPLOY_TARGET_DIR
+# Their fake cargo writes a few-byte stand-in; the builder refuses those by default.
+export AMUX_DEPLOY_MIN_BIN_BYTES=0
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LAUNCHER="$ROOT/scripts/rust-auto-build-authority.sh"
@@ -198,6 +203,54 @@ expect test "$(grep -c "sha=$RERUN" "$TRACE")" = 0
 run_cached env AMUX_CI_RED_RECHECK_S=0
 expect test "$(cat "$CACHE/rust_checks/$RERUN")" = green
 expect grep -q "repo=$WORK sha=$RERUN" "$TRACE"
+
+# THE GATE WITHOUT THE QUEUE (2026-11-12). GitHub has not run `gate` for the tip
+# yet (queued behind the runner limit); the launcher runs gate.yml's two steps on
+# the commit itself. A pass deploys the tip, a failure holds it, and the push time
+# is recorded from the first workflow run.
+cat > "$TMP/fetch-queued" <<'EOF'
+#!/usr/bin/env bash
+printf '{"workflow_runs":[{"name":"gate","status":"queued","conclusion":null,"created_at":"2026-11-12T10:00:00Z","run_attempt":1,"head_sha":"%s"}]}' "$1"
+EOF
+chmod +x "$TMP/fetch-queued"
+( cd "$AUTH"; mkdir -p scripts
+  printf '#!/bin/sh\nexit 0\n' > scripts/ci-secret-scan.sh
+  printf '#!/bin/sh\n[ -e gate-fails ] && { echo "FAILED a test"; exit 1; }\necho "fast gate: ok (verdict=fast_gate_done)"\n' > scripts/ci-fast-gate.sh
+  chmod +x scripts/ci-secret-scan.sh scripts/ci-fast-gate.sh )
+GATE_OK=$(commit_next gate-ok)
+PUSHED="$TMP/pushed-at"
+# launchd's PATH: no Homebrew, so no GNU timeout on a Mac (the first live local
+# gate failed with "timeout: command not found").
+run_gate() {
+  env PATH=/usr/bin:/bin AMUX_LOCAL_GATE_PATH= AMUX_CI_REQUIRED_WORKFLOWS=gate AMUX_CI_PUSHED_AT_DIR="$PUSHED" \
+  AMUX_AUTHORITY_REPO="$STALE" AMUX_AUTHORITY_WORKTREE="$WORK" AMUX_AUTHORITY_MARKER="$MARKER" \
+  AMUX_AUTHORITY_LOG="$LOG" AMUX_RS_ACTIVATION_REF=origin/main AMUX_CI_VERDICT_CACHE="$CACHE" \
+  AMUX_CI_FETCH_CMD="$TMP/fetch-queued" AMUX_RS_HEALTH_URL="file://$TMP/health.json" "$@" bash "$LAUNCHER"
+}
+: > "$TRACE"; : > "$LOG"
+run_gate
+expect grep -q "repo=$WORK sha=$GATE_OK" "$TRACE"
+expect grep -q "LOCAL GATE $GATE_OK green.*verdict=local_gate_green" "$LOG"
+# ...and is cached as the gate's verdict, so the next pass does not ask GitHub again.
+expect test "$(cat "$CACHE/gate/$GATE_OK" 2>/dev/null)" = green
+expect test "$(cat "$PUSHED/$GATE_OK")" = 1794477600
+expect test -z "$(git -C "$STALE" worktree list | grep amux-local-gate)"
+# A failing gate holds the tip, once per sha: the next pass does not rerun it.
+( cd "$AUTH"; : > gate-fails )
+GATE_BAD=$(commit_next gate-bad)
+: > "$TRACE"; : > "$LOG"
+run_gate
+expect test "$(grep -c "sha=$GATE_BAD" "$TRACE")" = 0
+expect grep -q "LOCAL GATE $GATE_BAD failed.*FAILED a test.*verdict=local_gate_failed" "$LOG"
+: > "$LOG"; run_gate
+expect test "$(grep -c "LOCAL GATE" "$LOG")" = 0
+# Off: GitHub's verdict alone, as before.
+( cd "$AUTH"; rm -f gate-fails )
+GATE_OFF=$(commit_next gate-off)
+: > "$TRACE"; : > "$LOG"
+run_gate AMUX_DEPLOY_LOCAL_GATE=0
+expect test "$(grep -c "sha=$GATE_OFF" "$TRACE")" = 0
+expect test "$(grep -c "LOCAL GATE" "$LOG")" = 0
 
 # THE GATE'S DEFAULT IS checks (2026-10-29): a commit whose rust run failed but
 # whose checks passed is elected when nothing sets the gate.

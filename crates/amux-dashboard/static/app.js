@@ -1216,15 +1216,120 @@ let hiddenTags = new Set();
 // for that client"). One record, written from render() so any mutator that
 // re-renders is covered, including ones added later.
 const _LIST_VIEW_KEY = 'amux_list_view_v1';
+// A TAB OF THE IN-PAGE TAB BAR KEEPS ITS OWN LIST VIEW (owner, 2026-11-16: a
+// new tab opened with the first tab's search and Working filter, and a filter
+// set in one tab came back in the first tab after a reload). Each tab after
+// the first is an iframe on this origin, so the shared localStorage record is
+// the page's, not the tab's: a tab starts clean and keeps its own copy in
+// sessionStorage under its tab id, beside the bar's per-tab address
+// (_CHROME_TAB_VIEW_KEY). The page itself keeps its own too (below). The tab id is read here rather than through _isInTab,
+// which is declared further down and not yet initialised when this runs.
+const _LIST_VIEW_TAB_KEY = 'amux_list_view_v1:tab:';
+// The default a new tab starts from (Save as default, in the filters panel), and
+// the storage key of the tab you were in before the one you are opening: a new
+// tab with no default copies it. Both hold filters only, never search text.
+const _LIST_DEFAULT_KEY = 'amux_list_default_v1';
+const _LIST_LAST_TAB_KEY = 'amux_list_last_tab_key';
+const _listViewTabId = (() => { try { return new URLSearchParams(location.search).get('_tab'); } catch (e) { return null; } })();
+// EVERY PAGE IS A TAB, NOT ONLY THE IN-PAGE BAR'S IFRAMES (owner, 2026-11-21:
+// "a tab should be a representation of a current work stream ... the fact that
+// filters change across tabs can make you very distraught when you pull out").
+// A Mac app tab (Cmd-T), a native pane and a browser tab are each their own
+// page, and all of them read and wrote the one localStorage record: a new tab
+// opened on the last tab's pills, and a tab WebKit reloaded in the background
+// came back, behind the worker it had open, on whatever filter another tab set
+// last, so backing out of that worker showed someone else's list. The DOWNSIDE
+// of a shared record, kept here so nobody restores it as a convenience: a
+// filter is part of one work stream, and sharing it silently rewrites the view
+// of every other stream the next time it loads.
+// So a page keeps its own view in sessionStorage (per browser tab or webview,
+// survives a reload), and the localStorage record is only the last view used,
+// read by a page that has none of its own AND finds no other amux page open:
+// the app reopened, or a phone PWA the OS evicted (Ethan, 2026-09-24: views
+// "saved for that client"). With another page open, a new page starts clean.
+const _LIST_VIEW_PAGE_KEY = 'amux_list_view_v1:page';
+const _LIST_VIEW_ALIVE_PREFIX = 'amux_page_alive:';
+// Hidden pages run timers about once a minute, so a beat this old is still a
+// live page; a closed one removes its beat on pagehide.
+const _LIST_VIEW_ALIVE_MS = 3 * 60 * 1000;
+const _listViewPageId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+function _listViewOtherPageOpen() {
+  const now = Date.now();
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(_LIST_VIEW_ALIVE_PREFIX) || k === _LIST_VIEW_ALIVE_PREFIX + _listViewPageId) continue;
+      const ts = parseInt(localStorage.getItem(k) || '0', 10);
+      if (now - ts < _LIST_VIEW_ALIVE_MS) return true;
+      localStorage.removeItem(k);   // a page that died without pagehide
+      i--;
+    }
+  } catch (e) { console.warn('[list-view] could not read which amux pages are open; this page starts clean', e); return true; }
+  return false;
+}
+function _listViewBeat() {
+  try { localStorage.setItem(_LIST_VIEW_ALIVE_PREFIX + _listViewPageId, String(Date.now())); } catch (e) { console.warn('[list-view] page heartbeat not written', e); }
+}
+function _listViewStore() { return sessionStorage; }
+function _listViewKey() { return _listViewTabId !== null ? _LIST_VIEW_TAB_KEY + _listViewTabId : _LIST_VIEW_PAGE_KEY; }
 let _listViewSaved = '';
 function _listViewSnapshot() {
   return JSON.stringify({ tag: activeTag || '', hidden: [...hiddenTags].sort(),
     providers: [...filterProviders].sort(), models: [...filterModels].sort(),
     statuses: [...filterStatuses].sort(), q: searchQuery || '', logs: !!logSearchMode });
 }
+// The filters a new tab inherits: tag, hidden tags, providers, models, statuses.
+// Search text and logs mode stay with the tab that set them.
+function _listFiltersOf(v) {
+  const arr = x => Array.isArray(x) ? x.filter(y => typeof y === 'string') : [];
+  return { tag: typeof v.tag === 'string' ? v.tag : '', hidden: arr(v.hidden), providers: arr(v.providers),
+    models: arr(v.models), statuses: arr(v.statuses) };
+}
+function _listDefaultRead() {
+  try { const v = JSON.parse(localStorage.getItem(_LIST_DEFAULT_KEY) || 'null'); return v && typeof v === 'object' ? v : null; }
+  catch (e) { console.warn('[list-view] saved default unreadable; new tabs start from the tab you came from', e); return null; }
+}
+// A new tab's starting filters: the saved default, else the tab you were in
+// before it (this browser tab's record), else nothing.
+function _listSeed() {
+  const d = _listDefaultRead();
+  if (d) return { from: 'default', v: d };
+  let last = null;
+  try { last = sessionStorage.getItem(_LIST_LAST_TAB_KEY); } catch (e) { last = null; }
+  if (!last) return null;
+  try { const v = JSON.parse(sessionStorage.getItem(last) || 'null'); if (v && typeof v === 'object') return { from: 'last_tab', v }; }
+  catch (e) { console.warn('[list-view] last tab\'s view unreadable; new tab starts clean', e); }
+  return null;
+}
+// The record a tab's view lives under: the page's own, or the tab's iframe copy.
+function _listKeyOfTab(id) {
+  return id === _chromePageId ? _LIST_VIEW_PAGE_KEY : _LIST_VIEW_TAB_KEY + id;
+}
 function _restoreListView() {
-  let v = null;
-  try { v = JSON.parse(localStorage.getItem(_LIST_VIEW_KEY) || 'null'); } catch (e) { v = null; }
+  let v = null, verdict = 'own_view';
+  try { v = JSON.parse(_listViewStore().getItem(_listViewKey()) || 'null'); } catch (e) { v = null; }
+  if (!v && _listViewTabId === null && !_listViewOtherPageOpen()) {
+    try { v = JSON.parse(localStorage.getItem(_LIST_VIEW_KEY) || 'null'); } catch (e) { console.warn('[list-view] last view unreadable', e); v = null; }
+    verdict = v ? 'reopened_last_view' : 'none_saved';
+  } else if (!v) {
+    const seed = _listSeed();
+    if (seed) { v = _listFiltersOf(seed.v); verdict = 'seeded_' + seed.from; }
+    else verdict = 'new_tab_clean';
+  }
+  _applyListView(v);
+  // A seeded tab writes its copy now, so a reload keeps the filters it started with.
+  if (verdict.startsWith('seeded_')) { try { _listViewStore().setItem(_listViewKey(), _listViewSnapshot()); } catch (e) { console.warn('[list-view] seeded filters not kept; a reload starts from the default again', e); } }
+  // The page's own copy now holds whatever it started on, so a reload keeps it.
+  if (v && _listViewTabId === null) _listViewSaved = '';
+  if (_listViewTabId === null) {
+    _listViewBeat();
+    setInterval(_listViewBeat, 30000);
+    window.addEventListener('pagehide', () => { try { localStorage.removeItem(_LIST_VIEW_ALIVE_PREFIX + _listViewPageId); } catch (e) { console.warn('[list-view] page heartbeat not removed', e); } });
+    window.addEventListener('pageshow', _listViewBeat);
+  }
+  try { amuxTrack('list_view_restored', {verdict, in_tab_bar: _listViewTabId !== null, measured: true, n_considered: 1}); } catch (e) { console.warn('[list-view] restore beacon failed', e); }
+}
+function _applyListView(v) {
   if (!v || typeof v !== 'object') return;
   const arr = x => Array.isArray(x) ? x.filter(y => typeof y === 'string') : [];
   activeTag = typeof v.tag === 'string' ? v.tag : '';
@@ -1240,7 +1345,24 @@ function _saveListView() {
   const snap = _listViewSnapshot();
   if (snap === _listViewSaved) return;
   _listViewSaved = snap;
-  try { localStorage.setItem(_LIST_VIEW_KEY, snap); } catch (e) {}
+  try { _listViewStore().setItem(_listViewKey(), snap); } catch (e) {}
+  // The last view used, for the app reopened; no open page reads it.
+  if (_listViewTabId === null) { try { localStorage.setItem(_LIST_VIEW_KEY, snap); } catch (e) { console.warn('[list-view] last view not saved for the app reopened', e); } }
+}
+// Closing the first tab of the in-page tab bar moves this page to the next
+// tab's place (_chromeCloseTab): its list view comes too, or the page would
+// show the closed tab's search and filters on the next tab's screen.
+function _takeTabListView(id) {
+  let v = null;
+  try { v = JSON.parse(sessionStorage.getItem(_LIST_VIEW_TAB_KEY + id) || 'null'); } catch (e) { v = null; }
+  if (!v || typeof v !== 'object') v = {};
+  _applyListView(v);
+  _listViewSaved = '';   // the page's own record now holds this view
+  const inp = document.getElementById('search-input');
+  if (inp) inp.value = searchQuery;
+  const wrap = document.getElementById('search-wrap');
+  if (wrap) wrap.classList.toggle('has-value', !!searchQuery);
+  setLogSearchMode(logSearchMode);   // placeholder, button, chips, and a render
 }
 // The search box is in the static shell; fill it once the DOM exists.
 function _applyRestoredSearchInput() {
@@ -2183,7 +2305,7 @@ function showConnHistory() {
       + blips.length + ' momentary fallback' + (blips.length === 1 ? '' : 's') + ' to polling, under '
       + Math.round(_CONN_BLIP_MS / 1000) + 's each, recovered automatically. Not listed above.</div></div>'
     : '';
-  const pending = offlineQueue.length + drafts.length;
+  const pending = offlineQueue.length + drafts.length + _dictPendingN;
   // Render pending outbox items inline in the connection modal so the user
   // can see what "N pending" means without opening a second modal (Ethan
   // 2026-09-14: "this should be in the 1 pending modal").
@@ -2213,10 +2335,23 @@ function showConnHistory() {
         + '<div style="flex:1;min-width:0;">Create &amp; start ' + esc(d.name) + '</div>'
         + '<span style="color:var(--dim);flex-shrink:0;font-size:var(--fs-sm);">draft</span></div>'
     ).join('');
+    // Dictation clips, the same rows: what is waiting, its error, one tap to send again.
+    const clipRows = _dictPendingRows.map(c => {
+      const age = Math.floor((Date.now() - (c.last || c.started || Date.now())) / 60000);
+      return '<div class="conn-clip-row">'
+        + '<span class="conn-clip-ico">' + (c.error ? '🔴' : '🎙') + '</span>'
+        + '<div class="conn-clip-body"><div>' + esc(_dictClipLabel(c)) + '</div>'
+        + (c.error ? '<div class="conn-clip-err">' + esc(c.error).substring(0, 100) + '</div>' : '')
+        + '</div>'
+        + '<span class="conn-clip-age">' + (age < 1 ? 'just now' : age + 'm ago') + '</span>'
+        // An unreadable clip has nothing to send again; it can only be deleted.
+        + (_dictNoResend(c) ? '' : ' <button type="button" class="btn conn-op-retry" onclick="_dictRetry(\'' + escJs(c.id) + '\');document.getElementById(\'conn-hist-modal\')?.remove();" title="Send this recording again">Send again</button>')
+        + '</div>';
+    }).join('');
     pendingHtml = '<div style="margin-top:var(--space-2-5);padding-top:var(--space-2);border-top:1px solid var(--border);">'
       + '<div style="display:flex;align-items:center;gap:var(--space-1-5);margin-bottom:var(--space-1);"><b style="font-size:var(--fs-lg);">Pending operations</b>'
       + '<span style="font-size:var(--fs-xs);color:var(--dim);">' + pending + '</span></div>'
-      + draftRows + itemRows
+      + draftRows + itemRows + clipRows
       // forceRetry, not runSyncBanner: replay skips blocked changes, and since
       // 07b42586 this modal is the only place a failed change is shown, so
       // its Retry has to re-arm them or a failed change can never be retried.
@@ -2398,14 +2533,24 @@ function _cloudOfferCheckLongJob() {
 }
 
 async function _cloudOfferTry(trigger, worker) {
+  // Each refusal is recorded on the verdict by name, so a missing offer says
+  // which gate held it rather than reading the same as "never tried".
+  const skip = why => { if (window._cloudOfferVerdict) window._cloudOfferVerdict.skipped = trigger + ':' + why; };
   if (!_cloudOfferOwner || document.getElementById('cloud-offer')) return;
   const st = await _cloudOfferLoad();
-  if (!st || st.dismissed || st[trigger] || document.getElementById('cloud-offer')) return;
+  if (!st) return skip('pref_unreadable');
+  if (st.dismissed || st[trigger]) return skip(st.dismissed ? 'dismissed' : 'already_offered');
+  if (document.getElementById('cloud-offer')) return;
   const setup = document.getElementById('apikey-setup-modal');
-  if (setup && setup.style.display === 'flex') return;   // first run comes first
+  if (setup && setup.style.display === 'flex') return skip('setup_open');   // first run comes first
   // Not over an open file or worker: it covered the markdown editor's text on a phone
   // (2026-10-31). Left unmarked, so it is offered again on the next trigger.
-  if (document.querySelector('#file-overlay.active, #peek-overlay.active')) return;
+  if (document.querySelector('#file-overlay.active, #peek-overlay.active')) return skip('overlay_open');
+  // Not over Home either: it is a pitch about running workers on servers, made
+  // to someone who came to say what they want (docs/design/intent-first.md).
+  // Unmarked, so the fleet view can still offer it later.
+  if (document.body.classList.contains('intent-simple') || !window._homeChoiceSettled || _HOME_VIEWS[activeView]) return skip('home');
+  if (window._cloudOfferVerdict) delete window._cloudOfferVerdict.skipped;
   _cloudOfferMark(trigger);
   _cloudOfferShow(trigger, worker);
 }
@@ -2957,8 +3102,8 @@ function _connectionSecurityPending(on) {
     const node=document.getElementById(id); if(node) node.disabled=on;
   }
 }
-// The iOS app's native bridge (WebView.swift, `amuxApp`): "settings" opens the app's
-// Settings with amux Cloud sign-in; "switch-server" returns to its setup screen.
+// The iOS app's native bridge (WebView.swift, `amuxApp`): "switch-server" and "settings"
+// open the app's server switcher, where every saved server is one tap away and stays loaded.
 function _appBridge(op) {
   const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.amuxApp;
   if (!h) return false;
@@ -2969,7 +3114,7 @@ function _connectionSessionControls() {
   const cloud = document.getElementById('connection-cloud-account');
   if (cloud) cloud.style.display = inApp ? '' : 'none';
   const out = document.getElementById('connection-sign-out');
-  if (out && inApp) out.textContent = 'Sign out and switch server';
+  if (out && inApp) out.textContent = 'Switch server';
   // A server behind the sign-in door (amux Cloud and dedicated hosts): its owner limits which
   // addresses may reach it on the door's own page (cloud/desktop/door.py, /_door/allowlist).
   const allow = document.getElementById('connection-allowlist');
@@ -3712,7 +3857,7 @@ function _uiComponentCheck(root = document) {
 
 // AF-749: measure open dialogs against the keyboard-visible viewport. Keep
 // diagnostics free of dialog text (worker messages and credentials live here).
-const _dialogSelector = '#psf-body,.amux-dialog-backdrop,.amux-workspace-dialog,#cmd-history-modal,#filters-modal,#saved-messages-modal,#skill-edit-modal,#file-overlay,#mdai-overlay,#channel-drawer,#board-detail-overlay,#apikey-setup-modal,#upgrade-modal,#video-overlay,.modal-backdrop,.edit-overlay,.queue-overlay,.board-edit-overlay,.map-modal,.modal-overlay,#conn-hist-modal,#team-scope-modal,#jrnl-config-overlay,#peek-lookup-modal,[data-ical-modal],.chip-picker-overlay,.tts-overlay,.focus-overlay,.conn-picker-overlay,.mdai-picker-overlay';
+const _dialogSelector = '#psf-body,.amux-dialog-backdrop,.amux-workspace-dialog,#cmd-history-modal,#filters-modal,#saved-messages-modal,#skill-edit-modal,#file-overlay,#mdai-overlay,#board-detail-overlay,#apikey-setup-modal,#upgrade-modal,#video-overlay,.modal-backdrop,.edit-overlay,.queue-overlay,.board-edit-overlay,.map-modal,.modal-overlay,#conn-hist-modal,#team-scope-modal,#jrnl-config-overlay,#peek-lookup-modal,[data-ical-modal],.chip-picker-overlay,.tts-overlay,.focus-overlay,.conn-picker-overlay,.mdai-picker-overlay';
 function _modalLayoutCheck() {
   const viewport = window.visualViewport;
   const top = viewport?.offsetTop || 0, height = viewport?.height || innerHeight;
@@ -3938,17 +4083,23 @@ function _dialogReachCheck(root) {
   refresh();
 })();
 
-// Modal: replaces confirm() / alert() — both blocked in PWA standalone mode
+// Modal: replaces confirm() / alert() / prompt(), all blocked in PWA standalone
+// mode (the iOS app's web view returns from them with no box shown). Every
+// dashboard dialog goes through these; tests/dashboard_assets.rs fails on a
+// native call.
 let _modalResolve = null;
 function _modalBgClick(e) { if (e.target === document.getElementById('modal-backdrop')) _modalClose(false); }
 function _modalClose(val) {
   document.getElementById('modal-backdrop').classList.remove('open');
+  document.querySelector('#modal-backdrop .modal-box')?.classList.remove('modal-form');
+  document.getElementById('modal-msg')?.classList.remove('modal-text');
   if (_modalResolve) { _modalResolve(val); _modalResolve = null; }
 }
 function showConfirm(msg, confirmLabel = 'Confirm', danger = false) {
   return new Promise(resolve => {
     _modalResolve = resolve;
-    document.getElementById('modal-msg').textContent = msg;
+    const m = document.getElementById('modal-msg');
+    m.textContent = msg; m.classList.add('modal-text');
     const btns = document.getElementById('modal-btns');
     btns.innerHTML = `
       <button class="btn ${danger ? 'danger' : 'primary'}" onclick="_modalClose(true)">${confirmLabel}</button>
@@ -3959,7 +4110,8 @@ function showConfirm(msg, confirmLabel = 'Confirm', danger = false) {
 function showAlert(msg) {
   return new Promise(resolve => {
     _modalResolve = resolve;
-    document.getElementById('modal-msg').textContent = msg;
+    const m = document.getElementById('modal-msg');
+    m.textContent = msg; m.classList.add('modal-text');
     const btns = document.getElementById('modal-btns');
     btns.innerHTML = `<button class="btn primary" onclick="_modalClose(true)">OK</button>`;
     document.getElementById('modal-backdrop').classList.add('open');
@@ -3981,15 +4133,21 @@ function showFormModal(title, innerHTML, confirmLabel = 'Save') {
   return new Promise(resolve => {
     _modalResolve = resolve;
     document.getElementById('modal-msg').innerHTML =
-      '<div style="font-weight:700;font-size:var(--fs-2xl);margin-bottom:var(--space-3);">' + esc(title) + '</div>' + innerHTML;
+      '<div style="font-weight:700;font-size:var(--fs-2xl);margin-bottom:var(--space-3);white-space:pre-line;">' + esc(title) + '</div>' + innerHTML;
     document.getElementById('modal-btns').innerHTML =
       `<button class="btn primary" onclick="_modalClose(true)">${esc(confirmLabel)}</button>` +
       `<button class="btn" onclick="_modalClose(false)">Cancel</button>`;
+    // A form scrolls as one page, its buttons after the last field, so a
+    // phone keeps the whole height for the form (owner, 2026-11-22). A
+    // confirm or alert keeps its buttons pinned below a scrolling message.
+    document.querySelector('#modal-backdrop .modal-box').classList.add('modal-form');
     document.getElementById('modal-backdrop').classList.add('open');
   });
 }
-// Single-line prompt on the same chrome. Resolves the string, or null if cancelled.
-async function showPrompt(msg, placeholder = '', value = '') {
+// Single-line prompt on the same chrome. Resolves the string, or null if
+// cancelled. `value` is the prefilled default. The answer is trimmed unless
+// opts.trim is false, which returns exactly what was typed, as prompt() did.
+async function showPrompt(msg, placeholder = '', value = '', opts = {}) {
   // Focused, and Enter submits: a prompt you must click into and then click
   // OK on invited pressing OK on an empty box (the bulk-delete "Delete
   // cancelled" report, 2026-09-24).
@@ -4000,7 +4158,8 @@ async function showPrompt(msg, placeholder = '', value = '') {
   setTimeout(() => { const i = document.getElementById('modal-prompt-input'); if (i) { i.focus(); if (value) i.select(); } }, 30);
   const ok = await shown;
   if (!ok) return null;
-  return (document.getElementById('modal-prompt-input')?.value || '').trim();
+  const typed = document.getElementById('modal-prompt-input')?.value || '';
+  return opts.trim === false ? typed : typed.trim();
 }
 
 // ── Bulk actions modal ──
@@ -4565,11 +4724,11 @@ function updateConnectionStatus() {
       el.textContent = blockedCount + ' failed';
     } else if (!online) {
       el.className = 'conn-status offline';
-      const total = offlineQueue.length + drafts.length;
+      const total = offlineQueue.length + drafts.length + _dictPendingN;
       el.textContent = total ? total + ' pending' : 'Offline';
-    } else if (offlineQueue.some(_outboxNeedsAttention) || drafts.length) {
+    } else if (offlineQueue.some(_outboxNeedsAttention) || drafts.length || _dictAttentionN) {
       el.className = 'conn-status polling';
-      el.textContent = (offlineQueue.length + drafts.length) + ' pending';
+      el.textContent = (offlineQueue.length + drafts.length + _dictPendingN) + ' pending';
     } else if (_syncPillText) {
       el.className = 'conn-status polling';
       el.textContent = _syncPillText;
@@ -4687,13 +4846,19 @@ async function _syncOneUpload(item, onProgress) {
       if (!f.path || !f.url) await _runUpload(f, {render:() => { if (onProgress) onProgress(f); }});
       if (!f.path || !f.url) throw new Error(f.error || 'Server has not confirmed this file');
     } else {
-      const fd = new FormData();
-      fd.append('dir', current.dir);
-      fd.append('file', current.blob, current.name);
-      const response = await fetch(API + '/api/fs/upload', {
-        method:'POST', body:fd, _skipOutbox:true, signal:AbortSignal.timeout(30000)});
-      const result = await response.json();
-      if (!response.ok || !(result.saved || []).length) throw new Error('Server has not confirmed this file');
+      // A row queued before the IDB chunk store (kept under upload_queue, the
+      // whole file as one Blob). It goes through the same chunked upload as
+      // every other file now, the one upload path (primitive integrity audit
+      // P1), rather than a single multipart POST to /api/fs/upload. The bytes
+      // are already on this device, so the row is not copied again
+      // (noLocalCopy); it leaves the old store only once finish confirms it.
+      const blob = current.blob;
+      if (!blob) throw new Error('This queued file has no bytes left on this device');
+      const f = {id:current.id, surface:'directory', dir:current.dir || '', name:current.name || 'upload.bin',
+        file:new File([blob], current.name || 'upload.bin', {type:current.mime || blob.type || ''}),
+        noLocalCopy:true, chunk:0};
+      await _runUpload(f, {render:() => { if (onProgress) onProgress(f); }});
+      if (!f.path || !f.url) throw new Error(f.error || 'Server has not confirmed this file');
     }
     await _upqRemove(item.id);
   };
@@ -4843,7 +5008,7 @@ function _syncBackoffReset() { _syncBackoffMs = 0; }
 function _scheduleSyncRetry() {
   clearTimeout(_syncRetryTimer);
   const pending = offlineQueue.some(q => q.state !== 'blocked' || _outboxUncertainMessage(q)) || drafts.length || _uploadSyncPending
-    || _outboxOwnedMissing() > 0;
+    || _dictSyncPending || _outboxOwnedMissing() > 0;
   if (!pending) { _syncBackoffMs = 0; return; }
   _syncBackoffMs = _syncBackoffMs ? Math.min(_syncBackoffMs * 2, _SYNC_MAX_MS) : _SYNC_MIN_MS;
   _syncRetryTimer = setTimeout(() => { runSyncBanner(true); }, _syncBackoffMs);
@@ -5073,7 +5238,7 @@ function _connPillClick() {
   // sync checklist leaves blocked ops out on purpose, so sending the tap there
   // showed a list without the failure the badge named (AMUX-5371).
   const failed = offlineQueue.some(q => q.state === 'blocked' && !_outboxUncertainMessage(q));
-  const pending = offlineQueue.length || drafts.length || _syncPillText;
+  const pending = offlineQueue.length || drafts.length || _dictPendingN || _syncPillText;
   if (failed || !pending) return showConnHistory();
   // Pending work opens BOTH: the status modal (what is queued, connection
   // history, retry) and the checklist at the bottom. 0ccc6e06c (09-24) made a
@@ -5132,7 +5297,12 @@ async function _runSyncBanner(quiet = false, token = null) {
   _syncSetPhase('read_upload_list');
   const uploads = await _upqListBounded();
   _uploadSyncPending = uploads.length > 0;
-  const totalOps = draftCount + queue.length + uploads.length;
+  // Dictation clips ride the same pass as messages and uploads (owner,
+  // 2026-11-17): one checklist, one pending count, one retry loop. An automatic
+  // pass keeps each clip's backoff; a pass someone asked for sends them all.
+  _syncSetPhase('read_dictation_list');
+  const clips = await _dictSyncClips(!quiet);
+  const totalOps = draftCount + queue.length + uploads.length + clips.length;
   if (!totalOps) return;
 
   // Build item list
@@ -5140,6 +5310,7 @@ async function _runSyncBanner(quiet = false, token = null) {
   drafts.forEach(d => items.push({ key:'draft:' + d.name, label: 'Create & start "' + d.name + '"', status: 'pending', type: 'draft', draft: d }));
   queue.forEach(q => items.push({ key:'queue:' + q.id, label: describeOp(q), status: 'pending', type: 'queue', item: q }));
   uploads.forEach(file => items.push({ key:'upload:' + file.id, label: 'Upload ' + file.name, status: 'pending', type: 'upload', file }));
+  clips.forEach(clip => items.push({ key:'clip:' + clip.id, label: _dictClipLabel(clip), status: 'pending', type: 'clip', clip }));
 
   // A retry updates its rows; it must not erase already-acknowledged files or
   // blocked changes from the visible reconnect receipt. Dismiss starts a new list.
@@ -5357,6 +5528,31 @@ async function _runSyncBanner(quiet = false, token = null) {
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     renderBanner();
   }
+  const clipItems = items.filter(i => i.type === 'clip' && i.replay !== false);
+  if (clipItems.length && !_dictFlushing) {
+    _dictFlushing = Date.now();
+    _syncSetPhase('dictation');
+    let sent = 0;
+    try {
+      for (const item of clipItems) {
+        item.status = 'running'; renderBanner();
+        if (!quiet) await _dictOutboxPatch(item.clip.id, { attempts: 0, last: 0 });
+        if (await _dictTrySend(item.clip.id, false) !== null) { item.status = 'done'; sent++; }
+        else {
+          const now = (await _dictOutbox()).find(x => x.id === item.clip.id);
+          item.status = 'failed'; item.label += ' \u2014 ' + ((now && now.error) || 'not sent');
+        }
+        renderBanner();
+      }
+    } finally { _dictFlushing = 0; }
+    try { amuxTrack('dictation_sync_pass', {sent, failed: clipItems.length - sent, forced: quiet ? 0 : 1,
+      measured: true, n_considered: clipItems.length}); } catch (e) { console.warn('dictation: sync pass beacon failed', e); }
+    if (sent) {
+      showToast(sent + ' queued dictation' + (sent === 1 ? '' : 's') + ' transcribed');
+      if (_peekTab === 'dictation') _dictLoad();
+    }
+  }
+  if (clips.length) await _dictPendingBadge();
   _uploadSyncPending = (await _upqListBounded()).length > 0;
   if (uploads.length) {
     _upqRenderBadge();
@@ -5714,7 +5910,7 @@ async function clearQueue() {
 }
 async function forceRetry() {
   closeQueueModal();
-  if (!offlineQueue.length && !drafts.length) return;
+  if (!offlineQueue.length && !drafts.length && !_dictPendingN) return;
   const rearmed = offlineQueue.filter(q => q.state === 'blocked').length;
   if (rearmed) {
     // A failed change re-armed by the owner: visible in /api/client-debug so a
@@ -5741,7 +5937,7 @@ async function forceRetry() {
 // Auto-retry queued ops when page becomes visible (returning from background on mobile)
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) {
-    if ((offlineQueue.length || drafts.length) && online) {
+    if ((offlineQueue.length || drafts.length || _dictPendingN) && online) {
       runSyncBanner();
     } else if (!online && navigator.onLine !== false) {
       consecutiveFailures = 0;
@@ -5807,7 +6003,11 @@ function _warnIgnoredFields(r, url, options) {
 }
 
 async function apiCall(url, options) {
-  if (!online) {
+  // A call the outbox must never hold (_OUTBOX_SKIP) goes to the network even
+  // when this tab believes it is offline. `online` is this tab's belief, and a
+  // worker delete pressed under a stale `false` was queued with no request
+  // sent (2026-11-16). The network answers, and a failure is shown, not queued.
+  if (!online && !_OUTBOX_SKIP.test(String(url))) {
     await _queueOp(url, options);
     return null;
   }
@@ -5861,7 +6061,14 @@ async function apiCall(url, options) {
     consecutiveFailures++;
     if (consecutiveFailures >= 2) setOnline(false);
     amuxTrack('api_unreachable', { url: url.split('?')[0], err: String(e).slice(0, 200) });
-    await _queueOp(url, options);
+    // A write the outbox refuses (a worker delete, an email release) was not
+    // done and will not be retried; returning null without a word read as
+    // "the click did nothing".
+    const queued = await _queueOp(url, options);
+    const method = ((options && options.method) || 'GET').toUpperCase();
+    if (!queued && method !== 'GET' && method !== 'HEAD') {
+      showToast('Not done: the server could not be reached. Try again when amux is back.');
+    }
     return null;
   }
 }
@@ -5981,7 +6188,8 @@ const _origFetch = window.fetch.bind(window);
 // Never queue interactive/ephemeral endpoints: telemetry, speed tests, live
 // terminal keystrokes, uploads (bodies too big for localStorage), login and
 // tunnel flows, and request/response helpers whose answer the UI needs NOW.
-// `files/mdai/run` joined this list for BOTH of the reasons the comment above
+// `mdai/run` (spelled `files/mdai/run` until the engine moved to /api/mdai;
+// both spellings stay listed) joined this list for BOTH of the reasons the comment above
 // gives, and it is the clearest case of each (AF-371).
 //
 // ANSWER NEEDED NOW: an mdai run's whole product is the output the panel is
@@ -6010,7 +6218,24 @@ const _origFetch = window.fetch.bind(window);
 // got the synthetic 202, which has no authorize_url, so the button said
 // "Could not start the grant: unknown", and the queued POST would later
 // start a sign-in nobody was there to open.
-const _OUTBOX_SKIP = /\/api\/(connectors\/[^/]+\/(?:auth|token|test)(?:[?#]|$)|connection\/|client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/(?:run|chat)(?:[?#]|$)|history\/ask|config\/cross-group|gateway\/switch-org)/;
+// `email/(approve|reject)` joined 2026-11-12: a release that failed upstream
+// answered 502, the outbox queued it and handed back its synthetic 202, and the
+// banner said "Approved — sent for worker" while nothing was sent; the queue
+// then replayed the approval seven times. A human's release needs the server's
+// answer, never a promise to try later.
+// `sessions/<name>/delete` joined 2026-11-16 for the same reason. The server
+// takes a worker delete only from a person in the dashboard, and it cannot be
+// undone. Queued, it waited on a replay that stalled across windows
+// (outbox_replay_lock_stalled): 8 deletes of two workers from two browsers over
+// four days, none in the request log, each press held 30 s at "accepted"
+// (press_busy_released_unsettled), and the workers stayed. A delete now goes
+// to the server or says it did not.
+// `palette/visit` and `palette/history/import` joined 2026-11-24: a Cmd-K
+// visit is a ranking hint that is also counted locally (_NAV.usage), so offline
+// it is dropped, not queued. Queued, three visits sat in the outbox beside a
+// person's real edits and sends, and LC-OFFLINE-ROUNDTRIP counted 8 held
+// operations where it made 5 (AF-1392, red on every scheduled run since 278d16114).
+const _OUTBOX_SKIP = /\/api\/(palette\/(?:visit|history\/import)(?:[?#]|$)|sessions\/[^/?#]+\/delete(?:[?#]|$)|email\/(?:approve|reject)\/|connectors\/[^/]+\/(?:auth|token|test)(?:[?#]|$)|connection\/|client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|(?:files\/)?mdai\/(?:run|chat)(?:[?#]|$)|history\/ask|config\/cross-group|gateway\/switch-org)/;
 const _OUTBOX_METHODS = { POST: 1, PATCH: 1, PUT: 1, DELETE: 1 };
 function _outboxQueueable(url, init) {
   if (!url || typeof url !== 'string') return false;
@@ -6037,7 +6262,10 @@ function _outboxAccepted() {
 // copy already changed the node) and sits under Pending operations for good
 // (Ethan's screenshot, 2026-10-18). Its change either landed or is one press
 // away, so the entries are dropped once at load, and the count is reported.
-const _OUTBOX_ANSWER_NOW = /\/api\/files\/mdai\/(?:run|chat)(?:[?#]|$)/;
+// A worker delete queued before it joined the skip list is dropped the same
+// way: replayed days later it would remove a worker nobody is looking at, and
+// the person who pressed it has already seen the worker come back.
+const _OUTBOX_ANSWER_NOW = /\/api\/(?:(?:files\/)?mdai\/(?:run|chat)(?:[?#]|$)|email\/(?:approve|reject)\/|sessions\/[^/?#]+\/delete(?:[?#]|$))/;
 function _outboxDropAnswerNow() {
   let dropped = 0, considered = 0;
   return _mutateQueue(current => {
@@ -6499,6 +6727,26 @@ let lastSessionsJSON = '';
 // ── In-app notification system ──
 const _prevSessionState = {};  // name → {status, running}
 let _notifsNative = localStorage.getItem('amux_notifs') === '1';
+// In the Mac app the app owns the device switch (its menu and Settings carry it
+// too), so the page reads and writes the app's value instead of localStorage.
+// amuxNotifyPrefs exists only in an app that knows this; an older app's
+// amuxNotify posts whatever it is sent, so the page never probes that one.
+function _notifDesktopPrefs() {
+  try { return (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.amuxNotifyPrefs) || null; } catch (e) { return null; }
+}
+function _notifInOlderApp() {
+  try { return !_notifDesktopPrefs() && !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.amuxNotify); } catch (e) { return false; }
+}
+// The app answers a get with this, and calls it in every window when the
+// switch changes anywhere (a page, the menu, the app's Settings).
+function _notifDesktopState(on) {
+  _notifsNative = !!on;
+  _notifUpdateNativeBtn();
+}
+if (_notifDesktopPrefs()) {
+  _notifsNative = true;   // the app's default until it answers
+  try { _notifDesktopPrefs().postMessage({ op: 'get' }); } catch (e) { console.warn('amux: could not ask the app for its notification switch', e); }
+}
 let _notifBanners = localStorage.getItem('amux_notif_banners') !== '0';  // in-app pop-ups, default on
 let _notifItems = JSON.parse(localStorage.getItem('amux_notif_items') || '[]').slice(0, 100);
 let _notifUnread = _notifItems.filter(n => !n.read).length;
@@ -6680,28 +6928,51 @@ async function _pushSubscribe() {
   }
 }
 
+// Ends this device's push subscription. The device side goes even when the
+// server cannot be told: the push service then answers 410 and the server
+// prunes the endpoint on its next send (push/mod.rs), so nothing reaches here.
 async function _pushUnsubscribe() {
+  let sub = null;
   try {
-    const reg = await navigator.serviceWorker.ready;
-    const sub = await reg.pushManager.getSubscription();
-    if (sub) {
-      await apiCall(API + '/api/push/unsubscribe', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint: sub.endpoint }),
-      });
-      await sub.unsubscribe();
-    }
-  } catch (e) {}
+    const reg = await _swReady(8000);
+    sub = await reg.pushManager.getSubscription();
+    if (!sub) return false;
+    await apiCall(API + '/api/push/unsubscribe', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint: sub.endpoint }),
+    });
+  } catch (e) { console.warn('amux: push unsubscribe did not reach the server; the device drops it anyway', e); }
+  if (!sub) return false;
+  try { await sub.unsubscribe(); return true; } catch (e) { return false; }
 }
 
-// Step-by-step on-device diagnostic. Uses alert() so the full report is
-// readable on a phone (toasts truncate). Leads with the iOS Home-Screen fix,
+// On load, make this device's push subscription agree with its switch: off
+// with a subscription left behind (a failed unsubscribe, another browser
+// profile's toggle, a subscription from before the switch) ends it; on with
+// permission but no subscription (the push service expired it) renews it.
+async function _pushReconcile() {
+  if (_notifDesktopPrefs() || _notifInOlderApp()) return;   // the Mac app notifies natively
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || typeof Notification === 'undefined') return;
+  let sub = null;
+  try { sub = await (await _swReady(8000)).pushManager.getSubscription(); } catch (e) { return; }
+  let verdict = '';
+  if (!_notifsNative && sub) verdict = (await _pushUnsubscribe()) ? 'push_unsubscribed_device_off' : 'push_unsubscribe_failed';
+  else if (_notifsNative && !sub && Notification.permission === 'granted') verdict = (await _pushSubscribe()).ok ? 'push_resubscribed' : 'push_resubscribe_failed';
+  if (verdict) {
+    try { _interactionDiagnostic({ kind: 'notification', verdict, measured: true, n_considered: 1 }); } catch (e) { console.warn('amux: ' + verdict, e); }
+  }
+}
+setTimeout(_pushReconcile, 6000);
+
+// Step-by-step on-device diagnostic. Uses showAlert so the full report is
+// readable on a phone (toasts truncate) and shows in the installed PWA, where
+// a native alert() is blocked. Leads with the iOS Home-Screen fix,
 // which is the usual cause of "this browser has no Notification API".
 async function _notifSendTest() {
   const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
   const standalone = window.navigator.standalone || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
   const steps = [];
-  const report = (extra) => alert('amux push test\n\n' + steps.join('\n') + (extra ? '\n\n' + extra : ''));
+  const report = (extra) => showAlert('amux push test\n\n' + steps.join('\n') + (extra ? '\n\n' + extra : ''));
 
   // 1. Notification API present? On iOS it only exists in an installed PWA.
   if (typeof Notification === 'undefined' || !('serviceWorker' in navigator) || !('PushManager' in window)) {
@@ -6756,6 +7027,14 @@ async function _notifSendTest() {
 }
 
 async function _notifToggleNative() {
+  const app = _notifDesktopPrefs();
+  if (app) {
+    _notifsNative = !_notifsNative;
+    try { app.postMessage({ op: 'set', on: _notifsNative }); } catch (e) { console.warn('amux: could not set the app\'s notification switch', e); }
+    showToast(_notifsNative ? 'Notifications on for this Mac' : 'Notifications off for this Mac');
+    _notifUpdateNativeBtn();
+    return;
+  }
   if (_notifsNative) {
     _notifsNative = false;
     localStorage.setItem('amux_notifs', '0');
@@ -6764,10 +7043,10 @@ async function _notifToggleNative() {
   } else {
     try {
       if (typeof Notification !== 'undefined') {
-        if (Notification.permission === 'denied') { showToast('Blocked — enable in browser Site Settings'); return; }
+        if (Notification.permission === 'denied') { showToast('Blocked — enable in browser Site Settings'); _notifUpdateNativeBtn(); return; }
         if (Notification.permission !== 'granted') {
           const perm = await Notification.requestPermission();
-          if (perm !== 'granted') { showToast('Permission not granted'); return; }
+          if (perm !== 'granted') { showToast('Permission not granted'); _notifUpdateNativeBtn(); return; }
         }
       }
     } catch(e) {}
@@ -6781,6 +7060,8 @@ async function _notifToggleNative() {
 }
 
 function _notifUpdateNativeBtn() {
+  const cb = document.getElementById('notif-device-native-cb');
+  if (cb) cb.checked = _notifsNative;
   const btn = document.getElementById('notif-native-btn');
   if (!btn) return;
   btn.style.opacity = _notifsNative ? '1' : '0.4';
@@ -6802,6 +7083,8 @@ function _notifToggleBanners() {
 }
 
 function _notifUpdateBannerBtn() {
+  const cb = document.getElementById('notif-device-banner-cb');
+  if (cb) cb.checked = _notifBanners;
   const btn = document.getElementById('notif-banner-btn');
   if (!btn) return;
   btn.style.opacity = _notifBanners ? '1' : '0.4';
@@ -6809,6 +7092,9 @@ function _notifUpdateBannerBtn() {
   btn.title = 'In-app pop-ups (banners and action toasts): ' + (_notifBanners ? 'on' : 'off');
   btn.setAttribute('aria-label', btn.title);
 }
+
+// The Settings switches show the device's state from the first paint.
+setTimeout(() => { _notifUpdateNativeBtn(); _notifUpdateBannerBtn(); }, 0);
 
 function toggleNotifPanel() {
   _notifPanelOpen = !_notifPanelOpen;
@@ -6967,6 +7253,9 @@ function _needsYouRenderPanel() {
 })();
 
 function _fireSessionNotif(name, title, body) {
+  // Home speaks in requests and results, not in which worker started what
+  // (a "family-admin started working" pop-up confused the second Dana run).
+  if (document.body.classList.contains('intent-simple')) return;
   let icon = '\u{1f535}';
   if (title.includes('needs input')) icon = '⚠️';
   else if (title.includes('stopped')) icon = '⏹';
@@ -7210,6 +7499,14 @@ function _refreshOpenPeekOnSessions() {
     if (typeof peekSession !== 'undefined' && peekSession && pov && pov.classList.contains('active')) {
       if (typeof updatePeekStatus === 'function') updatePeekStatus();
       if (!document.hidden) _peekPollNow();
+      // The Board switch renders only once the worker is in `sessions`. A peek
+      // opened on a worker the list did not have yet kept it hidden until the
+      // tab's board fetch came back, however long that took. Every list
+      // refresh re-syncs it now.
+      const pbc = document.getElementById('peek-board-config');
+      const hidden = !!pbc && pbc.style.display === 'none';
+      _peekBoardPolicySync();
+      if (hidden && pbc.style.display !== 'none') console.info('[peek] board switch shown once the worker reached the list', { verdict: 'board_switch_late', session: peekSession });
     }
   } catch (e) {}
 }
@@ -7604,7 +7901,8 @@ function _niRender() {
     + (it.unblocks ? '<div class="ni-unblocks"><span class="ni-label">Unblocks</span> ' + esc(it.unblocks) + '</div>' : '')
     + (it.email ? '<div class="ni-email"><div><span class="ni-label">To</span> ' + esc(it.email.to || '') + (it.email.cc ? ' <span class="ni-label">cc</span> ' + esc(it.email.cc) : '') + '</div>'
         + '<div><span class="ni-label">Subject</span> ' + esc(it.email.subject || '') + '</div></div>' : '')
-    + (it.context ? '<details class="ni-context" open><summary>Context</summary><pre>' + esc(it.context) + '</pre></details>' : '')
+    + (it.outbound ? _niOutboundHtml(it.outbound)
+        : it.context ? '<details class="ni-context" open><summary>Context</summary><pre>' + esc(it.context) + '</pre></details>' : '')
     + _niPanelHtml(it);
   const hasTarget = !!(it.worker || it.kind === 'email' || it.card);
   if (_niAllArmed) { foot.innerHTML = _niApproveAllConfirmHtml(); return; }
@@ -7618,19 +7916,50 @@ function _niRender() {
     // Email approvals are gated per message by email_approval.rs, which does not
     // read standing approvals, so a rule saved from one would be a promise
     // nothing keeps.
-    + '<button class="btn ni-always" onclick="_niShowPanel(\'always\')"' + (it.worker && it.kind !== 'email' ? '' : ' disabled title="Email sends are approved one at a time"') + '>Approve &amp; always</button>'
+    + (it.approval
+      // An approval card (governance PR 12) remembers an exact decision for
+      // this worker; land and capability approvals cannot be remembered.
+      ? '<button class="btn ni-always" onclick="_niShowPanel(\'always\')"' + (it.approval.remember ? '' : ' disabled title="This kind of approval is decided one at a time"') + '>Approve &amp; remember</button>'
+      : '<button class="btn ni-always" onclick="_niShowPanel(\'always\')"' + (it.worker && it.kind !== 'email' ? '' : ' disabled title="Email sends are approved one at a time"') + '>Approve &amp; always</button>')
     + '<button class="btn ni-snooze1" onclick="_niSnooze(60)">Snooze 1h</button>'
     + '<button class="btn ni-snooze2" onclick="_niSnooze(\'tomorrow\')">Tomorrow</button>'
     + '<button class="btn ni-open" onclick="_niOpenTarget()">Open</button>'
     + '</div>';
   foot.querySelectorAll('button').forEach(b => { if (_niBusy) b.disabled = true; });
 }
+// A held outbound message, whole: where it goes, why, what it answers, the
+// recent conversation, and the full text (api/outbound.rs context).
+function _niOutboundHtml(o) {
+  const row = (label, v) => v ? '<div><span class="ni-label">' + label + '</span> ' + _linkifyUrls(esc(String(v))) + '</div>' : '';
+  const what = [o.channel, o.action].filter(Boolean).join(' ') + (o.account ? ', as ' + o.account : '');
+  const p = o.parent && typeof o.parent === 'object' ? o.parent : null;
+  const thread = Array.isArray(o.thread) ? o.thread : [];
+  return '<div class="ni-email ni-outbound">'
+    + row('What', what) + row('To', o.to) + row('Where', o.target_url) + row('Subject', o.subject) + row('Contact', o.contact)
+    + row('Why', o.reason || 'the worker gave no reason')
+    + '</div>'
+    + (p ? '<details class="ni-context" open><summary>Replying to' + (p.author ? ' ' + esc(p.author) : '') + (p.ts ? ' · ' + esc(p.ts) : '') + '</summary>'
+        + (p.url ? '<div>' + _linkifyUrls(esc(p.url)) + '</div>' : '')
+        + '<pre>' + esc(p.text || ('not shown: ' + (p.why_unmeasured || 'no text was given'))) + '</pre></details>' : '')
+    + (thread.length ? '<details class="ni-context"><summary>Recent conversation (' + thread.length + ')</summary><pre>'
+        + esc(thread.map(m => (m.author || '?') + ': ' + (m.text || '')).join('\n\n')) + '</pre></details>' : '')
+    + (o.notes ? row('Notes', o.notes) : '')
+    + '<details class="ni-context" open><summary>Full text</summary><pre>' + esc(o.text || '') + '</pre></details>';
+}
+
 function _niPanelHtml(it) {
   if (_niPanel === 'reply') {
     return '<div class="ni-panel ni-reply-panel">'
       + ((it.chips || []).length ? '<div class="ni-chips">' + it.chips.map((c, i) => '<button class="btn ni-chip" onclick="_niChip(' + i + ')">' + esc(c.label) + '</button>').join('') + '</div>' : '')
       + '<textarea id="ni-reply" class="input ni-reply" rows="3" placeholder="Your answer. Dictation works here." autocomplete="off"></textarea>'
       + '<div class="ni-actions"><button class="btn primary ni-send" onclick="_niAct(\'reply\')">Send reply</button><button class="btn" onclick="_niShowPanel(\'\')">Cancel</button></div></div>';
+  }
+  if (_niPanel === 'always' && it.approval) {
+    const what = { email: 'emails to these same recipients', grant: 'charges at this merchant up to this amount', publish: 'links of this kind' }[it.approval.kind] || 'this exact request';
+    return '<div class="ni-panel ni-remember-panel"><label class="ni-label" for="ni-remember-until">Remember for ' + esc(it.worker || 'this worker') + ': ' + esc(what) + '</label>'
+      + '<select id="ni-remember-until" class="input" aria-label="Remember until">'
+      + '<option value="0">Until I revoke it</option><option value="30">For 30 days</option><option value="7">For 7 days</option><option value="1">For 1 day</option></select>'
+      + '<div class="ni-actions"><button class="btn primary ni-remember-go" onclick="_niAct(\'approve_always\')">Approve and remember</button><button class="btn" onclick="_niShowPanel(\'\')">Cancel</button></div></div>';
   }
   if (_niPanel === 'always') {
     const cats = ['budget', 'customer_outbound', 'prod_data', 'credential', 'access', 'decision'];
@@ -7747,6 +8076,30 @@ async function _niApply(it, action, typed, rule, surface = 'needs-input triage')
   const stamp = new Date().toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   const done = [], errs = [];
   try {
+    // AN APPROVAL CARD IS DECIDED BY ITS ITEM'S OWN PATH (governance PR 12):
+    // the server calls the email, grant, publish, land or capability approve
+    // or reject with this request's identity, closes the card, and with
+    // "remember" records a standing approval for the exact same request.
+    if (it.approval && (action === 'approve' || action === 'approve_always' || action === 'decline')) {
+      const body = { approval_ref: it.approval.ref, decision: action === 'decline' ? 'reject' : 'approve' };
+      if (typed) body.reason = typed;
+      if (action === 'approve_always') {
+        const days = Number(((rule && rule.until_days) || 0));
+        body.remember = days > 0 ? { until: Math.floor(Date.now() / 1000) + days * 86400 } : {};
+      }
+      const r = await fetch(API + '/api/approvals/decide', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(body), _skipOutbox: true });
+      const d = await _niJson(r);
+      if (r.ok) {
+        done.push((action === 'decline' ? 'Rejected ' : 'Approved ') + it.approval.kind + (d.card ? ', ' + d.card + ' closed' : ''));
+        if (d.standing_approval) done.push('remembered as SA-' + d.standing_approval);
+        if (d.standing_approval_error) errs.push('remember: ' + d.standing_approval_error);
+      } else {
+        errs.push(it.approval.kind + ': ' + _niErr(d, r));
+        if (r.status === 404 || (d && d.code === 'already_decided')) _niHandled.set(it.key, Date.now() + 5 * 60_000);
+      }
+      return { done, errs };
+    }
     if (it.kind === 'email') {
       const e = await _niEmail(it, action === 'decline' ? 'decline' : 'approve', typed);
       if (e.ok) done.push(e.msg); else errs.push(e.error);
@@ -7788,7 +8141,9 @@ async function _niApply(it, action, typed, rule, surface = 'needs-input triage')
         const marker = '#triage-' + _niHash(it.key + '|' + action + '|' + typed);
         // A dismissed card leaves needsyou for backlog, not todo: todo is
         // dispatched, which would hand the ask straight back to the worker.
-        const c = await _niCard(it.card, note, marker, true, action === 'dismiss' ? 'backlog' : 'todo');
+        // An approval card moves only through its decision, so a reply or a
+        // dismiss leaves a note on it and nothing else.
+        const c = await _niCard(it.card, note, marker, !it.approval, action === 'dismiss' ? 'backlog' : 'todo');
         if (c.ok) done.push(c.already ? it.card + ' already recorded' : it.card + ' ' + (c.status === 'todo' ? 'moved to todo' : c.status === 'backlog' ? (action === 'dismiss' ? 'moved to backlog' : 'moved to backlog (todo full)') : 'noted'));
         else errs.push(c.error);
       }
@@ -7825,7 +8180,9 @@ async function _niAct(action) {
   const typed = replyEl ? replyEl.value.trim() : '';
   if (action === 'reply' && !typed) { showToast('Type a reply first'); replyEl && replyEl.focus(); return; }
   let rule = null;
-  if (action === 'approve_always') {
+  if (action === 'approve_always' && it.approval) {
+    rule = { until_days: Number((document.getElementById('ni-remember-until') || {}).value || 0) };
+  } else if (action === 'approve_always') {
     rule = { allowed: ((document.getElementById('ni-always-text') || {}).value || '').trim(),
       category: (document.getElementById('ni-always-cat') || {}).value || it.standing_category || 'decision' };
     if (!rule.allowed) { showToast('Write the rule sentence first'); return; }
@@ -8024,7 +8381,7 @@ async function _niAutoToggle() {
 async function _niAutoSet(level, name, field, value) {
   if (field === 'money_cap_usd' && value !== null && !(value >= 0 && value <= 100000)) { showToast('Cap must be 0 to 100000 dollars'); return; }
   if (field === 'outbound' && value === true
-      && !confirm('Outbound on: real emails and posts to outside people will go out without you seeing them first. Sends cannot be undone. Turn it on?')) return;
+      && !(await showConfirm('Outbound on: real emails and posts to outside people will go out without you seeing them first. Sends cannot be undone. Turn it on?', 'Turn on', true))) return;
   try {
     // _skipOutbox: a policy change must land or say it did not; a queued
     // write would show the old policy as saved.
@@ -8040,7 +8397,7 @@ async function _niAutoSet(level, name, field, value) {
 }
 async function _niAutoSweep(btn) {
   const n = (_niAuto && _niAuto.already_waiting_unapproved) || 0;
-  if (!confirm('Apply the current policy to the ' + n + ' asks already waiting? Each is approved only if its worker’s policy covers it.')) return;
+  if (!(await showConfirm('Apply the current policy to the ' + n + ' asks already waiting? Each is approved only if its worker’s policy covers it.'))) return;
   if (btn) btn.disabled = true;
   try {
     const r = await fetch(API + '/api/needs-input/auto/sweep', { method: 'POST', _skipOutbox: true, headers: _authHeaders({ 'Content-Type': 'application/json' }) });
@@ -9233,6 +9590,7 @@ function _goalTile(g) {
     ck.why_unmeasured ? `Checker problem: ${ck.why_unmeasured}` : '',
     ck.checked_at ? `Checked ${when(ck.checked_at)}; last movement ${when(ck.progress_changed_at)}` : '',
     ck.stalled ? `STALLED: no movement for over ${Math.round((ck.stall_after_s || 0) / 3600)}h; the owner is alerted once per stall` : '',
+    ck.schedule?.id ? `Runs as schedule ${ck.schedule.id}${ck.schedule.enabled ? '' : ' (paused' + (ck.schedule.disabled_reason === 'goal_check_worker_stopped' ? ' while the worker is stopped' : '') + ')'}; its run history is in the Schedules tab` : '',
   ].filter(Boolean);
   return `<span class="badge goal ${esc(cls)}" data-goal-state="${esc(state)}" title="${esc(lines.join('\n'))}">&#9678; ${esc(label)}${esc(progress)}</span>`;
 }
@@ -9358,8 +9716,524 @@ document.addEventListener('mouseout', (e) => {
 });
 ['scroll', 'mousedown', 'keydown'].forEach(t => document.addEventListener(t, () => { if (_wkHoverLink) _wkHoverHide(); }, true));
 
+// A TASK LINE'S WORKER, FROM INSIDE MARKDOWN (owner, 2026-11-22: "In markdown I
+// want a way to highlight text/worker and be able to send a command to chat /
+// terminal selectively. Basically a simple way to check the status of a task
+// from within md"). Each @worker carries a dot in its status colour, repainted
+// on every render. A click opens a small card: status, what it is on, its
+// latest reply, and a box pre-filled with the line's task to ask about it. The
+// reply to that ask shows in the card. Chat and Terminal open the worker on
+// that view; ⌘/Ctrl-click opens it straight away, as the link used to.
+function _mdWorkerDotStatus(name) {
+  const s = (typeof sessions !== 'undefined' ? sessions : []).find(x => x.name === name);
+  if (!s) return 'none';
+  const st = _workerStatus(s);
+  return st.key === 'needs_input' ? 'needs_input' : st.group;
+}
+function _mdWorkerStatusText(name) {
+  const k = _mdWorkerDotStatus(name);
+  if (k === 'none') return 'Not running here';
+  if (k === 'needs_input') return 'Waiting on you';
+  return _STATUS_LABELS[k] || k;
+}
+function _mdWorkerDotsPaint() {
+  const dots = document.querySelectorAll('.md-worker-dot');
+  for (const d of dots) {
+    const a = d.closest('[data-worker]');
+    if (!a) continue;
+    const st = _mdWorkerDotStatus(a.dataset.worker);
+    if (d.dataset.status !== st) d.dataset.status = st;
+  }
+  if (_mdTask.name) _mdTaskPaint();
+}
+// The task a mention sits in: its list item or paragraph, without the mention.
+function _mdTaskLine(a) {
+  const block = a.closest('li, p, td, th, h1, h2, h3, h4, h5, h6, blockquote') || a.parentElement;
+  if (!block) return '';
+  const c = block.cloneNode(true);
+  c.querySelectorAll('ul, ol').forEach(n => n.remove());   // a nested list is other lines
+  c.querySelectorAll('.md-worker-link, .md-ask-reply').forEach(n => n.remove());   // a drawn reply is not the line
+  return c.textContent.replace(/\s+/g, ' ').replace(/^[\s:—–-]+/, '').trim().slice(0, 300);
+}
+const _mdTask = { name: '', task: '', last: '', lastAt: '', waiting: false, sentAt: 0, pollAt: 0, anchor: null, timer: 0 };
+// While the card is open it reads the reply on its own clock: a worker's reply
+// sends no session event, so render alone may not come round. Every 5 s while
+// an ask waits, every 10 s otherwise (owner, 2026-11-23: a card opened before
+// the worker's newest reply kept showing the one before it).
+function _mdTaskWait(on) {
+  clearInterval(_mdTask.timer);
+  _mdTask.timer = on ? setInterval(_mdTaskPaint, 5000) : 0;
+}
+// "Latest reply · 1:08 PM, 3m ago": when the reply was written, so an old one reads as old.
+function _mdReplyLabel(base, at) {
+  const t = at ? Date.parse(at) : NaN;
+  if (!isFinite(t)) return base;
+  const clock = new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return base + ' · ' + clock + ', ' + timeAgo(Math.floor(t / 1000));
+}
+function _mdTaskEl() {
+  let el = document.getElementById('md-task-card');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'md-task-card';
+    el.className = 'md-task-card';
+    el.setAttribute('role', 'dialog');
+    el.hidden = true;
+    el.innerHTML = '<div class="mtc-head"><span class="md-worker-dot"></span><b class="mtc-name"></b>'
+      + '<span class="mtc-status"></span><button class="btn mtc-close" type="button" aria-label="Close">×</button></div>'
+      + '<div class="mtc-doing"></div>'
+      + '<div class="mtc-reply-label"></div><div class="mtc-reply md-body"></div>'
+      + '<textarea class="input mtc-ask" rows="2" aria-label="Ask the worker"></textarea>'
+      + '<div class="mtc-row"><button class="btn primary mtc-send" type="button">Ask</button>'
+      + '<span class="mtc-note"></span><span class="mtc-open">Open'
+      + '<button class="btn mtc-chat" type="button">Chat</button><button class="btn mtc-term" type="button">Terminal</button></span></div>';
+    document.body.appendChild(el);
+    el.querySelector('.mtc-close').onclick = () => _mdTaskClose();
+    el.querySelector('.mtc-send').onclick = () => _mdTaskSend();
+    el.querySelector('.mtc-chat').onclick = () => _mdTaskOpenWorker('chat');
+    el.querySelector('.mtc-term').onclick = () => _mdTaskOpenWorker('terminal');
+    el.querySelector('.mtc-ask').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); _mdTaskSend(); }
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _mdTaskClose(); }
+    });
+    document.addEventListener('mousedown', e => {
+      if (!el.hidden && !el.contains(e.target) && !(e.target.closest && e.target.closest('.md-worker-link'))) _mdTaskClose();
+    }, true);
+  }
+  return el;
+}
+function _mdTaskPlace(el, a) {
+  if (window.matchMedia('(max-width: 600px)').matches) { el.style.top = el.style.left = ''; return; }   // a bottom sheet on a phone (CSS)
+  const r = a.getBoundingClientRect(), pr = el.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight, gap = 6;
+  let top = r.bottom + gap;
+  if (top + pr.height > vh - 8 && r.top - gap - pr.height >= 8) top = r.top - gap - pr.height;
+  el.style.top = Math.max(8, Math.min(top, vh - pr.height - 8)) + 'px';
+  el.style.left = Math.max(8, Math.min(r.left, vw - pr.width - 8)) + 'px';
+}
+function _mdTaskOpen(a) {
+  _wkHoverHide();
+  const name = a.dataset.worker;
+  const task = _mdTaskLine(a);
+  _mdTaskWait(false);
+  Object.assign(_mdTask, { name, task, last: '', lastAt: '', waiting: false, sentAt: 0, pollAt: Date.now(), anchor: a });
+  const el = _mdTaskEl();
+  el.setAttribute('aria-label', name + ': status and ask');
+  el.querySelector('.mtc-name').textContent = '@' + name;
+  el.querySelector('.mtc-ask').value = task ? 'Where are you on: ' + task + '?' : 'What is your status?';
+  el.querySelector('.mtc-note').textContent = '';
+  el.querySelector('.mtc-reply-label').textContent = 'Latest reply';
+  el.querySelector('.mtc-reply').textContent = 'Reading…';
+  el.hidden = false;
+  _mdTaskPaint();
+  _mdTaskPlace(el, a);
+  _mdBeacon('md_task_card_opened', { known: _mdWorkerKnown(name) ? 1 : 0, task_chars: task.length });
+  _mdTaskWait(true);
+  _mdTaskReadReply(name, false);
+}
+function _mdTaskClose() {
+  const el = document.getElementById('md-task-card');
+  if (el) el.hidden = true;
+  _mdTask.name = ''; _mdTask.waiting = false; _mdTask.anchor = null;
+  _mdTaskWait(false);
+}
+function _mdTaskPaint() {
+  const el = document.getElementById('md-task-card');
+  if (!el || el.hidden || !_mdTask.name) return;
+  const name = _mdTask.name;
+  const s = sessions.find(x => x.name === name);
+  el.querySelector('.mtc-head .md-worker-dot').dataset.status = _mdWorkerDotStatus(name);
+  el.querySelector('.mtc-status').textContent = _mdWorkerStatusText(name);
+  el.querySelector('.mtc-doing').textContent = s ? (s.task_name || s.desc || '') : '';
+  el.querySelector('.mtc-send').disabled = !s;
+  // An ask in flight: read the latest reply every 5 s until it changes (10 min at most).
+  // Otherwise every 10 s, so a reply the worker writes while the card is open shows.
+  const now = Date.now();
+  if (_mdTask.waiting) {
+    if (now - _mdTask.sentAt > 600000) { _mdTask.waiting = false; el.querySelector('.mtc-note').textContent = 'No reply yet; open the worker to see it.'; }
+    else if (now - _mdTask.pollAt > 4500) { _mdTask.pollAt = now; _mdTaskReadReply(name, true); }
+  } else if (now - _mdTask.pollAt > 9500) { _mdTask.pollAt = now; _mdTaskReadReply(name, false); }
+}
+async function _mdTaskReadReply(name, afterAsk) {
+  let text = '', at = '', read = false;
+  try {
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/last-message', { headers: _authHeaders(), signal: AbortSignal.timeout(8000) });
+    const d = (await r.json()) || {};
+    text = String(d.text || '').trim();
+    at = String(d.at || '');
+    read = r.ok;
+  } catch (e) { console.warn('md task card: latest reply not read', e); }
+  if (_mdTask.name !== name) return;
+  const el = _mdTaskEl();
+  const label = el.querySelector('.mtc-reply-label');
+  if (afterAsk) {
+    if (!text || text === _mdTask.last) return;   // still the reply from before the ask
+    _mdTask.waiting = false;
+    Object.assign(_mdTask, { last: text, lastAt: at });   // a second ask waits for a reply newer than this one
+    el.querySelector('.mtc-note').textContent = '';
+    label.textContent = _mdReplyLabel('Reply', at);
+    _mdBeacon('md_task_reply_shown', { wait_ms: Date.now() - _mdTask.sentAt, chars: text.length });
+  } else {
+    // An unchanged reply keeps its place (and the reader's scroll); only its age moves on.
+    const same = text === _mdTask.last && at === _mdTask.lastAt && el.querySelector('.mtc-reply').textContent !== 'Reading…';
+    if (same || (!read && _mdTask.last)) {
+      if (!label.textContent.startsWith('Reply')) label.textContent = _mdReplyLabel('Latest reply', _mdTask.lastAt);
+      return;
+    }
+    if (_mdTask.last && text !== _mdTask.last) _mdBeacon('md_task_reply_refreshed', { chars: text.length });
+    Object.assign(_mdTask, { last: text, lastAt: at });
+    label.textContent = _mdReplyLabel('Latest reply', at);
+  }
+  const box = el.querySelector('.mtc-reply');
+  if (text) box.innerHTML = renderMarkdown(text, '', { workers: true });
+  else box.textContent = 'No reply from ' + name + ' yet.';
+  _bindMdFileLinks(box);
+  if (_mdTask.anchor && _mdTask.anchor.isConnected) _mdTaskPlace(el, _mdTask.anchor);
+}
+async function _mdTaskSend() {
+  const name = _mdTask.name;
+  const el = _mdTaskEl();
+  const text = el.querySelector('.mtc-ask').value.trim();
+  if (!name || !text) return;
+  const btn = el.querySelector('.mtc-send'), note = el.querySelector('.mtc-note');
+  btn.disabled = true;
+  note.textContent = 'Sending…';
+  try {
+    // The composer's own send: a busy worker gets it queued for its next pause.
+    const r = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(name) + '/send', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }), signal: AbortSignal.timeout(30000) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) throw new Error(d.error || d.message || ('HTTP ' + r.status));
+    const queued = String(d.message || '').startsWith('queued');
+    if (_mdTask.name !== name) return;
+    Object.assign(_mdTask, { waiting: true, sentAt: Date.now(), pollAt: Date.now() });
+    _mdTaskWait(true);
+    note.textContent = queued ? 'Queued for its next pause. The reply shows here.' : 'Sent. The reply shows here.';
+    _mdBeacon('md_task_asked', { queued: queued ? 1 : 0, chars: text.length });
+  } catch (e) {
+    note.textContent = 'Not sent: ' + ((e && e.message) || e);
+    _mdBeacon('md_task_ask_failed', { error: String((e && e.message) || e).slice(0, 120) });
+  } finally {
+    btn.disabled = !sessions.find(x => x.name === name);
+  }
+}
+function _mdTaskOpenWorker(tab) {
+  const name = _mdTask.name;
+  const a = _mdTask.anchor;
+  _mdTaskClose();
+  if (!name) return;
+  _mdBeacon('md_task_open_worker', { tab });
+  const fo = document.getElementById('file-overlay');
+  if (fo && fo.classList.contains('active') && a && a.closest('#file-overlay')) {
+    if (typeof _navNote === 'function') { clearTimeout(_nav.timer); _navNote(); }
+    closeFilePreview();
+    if (fo.classList.contains('active')) return;   // unsaved edits keep the file open
+  }
+  if (typeof openPeek === 'function') openPeek(name);
+  if (typeof setPeekTab === 'function') setPeekTab(tab);
+  if (typeof _navSoon === 'function') _navSoon();
+}
+
+// ASK SEVERAL WORKERS FROM A FILE (owner, 2026-11-24: "highlight and all
+// highlighted @ workers I can send a mass message ... But then I also want to
+// see all the results at once"). Select lines in a markdown preview and an
+// "Ask N workers" button appears; the file menu's "Ask every @worker…" does
+// the same for the whole file. Each worker gets the question plus its own line
+// from the file, through the same send the single-worker card uses (a busy
+// worker gets it queued, a stopped one is woken). Its reply shows under its
+// line, drawn by the viewer only (the file is never written), and a bar at the
+// top counts replies. The state lives per file, so closing and reopening it
+// keeps the answers; a re-render (Split typing, a reload) redraws them.
+const _mdAsk = { path: '', question: '', sentAt: 0, rows: new Map(), timer: 0 };
+const _MD_ASK_WAIT_MS = 15 * 60 * 1000;
+function _mdAskBody() {
+  const b = document.getElementById('file-body');
+  return b && b.classList.contains('markdown') ? b : null;
+}
+function _mdAskNamesIn(body, range) {
+  const names = [];
+  body.querySelectorAll('.md-worker-link[data-worker]').forEach(a => {
+    if (range && !range.intersectsNode(a)) return;
+    if (!names.includes(a.dataset.worker)) names.push(a.dataset.worker);
+  });
+  return names;
+}
+function _mdAskSelBtn() {
+  let b = document.getElementById('md-ask-sel');
+  if (!b) {
+    b = document.createElement('button');
+    b.id = 'md-ask-sel';
+    b.type = 'button';
+    b.className = 'btn primary md-ask-sel';
+    b.hidden = true;
+    // mousedown, so the click does not first collapse the selection it acts on
+    b.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); });
+    b.addEventListener('click', e => {
+      e.preventDefault(); e.stopPropagation();
+      const names = (b.dataset.names || '').split('\n').filter(Boolean);
+      b.hidden = true;
+      _mdAskStart(names, 'selection');
+    });
+    document.body.appendChild(b);
+  }
+  return b;
+}
+function _mdAskSelSync() {
+  const btn = _mdAskSelBtn(), body = _mdAskBody();
+  const sel = window.getSelection();
+  if (!body || !sel || sel.isCollapsed || !sel.rangeCount || !body.isConnected
+      || !document.getElementById('file-overlay').classList.contains('active')) { btn.hidden = true; return; }
+  const range = sel.getRangeAt(0);
+  if (!body.contains(range.commonAncestorContainer)) { btn.hidden = true; return; }
+  const names = _mdAskNamesIn(body, range);
+  if (!names.length) { btn.hidden = true; return; }
+  btn.dataset.names = names.join('\n');
+  btn.textContent = 'Ask ' + names.length + (names.length === 1 ? ' worker' : ' workers');
+  btn.hidden = false;
+  const r = range.getBoundingClientRect(), bw = btn.offsetWidth || 120, bh = btn.offsetHeight || 32;
+  let top = r.bottom + 6;
+  if (top + bh > window.innerHeight - 8) top = Math.max(8, r.top - bh - 6);
+  btn.style.top = top + 'px';
+  btn.style.left = Math.max(8, Math.min(r.right - bw, window.innerWidth - bw - 8)) + 'px';
+}
+let _mdAskSelT = 0;
+document.addEventListener('selectionchange', () => { clearTimeout(_mdAskSelT); _mdAskSelT = setTimeout(_mdAskSelSync, 120); });
+function _mdAskAll() {
+  const m = document.getElementById('file-actions'); if (m) m.classList.remove('open');
+  const body = _mdAskBody();
+  _mdAskStart(body ? _mdAskNamesIn(body, null) : [], 'file');
+}
+async function _mdAskReadLast(name) {
+  const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/last-message', { headers: _authHeaders(), signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const d = (await r.json()) || {};
+  return { text: String(d.text || '').trim(), at: String(d.at || '') };
+}
+async function _mdAskStart(names, from) {
+  const body = _mdAskBody(), path = _fileData && _fileData.path;
+  if (!body || !path) return;
+  names = names.filter(n => _mdWorkerKnown(n));
+  if (!names.length) { showToast('No @workers here to ask'); return; }
+  const off = names.filter(n => { const s = sessions.find(x => x.name === n); return !s || !s.running; }).length;
+  const title = 'Ask ' + names.length + (names.length === 1 ? ' worker' : ' workers')
+    + (off ? ' (' + off + ' off: the message starts ' + (off === 1 ? 'it' : 'them') + ')' : '')
+    + '. Each also gets its line from this file.';
+  const q = ((await showPrompt(title, 'Your question', 'What is your status?')) || '').trim();
+  if (!q) return;
+  const file = path.split('/').pop();
+  clearInterval(_mdAsk.timer);
+  Object.assign(_mdAsk, { path, question: q, sentAt: Date.now(), rows: new Map(), timer: 0 });
+  for (const n of names) _mdAsk.rows.set(n, { state: 'sending', before: null, text: '', at: '', error: '', queued: false });
+  _mdAskPaint();
+  await Promise.all(names.map(async n => {
+    const row = _mdAsk.rows.get(n);
+    const a = body.querySelector('.md-worker-link[data-worker="' + CSS.escape(n) + '"]');
+    const line = a ? _mdTaskLine(a) : '';
+    const text = q + (line ? '\n\n(Your line in ' + file + ': "' + line + '")' : '');
+    try {
+      // null when unread: the poll then never takes the message from before the ask as its answer
+      row.before = await _mdAskReadLast(n).catch(() => null);
+      const r = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(n) + '/send', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }), signal: AbortSignal.timeout(30000) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.ok === false) throw new Error(d.error || d.message || ('HTTP ' + r.status));
+      row.queued = String(d.message || '').startsWith('queued');
+      row.state = 'waiting';
+    } catch (e) {
+      row.state = 'failed';
+      row.error = String((e && e.message) || e).slice(0, 160);
+    }
+    if (_mdAsk.path === path) _mdAskPaint();
+  }));
+  const failed = [..._mdAsk.rows.values()].filter(r => r.state === 'failed').length;
+  _mdBeacon('md_ask_sent', { n_considered: names.length, from, off, failed, chars: q.length });
+  if (failed) _mdBeacon('md_ask_failed', { failed, first_error: [..._mdAsk.rows.values()].find(r => r.error).error });
+  _mdAsk.timer = setInterval(_mdAskPoll, 5000);
+}
+async function _mdAskPoll() {
+  const waiting = [..._mdAsk.rows.entries()].filter(([, r]) => r.state === 'waiting');
+  if (!waiting.length) { clearInterval(_mdAsk.timer); _mdAsk.timer = 0; return; }
+  if (Date.now() - _mdAsk.sentAt > _MD_ASK_WAIT_MS) {
+    waiting.forEach(([, r]) => { r.state = 'silent'; });
+    _mdBeacon('md_ask_unanswered', { n_considered: _mdAsk.rows.size, silent: waiting.length });
+    clearInterval(_mdAsk.timer); _mdAsk.timer = 0;
+    _mdAskPaint();
+    return;
+  }
+  let changed = false;
+  await Promise.all(waiting.map(async ([n, r]) => {
+    let now;
+    try { now = await _mdAskReadLast(n); } catch (e) { return; }
+    if (!now.text) return;
+    if (!r.before) {
+      // The read before the ask failed. A message stamped after the ask is the
+      // answer; anything else becomes the baseline a later reply must differ from.
+      const t = Date.parse(now.at);
+      if (!(isFinite(t) && t >= _mdAsk.sentAt - 2000)) { r.before = now; return; }
+    } else if (now.text === r.before.text && now.at === r.before.at) return;
+    Object.assign(r, { state: 'replied', text: now.text, at: now.at });
+    _mdBeacon('md_ask_replied', { wait_ms: Date.now() - _mdAsk.sentAt, chars: now.text.length });
+    changed = true;
+  }));
+  if (changed) _mdAskPaint();
+}
+function _mdAskClear() {
+  clearInterval(_mdAsk.timer);
+  Object.assign(_mdAsk, { path: '', question: '', sentAt: 0, rows: new Map(), timer: 0 });
+  const body = _mdAskBody();
+  if (body) body.querySelectorAll('.md-ask-reply, .md-ask-bar').forEach(n => n.remove());
+}
+// Draws the answers into the preview showing this file; safe to call after any render.
+function _mdAskPaint() {
+  const body = _mdAskBody();
+  if (!body) return;
+  body.querySelectorAll('.md-ask-reply, .md-ask-bar').forEach(n => n.remove());
+  if (!_mdAsk.rows.size || !_fileData || _fileData.path !== _mdAsk.path) return;
+  const rows = [..._mdAsk.rows.values()];
+  const n = { replied: 0, waiting: 0, failed: 0, silent: 0, sending: 0 };
+  rows.forEach(r => { n[r.state] = (n[r.state] || 0) + 1; });
+  const bar = document.createElement('div');
+  bar.className = 'md-ask-bar';
+  bar.setAttribute('role', 'status');
+  const parts = [n.replied + ' of ' + rows.length + ' replied'];
+  if (n.sending) parts.push(n.sending + ' sending');
+  if (n.waiting) parts.push(n.waiting + ' waiting');
+  if (n.silent) parts.push(n.silent + ' no reply in 15 min');
+  if (n.failed) parts.push(n.failed + ' not sent');
+  bar.innerHTML = '<span class="md-ask-q">Asked: “' + esc(_mdAsk.question.slice(0, 80)) + '”</span>'
+    + '<span class="md-ask-count">' + esc(parts.join(' · ')) + '</span>'
+    + '<button class="btn md-ask-clear" type="button">Clear</button>';
+  bar.querySelector('.md-ask-clear').onclick = () => { _mdBeacon('md_ask_cleared', { n_considered: rows.length }); _mdAskClear(); };
+  body.prepend(bar);
+  for (const [name, r] of _mdAsk.rows) {
+    const a = body.querySelector('.md-worker-link[data-worker="' + CSS.escape(name) + '"]');
+    if (!a) continue;
+    const block = a.closest('li, p, td, th, h1, h2, h3, h4, h5, h6, blockquote') || a.parentElement;
+    const btn = document.createElement('button');   // a control: keyboard and the shared press layer reach it
+    btn.type = 'button';
+    btn.className = 'md-ask-reply';
+    btn.dataset.worker = name;
+    btn.dataset.state = r.state;
+    let txt;
+    if (r.state === 'replied') {   // one line of plain text; the card shows it formatted
+      const t = document.createElement('div');
+      t.innerHTML = renderMarkdown(r.text, '');
+      txt = t.textContent.replace(/\s+/g, ' ').trim();
+    }
+    else if (r.state === 'failed') txt = 'Not sent: ' + r.error;
+    else if (r.state === 'silent') txt = 'No reply in 15 minutes; open the worker to see it.';
+    else if (r.state === 'sending') txt = 'Sending…';
+    else txt = r.queued ? 'Queued for its next pause; waiting…' : 'Waiting…';
+    btn.innerHTML = '<span class="md-ask-arrow" aria-hidden="true">↳</span>'
+      + (r.state === 'replied' && r.at ? '<span class="md-ask-when">' + esc(timeAgo(Math.floor(Date.parse(r.at) / 1000))) + '</span>' : '')
+      + '<span class="md-ask-text"></span>';
+    btn.querySelector('.md-ask-text').textContent = txt;
+    btn.title = r.state === 'replied' ? 'Open @' + name + "'s card to read the whole reply and ask more" : '';
+    btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); _mdBeacon('md_ask_reply_opened', { state: r.state }); _mdTaskOpen(a); });
+    const nested = [...block.children].find(c => c.tagName === 'UL' || c.tagName === 'OL');
+    if (nested) block.insertBefore(btn, nested); else block.appendChild(btn);
+  }
+}
+
+// HOVER PREVIEW OF A LINKED FILE (owner, 2026-11-18: "file path is clickable
+// and on mouseover shows a preview"). Any .md-file-link to a file: the head of
+// the file, rendered as markdown for .md and as text otherwise, in the same
+// inert card as an @worker preview. A click still opens the file. Pointers
+// that hover only. Reads are cached for 30 s so moving across a list of paths
+// does not refetch.
+let _fhTimer = null, _fhLink = null;
+const _fhCache = new Map();
+async function _fhRead(path) {
+  const hit = _fhCache.get(path);
+  if (hit && Date.now() - hit.at < 30000) return hit;
+  let res;
+  try {
+    const r = await fetch(API + '/api/file/raw?path=' + encodeURIComponent(path), { headers: _authHeaders(), signal: AbortSignal.timeout(6000) });
+    if (!r.ok) res = { error: r.status === 404 ? 'No file at this path' : 'Could not read it (' + r.status + ')' };
+    else {
+      const type = r.headers.get('content-type') || '';
+      if (!/^text\/|json|xml|javascript|markdown/i.test(type) && !/\.(md|txt|json|ya?ml|toml|csv|rs|js|ts|py|sh)$/i.test(path)) res = { error: 'No preview for this kind of file' };
+      else { const t = await r.text(); res = { text: t.slice(0, 6000), cut: t.length > 6000 }; }
+    }
+  } catch (e) { res = { error: 'Could not read it' }; }
+  res.at = Date.now();
+  _fhCache.set(path, res);
+  return res;
+}
+// Every file link: a markdown link carries the full path; a path in worker
+// output (Messages, Chat, a peek) is relative to the worker, so it is resolved
+// the way its context menu resolves it.
+const _FH_LINKS = '.md-file-link[data-file]:not([data-dir]), .file-link[data-path], .md-link[data-path]';
+async function _fhPath(a) {
+  if (a.classList.contains('md-file-link')) return a.dataset.file || '';
+  const raw = (a.dataset.path || '').replace(/(?::\d+){1,2}$/, '');
+  try { return (await _resolveLinkedPath(raw)) || raw; }
+  catch (e) { console.warn('[hover] could not resolve a linked path', e); return raw; }
+}
+async function _fhShow(a) {
+  const pop = _wkHoverCard();
+  const path = await _fhPath(a);
+  if (_fhLink !== a || !path) return;
+  pop.innerHTML = '<div class="worker-hovercard-none">Loading ' + esc(path.split('/').pop()) + '…</div>';
+  pop.hidden = false;
+  const res = await _fhRead(path);
+  if (_fhLink !== a) return;
+  const head = '<div class="file-hovercard-path">' + esc(path) + '</div>';
+  let body;
+  if (res.error) body = '<div class="worker-hovercard-none">' + esc(res.error) + '</div>';
+  else if (/\.md$/i.test(path)) body = '<div class="file-hovercard-body md-body">' + renderMarkdown(res.text, path) + '</div>';
+  else body = '<pre class="file-hovercard-body">' + esc(res.text) + '</pre>';
+  pop.innerHTML = head + body + (res.cut ? '<div class="worker-hovercard-none">…</div>' : '');
+  const r = a.getBoundingClientRect(), pr = pop.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight, gap = 6;
+  let top = r.bottom + gap;
+  if (top + pr.height > vh - 8 && r.top - gap - pr.height >= 8) top = r.top - gap - pr.height;
+  pop.style.top = Math.max(8, Math.min(top, vh - pr.height - 8)) + 'px';
+  pop.style.left = Math.max(8, Math.min(r.left, vw - pr.width - 8)) + 'px';
+}
+function _fhHide() {
+  clearTimeout(_fhTimer); _fhTimer = null; _fhLink = null;
+  const pop = document.getElementById('worker-hovercard');
+  if (pop) pop.hidden = true;
+}
+document.addEventListener('mouseover', (e) => {
+  if (!window.matchMedia('(hover: hover)').matches) return;
+  const a = e.target.closest && e.target.closest(_FH_LINKS);
+  if (!a || a === _fhLink) return;
+  _fhHide();
+  _fhLink = a;
+  _fhTimer = setTimeout(() => { if (_fhLink === a && a.isConnected) _fhShow(a); }, 350);
+});
+document.addEventListener('mouseout', (e) => {
+  if (!_fhLink) return;
+  const to = e.relatedTarget;
+  if (to && _fhLink.contains(to)) return;
+  if (e.target.closest && e.target.closest(_FH_LINKS) === _fhLink) _fhHide();
+});
+['mousedown', 'keydown'].forEach(t => document.addEventListener(t, () => { if (_fhLink) _fhHide(); }, true));
+// Only a scroll that moves the link hides its card (owner, 2026-11-19: "file
+// preview mouseover not working"): any scroll anywhere used to, and a live
+// terminal or list scrolls all the time, so the card closed as it opened.
+document.addEventListener('scroll', (e) => {
+  if (!_fhLink) return;
+  const t = e.target;
+  if (t === document || t === document.documentElement || (t && t.contains && t.contains(_fhLink))) _fhHide();
+}, true);
+
 // One worker's card, as the worker list draws it. Top level so a hover
 // preview of an @worker mention draws the same card (owner, 2026-11-09).
+// A NEW WORKER OPENS FROM ITS CARD AT ONCE (owner, 2026-11-22: "it doesn't
+// open unless you click the terminal block, and the terminal block doesn't
+// always get started immediately when the worker is created"). Only the
+// preview block opened a worker; it appears once the pane has printed, the
+// server's preview cache has refreshed and the list has been fetched again,
+// and until then a click anywhere folded the card. The name is now a link to
+// the worker (a plain click opens it through the own-link handler, which
+// stops the click before the card folds; a middle click opens a new tab),
+// and a running worker with no output yet shows the block, saying so.
+function _workerCardHref(name) {
+  return '/#peek=' + encodeURIComponent(String(name || ''));
+}
 function _renderSessionCard(s) {
   const isExp = expanded.has(s.name);
   const flags = s.flags || '';
@@ -9402,7 +10276,7 @@ function _renderSessionCard(s) {
     <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
       <div class="card-header-top">
         <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
-        <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${s.isolated ? '<span class="card-isolated" title="ISOLATED (raw agent): tmux plus the CLI, no amux harness — no AMUX_SESSION/AMUX_URL, no MCP config or behavioral hooks. Passive lifecycle hooks report status only. Undiscoverable to peers: hidden from their fleet list and roster, and peer sends are refused. You can still peek and send from here. Applies at the next spawn.">ISOLATED</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
+        <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${s.isolated ? '<span class="card-isolated" title="ISOLATED (raw agent): tmux plus the CLI, no amux harness — no AMUX_SESSION/AMUX_URL, no MCP config or behavioral hooks. Passive lifecycle hooks report status only. Undiscoverable to peers: hidden from their fleet list and roster, and peer sends are refused. You can still peek and send from here. Applies at the next spawn.">ISOLATED</span> ' : ''}<a class="card-name-link" href="${esc(_workerCardHref(s.name))}" title="Open ${esc(s.name)}">${esc(s.name)}</a>${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
         <button class="card-menu-btn" onclick="event.stopPropagation();toggleMenu('${s.name}')" title="Options">&#x22EF;</button>
         <div class="card-menu" id="menu-${s.name}">
         ${_renderWorkerActionMenu(s, 'card')}
@@ -9475,6 +10349,7 @@ function _renderSessionCard(s) {
         : '');
     })() : ''}
     ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
+    ${_homeCardOutcomes(s.name)}
     ${logSearchMode && _logMatches[s.name] ? (() => {
       const hits = _logMatches[s.name];
       const sq = searchQuery.replace(/'/g,"\\'");
@@ -9521,7 +10396,8 @@ function _renderSessionCard(s) {
         ${s.task_time ? `<div class="timing-item"><span class="timing-label">Task</span><span class="timing-value accent">${esc(s.task_time)}</span></div>` : ''}
         ${s.last_activity ? `<div class="timing-item"><span class="timing-label">Last interaction</span><span class="timing-value">${timeAgo(s.last_activity)}</span></div>` : ''}
       </div>` : ''}
-      ${s.preview_lines && s.preview_lines.length ? `<div class="card-preview-lines" onclick="event.stopPropagation();openPeek('${s.name}')" style="cursor:pointer;">${rewriteLocalhostUrls(s.preview_lines.map(l => esc(l)).join('\n'))}</div>` : ''}
+      ${s.preview_lines && s.preview_lines.length ? `<div class="card-preview-lines" onclick="event.stopPropagation();openPeek('${s.name}')" style="cursor:pointer;">${rewriteLocalhostUrls(s.preview_lines.map(l => esc(l)).join('\n'))}</div>`
+        : s.running ? `<div class="card-preview-lines card-preview-pending" onclick="event.stopPropagation();openPeek('${s.name}')" title="Open ${esc(s.name)}">No output yet · open</div>` : ''}
       <div class="card-stats" id="stats-${s.name}"></div>
       ${s.running ? `
       <div class="chips" id="card-chips-${s.name}"></div>
@@ -9544,7 +10420,8 @@ function _renderSessionCard(s) {
 function render() {
   // The Send/Queue label reads the target's status, so it follows each render.
   try { _syncComposerPending(); } catch (_) {}
-  try { _sbLiveTick(); } catch (e) { console.warn('[scoreboard] live refresh failed', e); }
+  // @worker dots and an open task card in markdown follow the same data.
+  try { _mdWorkerDotsPaint(); } catch (e) { console.warn('md worker dots: repaint failed', e); }
   // THE PEEK HEADER UPDATES FIRST, ahead of the card-clobbering guard below.
   //
   // It used to sit AFTER that guard, so an open card menu / edit overlay froze
@@ -9567,6 +10444,10 @@ function render() {
   // DOM clobbering.
   if (openMenu || editState || document.getElementById('edit-overlay').classList.contains('active')) return;
   if (_cardsPressActive()) { _cardsRenderDefer(); return; }
+  // A card drag can outlast the 3s press window above; a redraw mid-drag
+  // rebuilt the list under the held card and the drop was lost. Wait for the
+  // drag to end, as the board and tab-menu drags do.
+  if (_deferForSortableDrag(render, 'worker-cards-render')) return;
   const el = document.getElementById('cards');
   // Skip re-render while user has focus inside any card input/textarea — prevents cursor reset and value loss
   const _active = document.activeElement;
@@ -9731,20 +10612,6 @@ function render() {
   });
 
 
-  // Freeze mode: flat list locked to captured order — bypasses status grouping and activity re-sort
-  if (_frozen && cardOrder.length) {
-    const frozenList = _sortByCardOrder(filtered);
-    _setCardsHtml(el, draftCards + frozenList.map(_renderSessionCard).join(''));
-    for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
-    _restoreCardFocus(focusedId, savedInputs);
-    _renderPausedSection();
-    _renderExpiredSection();
-    _renderArchivedSection();
-    requestAnimationFrame(initSortable);
-    requestAnimationFrame(() => { document.querySelectorAll('.chips[id^="card-chips-"]').forEach(el => { const name = el.id.replace('card-chips-', ''); if (name) renderChips(el, name, false); }); });
-    return;
-  }
-
   // Grid mode: flat list sorted by activity or alpha, no grouping (desktop only)
   if (layoutMode === 'grid' && window.innerWidth >= 900) {
     let sortedFiltered;
@@ -9820,8 +10687,9 @@ function render() {
     // list mode (flat) or group mode with active filter: flat list
     let flatList = [...filtered].sort(_sortFnFor(sortMode));
     _setCardsHtml(el, staleWorkerPrefix + draftCards + flatList.map(_renderSessionCard).join(''));
-    if (layoutMode === 'list') requestAnimationFrame(initSortable);
   }
+  // Every layout, so the grip and drag follow the sort (initSortable decides).
+  requestAnimationFrame(initSortable);
   _checkWorkerStatusOrder();
   _updateResetBtn();
 
@@ -10541,9 +11409,12 @@ const ALL_TABS = (function _discoverNavTabs() {
   // protection now lives in _honourBoardHide instead of in REQUIRED.
   const REQUIRED = new Set(['sessions']);
   const out = [];
+  // "Everything else" is simple mode's way out (_homeShowEverything), not a
+  // view: it is never a tab to reorder or hide. Chat, Ideas and Goals are.
+  const NOT_TABS = new Set(['everything']);
   document.querySelectorAll('.tab-bar button[id^="tab-"]').forEach(b => {
     const id = b.id.slice(4);   // strip 'tab-'
-    if (!id) return;
+    if (!id || NOT_TABS.has(id)) return;
     const lbl = b.querySelector('.tab-lbl');
     out.push({ id, label: lbl ? lbl.textContent.trim() : id, required: REQUIRED.has(id) });
   });
@@ -10619,6 +11490,9 @@ function _applyTabVisibility() {
     const el = document.getElementById('tab-' + id);
     if (el) bar.appendChild(el); // moves to end in order
   });
+  // "Everything else" is not a tab (NOT_TABS): it always ends the bar.
+  const everything = document.getElementById('tab-everything');
+  if (everything) bar.appendChild(everything);
   // Apply visibility
   ALL_TABS.forEach(t => {
     const el = document.getElementById('tab-' + t.id);
@@ -10717,6 +11591,49 @@ function _renderTabCustomizerMenu() {
   });
 }
 
+// ONE LIVE SORTABLE DRAG OWNS THE PAGE. Sortable keeps the drag in progress in
+// module globals shared by every instance, and destroy() on ANY instance runs
+// its drop with no event: the globals are cleared and the drag in progress
+// hangs with its floating copy under the pointer, and the drop never lands.
+// Measured 2026-11-23: renderBoard, reached from _ensureArchivedCount with the
+// Board not even shown, destroyed the board's Sortables while a tab of the
+// in-page strip was held, and that drag never ended. So a render that destroys
+// Sortables waits while any drag is live (Sortable.dragged is set from the
+// press to the drop) and runs once, after the pointer is let go. Each wait is
+// beaconed as kind=sortable-drag-deferred with what waited.
+function _sortableDragLive() { return !!(window.Sortable && window.Sortable.dragged); }
+const _afterSortableDrag = new Map();
+// A drag Sortable never closed (its globals left set) must not hold renders
+// for ever: past this, a render runs anyway and says so (sortable-drag-stuck).
+const _SORTABLE_HOLD_MAX_MS = 30000;
+let _sortableHoldSince = 0;
+function _deferForSortableDrag(fn, what) {
+  if (!_sortableDragLive()) { _sortableHoldSince = 0; return false; }
+  if (!_sortableHoldSince) _sortableHoldSince = Date.now();
+  if (Date.now() - _sortableHoldSince > _SORTABLE_HOLD_MAX_MS) {
+    console.warn('[sortable] a drag has been live for over 30s; rendering anyway', what);
+    try { window._clientDebug && window._clientDebug('sortable-drag-stuck', { what, held_ms: Date.now() - _sortableHoldSince, measured: true, n_considered: 1 }); } catch (e) { console.warn('[sortable] stuck-drag beacon not sent', e); }
+    return false;
+  }
+  if (!_afterSortableDrag.has(fn)) {
+    _afterSortableDrag.set(fn, what);
+    try { window._clientDebug && window._clientDebug('sortable-drag-deferred', { what, measured: true, n_considered: 1 }); } catch (e) { console.warn('[sortable] deferred-render beacon not sent', e); }
+  }
+  return true;
+}
+function _runAfterSortableDrag() {
+  if (!_afterSortableDrag.size) return;
+  // Sortable's own drop runs after this listener in the same event, so wait a turn.
+  setTimeout(function flush() {
+    if (_sortableDragLive()) { setTimeout(flush, 200); return; }
+    _sortableHoldSince = 0;
+    const waiting = [..._afterSortableDrag.keys()];
+    _afterSortableDrag.clear();
+    waiting.forEach(fn => { try { fn(); } catch (e) { console.warn('[sortable] a render held for a drag failed', e); } });
+  }, 0);
+}
+['pointerup', 'mouseup', 'touchend', 'pointercancel'].forEach(t => document.addEventListener(t, () => setTimeout(_runAfterSortableDrag, 0), true));
+
 // ONE DRAG FOR BOTH TAB MENUS, driven by the pointer (Ethan, 2026-10-25, the
 // Mac app's worker-view menu: "drag & tab not working or draggable"). Sortable's
 // default is the browser's native drag and drop, and in the Mac app that is an
@@ -10759,7 +11676,7 @@ function _tabMenuSortableCreate(menu, which, draggable, onReorder) {
   }
   return Sortable.create(menu, {
     draggable, animation: 120,
-    filter: 'input, .tab-cust-search-wrap', preventOnFilter: false,
+    filter: 'input, .tab-cust-search-wrap, .chrome-tab-close', preventOnFilter: false,
     forceFallback: true, fallbackTolerance: 4,
     delay: 160, delayOnTouchOnly: true, touchStartThreshold: 6,
     scroll: true, scrollSensitivity: 56, scrollSpeed: 14, bubbleScroll: true,
@@ -10830,6 +11747,8 @@ function _peekTabsWheel(e) {
 // different class (tab-customize-btn, not peek-tab), so it is not picked up. DOM
 // order is the default order, matching what a fresh browser shows.
 const PEEK_TABS = (function _discoverPeekTabs() {
+  // Outcomes leads (docs/design/intent-first.md): what was asked of this
+  // worker and how it went, before the machinery.
   const PINNED = new Set(['terminal']);
   const out = [];
   document.querySelectorAll('.peek-tabs button.peek-tab[id^="peek-tab-"]').forEach(b => {
@@ -10840,9 +11759,20 @@ const PEEK_TABS = (function _discoverPeekTabs() {
   });
   return out.length ? out : [{ id: 'simple', label: 'Translate' }];
 })();
-const PEEK_REQUIRED_TABS = new Set(['issues']);
+// Terminal is the only worker tab that cannot be hidden (PINNED above). Board
+// was required from 2026-09-24; the owner made it hideable again on
+// 2026-11-26 ("The only tab that should not be able to be hidden is
+// terminal"). As on the global bar, a stale saved list may still carry
+// 'issues' from before it became required, so only a list that also has the
+// 'issues!' marker, written by an explicit uncheck, hides it.
+const PEEK_REQUIRED_TABS = new Set();
+function _honourPeekBoardHide(set) {
+  if (set.has('issues') && !set.has('issues!')) set.delete('issues');
+  if (!set.has('issues')) set.delete('issues!');
+  return set;
+}
 let peekHiddenTabs = (function() {
-  try { const v = localStorage.getItem('amux_peek_hidden_tabs'); if (v !== null) return new Set(JSON.parse(v)); } catch(e) {}
+  try { const v = localStorage.getItem('amux_peek_hidden_tabs'); if (v !== null) return _honourPeekBoardHide(new Set(JSON.parse(v))); } catch(e) {}
   return new Set(['dictation', 'commits', 'git']);   // sensible default
 })();
 let peekTabOrder = (function() {
@@ -10878,7 +11808,7 @@ async function _loadPeekTabPrefs() {
     const saved = JSON.parse(value);
     const all = PEEK_TABS.map(t => t.id);
     if (!saved || !Array.isArray(saved.hidden) || !Array.isArray(saved.tab_order)) return;
-    peekHiddenTabs = new Set(saved.hidden.filter(id => all.includes(id)));
+    peekHiddenTabs = _honourPeekBoardHide(new Set(saved.hidden.filter(id => all.includes(id) || id === 'issues!')));
     peekTabOrder = [...new Set([
       ...saved.tab_order.filter(id => all.includes(id)),
       ...all.filter(id => !saved.tab_order.includes(id)),
@@ -10921,16 +11851,21 @@ function _applyPeekTabVisibility() {
   PEEK_TABS.forEach(t => {
     const el = document.getElementById('peek-tab-' + t.id);
     if (el) {
-      // Board is always shown, isolated workers included: it only views the
-      // worker's cards, it adds nothing to the raw CLI (Ethan, 2026-09-24).
+      // Board shows for isolated workers too unless the owner hides it: it only
+      // views the worker's cards, it adds nothing to the raw CLI (Ethan, 2026-09-24).
       const alwaysShown = PEEK_REQUIRED_TABS.has(t.id);
       // A type with no worktree has no Worktree tab to show.
-      const typeHides = t.id === 'git' && _peekType.worktree === 'unsupported';
+      // A chat worker's first tab is already its chat, so the companion Chat tab
+      // would be a second "Chat" beside it (owner screenshot, 2026-11-20).
+      const typeHides = (t.id === 'git' && _peekType.worktree === 'unsupported')
+        || (t.id === 'chat' && _primaryRenderer === 'chat')
+        || (t.id === 'intent' && !(peekSession && _peekIntentList().length));
       // Schedules are shown for isolated workers too: a schedule is owner
       // configuration and delivers into them (Ethan, 2026-09-26).
       el.style.display = !alwaysShown && (peekHiddenTabs.has(t.id) || typeHides) ? 'none' : '';
     }
   });
+  _peekIntentTabPaint();
 }
 _loadPeekTabPrefs();
 // Tab-customizer geometry beacon (AF-45). Ethan reported three times that the
@@ -11151,8 +12086,12 @@ function _renderPeekTabCustomizer() {
 }
 function togglePeekTabVisibility(id, show) {
   if (PEEK_REQUIRED_TABS.has(id)) show = true;
-  if (show) peekHiddenTabs.delete(id);
-  else { if (_peekTab === id) setPeekTab('terminal'); peekHiddenTabs.add(id); }
+  if (show) { peekHiddenTabs.delete(id); if (id === 'issues') peekHiddenTabs.delete('issues!'); }
+  else {
+    if (_peekTab === id) setPeekTab('terminal');
+    peekHiddenTabs.add(id);
+    if (id === 'issues') peekHiddenTabs.add('issues!');   // explicit owner hide (_honourPeekBoardHide)
+  }
   _savePeekTabPrefs(); _applyPeekTabVisibility();
 }
 
@@ -11231,7 +12170,7 @@ async function loadLayoutPreset(name, scope = 'global') {
     const all = PEEK_TABS.map(t => t.id);
     const saved = (p.tab_order || []).filter(id => all.includes(id));
     peekTabOrder = [...new Set([...saved, ...all.filter(id => !saved.includes(id))])];
-    peekHiddenTabs = new Set((p.hidden || []).filter(id => !PEEK_REQUIRED_TABS.has(id)));
+    peekHiddenTabs = _honourPeekBoardHide(new Set((p.hidden || []).filter(id => !PEEK_REQUIRED_TABS.has(id))));
     if (peekHiddenTabs.has(_peekTab)) setPeekTab('terminal');
     _savePeekTabPrefs();
     _applyPeekTabVisibility();
@@ -11382,7 +12321,7 @@ function _embedFitZoom() {
 const _EMBED_VIEW_EL = {
   sessions:'session-view', board:'board-view', groups:'groups-view', calendar:'calendar-view',
   scheduler:'scheduler-view', files:'files-view', logs:'logs-view',
-  messages:'messages-view', map:'map-view', metrics:'metrics-view', cost:'cost-view', scoreboard:'scoreboard-view',
+  messages:'messages-view', map:'map-view', metrics:'metrics-view', cost:'cost-view',
   torrents:'torrents-view', terminal:'terminal-view', browser:'browser-view', sql:'sql-view',
   graph:'graph-view', journal:'journal-view', habits:'habits-view', skills:'skills-view',
   draw:'draw-view'
@@ -12037,7 +12976,11 @@ function closeAddMenu() {
 // ── Describe what you want (Ethan, 2026-10-18) ──
 // One box: describe the outcome, and attach a recording or files if the
 // outcome lives in them. Everything else is a default under a closed
-// "Defaults and constraints" section, remembered in prefs (outcome_defaults).
+// "Defaults and constraints" section. Saved setups are presets (prefs key
+// outcome_presets): a preset holds every field of that section, picked from
+// the Preset selector (None = the built-in defaults) and saved only when
+// "Save as a preset" is ticked (owner, 2026-11-21, replacing "Remember these
+// as my defaults", which rewrote the defaults on every start).
 // The server (POST /api/outcome/plan) names the worker and picks the
 // directory and groups the fleet already uses for this work, reading the
 // text and the attachments (a recording is transcribed and the transcript
@@ -12072,89 +13015,686 @@ function _outcomePrompt(text, constraints, goal) {
     + ' Done when this outcome is achieved and verified.';
   return (goal ? '/goal ' : '') + body.slice(0, 4000);
 }
-async function _outcomeDefaults() {
-  let d = {};
-  try { d = JSON.parse(localStorage.getItem('amux_outcome_defaults') || '{}'); } catch (_) {}
-  try {
-    const r = await fetch(API + '/api/prefs?key=outcome_defaults', { headers: _authHeaders() });
-    if (r.ok) { const v = (await r.json()).value; if (v) d = JSON.parse(v); }
-  } catch (_) { /* offline: the cached copy stands */ }
+// The built-in defaults the "None" preset stands for.
+function _outcomeBaseDefaults() {
   return {
-    group: d.group ?? ((typeof activeTag === 'string' && activeTag) ? activeTag : ''),
-    dir: d.dir || '',
-    provider: d.provider || 'claude',
-    model: d.model || '',
-    isolated: d.isolated !== false,
-    constraints: d.constraints ?? _OUTCOME_DEFAULT_CONSTRAINTS,
+    group: (typeof activeTag === 'string' && activeTag) ? activeTag : '',
+    dir: '',
+    provider: 'claude',
+    model: '',
+    // Decided 2026-11-12 (docs/design/intent-first.md): routed and created
+    // workers are not isolated by default; isolation stays an explicit choice.
+    isolated: false,
+    constraints: _OUTCOME_DEFAULT_CONSTRAINTS,
   };
 }
+// Paths that start a worker without this dialog (Open in worker -> New
+// worker) use the preset the dialog opens on: the one last started with
+// (outcome_history.last_preset), or the built-in defaults.
+async function _outcomeDefaults() {
+  const last = (await _ocHistLoad()).last_preset;
+  if (!last) return _outcomeBaseDefaults();
+  const p = (await _outcomePresets()).find(x => x.name === last);
+  if (!p) { console.info('[outcome] last-used preset "' + last + '" is gone; using the built-in defaults'); return _outcomeBaseDefaults(); }
+  const { name: _n, ...cfg } = p;
+  return cfg;
+}
+const _OUTCOME_PRESET_FIELDS = ['group', 'dir', 'provider', 'model', 'isolated', 'constraints'];
+function _outcomePresetClean(p) {
+  const base = _outcomeBaseDefaults();
+  const out = { name: String(p.name || '').trim() };
+  for (const k of _OUTCOME_PRESET_FIELDS) out[k] = k === 'isolated' ? p[k] === true : (p[k] == null ? base[k] : String(p[k]));
+  return out;
+}
+async function _prefGet(key) {
+  const r = await fetch(API + '/api/prefs?key=' + encodeURIComponent(key), { headers: _authHeaders() });
+  if (!r.ok) throw new Error('prefs ' + r.status);
+  return (await r.json()).value || '';
+}
+// Presets live in prefs so every device sees them; localStorage is the
+// offline copy. The first load after this change carries the old remembered
+// defaults (outcome_defaults) over as a preset named "My defaults", so a
+// setup saved the old way is still one pick away. The old pref is not deleted.
+async function _outcomePresets() {
+  let list = null;
+  try { list = JSON.parse(localStorage.getItem('amux_outcome_presets') || 'null'); } catch (e) { console.warn('[outcome] cached presets unreadable', e); }
+  try {
+    const v = await _prefGet('outcome_presets');
+    if (v) list = JSON.parse(v);
+    else if (!list) {
+      let legacy = null;
+      try { const lv = await _prefGet('outcome_defaults'); legacy = lv ? JSON.parse(lv) : null; } catch (e) { console.warn('[outcome] old defaults unreadable on the server', e); }
+      if (!legacy) { try { legacy = JSON.parse(localStorage.getItem('amux_outcome_defaults') || 'null'); } catch (e) { console.warn('[outcome] cached old defaults unreadable', e); } }
+      const base = _outcomeBaseDefaults();
+      const differs = legacy && typeof legacy === 'object'
+        && _OUTCOME_PRESET_FIELDS.some(k => legacy[k] != null && legacy[k] !== '' && legacy[k] !== base[k] && !(k === 'isolated' && !legacy[k]));
+      list = differs ? [_outcomePresetClean({ ...legacy, name: 'My defaults' })] : [];
+      if (differs) {
+        console.info('[outcome] carried the remembered defaults over as preset "My defaults"');
+        await _outcomeSavePresets(list);
+        // They were what every start used, so the dialog opens on them.
+        await _ocHistEdit(h => { if (!h.last_preset) h.last_preset = 'My defaults'; });
+      }
+    }
+  } catch (e) { console.warn('[outcome] presets not read from the server; the cached copy stands', e); }
+  return Array.isArray(list) ? list.filter(p => p && p.name).map(_outcomePresetClean) : [];
+}
+// A save or delete is applied to the server's current list, so a preset another
+// device saved while this dialog was open is kept (and one it deleted stays gone).
+async function _outcomePresetsEdit(fn) {
+  let base = _outcomePresetList;
+  try {
+    const v = await _prefGet('outcome_presets');
+    if (v) base = JSON.parse(v).filter(p => p && p.name).map(_outcomePresetClean);
+  } catch (e) { console.warn('[outcome] presets not re-read before an edit; editing the cached copy', e); }
+  _outcomePresetList = fn(base);
+  return _outcomeSavePresets(_outcomePresetList);
+}
+async function _outcomeSavePresets(list) {
+  const val = JSON.stringify(list);
+  localStorage.setItem('amux_outcome_presets', val);
+  try {
+    const r = await fetch(API + '/api/prefs', { method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}),
+      body: JSON.stringify({ key: 'outcome_presets', value: val }) });
+    return r.ok || _isLocallyQueued(r);
+  } catch (_) { return false; }
+}
+// A preset saved without a name is named for what it holds: the folder's
+// last part and the group, made unique so it never replaces another preset.
+function _outcomePresetAutoName(cfg, taken) {
+  const parts = [(cfg.dir || '').replace(/\/+$/, '').split('/').pop(), cfg.group].filter(Boolean);
+  const base = parts.join(' · ') || 'Preset';
+  let name = base, n = 2;
+  while (taken.has(name)) name = base + ' ' + n++;
+  return name;
+}
+let _outcomePresetList = [];
+
+// ── Describe what you want: shared history (owner, 2026-11-21) ──
+// The working directories, groups and models used here, kept in prefs
+// (outcome_history) so every device sees one list, and x on an entry removes
+// it everywhere. The fleet's own directories and groups are offered too; x on
+// one of those hides it until it is used again. last_preset is the preset the
+// dialog opens on.
+const _OC_HIST_CAP = 25;
+function _ocHistEmpty() { return { dirs: [], groups: [], models: {}, hidden: { dirs: [], groups: [] }, last_preset: '' }; }
+function _ocHistClean(h) {
+  const out = _ocHistEmpty();
+  h = (h && typeof h === 'object') ? h : {};
+  const list = (a, cap) => Array.isArray(a)
+    ? [...new Set(a.filter(x => typeof x === 'string').map(x => x.trim()).filter(Boolean))].slice(0, cap) : [];
+  out.dirs = list(h.dirs, _OC_HIST_CAP);
+  out.groups = list(h.groups, _OC_HIST_CAP);
+  if (h.models && typeof h.models === 'object') {
+    for (const [p, l] of Object.entries(h.models)) { const v = list(l, _OC_HIST_CAP); if (v.length) out.models[p] = v; }
+  }
+  out.hidden.dirs = list(h.hidden && h.hidden.dirs, _OC_HIDDEN_CAP);
+  out.hidden.groups = list(h.hidden && h.hidden.groups, _OC_HIDDEN_CAP);
+  out.last_preset = typeof h.last_preset === 'string' ? h.last_preset : '';
+  return out;
+}
+let _ocHist = _ocHistEmpty();
+async function _ocHistRead() {
+  const v = await _prefGet('outcome_history');
+  return v ? _ocHistClean(JSON.parse(v)) : null;
+}
+async function _ocHistLoad() {
+  let h = null;
+  try { h = JSON.parse(localStorage.getItem('amux_outcome_history') || 'null'); } catch (e) { console.warn('[outcome] cached history unreadable', e); }
+  try { const s = await _ocHistRead(); if (s) h = s; } catch (e) { console.warn('[outcome] history not read from the server; the cached copy stands', e); }
+  _ocHist = _ocHistClean(h);
+  return _ocHist;
+}
+// One edit at a time (queued here), each applied to the server's current copy,
+// so neither two quick edits nor two devices undo each other's entries.
+let _ocHistQueue = Promise.resolve();
+function _ocHistEdit(fn) {
+  const run = _ocHistQueue.then(() => _ocHistEditNow(fn));
+  _ocHistQueue = run.catch(() => false);
+  return run;
+}
+async function _ocHistEditNow(fn) {
+  let base = _ocHistClean(_ocHist);
+  try { const s = await _ocHistRead(); if (s) base = s; } catch (e) { console.warn('[outcome] history not re-read before an edit; editing the cached copy', e); }
+  fn(base);
+  _ocHist = _ocHistClean(base);
+  const val = JSON.stringify(_ocHist);
+  localStorage.setItem('amux_outcome_history', val);
+  try {
+    const r = await fetch(API + '/api/prefs', { method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}),
+      body: JSON.stringify({ key: 'outcome_history', value: val }) });
+    return r.ok || _isLocallyQueued(r);
+  } catch (e) { console.warn('[outcome] history not saved on the server', e); return false; }
+}
+const _ocFront = (list, v, cap) => [v, ...list.filter(x => x !== v)].slice(0, cap || _OC_HIST_CAP);
+const _OC_HIDDEN_CAP = 500;
+// What a start teaches the lists: its directory, groups and model go to the
+// top (and are unhidden), and its preset is the one the dialog opens on next.
+function _ocHistRecord(cfg, preset) {
+  return _ocHistEdit(h => {
+    if (cfg.dir) { h.dirs = _ocFront(h.dirs, cfg.dir); h.hidden.dirs = h.hidden.dirs.filter(x => x !== cfg.dir); }
+    for (const g of _createGroupsFrom(cfg.group || '').reverse()) {
+      h.groups = _ocFront(h.groups, g); h.hidden.groups = h.hidden.groups.filter(x => x !== g);
+    }
+    if (cfg.model) h.models[cfg.provider || 'claude'] = _ocFront(h.models[cfg.provider || 'claude'] || [], cfg.model);
+    h.last_preset = preset || '';
+  });
+}
+function _ocFleet(field) {
+  const out = [];
+  for (const s of (sessions || [])) {
+    if (field === 'dirs' && s.dir) out.push(s.dir);
+    if (field === 'groups') out.push(...(s.tags || []));
+  }
+  return [...new Set(out)].sort();
+}
+// History first (most recent first), then the fleet's, minus what was removed.
+function _ocKnown(field) {
+  const hidden = new Set(_ocHist.hidden[field] || []);
+  const hist = _ocHist[field] || [];
+  return [...hist, ..._ocFleet(field).filter(x => !hist.includes(x) && !hidden.has(x))];
+}
+async function _ocForget(kind, value) {
+  const field = kind === 'dir' ? 'dirs' : kind === 'group' ? 'groups' : 'models';
+  const prov = document.getElementById('outcome-provider')?.value || 'claude';
+  const saved = await _ocHistEdit(h => {
+    if (field === 'models') { h.models[prov] = (h.models[prov] || []).filter(x => x !== value); return; }
+    h[field] = h[field].filter(x => x !== value);
+    if (_ocFleet(field).includes(value)) h.hidden[field] = _ocFront(h.hidden[field], value, _OC_HIDDEN_CAP);
+  });
+  if (kind === 'group') _ocGroupsRender(); else _ocComboShow(kind, true);
+  if (!saved) showToast('Removed here; the server did not save it');
+}
+
+// ── One combobox for the working directory and the model ──
+// Type freely, or pick from the list under the field: Recent (x removes it on
+// every device), then suggestions for what is typed (folders on the amux
+// host, or the provider's models from /api/models).
+const _ocCombo = { dir: { items: [], active: -1, seq: 0, timer: null }, model: { items: [], active: -1, seq: 0, timer: null } };
+let _ocModels = { provider: '', list: [], error: '' };
+function _ocComboHtml(kind, id, value, placeholder, extra) {
+  return `<div class="oc-combo" data-kind="${kind}"><div class="oc-combo-row">`
+    + `<input id="${id}" class="input" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off" spellcheck="false"`
+    + ` role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="${id}-list"`
+    + ` onfocus="_ocComboShow('${kind}')" oninput="_ocComboShow('${kind}')" onkeydown="_ocComboKey(event,'${kind}')" onblur="_ocComboBlur('${kind}')">`
+    + (extra || '') + `</div><div class="oc-combo-list" id="${id}-list" role="listbox" hidden></div></div>`;
+}
+const _ocComboInput = kind => document.getElementById(kind === 'dir' ? 'outcome-dir' : 'outcome-model');
+function _ocComboRender(kind, sections) {
+  const inp = _ocComboInput(kind);
+  const list = document.getElementById(inp.id + '-list');
+  const st = _ocCombo[kind];
+  st.items = [];
+  let html = '';
+  for (const sec of sections) {
+    if (!sec.items.length) continue;
+    html += '<div class="oc-combo-head">' + esc(sec.title) + '</div>';
+    for (const it of sec.items) {
+      const i = st.items.push(it.value) - 1;
+      html += '<div class="oc-opt" role="option" id="' + inp.id + '-opt-' + i + '" data-i="' + i + '">'
+        + '<span class="oc-opt-label">' + esc(it.label || it.value) + '</span>'
+        + (it.note ? '<span class="oc-opt-note">' + esc(it.note) + '</span>' : '')
+        + (sec.removable ? '<button type="button" class="oc-x" data-forget="' + i + '" tabindex="-1" aria-label="Remove ' + esc(it.value) + ' from the list">&times;</button>' : '')
+        + '</div>';
+    }
+  }
+  if (!html && sections.note) html = '<div class="oc-combo-head">' + esc(sections.note) + '</div>';
+  st.active = -1;
+  list.innerHTML = html;
+  const was = !list.hidden;
+  const open = !!html && document.activeElement === inp;
+  list.hidden = !open;
+  inp.setAttribute('aria-expanded', open ? 'true' : 'false');
+  inp.removeAttribute('aria-activedescendant');
+  if (!open) return;
+  // On a phone the list opens in the dialog's flow, as tall as the screen
+  // allows: the field moves to the dialog's top once, when the list opens, so
+  // the list has the room below it (owner, 2026-11-22). Elsewhere, and on
+  // later renders while typing, only make sure the list shows.
+  if (!was && matchMedia('(max-width: 600px)').matches) inp.closest('.outcome-field').scrollIntoView({ block: 'start' });
+  else list.scrollIntoView({ block: 'nearest' });
+}
+function _ocComboShow(kind, keep) {
+  const inp = _ocComboInput(kind);
+  if (!inp) return;
+  if (keep && document.activeElement !== inp) return;
+  const q = inp.value.trim(), ql = q.toLowerCase();
+  const match = v => !ql || v.toLowerCase().includes(ql);
+  const st = _ocCombo[kind];
+  if (kind === 'dir') {
+    const recent = _ocKnown('dirs').filter(v => v !== q && match(v)).slice(0, 12).map(value => ({ value }));
+    _ocComboRender(kind, [{ title: 'Recent', items: recent, removable: true }]);
+    clearTimeout(st.timer);
+    if (q.length < 2 || !/^[~/]/.test(q)) return;
+    const seq = ++st.seq;
+    st.timer = setTimeout(async () => {
+      let found = [];
+      try {
+        const r = await fetch(API + '/api/autocomplete/dir?q=' + encodeURIComponent(q), { headers: _authHeaders() });
+        if (r.ok) found = await r.json();
+      } catch (e) { console.warn('[outcome] folder suggestions unavailable', e); }
+      if (seq !== st.seq || !inp.isConnected || inp.value.trim() !== q) return;
+      const seen = new Set(recent.map(x => x.value));
+      const folders = (Array.isArray(found) ? found : []).map(f => String(f).replace(/\/+$/, '') || '/')
+        .filter(f => !seen.has(f) && f !== q).slice(0, 12).map(value => ({ value }));
+      _ocComboRender(kind, [{ title: 'Recent', items: recent, removable: true }, { title: 'Folders', items: folders }]);
+    }, 150);
+    return;
+  }
+  const prov = document.getElementById('outcome-provider')?.value || 'claude';
+  const recentIds = (_ocHist.models[prov] || []).filter(v => v !== q && match(v));
+  const seen = new Set(recentIds);
+  const catalog = _ocModels.provider === prov ? _ocModels.list : [];
+  const models = catalog.filter(m => !seen.has(m.id) && m.id !== q && (match(m.id) || match(m.model_type || '')))
+    .map(m => ({ value: m.id, note: _modelTypeLabel(m.model_type) }));
+  const secs = [{ title: 'Recent', items: recentIds.map(value => ({ value })), removable: true },
+    { title: 'Models', items: models }];
+  secs.note = _ocModels.provider !== prov ? 'Loading models…' : (_ocModels.error ? 'Model list unavailable: type a model id' : '');
+  _ocComboRender(kind, secs);
+}
+function _ocComboPick(kind, value) {
+  const inp = _ocComboInput(kind);
+  inp.value = value;
+  const list = document.getElementById(inp.id + '-list');
+  list.hidden = true;
+  inp.setAttribute('aria-expanded', 'false');
+  if (kind === 'dir') _ocBrowseClose();
+}
+function _ocComboKey(e, kind) {
+  const inp = _ocComboInput(kind), st = _ocCombo[kind];
+  const list = document.getElementById(inp.id + '-list');
+  if (list.hidden || !st.items.length) return;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    st.active = (st.active + (e.key === 'ArrowDown' ? 1 : -1) + st.items.length) % st.items.length;
+    list.querySelectorAll('.oc-opt').forEach((o, i) => o.classList.toggle('active', i === st.active));
+    const id = inp.id + '-opt-' + st.active;
+    inp.setAttribute('aria-activedescendant', id);
+    document.getElementById(id)?.scrollIntoView({ block: 'nearest' });
+  } else if (e.key === 'Enter' && st.active >= 0 && !(e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    _ocComboPick(kind, st.items[st.active]);
+  } else if (e.key === 'Escape') {
+    e.preventDefault(); e.stopPropagation();
+    list.hidden = true; inp.setAttribute('aria-expanded', 'false');
+  }
+}
+function _ocComboBlur(kind) {
+  setTimeout(() => {
+    const inp = _ocComboInput(kind);
+    if (!inp || document.activeElement === inp) return;
+    const list = document.getElementById(inp.id + '-list');
+    if (list) list.hidden = true;
+    inp.setAttribute('aria-expanded', 'false');
+  }, 150);
+}
+// mousedown, not click: picking must land before the input's blur hides the list.
+function _ocComboMouse(e) {
+  const list = e.target.closest('.oc-combo-list');
+  if (!list) return;
+  e.preventDefault();
+  const kind = list.closest('.oc-combo').dataset.kind;
+  const st = _ocCombo[kind];
+  const x = e.target.closest('[data-forget]');
+  if (x) { _ocForget(kind, st.items[+x.dataset.forget]); return; }
+  const opt = e.target.closest('.oc-opt');
+  if (opt) _ocComboPick(kind, st.items[+opt.dataset.i]);
+}
+async function _ocLoadModels(prov) {
+  _ocModels = { provider: '', list: [], error: '' };
+  try {
+    const list = await _workerModelsFor(prov);
+    if ((document.getElementById('outcome-provider')?.value || 'claude') !== prov) return;
+    _ocModels = { provider: prov, list, error: '' };
+  } catch (e) {
+    console.warn('[outcome] model list unavailable for ' + prov, e);
+    if ((document.getElementById('outcome-provider')?.value || 'claude') !== prov) return;
+    _ocModels = { provider: prov, list: [], error: String(e) };
+  }
+  _ocComboShow('model', true);
+}
+function _ocProviderChanged() {
+  const prov = document.getElementById('outcome-provider').value;
+  const m = document.getElementById('outcome-model');
+  // A model id belongs to one provider: it does not carry over.
+  if (m) { m.value = ''; m.placeholder = prov === 'claude' ? (window._AMUX_DEFAULT_MODEL || 'Default') : 'Provider default'; }
+  _ocLoadModels(prov);
+}
+// Providers a worker can run on, from the catalog; the three CLIs amux
+// launches are always offered, so a catalog outage cannot hide them.
+async function _ocProviders() {
+  const base = ['claude', 'codex', 'gemini'];
+  try {
+    const all = await _loadModelCatalog();
+    const extra = [...new Set(all.filter(m => m.worker_selectable && m.provider !== 'muse').map(m => m.provider))].filter(p => !base.includes(p));
+    return base.concat(extra);
+  } catch (e) { console.warn('[outcome] provider list from the built-in three; the catalog is unavailable', e); return base; }
+}
+
+// ── Groups: pills, with the known groups in one row to tap ──
+let _ocGroupsSel = [];
+function _ocGroupsSet(str) { _ocGroupsSel = _createGroupsFrom(str || ''); _ocGroupsRender(); }
+// Text still in the box when the dialog closes counts, as if committed.
+function _ocGroupsValue() { _ocGroupsCommit(); return _ocGroupsSel.join(','); }
+function _ocGroupsRender() {
+  const box = document.getElementById('outcome-groups');
+  const row = document.getElementById('outcome-group-known');
+  if (!box || !row) return;
+  box.querySelectorAll('.oc-pill').forEach(p => p.remove());
+  const input = document.getElementById('outcome-group');
+  for (const g of _ocGroupsSel) {
+    const pill = document.createElement('span');
+    pill.className = 'oc-pill';
+    pill.dataset.group = g;
+    pill.innerHTML = '<span>' + esc(g) + '</span><button type="button" class="oc-x" data-unpick="' + esc(g) + '" aria-label="Remove group ' + esc(g) + '">&times;</button>';
+    box.insertBefore(pill, input);
+  }
+  if (input) input.placeholder = _ocGroupsSel.length ? 'Add more' : 'Add groups, comma-separated';
+  const known = _ocKnown('groups').filter(g => !_ocGroupsSel.includes(g));
+  row.innerHTML = known.map(g => '<span class="oc-chip" data-group="' + esc(g) + '">'
+    + '<button type="button" class="oc-chip-add" data-pick="' + esc(g) + '">+ ' + esc(g) + '</button>'
+    + '<button type="button" class="oc-x" data-forget-group="' + esc(g) + '" aria-label="Remove ' + esc(g) + ' from the list">&times;</button></span>').join('');
+  row.hidden = !known.length;
+}
+function _ocGroupsCommit() {
+  const input = document.getElementById('outcome-group');
+  if (!input || !input.value.trim()) return;
+  const add = _createGroupsFrom(input.value);
+  input.value = '';
+  _ocGroupsSel = [...new Set([..._ocGroupsSel, ...add])];
+  _ocGroupsRender();
+}
+function _ocGroupKey(e) {
+  if (e.key === ',' || (e.key === 'Enter' && !(e.metaKey || e.ctrlKey))) {
+    if (!e.target.value.trim()) { if (e.key === ',') e.preventDefault(); return; }
+    e.preventDefault(); _ocGroupsCommit();
+  } else if (e.key === 'Backspace' && !e.target.value && _ocGroupsSel.length) {
+    _ocGroupsSel.pop(); _ocGroupsRender();
+  }
+}
+// Pressing a pill's or chip's button must not blur the group box first: the
+// blur commits typed text and redraws the row, removing the button before its
+// click lands.
+function _ocGroupsPress(e) { if (e.target.closest('button')) e.preventDefault(); }
+function _ocGroupsClick(e) {
+  const t = e.target.closest('[data-unpick],[data-pick],[data-forget-group]');
+  if (!t) { if (e.currentTarget.id === 'outcome-groups') document.getElementById('outcome-group')?.focus(); return; }
+  if (t.dataset.unpick != null) { _ocGroupsSel = _ocGroupsSel.filter(g => g !== t.dataset.unpick); _ocGroupsRender(); }
+  else if (t.dataset.pick != null) { _ocGroupsSel = [...new Set([..._ocGroupsSel, t.dataset.pick])]; _ocGroupsRender(); }
+  else _ocForget('group', t.dataset.forgetGroup);
+}
+
+// ── Browse: the amux host's folders, on any device ──
+// The worker runs on the amux host, so its folders are what to pick from,
+// whether this page is on that Mac or on a phone. The rows are the Files
+// view's (_feBuildRow); only folders are listed.
+let _ocBrowsePath = '', _ocBrowseSeq = 0;
+async function _ocBrowseOpen(path) {
+  const box = document.getElementById('outcome-browse');
+  if (!box) return;
+  const seq = ++_ocBrowseSeq;   // a slower earlier listing must not replace a later one
+  box.hidden = false;
+  document.getElementById('outcome-browse-btn')?.setAttribute('aria-expanded', 'true');
+  const want = path || document.getElementById('outcome-dir')?.value.trim() || '~';
+  const crumbs = box.querySelector('.oc-browse-crumbs'), rows = box.querySelector('.oc-browse-rows');
+  rows.innerHTML = '';
+  rows.appendChild(_feEmptyRow('Loading…'));
+  let d = null;
+  try {
+    const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(want), { headers: _authHeaders() });
+    d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+  } catch (e) {
+    if (seq !== _ocBrowseSeq) return;
+    console.warn('[outcome] cannot list ' + want, e);
+    rows.innerHTML = '';
+    rows.appendChild(_feEmptyRow('Cannot open ' + want + ': ' + (e.message || e)));
+    if (want !== '~' && !path) return _ocBrowseOpen('~');
+    return;
+  }
+  if (seq !== _ocBrowseSeq) return;
+  _ocBrowsePath = d.path;
+  crumbs.innerHTML = _feCrumbsHtml(d.path, '_ocBrowseOpen');
+  rows.innerHTML = '';
+  if (d.parent && d.parent !== d.path) rows.appendChild(_feParentRow(() => _ocBrowseOpen(d.parent)));
+  const dirs = (d.entries || []).filter(e => e.type === 'dir' && !e.name.startsWith('.'));
+  for (const e of dirs) rows.appendChild(_feBuildRow(e, d.path, 0, '', { openDir: _ocBrowseOpen, openFile: () => {} }));
+  if (!dirs.length) rows.appendChild(_feEmptyRow('No folders here'));
+  box.querySelector('.oc-browse-use').textContent = 'Use ' + (d.path.split('/').pop() || d.path);
+}
+function _ocBrowseToggle() {
+  const box = document.getElementById('outcome-browse');
+  if (box && !box.hidden) { _ocBrowseClose(); return; }
+  _ocBrowseOpen();
+}
+function _ocBrowseClose() {
+  const box = document.getElementById('outcome-browse');
+  if (box) box.hidden = true;
+  document.getElementById('outcome-browse-btn')?.setAttribute('aria-expanded', 'false');
+}
+function _ocBrowseUse() {
+  if (!_ocBrowsePath) return;
+  document.getElementById('outcome-dir').value = _ocBrowsePath;
+  _ocBrowseClose();
+}
+
+function _outcomePresetPick(name) {
+  const p = _outcomePresetList.find(x => x.name === name) || _outcomeBaseDefaults();
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+  const provSel = document.getElementById('outcome-provider');
+  const prov = p.provider || 'claude';
+  if (provSel && ![...provSel.options].some(o => o.value === prov)) provSel.add(new Option(prov, prov));
+  const provChanged = provSel && provSel.value !== prov;
+  set('outcome-provider', prov);
+  if (provChanged || _ocModels.provider !== prov) _ocLoadModels(prov);
+  set('outcome-dir', p.dir); set('outcome-model', p.model); set('outcome-constraints', p.constraints);
+  const m = document.getElementById('outcome-model');
+  if (m) m.placeholder = prov === 'claude' ? (window._AMUX_DEFAULT_MODEL || 'Default') : 'Provider default';
+  set('outcome-group', '');
+  _ocGroupsSet(p.group);
+  const iso = document.getElementById('outcome-isolated'); if (iso) iso.checked = !!p.isolated;
+  set('outcome-preset-name', name || '');
+  const del = document.getElementById('outcome-preset-delete');
+  if (del) { del.hidden = !name; del.textContent = 'Delete'; delete del.dataset.armed; }
+}
+function _outcomePresetSaveToggle() {
+  const on = !!document.getElementById('outcome-save-preset')?.checked;
+  const f = document.getElementById('outcome-preset-name-field');
+  if (f) f.hidden = !on;
+  if (on) document.getElementById('outcome-preset-name')?.focus();
+}
+// Delete asks twice on the same button (a second dialog would close this one).
+async function _outcomePresetDelete(btn) {
+  const sel = document.getElementById('outcome-preset');
+  const name = sel?.value;
+  if (!name) return;
+  if (!btn.dataset.armed) { btn.dataset.armed = '1'; btn.textContent = 'Delete "' + name + '"?'; return; }
+  const saved = await _outcomePresetsEdit(list => list.filter(p => p.name !== name));
+  sel.querySelector('option[value="' + CSS.escape(name) + '"]')?.remove();
+  sel.value = '';
+  _outcomePresetPick('');
+  showToast(saved ? 'Preset "' + name + '" deleted' : 'Preset "' + name + '" deleted here; the server did not save it');
+}
 async function openOutcome() {
-  const d = await _outcomeDefaults();
+  // Presets first: carrying old defaults over also sets the preset to open on.
+  const providersLoad = _ocProviders();
+  _outcomePresetList = await _outcomePresets();
+  const [, providers] = await Promise.all([_ocHistLoad(), providersLoad]);
+  // Opens on the preset last started with (shared across devices); None when
+  // that was None or the preset is gone.
+  const last = _outcomePresetList.some(p => p.name === _ocHist.last_preset) ? _ocHist.last_preset : '';
+  const d = _outcomeBaseDefaults();
   const draft = localStorage.getItem('amux_outcome_draft') || '';
-  const groups = [...new Set((sessions || []).flatMap(s => s.tags || []))].sort();
-  const chk = (id, on, label) => `<label class="outcome-check"><input type="checkbox" id="${id}"${on ? ' checked' : ''}> ${label}</label>`;
-  const html = `<div class="outcome-form">
+  const chk = (id, on, label, extra) => `<label class="outcome-check"><input type="checkbox" id="${id}"${on ? ' checked' : ''}${extra || ''}> ${label}</label>`;
+  const html = `<div class="outcome-form" onpaste="_outcomePaste(event)">
     <textarea id="outcome-text" class="input outcome-text" rows="4"
       placeholder="e.g. Add a dark mode toggle to settings and ship it"
       onkeydown="if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)){event.preventDefault();_modalClose(true)}">${esc(draft)}</textarea>
     <div class="outcome-files">
-      <button type="button" class="btn" onclick="document.getElementById('outcome-file').click()">&#x1F4CE; Attach a recording or files</button>
+      <button type="button" class="btn" title="Or paste an image (Ctrl/Cmd+V)" onclick="document.getElementById('outcome-file').click()">&#x1F4CE; Attach a recording or files</button>
       <input type="file" id="outcome-file" multiple hidden onchange="_outcomeAttach(this.files);this.value=''">
-      <div id="outcome-file-list" class="ui-help" aria-live="polite"></div>
+      <div id="outcome-file-list" class="peek-attach-bar oc-file-list" aria-live="polite"></div>
     </div>
     <details class="outcome-settings">
-      <summary>Defaults and constraints</summary>
-      <label class="outcome-field">Group<input id="outcome-group" class="input" list="outcome-group-list" value="${esc(d.group)}" placeholder="none"></label>
-      <datalist id="outcome-group-list">${groups.map(g => '<option value="' + esc(g) + '"></option>').join('')}</datalist>
-      <label class="outcome-field">Working directory<input id="outcome-dir" class="input" value="${esc(d.dir)}" placeholder="Chosen from your description"></label>
-      <label class="outcome-field">Provider<select id="outcome-provider" class="input">
-        ${['claude', 'codex', 'gemini'].map(p => `<option value="${p}"${p === d.provider ? ' selected' : ''}>${p}</option>`).join('')}
-      </select></label>
-      <label class="outcome-field">Model<input id="outcome-model" class="input" value="${esc(d.model)}" placeholder="${esc(window._AMUX_DEFAULT_MODEL || 'default')}"></label>
+      <summary>Defaults and constraints${last ? '<span class="oc-summary-preset">· ' + esc(last) + '</span>' : ''}</summary>
+      <label class="outcome-field">Preset<span class="outcome-preset-row">
+        <select id="outcome-preset" class="input" onchange="_outcomePresetPick(this.value)">
+          <option value="">None</option>
+          ${_outcomePresetList.map(p => '<option value="' + esc(p.name) + '">' + esc(p.name) + '</option>').join('')}
+        </select>
+        <button type="button" class="btn" id="outcome-preset-delete" hidden onclick="_outcomePresetDelete(this)">Delete</button>
+      </span></label>
+      <div class="outcome-field"><label for="outcome-group">Groups</label>
+        <div class="oc-pills" id="outcome-groups" onclick="_ocGroupsClick(event)" onmousedown="_ocGroupsPress(event)">
+          <input id="outcome-group" class="oc-pill-input" autocomplete="off" placeholder="Add groups, comma-separated" onkeydown="_ocGroupKey(event)" onblur="_ocGroupsCommit()">
+        </div>
+        <div class="oc-chip-row" id="outcome-group-known" aria-label="Known groups" onclick="_ocGroupsClick(event)" onmousedown="_ocGroupsPress(event)" hidden></div>
+      </div>
+      <div class="outcome-field"><label for="outcome-dir">Working directory</label>
+        ${_ocComboHtml('dir', 'outcome-dir', d.dir, 'Chosen from your description',
+          '<button type="button" class="btn" id="outcome-browse-btn" aria-expanded="false" aria-controls="outcome-browse" onclick="_ocBrowseToggle()">Browse</button>')}
+        <div class="oc-browse" id="outcome-browse" hidden>
+          <div class="oc-browse-crumbs"></div>
+          <div class="oc-browse-rows"></div>
+          <div class="oc-browse-btns"><button type="button" class="btn primary oc-browse-use" onclick="_ocBrowseUse()">Use this folder</button>
+            <button type="button" class="btn" onclick="_ocBrowseClose()">Close</button></div>
+        </div>
+      </div>
+      <div class="outcome-row2">
+        <label class="outcome-field">Provider<select id="outcome-provider" class="input" onchange="_ocProviderChanged()">
+          ${providers.map(p => `<option value="${esc(p)}"${p === d.provider ? ' selected' : ''}>${esc(p)}</option>`).join('')}
+        </select></label>
+        <div class="outcome-field"><label for="outcome-model">Model</label>
+          ${_ocComboHtml('model', 'outcome-model', d.model, window._AMUX_DEFAULT_MODEL || 'Default')}
+        </div>
+      </div>
       <label class="outcome-field">Constraints<textarea id="outcome-constraints" class="input" rows="3">${esc(d.constraints)}</textarea></label>
       ${chk('outcome-isolated', d.isolated, 'Isolated (no board or harness prompts)')}
-      ${chk('outcome-remember', true, 'Remember these as my defaults')}
+      ${chk('outcome-save-preset', false, 'Save as a preset', ' onchange="_outcomePresetSaveToggle()"')}
+      <label class="outcome-field" id="outcome-preset-name-field" hidden>Preset name (optional)<input id="outcome-preset-name" class="input" placeholder="Named from the folder and group"></label>
     </details>
   </div>`;
+  _outcomeFiles.forEach(_outcomeForget);
   _outcomeFiles = [];
   const shown = showFormModal('Describe what you want', html, 'Start');
+  document.querySelectorAll('#modal-msg .oc-combo-list').forEach(l => l.addEventListener('mousedown', _ocComboMouse));
+  document.getElementById('outcome-preset').value = last;
+  _outcomePresetPick(last);
   setTimeout(() => document.getElementById('outcome-text')?.focus(), 30);
   const ok = await shown;
   const v = (id) => (document.getElementById(id)?.value || '').trim();
   const on = (id) => !!document.getElementById(id)?.checked;
   const text = v('outcome-text');
   if (text) localStorage.setItem('amux_outcome_draft', text);   // kept until a worker exists
-  if (!ok || !text) return;
-  const cfg = { group: v('outcome-group'), dir: v('outcome-dir'), provider: v('outcome-provider') || 'claude',
+  const cfg = { group: _ocGroupsValue(), dir: v('outcome-dir'), provider: v('outcome-provider') || 'claude',
     model: v('outcome-model'), isolated: on('outcome-isolated'),
     constraints: document.getElementById('outcome-constraints')?.value ?? d.constraints };
+  let picked = v('outcome-preset');
+  // Saving a preset does not need a description: Start with an empty box
+  // saves the preset and starts nothing.
+  if (ok && on('outcome-save-preset')) {
+    const typed = v('outcome-preset-name');
+    const name = typed || _outcomePresetAutoName({ ...cfg, group: _createGroupsFrom(cfg.group).join(', ') }, new Set(_outcomePresetList.map(p => p.name)));
+    const replaced = _outcomePresetList.some(p => p.name === name);
+    const saved = await _outcomePresetsEdit(list => list.filter(p => p.name !== name).concat([_outcomePresetClean({ ...cfg, name })]));
+    showToast((saved ? '' : 'Saved on this device only: ') + 'Preset "' + name + '" ' + (replaced ? 'updated' : 'saved'));
+    picked = name;
+  }
+  if (!ok) return;
+  if (!text) { if (on('outcome-save-preset')) _ocHistRecord(cfg, picked); return; }
   const files = await _outcomeFilesReady();
   if (files === null) { showToast('Not started: an attachment did not upload. Your description is kept.'); return; }
-  if (on('outcome-remember')) {
-    const val = JSON.stringify(cfg);
-    localStorage.setItem('amux_outcome_defaults', val);
-    fetch(API + '/api/prefs', { method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}),
-      body: JSON.stringify({ key: 'outcome_defaults', value: val }) }).catch(() => {});
-  }
+  _ocHistRecord(cfg, picked);
   await _outcomeStart(text, cfg, files);
 }
 // Attachments upload as soon as they are picked (the same upload API voice
-// notes use), so Start only waits for the ones still in flight.
+// notes use), so Start only waits for the ones still in flight. Each shows as
+// the composer's attachment chip (.peek-attach-chip): an image shows itself, a
+// video its first frame under a play mark, anything else its file icon, and
+// the thumbnail opens the shared preview (_attachPreviewOpen).
 let _outcomeFiles = [];
 function _outcomeAttach(list) {
   for (const file of list || []) {
-    const it = { name: file.name, path: '', failed: false };
+    const kind = _attachKind(file.name, file.type);
+    const it = { name: file.name, file, kind, path: '', failed: false, thumb: '' };
+    if (kind === 'image' && file.size < 10 * 1024 * 1024) it.thumb = URL.createObjectURL(file);
+    if (kind === 'video') _videoFirstFrame(file).then(src => { it.thumb = src; it.frame = src ? 'captured' : 'none'; _outcomeRenderFiles(); });
     it.done = _cvUploadVoice(file).then(p => { it.path = p; it.failed = !p; _outcomeRenderFiles(); return p; });
     _outcomeFiles.push(it);
   }
   _outcomeRenderFiles();
 }
+// The first frame of a local video as a small JPEG data URL, or '' when the
+// browser cannot decode it (the chip then shows the play mark alone).
+function _videoFirstFrame(file) {
+  return new Promise(resolve => {
+    const url = URL.createObjectURL(file), v = document.createElement('video');
+    let settled = false;
+    const done = src => {
+      if (settled) return; settled = true;
+      clearTimeout(timer); v.removeAttribute('src'); v.load(); URL.revokeObjectURL(url);
+      if (window._clientDebug) window._clientDebug('outcome-video-frame', { verdict: src ? 'captured' : 'no_frame', measured: true, n_considered: 1 });
+      resolve(src);
+    };
+    const timer = setTimeout(() => done(''), 8000);
+    v.muted = true; v.playsInline = true; v.preload = 'auto';
+    v.onloadeddata = () => { v.currentTime = Math.min(0.1, (v.duration || 0) / 2); };
+    v.onseeked = () => {
+      try {
+        const w = 160, h = Math.round(w * (v.videoHeight || 9) / (v.videoWidth || 16)) || 90;
+        const c = document.createElement('canvas'); c.width = w; c.height = h;
+        c.getContext('2d').drawImage(v, 0, 0, w, h);
+        done(c.toDataURL('image/jpeg', 0.75));
+      } catch (_) { done(''); }
+    };
+    v.onerror = () => done('');
+    v.src = url;
+  });
+}
+// Ctrl/Cmd-V of an image (a screenshot) anywhere in the dialog attaches it
+// like a picked file. Clipboard images all arrive as "image.png", so each
+// gets a unique name. A text paste is left to the field.
+function _outcomePaste(e) {
+  const files = [...(e.clipboardData?.items || [])].filter(i => i.kind === 'file')
+    .map(i => i.getAsFile()).filter(Boolean)
+    .map(f => /^image\//.test(f.type) ? new File([f], _pasteImageName(f), { type: f.type }) : f);
+  if (!files.length) return;
+  e.preventDefault();
+  _outcomeAttach(files);
+  if (window._clientDebug) window._clientDebug('outcome-paste-attach', { verdict: 'attached', measured: true, n_considered: files.length });
+}
+function _outcomeThumb(f) {
+  if (f.kind === 'video') return '<span class="oc-video-thumb">' + (f.thumb ? '<img src="' + esc(f.thumb) + '" alt="">' : '')
+    + '<span class="oc-play" aria-hidden="true">&#x25B6;</span></span>';
+  if (f.kind === 'image' && f.thumb) return '<img src="' + esc(f.thumb) + '" alt="">';
+  return '<span class="chip-icon">' + (f.kind === 'audio' ? '&#x1F3B5;' : _fileIcon(f.name)) + '</span>';
+}
+// The preview shows the device's copy. It is given no path, because its
+// "Open in the file viewer" would open beneath this dialog.
+function _outcomePreview(i, opener) {
+  const f = _outcomeFiles[i];
+  if (f) _attachPreviewOpen({ name: f.name, file: f.file, path: '', state: f.failed ? 'upload failed' : f.path ? 'uploaded' : 'uploading' }, opener);
+}
+function _outcomeForget(f) {
+  if (f && f.thumb && f.thumb.startsWith('blob:')) URL.revokeObjectURL(f.thumb);
+}
+function _outcomeRemoveFile(i) {
+  _outcomeForget(_outcomeFiles[i]);
+  _outcomeFiles.splice(i, 1);
+  _outcomeRenderFiles();
+}
 function _outcomeRenderFiles() {
   const el = document.getElementById('outcome-file-list');
   if (!el) return;
-  el.innerHTML = _outcomeFiles.map((f, i) => '<span class="outcome-file">' + esc(f.name)
-    + (f.failed ? ' (did not upload)' : f.path ? '' : ' (uploading)')
-    + ' <button type="button" class="btn" aria-label="Remove ' + esc(f.name) + '" onclick="_outcomeFiles.splice(' + i + ',1);_outcomeRenderFiles()">&times;</button></span>').join(' ');
+  el.classList.toggle('has-files', _outcomeFiles.length > 0);
+  el.innerHTML = _outcomeFiles.map((f, i) => {
+    const status = f.failed ? '<span class="chip-err" title="did not upload">!</span><span class="oc-file-state">did not upload</span>'
+      : f.path ? '<span class="oc-file-ok" aria-label="uploaded">&#x2713;</span>' : '<span class="oc-file-state">uploading</span>';
+    return '<div class="peek-attach-chip outcome-file oc-kind-' + f.kind + (f.failed ? ' failed' : f.path ? '' : ' uploading') + '">'
+      + _attachThumbButton(_outcomeThumb(f), f.name, '_outcomePreview(' + i + ', this)')
+      + '<span class="chip-name" title="' + esc(f.name) + '">' + esc(f.name) + '</span>' + status
+      + '<button type="button" class="chip-remove" aria-label="Remove ' + esc(f.name) + '" title="Remove" onclick="_outcomeRemoveFile(' + i + ')">&times;</button></div>';
+  }).join('');
 }
 async function _outcomeFilesReady() {
   const paths = await Promise.all(_outcomeFiles.map(f => f.done));
@@ -12171,10 +13711,39 @@ async function _outcomePlan(text, files) {
   } catch (_) {}
   return null;
 }
+// One routing decision (POST /api/intent/plan): answer it, send it to the
+// worker that already owns this work, or create one. A failed router call
+// falls back to the create plan above, so the dialog never stalls.
+async function _intentRoute(text, extra) {
+  try {
+    const r = await fetch(API + '/api/intent/plan', { method: 'POST',
+      headers: _authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify(Object.assign({ text }, extra || {})) });
+    if (r.ok) return await r.json();
+  } catch (e) { console.warn('[intent] routing unavailable; the create plan stands', e); }
+  return null;
+}
 async function _outcomeStart(text, cfg, files) {
   files = files || [];
   showToast('Reading your description' + (files.length ? ' and attachments' : '') + '...');
-  const plan = await _outcomePlan(text, files);
+  const route = files.length || cfg.dir ? null : await _intentRoute(text);
+  if (route?.action === 'answer' && route.answer) {
+    localStorage.removeItem('amux_outcome_draft');
+    showFormModal(route.title || 'Answer', '<div class="outcome-answer">' + esc(route.answer).replace(/\n/g, '<br>') + '</div>', 'Done');
+    return '';
+  }
+  if (route?.action === 'send' && route.worker) {
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(route.worker) + '/send', { method: 'POST',
+      headers: _authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify({ text, record_history: true }) }).catch(() => null);
+    if (r && (r.ok || _isLocallyQueued(r))) {
+      localStorage.removeItem('amux_outcome_draft');
+      showToast('Sent to ' + route.worker + (route.why ? ': ' + route.why : ''));
+      return route.worker;
+    }
+    showToast('Not sent to ' + route.worker + '. Your description is kept.');
+    return;
+  }
+  const spec = route?.action === 'create' ? (route.create || {}) : null;
+  const plan = spec ? { name: spec.name, dir: spec.dir, desc: spec.desc, groups: spec.groups } : await _outcomePlan(text, files);
   const name = plan?.name || _outcomeName(text, new Set((sessions || []).map(s => s.name)));
   const dir = cfg.dir || plan?.dir || (window._cloudEmail ? '/root' : '');
   const context = (plan?.attachments || []).map(a => a.transcript
@@ -12185,6 +13754,8 @@ async function _outcomeStart(text, cfg, files) {
     desc: plan?.desc || _outcomeDesc(text), prompt: _outcomePrompt(ask, cfg.constraints || '', false) };
   if (cfg.provider !== 'claude') body.provider = cfg.provider;
   if (cfg.model) body.model = cfg.model;
+  else if (spec?.model) body.model = spec.model;
+  if (spec?.worker_type === 'chat' && cfg.provider === 'claude') body.worker_type = 'chat';
   const groups = _createGroupsFrom(cfg.group || (plan?.groups || []).join(','));
   if (groups.length) body.tags = groups;
   if (cfg.isolated) body.isolated = true;
@@ -12211,6 +13782,747 @@ async function _outcomeStart(text, cfg, files) {
   await fetchSessions();
   document.querySelector('[data-session="' + CSS.escape(name) + '"]')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   return name;
+}
+
+// ── Chat (docs/design/intent-first.md) ──
+// One tab in the normal tab bar. Chat is a composer and the requests it
+// started; each is a Messages thread (o:<id>) the server routed to a worker,
+// and the person reads results, not workers. Below the requests, the same
+// screen shows what is coming up (calendar, reminders, to-dos and goals) and
+// ideas: views over board cards, the scheduler and the calendar. An open
+// conversation shows only itself. For a new person (the `home` choice is
+// intent) the other tabs are hidden until "Everything else". Words
+// on this path avoid the machinery (worker, session, model, card, board,
+// terminal): a worker is "a helper".
+const _home = { pane: 'chat', open: null, outcomes: [], ideas: null, goals: null, timer: null, sending: false, detail: null };
+const _HOME_VIEWS = { home: 'chat' };
+function _homeEnter(view) {
+  if (document.body.classList.contains('intent-simple')) {
+    // A first-run tour of workers that opened before Chat did is closed:
+    // Chat is this person's first run.
+    if (document.getElementById('wt-overlay')?.classList.contains('open') && typeof window._wtDismiss === 'function') window._wtDismiss();
+    document.getElementById('cloud-offer')?.remove();
+  }
+  document.documentElement.classList.remove('boot-home-pending');
+  _home.pane = 'chat';
+  _homeFit();
+  _home.extrasAt = 0;
+  _homeRefresh();
+  _homeEnsureTimer();
+}
+// Chat fills the screen below the tab bar, its composer at the bottom (the
+// same measurement Messages uses, _cvFit).
+function _homeFit() {
+  const view = document.getElementById('home-view'); if (!view) return;
+  requestAnimationFrame(() => view.style.setProperty('--mv-top', Math.max(0, view.getBoundingClientRect().top) + 'px'));
+}
+window.addEventListener('resize', () => { if (activeView === 'home') _homeFit(); });
+// Simple mode (a new person): only Chat in the tab bar.
+// "Everything else" shows every tab for this visit.
+function _homeSimple(on) { document.body.classList.toggle('intent-simple', !!on); }
+function _homeShowEverything() { _homeSimple(false); switchView('sessions'); }
+// Every 2s while an open request is still being worked on, else every 4s.
+function _homeEnsureTimer() {
+  if (_home.timer) return;
+  let tick = 0;
+  // A tab the browser reports hidden still refreshes, every 16s: an embedded
+  // or automated browser can report hidden while a person is looking at it
+  // (the first Dana run sat on "Working on it" for minutes over a finished
+  // answer). Coming back to the tab refreshes at once.
+  _home.timer = setInterval(() => {
+    if (!_HOME_VIEWS[activeView]) return;
+    tick++;
+    const hurry = _home.open && _home.openStatus !== 'ready';
+    if (document.hidden ? tick % 8 === 0 : (hurry || tick % 2 === 0)) _homeRefresh();
+  }, 2000);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && _HOME_VIEWS[activeView]) _homeRefresh(); });
+function _homeLeave() {
+  if (_home.timer) { clearInterval(_home.timer); _home.timer = null; }
+}
+// Go to Chat; 'ideas' or 'goals' closes any open conversation and scrolls
+// to that section of the list.
+function _homeSetPane(p) {
+  if (activeView !== 'home') switchView('home');
+  if (p === 'chat') return;
+  if (_home.open) _homeBack();
+  _homeExtrasLoad(true).then(() => document.getElementById(p === 'ideas' ? 'home-ideas' : 'home-goals')?.scrollIntoView({ block: 'start' }));
+}
+async function _homeJson(path, opts) {
+  // Bounded: one request that hangs (a busy server) must not freeze the
+  // screen; the next poll asks again. A POST gets longer, it may create a helper.
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), opts && opts.method === 'POST' ? 120000 : 15000);
+  try {
+    const r = await fetch(API + path, Object.assign({ headers: _authHeaders({'Content-Type': 'application/json'}), signal: ctl.signal }, opts || {}));
+    let v = null; try { v = await r.json(); } catch (e) { console.warn('[home] not JSON from ' + path, e); }
+    return { ok: r.ok, status: r.status, v: v || {} };
+  } catch (_) { return { ok: false, status: 0, v: {} }; } finally { clearTimeout(t); }
+}
+async function _homeRefresh() {
+  if (_home.pane === 'chat') {
+    // A send in flight owns the screen (its "Getting started" line); a
+    // refresh drew the list over it and the answer never opened by itself.
+    if (_home.detailsFor || _home.sending) return;
+    if (_home.open) return _homeLoadOutcome(_home.open, true);
+    const r = await _homeJson('/api/intent/outcomes');
+    // Chat lists what the person asked for. A goal's own thread (marked
+    // item_kind goal) lives under Goals, behind its Open button: listed here,
+    // the pass's goals buried the request she had just made (final uc5).
+    if (r.ok) _home.outcomes = (r.v.outcomes || []).filter(o => o.item_kind !== 'goal');
+    if (r.ok) _home.owner = r.v.owner || '';
+    _homeRenderList();
+    _homeExtrasLoad(false);
+  }
+}
+// What is coming up and ideas, below the requests: every 20 seconds at most
+// (the request list polls every few seconds), or at once when forced.
+async function _homeExtrasLoad(force) {
+  if (!force && Date.now() - (_home.extrasAt || 0) < 20000) return;
+  _home.extrasAt = Date.now();
+  await Promise.all([_homeIdeasLoad(), _homeGoalsLoad()]);
+}
+async function _homeIdeasLoad() {
+  const r = await _homeJson('/api/intent/ideas');
+  _home.ideas = r.ok ? (r.v.ideas || []) : [];
+  _homeRenderIdeas(r.ok ? r.v : null);
+}
+async function _homeGoalsLoad() {
+  const [r, rm, ev] = await Promise.all([_homeJson('/api/intent/goals'), _homeJson('/api/intent/reminders'), _homeJson('/api/cal-events')]);
+  _home.goals = r.ok ? (r.v.goals || []) : [];
+  _home.todos = r.ok ? (r.v.todos || []) : [];
+  _home.reminders = rm.ok ? (rm.v.reminders || []) : [];
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const week = new Date(today.getTime() + 8 * 86400000);
+  _home.events = (ev.ok ? (Array.isArray(ev.v) ? ev.v : ev.v.events || []) : [])
+    .filter(e => { const d = _homeLocalDate(e.start); return !isNaN(d) && d >= today && d < week; })
+    .sort((a, b) => String(a.start).localeCompare(String(b.start)));
+  _homeRenderGoals(r.ok ? r.v : null);
+}
+function _homeAgo(ms) {
+  if (!ms) return '';
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.round(s / 60) + ' min ago';
+  if (s < 86400) return Math.round(s / 3600) + ' h ago';
+  return Math.round(s / 86400) + ' d ago';
+}
+function _homeStatusLabel(st) {
+  return st === 'ready' ? 'Ready' : 'Working on it';
+}
+// Small line icons for the Intent screen's rows and section heads.
+const _HOME_ICO = {
+  mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>',
+  cal: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18"/>',
+  bulb: '<path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 00-4 10.5c.7.7 1 1.5 1 2.5h6c0-1 .3-1.8 1-2.5A6 6 0 0012 3z"/>',
+  target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+  chat: '<path d="M21 12a8 8 0 01-11.6 7.1L4 20l1-4.6A8 8 0 1121 12z"/>',
+  layers: '<path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/>',
+  doc: '<path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>',
+  check: '<path d="M5 12l5 5 9-10"/>',
+  play: '<path d="M8 5v14l11-7z"/>',
+};
+function _homeIco(name, cls) {
+  return '<span class="' + (cls || 'home-ico') + '" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + (_HOME_ICO[name] || '') + '</svg></span>';
+}
+// A section of the Intent screen: an icon, its title, and "See all" when
+// there is more than it shows.
+function _homeSectionHead(ico, title, more, extra) {
+  return '<div class="home-sec-head">' + _homeIco(ico, 'home-sec-ico') + '<span class="home-pane-title">' + esc(title) + '</span>'
+    + (extra || '') + (more ? '<button type="button" class="home-link home-see-all" onclick="' + more.onclick + '">' + esc(more.label) + '</button>' : '') + '</div>';
+}
+// Tapping a row shows its details and its other actions, and hides them again.
+// Which rows are open survives the screen's refresh.
+function _homeToggleRow(ev, el) {
+  if (ev.target.closest('button, a, input, textarea')) return;
+  const open = el.classList.toggle('open');
+  el.setAttribute('aria-expanded', open ? 'true' : 'false');
+  const key = el.dataset.idea || el.dataset.goal;
+  _home.openRows = _home.openRows || new Set();
+  if (key) open ? _home.openRows.add(key) : _home.openRows.delete(key);
+}
+function _homeRowOpen(id) { return !!(_home.openRows && _home.openRows.has(id)); }
+function _homeRenderHello() {
+  const g = document.getElementById('home-greet'); const c = document.getElementById('home-counts');
+  if (!g || !c) return;
+  const h = new Date().getHours();
+  g.textContent = (h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening') + (_home.owner ? ', ' + _home.owner : '') + '.';
+  const n = (k, one, many) => k + ' ' + (k === 1 ? one : many);
+  const parts = [];
+  if (_home.ideas) parts.push(n(_home.ideas.length, 'idea', 'ideas'));
+  if (_home.goals) parts.push(n(_home.goals.length, 'active goal', 'active goals'));
+  parts.push(n((_home.outcomes || []).length, 'request', 'requests'));
+  c.textContent = parts.join(' · ');
+}
+function _homeRenderList() {
+  const el = document.getElementById('home-chat-body');
+  if (!el) return;
+  _homeRenderHello();
+  const list = _home.outcomes || [];
+  if (!list.length) {
+    el.innerHTML = '<div class="home-empty"><div class="home-empty-title" onclick="document.getElementById(\'home-input\')?.focus()">What can I help with?</div>'
+      + '<div class="home-empty-sub">Ask for a reminder, a plan, or something from your inbox or calendar. '
+      + 'You will see the result here, and nothing goes to anyone without your OK.</div>'
+      + '<div class="home-examples">' + ['Remind me to call the dentist on Friday', 'Plan dinners this week', 'Find anything I need to sign in my inbox']
+        .map(t => '<button type="button" class="btn home-example" onclick="_homeFill(this.textContent)">' + esc(t) + '</button>').join('') + '</div></div>';
+    return;
+  }
+  // The newest three, so the screen reads at a glance; "See all" for the rest.
+  const shown = _home.outcomesAll ? list : list.slice(0, 3);
+  const more = list.length > 3 ? { label: _home.outcomesAll ? 'Show fewer' : 'See all ' + list.length, onclick: '_home.outcomesAll=!_home.outcomesAll;_homeRenderList()' } : null;
+  el.innerHTML = '<div class="home-sec">' + _homeSectionHead('layers', 'Your requests', more)
+    + '<div class="home-list" role="list">' + shown.map(o => {
+      const ready = o.status === 'ready';
+      const snip = _homePlainReply(o.latest_reply || '').replace(/[#*_`>]/g, '').slice(0, 140);
+      return '<button type="button" role="listitem" class="home-row home-item" data-outcome="' + esc(o.id) + '" onclick="_homeOpenOutcome(this.dataset.outcome)">'
+        + _homeIco('chat') + '<span class="home-item-text"><span class="home-row-title">' + esc(o.title || 'Request') + '</span>'
+        + '<span class="home-row-snip">' + esc(snip || _homeAgo(o.updated_ms)) + '</span></span>'
+        + (ready ? '<span class="home-pill ready">' + _homeStatusLabel(o.status) + '</span>'
+          : '<span class="home-ring" role="img" aria-label="' + _homeStatusLabel(o.status) + '" title="' + _homeStatusLabel(o.status) + '"></span>')
+        + '</button>';
+    }).join('') + '</div></div>';
+}
+// An answer, with each ```draft block (To:, Subject:, blank line, body) shown
+// as a card the person sends from their own mail: amux never sends it.
+function _homeAnswerHtml(text) {
+  const drafts = [];
+  const md = text.replace(/```draft\s*\n([\s\S]*?)```/g, (m, d) => { drafts.push(d); return '\n\nHOMEDRAFT' + (drafts.length - 1) + '\n\n'; });
+  let h = renderMarkdown(md, '');
+  drafts.forEach((d, i) => {
+    // [ \t]*, not \s*: an empty To: line must not take the Subject line.
+    const to = (d.match(/^To:[ \t]*(.*)$/mi) || [])[1] || '';
+    const subject = (d.match(/^Subject:[ \t]*(.*)$/mi) || [])[1] || '';
+    const body = d.replace(/^(To|Subject|Cc):.*\n?/gmi, '').replace(/^\s*\n/, '').trim();
+    const href = 'mailto:' + encodeURIComponent(to.trim()) + '?subject=' + encodeURIComponent(subject.trim()) + '&body=' + encodeURIComponent(body);
+    const card = '<div class="home-draft"><div class="home-draft-head">Draft email, not sent</div>'
+      + (to ? '<div class="home-draft-meta">To: ' + esc(to) + '</div>' : '') + (subject ? '<div class="home-draft-meta">Subject: ' + esc(subject) + '</div>' : '')
+      + '<div class="home-card-actions"><a class="btn primary" href="' + esc(href) + '" onclick="showToast(\'Opening your mail app with this draft\')">Open in Mail</a>'
+      + '<button type="button" class="btn" data-copy="' + esc(body) + '" onclick="navigator.clipboard?.writeText(this.dataset.copy).then(() => showToast(\'Copied\'))">Copy</button></div>'
+      + '<div class="home-draft-body">' + esc(body).replace(/\n/g, '<br>') + '</div></div>';
+    h = h.replace(new RegExp('<p>\\s*HOMEDRAFT' + i + '\\s*</p>|HOMEDRAFT' + i), card);
+  });
+  return h;
+}
+// A goal's helper starts its answer with a STATUS: line (the status line
+// Goals reads); on screen it is just the first sentence.
+function _homePlainReply(t) {
+  return String(t || '').replace(/^\s*\**STATUS:\**\s*/i, '').replace(/^\s*\**ASK:\**\s*/gim, '');
+}
+// A calendar date as the family's own day: "2026-11-19" parsed by Date is
+// UTC midnight, the evening before in New York (picture day showed Wednesday).
+function _homeLocalDate(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || ''));
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : new Date(s);
+}
+// A helper's name as words, the way the receipt says it: family-admin -> Family admin.
+function _homePlainName(n) {
+  const w = String(n || '').replace(/[-_]+/g, ' ');
+  return w.charAt(0).toUpperCase() + w.slice(1);
+}
+function _homeFill(t) {
+  const i = document.getElementById('home-input');
+  if (i) { i.value = t; i.focus(); _homeGrow(i); }
+}
+function _homeGrow(i) {
+  i.style.height = 'auto';
+  i.style.height = Math.min(i.scrollHeight, 160) + 'px';
+}
+function _homeOpenOutcome(id) {
+  _home.detailsFor = null;
+  _home.open = id;
+  _home.detail = null;
+  _home.openStatus = 'working';
+  _homeEnsureTimer();
+  _homeLoadOutcome(id, false);
+}
+function _homeBack() {
+  _home.detailsFor = null;
+  _home.open = null;
+  const i = document.getElementById('home-input');
+  if (i) i.placeholder = 'Ask for anything: a reminder, a plan, something from your inbox';
+  _home.detail = null;
+  _homeRefresh();
+}
+async function _homeLoadOutcome(id, quiet) {
+  const r = await _homeJson('/api/intent/outcomes/' + encodeURIComponent(id));
+  if (_home.open !== id) return;
+  if (!r.ok) { if (!quiet) showToast('That conversation could not be opened.'); _homeBack(); return; }
+  const sig = JSON.stringify([r.v.thread?.length, r.v.status, r.v.worker, r.v.thread?.[r.v.thread.length - 1]?.id, Math.floor(Date.now() / 60000)]);
+  if (quiet && _home.detail === sig) return;
+  _home.detail = sig;
+  _home.openStatus = r.v.status;
+  // Reminders its helper set while answering this conversation: shown in it,
+  // so a promised reminder can be seen saved (asked for in four runs).
+  const rm = await _homeJson('/api/intent/reminders');
+  // One that names its conversation belongs to that one alone; one that names
+  // none falls back to the turns its helper set it in.
+  const rms = (rm.ok ? rm.v.reminders || [] : []).filter(x => !x.conv || x.conv === 'o:' + id);
+  r.v.reminders = rms.filter(x => x.conv).concat(_homeTurnReminders(r.v.thread || [], rms.filter(x => !x.conv), r.v.worker, Date.now()));
+  // Emails its helper wrote in these turns, held by the email API for her OK.
+  const ap = await _homeJson('/api/email/approvals');
+  const now = Date.now();
+  // A draft that names its conversation (amux email send --conv) belongs to
+  // that one alone; one that names none falls back to its helper's turns.
+  const held = (ap.ok ? ap.v.pending || [] : []).filter(p => !(p.preview || {}).conv || p.preview.conv === 'o:' + id)
+    .map(p => Object.assign({}, p, { worker: p.session, created: (now - (p.age_s || 0) * 1000) / 1000 }));
+  r.v.drafts = held.filter(p => p.preview && p.preview.conv).concat(_homeTurnReminders(r.v.thread || [], held.filter(p => !(p.preview || {}).conv), r.v.worker, now));
+  if (_home.open !== id) return;
+  _homeRenderOutcome(r.v);
+}
+// The reminders a helper set inside this conversation's own turns: from each
+// request of hers to the helper's answer (plus a little slack). A helper that
+// also runs goals sets reminders for them too, and "since the first request"
+// pinned all 13 household reminders onto the camp thread (walkthrough recording).
+// When a reminder comes: its next time, and for a repeating one how often
+// ("Sun Nov 15, 9:00 AM, then daily at 09:00").
+function _homeReminderWhen(x) {
+  const next = new Date(x.when).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  if (!x.every) return next;
+  const e = String(x.every);
+  return next + ', then ' + (/^\s*[\d*]/.test(e) ? 'on a repeating schedule' : e.replace(/^every\s+/i, 'every '));
+}
+function _homeTurnReminders(thread, reminders, worker, now) {
+  const ms = (t) => Number(t) * (Number(t) < 1e12 ? 1000 : 1);
+  const turns = [];
+  thread.forEach((p, n) => {
+    if (!String(p.author_key || '').startsWith('person:')) return;
+    const reply = thread.slice(n + 1).find(q => String(q.author_key || '').startsWith('worker:'));
+    turns.push([ms(p.ts) - 5000, reply ? ms(reply.ts) + 15000 : now]);
+  });
+  return reminders.filter(x => x.worker === worker && turns.some(([a, b]) => ms(x.created) >= a && ms(x.created) <= b));
+}
+// Her to-dos: cards on her own board tagged todo (POST /api/intent/todos from
+// a helper). Done closes the card through the board's own update.
+function _homeTodosHtml() {
+  const t = _home.todos || [];
+  if (!t.length) return '';
+  return '<div class="home-pane-head"><span class="home-pane-title home-sub-title">To-dos</span></div><div class="home-list">'
+    + t.map(x => '<div class="home-card"><div class="home-card-top"><span class="home-card-title">' + esc(x.title) + '</span>'
+      + '<button type="button" class="btn" onclick="_homeTodoDone(\'' + esc(x.id) + '\',this)">Done</button></div>'
+      + (x.due ? '<div class="home-card-from">Due ' + esc(_homeLocalDate(x.due).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })) + '</div>' : '')
+      + '</div>').join('') + '</div>';
+}
+async function _homeTodoDone(id, btn) {
+  if (btn) btn.disabled = true;
+  const r = await _homeJson('/api/board/' + encodeURIComponent(id), { method: 'PATCH',
+    body: JSON.stringify({ status: 'done', evidence: 'none: marked done in Goals', gate_ack: true }) });
+  if (!r.ok) { showToast('Not marked done: ' + (r.v.error || 'please try again')); if (btn) btn.disabled = false; return; }
+  showToast('Done');
+  _homeExtrasLoad(true);
+}
+// A held email (POST /api/email/send from her helper, held for her OK), with
+// the approvals banner's own Send and Discard (_apprApprove/_apprReject).
+const _homeApprOpts = { plain: true, after: () => { _home.detail = null; _homeRefresh(); } };
+function _homeHeldDraftHtml(p) {
+  const pv = p.preview || {};
+  const body = (p.review && p.review.body_complete && typeof p.review.body === 'string') ? p.review.body : (pv.body || '');
+  const id = esc(p.id);
+  return '<div class="home-draft" data-approval="' + id + '"><div class="home-draft-head">Draft email, waiting for your OK</div>'
+    + '<div class="home-draft-meta">To: ' + esc(pv.to || '') + '</div><div class="home-draft-meta">Subject: ' + esc(pv.subject || '') + '</div>'
+    + '<div class="home-draft-body">' + esc(body).replace(/\n/g, '<br>') + '</div>'
+    + '<div class="home-card-actions"><button type="button" class="btn primary" onclick="_apprApprove(\'' + id + '\',this,_homeApprOpts)">Send email</button>'
+    + '<button type="button" class="btn" onclick="_apprReject(\'' + id + '\',this,_homeApprOpts)">Discard</button>'
+    + '<button type="button" class="btn" onclick="_homeCopyDraft(this)">Copy</button></div></div>';
+}
+function _homeCopyDraft(btn) {
+  const d = btn.closest('.home-draft');
+  const text = Array.from(d.querySelectorAll('.home-draft-meta, .home-draft-body')).map(n => n.innerText).join('\n\n');
+  _copyTextWithToast(text, 'Copied');
+}
+// A helper still working: a post in the same shape, its body the dots.
+function _homeTypingPost(name, words, note) {
+  return _cvPostHtml({ id: 'typing', author_key: 'worker:', author_name: name, body: '', ts: Date.now() }, false, true,
+    { plain: true, from: 'typing', name, body: '<span class="home-typing" aria-label="' + esc(words) + '">' + esc(words)
+      + '<span>.</span><span>.</span><span>.</span>' + esc(note) + '</span>' });
+}
+function _homeRenderOutcome(o) {
+  const el = document.getElementById('home-chat-body');
+  if (!el) return;
+  // The Messages thread view's own post (_cvPostHtml), plain: her name is
+  // "You", a helper's is its plain name, and a helper's answer keeps Chat's
+  // reading of drafts and dates (_homeAnswerHtml).
+  const helper = o.worker ? _homePlainName(o.worker) : 'amux';
+  const posts = (o.thread || []).map(p => {
+    const mine = String(p.author_key || '').startsWith('person:');
+    return _cvPostHtml(p, false, true, { plain: true, from: mine ? 'you' : 'helper', name: mine ? 'You' : helper,
+      body: mine ? undefined : _homeAnswerHtml(_homePlainReply(String(p.body || ''))) });
+  }).join('');
+  const working = o.status !== 'ready';
+  const canChange = o.worker && o.action !== 'answer';
+  // How long the newest request has been worked on, so a long wait reads as
+  // progress rather than a frozen screen.
+  const askedAt = [...(o.thread || [])].reverse().find(p => String(p.author_key || '').startsWith('person:'))?.ts || 0;
+  const mins = askedAt ? Math.floor((Date.now() - askedAt) / 60000) : 0;
+  const waitNote = mins >= 1 ? ' · ' + mins + ' min' + (mins >= 2 ? '. Reading email and calendar can take a few minutes.' : '') : '';
+  el.innerHTML = '<div class="home-thread">'
+    + '<div class="home-thread-head"><button type="button" class="btn home-back" onclick="_homeBack()" aria-label="Back to all requests">&#x2039; All</button>'
+    + '<span class="home-thread-title">' + esc(o.title || 'Request') + '</span></div>'
+    + '<div class="home-receipt" id="home-receipt">' + esc(working ? (o.receipt || '') : String(o.receipt || '').replace(/ is on it$/, ' answered'))
+    + (canChange ? ' · <button type="button" class="home-link" onclick="_homeChange(\'' + esc(o.id) + '\')">Change</button>' : '')
+    + (o.worker ? ' · <button type="button" class="home-link" onclick="_homeDetails(\'' + esc(o.id) + '\')">Details</button>' : '')
+    + '</div>'
+    + '<div class="home-msgs" id="home-msgs">' + posts
+    // Below the request that asked for them, not above it (walkthrough).
+    + (o.reminders || []).map(x => '<div class="home-reminder">&#x23F0; Reminder set: ' + esc(x.title) + ' · '
+      + esc(_homeReminderWhen(x)) + '</div>').join('')
+    + (o.drafts || []).map(_homeHeldDraftHtml).join('')
+    + (working ? _homeTypingPost(helper, 'Working on it', waitNote) : '')
+    + '</div></div>';
+  // Land on the START of the newest answer: a long one opened at its bottom
+  // on a phone, hiding its first line (where the result is).
+  const replies = el.querySelectorAll('.cv-post[data-from="helper"]:not(:has(.home-typing))');
+  const newest = replies[replies.length - 1];
+  // Scrolled inside Chat's own pane: scrollIntoView moved the whole page and
+  // pushed the tab bar off the top of a phone (walkthrough).
+  const pane = el.closest('.home-main');
+  const head = el.querySelector('.home-thread-head');
+  if (pane && working) pane.scrollTop = pane.scrollHeight;
+  else if (pane && newest) pane.scrollTop = Math.max(0, newest.offsetTop - pane.offsetTop - (head ? head.offsetHeight : 0) - 8);
+  const i = document.getElementById('home-input');
+  if (i) i.placeholder = 'Reply or ask a follow-up';
+}
+// Details: what the helper looked at and set up for this request, read from
+// its own tool calls (the emails it opened, the searches it ran, the
+// calendar, the reminders), shown inside Home. Each email opens in place, so
+// a person can check the answer against the source. The full workspace is a
+// small link at the end, for whoever wants the machinery.
+async function _homeDetails(id) {
+  const el = document.getElementById('home-chat-body');
+  if (!el) return;
+  _home.detailsFor = id;
+  el.innerHTML = '<div class="home-thread"><div class="home-thread-head"><button type="button" class="btn home-back" onclick="_homeCloseDetails()" aria-label="Back to the conversation">&#x2039; Back</button>'
+    + '<span class="home-thread-title">What it looked at</span></div><div class="home-empty-sub">Loading...</div></div>';
+  const o = (await _homeJson('/api/intent/outcomes/' + encodeURIComponent(id))).v;
+  const w = o.worker;
+  const ch = w ? (await _homeJson('/api/sessions/' + encodeURIComponent(w) + '/chat?limit=120')).v : {};
+  const msgs = ch.messages || [];
+  // The turns that belong to this request: from a delivered post naming o:<id>
+  // up to the next delivery for a different thread.
+  const key = "o:" + id;
+  let mine = false;
+  const mails = new Set(), searches = new Set(), wakes = [];
+  let calendar = false;
+  for (const m of msgs) {
+    if (m.role === 'user') { mine = String(m.text || '').includes(key) || (mine && !/amux post 'o:/.test(String(m.text || ''))); continue; }
+    if (!mine) continue;
+    for (const t of m.tool_calls || []) {
+      let cmd = '';
+      try { cmd = JSON.parse(t.args || '{}').command || ''; } catch (e) { cmd = String(t.args || ''); }
+      for (const x of cmd.matchAll(/api\/email\/message\/([^'"\s;&|)]+)/g)) {
+        let mid = x[1]; try { mid = decodeURIComponent(mid); } catch (e) { console.warn('[home] id not decodable', e); }
+        mails.add(mid.replace(/^</, '').replace(/>$/, ''));
+      }
+      for (const x of cmd.matchAll(/api\/email\/search\?q=([^&'"\s]+)/g)) { try { searches.add(decodeURIComponent(x[1].replace(/\+/g, ' '))); } catch (e) { searches.add(x[1]); } }
+      if (/api\/cal-events/.test(cmd)) calendar = true;
+      for (const x of cmd.matchAll(/amux wake "?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/g)) wakes.push(x[1]);
+    }
+  }
+  if (_home.detailsFor !== id) return;
+  const fetched = await Promise.all([...mails].slice(0, 12).map(mid => _homeJson('/api/email/message/' + encodeURIComponent(mid)).then(r => r.ok ? r.v : null)));
+  if (_home.detailsFor !== id) return;
+  const fmtWhen = (s) => { const d = new Date(s); return isNaN(d) ? s : d.toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); };
+  const mailHtml = fetched.filter(Boolean).map(m => '<details class="home-mail"><summary><b>' + esc(m.subject || '(no subject)') + '</b><br><span class="ui-help">'
+    + esc(String(m.from || '').replace(/<[^>]*>/, '').trim()) + ' · ' + esc(fmtWhen(m.date || '')) + '</span></summary>'
+    + '<div class="home-mail-body">' + esc(String(m.body || m.snippet || '')).replace(/\n/g, '<br>') + '</div></details>').join('');
+  const parts = [];
+  if (mailHtml) parts.push('<div class="home-pane-head"><span class="home-pane-title">Emails it read</span></div>' + mailHtml);
+  if (searches.size) parts.push('<div class="home-pane-head"><span class="home-pane-title">It searched your email for</span></div><div class="home-card-body">' + [...searches].map(q => '"' + esc(q) + '"').join(', ') + '</div>');
+  if (calendar) parts.push('<div class="home-pane-head"><span class="home-pane-title">Your calendar</span></div><div class="home-card-body">It checked your calendar.</div>');
+  if (wakes.length) parts.push('<div class="home-pane-head"><span class="home-pane-title">Reminders it set</span></div><div class="home-card-body">' + [...new Set(wakes)].map(x => esc(fmtWhen(x))).join('<br>') + '</div>');
+  if (!parts.length) parts.push('<div class="home-empty-sub">' + (o.status === 'ready'
+    ? 'It answered without opening your email or calendar.'
+    : 'Still working. The emails and calendar it looks at show up here as it goes.') + '</div>');
+  el.innerHTML = '<div class="home-thread"><div class="home-thread-head"><button type="button" class="btn home-back" onclick="_homeCloseDetails()" aria-label="Back to the conversation">&#x2039; Back</button>'
+    + '<span class="home-thread-title">What it looked at</span></div>' + parts.join('')
+    + (w ? '<div class="home-workspace-link"><button type="button" class="home-link" onclick="_homeShowWork(\'' + esc(w) + '\')">See everything behind this</button></div>' : '') + '</div>';
+}
+function _homeCloseDetails() {
+  _home.detailsFor = null;
+  _home.detail = null;
+  if (_home.open) _homeLoadOutcome(_home.open, false); else _homeRefresh();
+}
+function _homeShowWork(worker) {
+  _homeLeave();
+  switchView('sessions');
+  setTimeout(() => openPeek(worker), 50);
+}
+async function _homeSend() {
+  const i = document.getElementById('home-input');
+  const text = (i?.value || '').trim();
+  if (!text || _home.sending) return;
+  _home.sending = true;
+  const btn = document.getElementById('home-send');
+  if (btn) { btn.disabled = true; btn.setAttribute('aria-busy', 'true'); }
+  const body = { text };
+  if (_home.open) body.outcome = _home.open;
+  if (!_home.open) {
+    const el = document.getElementById('home-chat-body');
+    if (el) el.innerHTML = '<div class="home-thread"><div class="home-msgs">'
+      + _cvPostHtml({ id: 'pending', author_key: 'person:owner', author_name: 'You', body: text, ts: Date.now() }, false, true, { plain: true, from: 'you', name: 'You' })
+      + _homeTypingPost('amux', 'Getting started', '') + '</div></div>';
+  }
+  const r = await _homeJson('/api/intent/outcomes', { method: 'POST', body: JSON.stringify(body) });
+  _home.sending = false;
+  if (btn) { btn.disabled = false; btn.removeAttribute('aria-busy'); }
+  if (!r.ok) { showToast('Not sent: ' + (r.v.error || 'please try again') + '. Your message is kept.'); _homeRefresh(); return; }
+  if (i) { i.value = ''; _homeGrow(i); }
+  const id = r.v.outcome?.id;
+  if (id) _homeOpenOutcome(id);
+}
+async function _homeChange(id) {
+  const r = await _homeJson('/api/intent/helpers');
+  const helpers = (r.ok ? r.v.helpers : []) || [];
+  const cur = _home.open && (_home.outcomes.find(o => o.id === id)?.worker);
+  const rows = helpers.filter(h => h.name !== cur).map((h, n) =>
+    '<label class="home-choice"><input type="radio" name="home-change" value="' + esc(h.name) + '"' + (n === 0 ? ' checked' : '') + '> <span><b>' + esc(_homePlainName(h.name)) + '</b>'
+    + (h.desc ? '<br><span class="ui-help">' + esc(h.desc) + '</span>' : '') + '</span></label>').join('');
+  const html = '<div class="home-change">' + rows
+    + '<label class="home-choice"><input type="radio" name="home-change" value="__new__"' + (rows ? '' : ' checked') + '> <span><b>A new helper</b><br><span class="ui-help">Start a fresh helper just for this.</span></span></label></div>';
+  const ok = await showFormModal('Who should handle this?', html, 'Move it');
+  if (!ok) return;
+  const pick = document.querySelector('input[name="home-change"]:checked')?.value;
+  if (!pick) return;
+  const res = await _homeJson('/api/intent/outcomes/' + encodeURIComponent(id) + '/change', { method: 'POST',
+    body: JSON.stringify(pick === '__new__' ? { new: true } : { worker: pick }) });
+  showToast(res.ok ? (res.v.receipt || 'Moved') : ('Not moved: ' + (res.v.error || 'error')));
+  _home.detail = null;
+  _homeRefresh();
+}
+function _homeSourcesText(sources) {
+  const kinds = { message: 'your message', email: 'an email', event: 'your calendar', outcome: 'an earlier request', request: 'your request', post: 'your message' };
+  const seen = [];
+  for (const s of sources || []) {
+    const label = kinds[s.kind] || s.kind;
+    const t = label + (s.text ? ': "' + String(s.text).slice(0, 60) + (String(s.text).length > 60 ? '...' : '') + '"' : '');
+    if (seen.length < 2 && !seen.includes(t)) seen.push(t);
+  }
+  return seen.length ? 'From ' + seen.join('; ') : '';
+}
+function _homeIdeaIco(it) {
+  const k = (it.sources || []).map(x => x.kind);
+  return k.includes('email') ? 'mail' : k.includes('event') ? 'cal' : 'bulb';
+}
+// One short line saying where an idea came from: the email's sender and
+// subject, the calendar event, or the request it follows.
+function _homeIdeaSub(it) {
+  const src = it.sources || [];
+  const mail = src.find(x => x.kind === 'email');
+  if (mail) {
+    const [from, subject] = String(mail.text || '').split(' | ');
+    const who = String(from || '').replace(/^From\s+/, '').replace(/<[^>]*>/g, '').replace(/"/g, '').trim();
+    const name = who.includes('@') ? who.split('@')[0] : who;
+    return 'Email' + (name ? ' from ' + name : '') + (subject ? ': ' + subject.trim() : '');
+  }
+  const ev = src.find(x => x.kind === 'event');
+  if (ev) return 'Your calendar: ' + String(ev.text || '').trim();
+  return src.some(x => x.kind === 'outcome' || x.kind === 'request') ? 'Follows something you asked for' : _homeSourcesText(src);
+}
+function _homeRenderIdeas(v) {
+  const el = document.getElementById('home-ideas-body');
+  if (!el) return;
+  _homeRenderHello();
+  const ideas = _home.ideas || [];
+  const refresh = '<button type="button" class="home-link" id="home-ideas-refresh" onclick="_homeIdeasRefresh()">Look for new ideas</button>';
+  if (!ideas.length) {
+    el.innerHTML = '<div class="home-sec">' + _homeSectionHead('bulb', 'Ideas for you', null) + '<div class="home-sec-empty">'
+      + (v && v.measured === false ? 'Ideas could not be checked just now.' : 'As you ask for things, ideas for the next useful step show up here.')
+      + ' ' + refresh + '</div></div>';
+    return;
+  }
+  const shown = _home.ideasAll ? ideas : ideas.slice(0, 3);
+  const more = ideas.length > 3 ? { label: _home.ideasAll ? 'Show fewer' : 'See all ' + ideas.length, onclick: '_home.ideasAll=!_home.ideasAll;_homeRenderIdeas()' } : null;
+  el.innerHTML = '<div class="home-sec">' + _homeSectionHead('bulb', 'Ideas for you', more) + '<div class="home-list">' + shown.map(it =>
+    '<div class="home-card home-item' + (_homeRowOpen(it.id) ? ' open' : '') + '" data-idea="' + esc(it.id) + '" role="button" tabindex="0" aria-expanded="' + _homeRowOpen(it.id) + '" onclick="_homeToggleRow(event,this)"'
+    + ' onkeydown="if(event.target===this&&(event.key===\'Enter\'||event.key===\' \')){event.preventDefault();_homeToggleRow(event,this)}">'
+    + _homeIco(_homeIdeaIco(it)) + '<div class="home-item-text"><div class="home-card-title">' + esc(it.title) + '</div>'
+    + '<div class="home-card-from" title="' + esc(_homeSourcesText(it.sources)) + '">' + esc(_homeIdeaSub(it)) + '</div>'
+    + '<div class="home-item-more"><div class="home-card-body">' + esc(it.body || '') + '</div>'
+    + '<div class="home-card-actions"><button type="button" class="btn" onclick="_homeIdeaDismiss(\'' + esc(it.id) + '\')">Not now</button></div></div></div>'
+    + '<button type="button" class="home-play" aria-label="Do it" title="Do it" onclick="_homeIdeaStart(\'' + esc(it.id) + '\')">'
+    + '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true">' + _HOME_ICO.play + '</svg></button></div>').join('')
+    + '</div><div class="home-sec-foot">' + refresh + '</div></div>';
+}
+async function _homeIdeasRefresh() {
+  const b = document.getElementById('home-ideas-refresh');
+  if (b) { b.disabled = true; b.textContent = 'Looking...'; }
+  const r = await _homeJson('/api/intent/ideas/refresh', { method: 'POST', body: '{}' });
+  if (!r.ok) showToast('Could not look for ideas just now.');
+  _homeExtrasLoad(true);
+}
+async function _homeIdeaStart(id) {
+  const r = await _homeJson('/api/intent/ideas/' + encodeURIComponent(id) + '/start', { method: 'POST', body: '{}' });
+  if (!r.ok) { showToast('Not started: ' + (r.v.error || 'error')); return; }
+  _homeSetPane('chat', true);
+  if (r.v.outcome?.id) _homeOpenOutcome(r.v.outcome.id);
+}
+async function _homeIdeaDismiss(id) {
+  await _homeJson('/api/intent/ideas/' + encodeURIComponent(id) + '/dismiss', { method: 'POST', body: '{}' });
+  _homeExtrasLoad(true);
+}
+function _homeDaysLeft(due) {
+  if (!due) return '';
+  // Calendar days between today and the due date, the way a person counts.
+  const t = new Date(); const today = Date.UTC(t.getFullYear(), t.getMonth(), t.getDate());
+  const [yy, mm, dd] = String(due).split('-').map(Number);
+  const d = Math.round((Date.UTC(yy, (mm || 1) - 1, dd || 1) - today) / 86400000);
+  if (isNaN(d)) return '';
+  return d < 0 ? 'past due' : d === 0 ? 'due today' : d === 1 ? '1 day left' : d + ' days left';
+}
+function _homeGoalCard(g) {
+  const days = g.tier === 'tracking' ? _homeDaysLeft(g.due) : '';
+  const badge = g.pending_ask ? '<span class="home-badge wait">Awaiting you</span>'
+    : days ? '<span class="home-badge' + (/past|today|^1 day/.test(days) ? ' wait' : '') + '">' + esc(days) + '</span>' : '';
+  const ask = g.pending_ask ? '<div class="home-ask"><div>' + esc(g.pending_ask) + '</div>'
+    + '<button type="button" class="btn primary" onclick="_homeGoalApprove(\'' + esc(g.id) + '\')">Yes, go ahead</button>'
+    + '<div class="ui-help">An email still waits for your OK in its conversation.</div></div>' : '';
+  return '<div class="home-card home-item' + (_homeRowOpen(g.id) ? ' open' : '') + '" data-goal="' + esc(g.id) + '" role="button" tabindex="0" aria-expanded="' + _homeRowOpen(g.id) + '" onclick="_homeToggleRow(event,this)"'
+    + ' onkeydown="if(event.target===this&&(event.key===\'Enter\'||event.key===\' \')){event.preventDefault();_homeToggleRow(event,this)}">'
+    + _homeIco(g.tier === 'tracking' ? 'cal' : 'target') + '<div class="home-item-text"><div class="home-card-title">' + esc(g.title) + '</div>'
+    + '<div class="home-status-line">' + esc(g.status_line || 'Getting started...') + '</div>'
+    + '<div class="home-item-more">' + (g.status_at ? '<div class="home-card-from">Checked ' + esc(_homeAgo(g.status_at)) + '</div>' : '')
+    + ask + '<div class="home-card-actions">'
+    + (g.outcome_id ? '<button type="button" class="btn" onclick="_homeSetPane(\'chat\',true);_homeOpenOutcome(\'' + esc(g.outcome_id) + '\')">Open</button>' : '')
+    + '<button type="button" class="btn" onclick="_homeGoalRename(\'' + esc(g.id) + '\')">Reword</button>'
+    + '<button type="button" class="btn" onclick="_homeGoalDismiss(\'' + esc(g.id) + '\')">Stop</button></div></div></div>'
+    + badge + '</div>';
+}
+// Goals with a deadline (Tracking) and standing ones (Ongoing), one at a time.
+function _homeGoalTab(t) { _home.goalTab = t; _home.goalsAll = false; _homeRenderGoals(); }
+function _homeRenderGoals(v) {
+  _homeRenderUpcoming();
+  _homeRenderHello();
+  const el = document.getElementById('home-goals-body');
+  if (!el) return;
+  const goals = _home.goals || [];
+  if (!goals.length) {
+    el.innerHTML = '<div class="home-sec">' + _homeSectionHead('target', 'Goals', null) + '<div class="home-sec-empty">'
+      + (v && v.measured === false ? 'Goals could not be checked just now.' : 'When something keeps coming up, a goal appears here and is kept up to date for you.') + '</div></div>';
+    return;
+  }
+  const tracking = goals.filter(g => g.tier === 'tracking');
+  const ongoing = goals.filter(g => g.tier !== 'tracking');
+  const tab = _home.goalTab === 'ongoing' || !tracking.length ? 'ongoing' : 'tracking';
+  const list = tab === 'tracking' ? tracking : ongoing;
+  const shown = _home.goalsAll ? list : list.slice(0, 3);
+  const more = list.length > 3 ? { label: _home.goalsAll ? 'Show fewer' : 'See all ' + list.length, onclick: '_home.goalsAll=!_home.goalsAll;_homeRenderGoals()' } : null;
+  const tabBtn = (t, label, n) => '<button type="button" role="tab" class="home-seg-btn' + (tab === t ? ' on' : '') + '" aria-selected="' + (tab === t) + '"'
+    + (n ? '' : ' disabled') + ' onclick="_homeGoalTab(\'' + t + '\')">' + label + ' (' + n + ')</button>';
+  el.innerHTML = '<div class="home-sec">' + _homeSectionHead('target', 'Goals', more)
+    + '<div class="home-seg" role="tablist" aria-label="Goals">' + tabBtn('tracking', 'Tracking', tracking.length) + tabBtn('ongoing', 'Ongoing', ongoing.length) + '</div>'
+    + '<div class="home-pane-sub">' + (tab === 'tracking' ? 'Things with a deadline' : 'Kept up to date for you, week after week') + '</div>'
+    + '<div class="home-list" role="tabpanel">' + shown.map(_homeGoalCard).join('') + '</div></div>';
+}
+// What is coming up: the next week of the calendar, reminders and to-dos.
+function _homeRenderUpcoming() {
+  const el = document.getElementById('home-upcoming-body');
+  if (!el) return;
+  // One row per subject here (the server keeps one per subject in each
+  // conversation, so a conversation still shows its own).
+  const remSeen = new Set();
+  const remAll = (_home.reminders || []).filter(x => { const k = String(x.title || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); return !remSeen.has(k) && remSeen.add(k); });
+  const remShown = _home.remindersAll ? remAll : remAll.slice(0, 5);
+  const rem = remAll.length ? '<div class="home-pane-head"><span class="home-pane-title home-sub-title">Reminders</span>'
+    + (remAll.length > 5 ? '<button type="button" class="home-link" onclick="_home.remindersAll=!_home.remindersAll;_homeRenderUpcoming()">' + (_home.remindersAll ? 'Show fewer' : 'Show all ' + remAll.length) + '</button>' : '')
+    + '</div><div class="home-pane-sub">You get these here, at the time shown</div><div class="home-list">'
+    + remShown.map(x => '<div class="home-card"><div class="home-card-title">' + esc(x.title) + '</div><div class="home-card-from">'
+      + esc(_homeReminderWhen(x)) + '</div></div>').join('') + '</div>' : '';
+  const fmtEv = (e) => { const d = _homeLocalDate(e.start); const allDay = e.all_day || String(e.start).length <= 10;
+    return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + (allDay ? '' : ', ' + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })); };
+  const up = (_home.events || []).length ? '<div class="home-pane-sub">Your calendar for the next week</div><div class="home-list">'
+    + _home.events.map(e => '<div class="home-agenda"><span class="home-agenda-when">' + esc(fmtEv(e)) + '</span><span class="home-agenda-what">' + esc(e.title || '')
+      + (e.location ? ' · ' + esc(e.location) : '') + '</span></div>').join('') + '</div>' : '';
+  const todos = _homeTodosHtml();
+  el.innerHTML = up || rem || todos ? '<div class="home-sec">' + _homeSectionHead('cal', 'Coming up', null) + up + rem + todos + '</div>' : '';
+}
+async function _homeGoalDismiss(id) {
+  if (!await showConfirm('Stop keeping track of this?', 'Stop')) return;
+  await _homeJson('/api/intent/goals/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ status: 'dismissed' }) });
+  _homeExtrasLoad(true);
+}
+async function _homeGoalRename(id) {
+  const g = (_home.goals || []).find(x => x.id === id);
+  const t = await showPrompt('Reword this goal', g?.title || '');
+  if (!t || !t.trim()) return;
+  await _homeJson('/api/intent/goals/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ title: t.trim() }) });
+  _homeExtrasLoad(true);
+}
+async function _homeGoalApprove(id) {
+  const r = await _homeJson('/api/intent/goals/' + encodeURIComponent(id) + '/approve', { method: 'POST', body: '{}' });
+  showToast(r.ok ? 'Approved' : ('Not approved: ' + (r.v.error || 'error')));
+  _homeExtrasLoad(true);
+}
+// Each worker's conversations from Chat, for its card line. One fetch
+// of /api/intent/outcomes, refreshed at most every 20 seconds.
+let _homeOutcomeIndex = { at: 0, by: {}, loading: false };
+function _homeOutcomeIndexLoad(force) {
+  if (_homeOutcomeIndex.loading || (!force && Date.now() - _homeOutcomeIndex.at < 20000)) return;
+  _homeOutcomeIndex.loading = true;
+  fetch(API + '/api/intent/outcomes', { headers: _authHeaders() }).then(r => r.ok ? r.json() : null).then(v => {
+    const by = {};
+    for (const o of (v && v.outcomes) || []) if (o.worker) (by[o.worker] = by[o.worker] || []).push(o);
+    const changed = JSON.stringify(Object.keys(by).map(k => [k, by[k].length])) !== JSON.stringify(Object.keys(_homeOutcomeIndex.by).map(k => [k, _homeOutcomeIndex.by[k].length]));
+    _homeOutcomeIndex = { at: Date.now(), by, loading: false };
+    if (changed && activeView === 'sessions') { try { render(); } catch (e) { console.warn('[home] card re-render failed', e); } }
+    // The worker view's Intent tab shows only when this worker has some.
+    if (peekSession) { try { _applyPeekTabVisibility(); } catch (e) { console.warn('[home] Intent tab repaint failed', e); } }
+  }).catch(() => { _homeOutcomeIndex.loading = false; });
+}
+function _homeCardOutcomes(name) {
+  _homeOutcomeIndexLoad(false);
+  const list = _homeOutcomeIndex.by[name] || [];
+  if (!list.length) return '';
+  const names = list.slice(0, 3).map(o => o.title).join(' · ');
+  return '<div class="card-outcomes" title="Conversations from Intent routed to this worker">From Intent: ' + esc(names) + (list.length > 3 ? ' +' + (list.length - 3) : '') + '</div>';
+}
+// The conversations from Intent routed to this worker, in its own Intent tab
+// (owner, 2026-11-19: "These should be in a separate intent tab in the worker
+// details page"). They used to sit above the Messages list, where on a phone
+// they took the top third of the screen. The tab shows only for a worker that
+// has some (_peekIntentList), with their count.
+function _peekIntentList(name) {
+  _homeOutcomeIndexLoad(false);
+  return (_homeOutcomeIndex.by[name || peekSession] || []);
+}
+function _peekIntentTabPaint() {
+  const n = peekSession ? _peekIntentList().length : 0;
+  const c = document.getElementById('peek-tab-intent-count');
+  if (c) { c.textContent = n ? String(n) : ''; c.classList.toggle('has-count', n > 0); }
+}
+async function _peekConvsLoad() {
+  const el = document.getElementById('peek-msg-convs');
+  if (!el || !peekSession) return;
+  const who = peekSession;
+  let v = null;
+  try { const r = await fetch(API + '/api/intent/outcomes', { headers: _authHeaders() }); v = r.ok ? await r.json() : null; } catch (e) { console.warn('[home] conversations for the worker view did not load', e); }
+  if (peekSession !== who) return;
+  const mine = ((v && v.outcomes) || []).filter(o => o.worker === who);
+  el.innerHTML = !mine.length ? '<div class="dict-empty">No conversations from Intent for this worker.</div>' : '<div class="home-list">'
+    + mine.slice(0, 8).map(o => '<button type="button" class="home-row" onclick="_homeOpenFromPeek(\'' + esc(o.id) + '\')">'
+      + '<span class="home-row-top"><span class="home-row-title">' + esc(o.title) + '</span><span class="home-pill ' + (o.status === 'ready' ? 'ready' : 'working') + '">' + _homeStatusLabel(o.status) + '</span></span>'
+      + '<span class="home-row-when">' + esc(_homeAgo(o.updated_ms)) + (o.overridden ? ' · moved here by Change' : '') + '</span></button>').join('') + '</div>';
+}
+function _homeOpenFromPeek(id) {
+  closePeek();
+  switchView('home');
+  _homeSetPane('chat', true);
+  _homeOpenOutcome(id);
+}
+// Which screen a person lands on when nothing else names one: the `home`
+// pref, or intent for someone new (GET /api/intent/home decides).
+async function _homeBootChoice() {
+  let choice = null;
+  try { choice = localStorage.getItem('amux_home_choice'); } catch (e) { console.warn('[home] storage unreadable', e); }
+  // Retried: a server still starting answers nothing, and a missed answer
+  // used to leave a new person on the fleet with the first-run tour over it.
+  let r = await _homeJson('/api/intent/home');
+  for (let i = 0; i < 6 && !r.ok; i++) { await new Promise(res => setTimeout(res, 1000 * (i + 1))); r = await _homeJson('/api/intent/home'); }
+  if (r.ok && r.v.home) { choice = r.v.home; try { localStorage.setItem('amux_home_choice', choice); } catch (e) { console.warn('[home] storage unwritable', e); } }
+  _homeSimple(choice === 'intent');
+  document.documentElement.classList.remove('boot-home-pending');
+  // Settled after the caller's switch (a microtask later): the first-run tour
+  // waits on this, so it never opens over a Home about to appear.
+  Promise.resolve().then(() => { window._homeChoiceSettled = true; });
+  return choice;
 }
 
 // ── Set default model label from server config ──
@@ -12721,7 +15033,7 @@ async function shareSession(session) {
     }
     return;
   }
-  const perms = prompt('Share permissions:\n  output — terminal output only\n  output+files — output + working directory\n  output+files+notes — output + files + notes', 'output');
+  const perms = (await showPrompt('Share permissions:\n  output — terminal output only\n  output+files — output + working directory\n  output+files+notes — output + files + notes', '', 'output', { trim: false }));
   if (!perms) return;
   const r = await apiCall(API + '/api/sessions/' + session + '/share', {
     method: 'POST', headers: {'Content-Type':'application/json'},
@@ -12755,6 +15067,15 @@ async function deleteSession(session) {
   done();
   if (r) showToast('Worker "' + session + '" deleted');
   expanded.delete(session);
+  // The open peek is on a worker that no longer exists. Leave it for the
+  // workers overview; the list filters live in localStorage, so they stay.
+  if (r && peekSession === session) {
+    closePeek();
+    if (!peekSession) {
+      switchView('sessions');
+      amuxTrack('worker_deleted_from_peek', { verdict: 'returned_to_overview', measured: true, n_considered: 1 });
+    }
+  }
   await fetchSessions();
 }
 
@@ -12822,7 +15143,22 @@ async function _changeWorkerPaused(session, paused) {
 async function archiveSession(session) {
   closeAllMenus();
   const done = _cardBusy(session, 'Archiving');
-  const r = await apiCall(API + '/api/sessions/' + session + '/archive', { method: 'POST', headers: { 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') } });
+  const url = API + '/api/sessions/' + session + '/archive';
+  const post = body => fetch(url, { method: 'POST', body: JSON.stringify(body),
+    headers: _authHeaders({ 'Content-Type': 'application/json', 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') }) });
+  let r = null;
+  try {
+    let res = await post({});
+    let d = await res.json().catch(() => ({}));
+    // The worker Intent sends unmatched requests to: the server says what breaks, and asks.
+    if (res.status === 409 && d.code === 'intent_helper') {
+      if (!(await showConfirm(d.error, 'Archive anyway', true))) { done(); return; }
+      res = await post({ confirm_helper: true });
+      d = await res.json().catch(() => ({}));
+    }
+    if (res.ok && d.ok !== false) r = d;
+    else showToast((d && d.error) || ('Could not archive ' + session));
+  } catch (e) { showToast('Could not archive ' + session + ': ' + ((e && e.message) || e)); }
   done();
   if (r) {
     _expiredWorkerInventory.delete(session);
@@ -13883,6 +16219,32 @@ const _SCOPE_EDIT_HINT = {
   connectors: 'JSON object keyed by connector. Each value can set enabled, account, and mcp; omitted connectors inherit.',
 };
 
+// The environment registry (GET /api/scope, env capability `registry`): the
+// keys a scope file can set and the order each one resolves in. Collapsed
+// inside the hint line, so the dialog gains no row on a phone.
+function _scopeEnvRegistryRender(reg) {
+  const hint = document.getElementById('scope-edit-hint');
+  if (!hint || !Array.isArray(reg)) return;
+  const scoped = reg.filter(r => r && r.scopable);
+  if (!scoped.length) return;
+  const det = document.createElement('details');
+  det.id = 'scope-env-registry';
+  const sum = document.createElement('summary');
+  sum.textContent = scoped.length + ' keys can be set per worker or group';
+  det.appendChild(sum);
+  const list = document.createElement('div');
+  list.className = 'scope-env-registry-list';
+  scoped.forEach(r => {
+    const row = document.createElement('div');
+    row.className = 'scope-env-registry-row';
+    row.dataset.key = r.key;
+    row.textContent = r.key + '  (' + (r.order || []).join(' > ') + ')  ' + (r.doc || '');
+    list.appendChild(row);
+  });
+  det.appendChild(list);
+  hint.appendChild(det);
+}
+
 async function _scopeEditOpen(lvl, name, key) {
   const bd = document.getElementById('scope-edit-backdrop');
   const ta = document.getElementById('scope-edit-input');
@@ -13936,6 +16298,7 @@ async function _scopeEditOpen(lvl, name, key) {
       document.getElementById('scope-edit-msg').textContent = keys.length
         ? 'Values are hidden. Re-enter a value to change it, leave KEY= to preserve it, or remove the line to delete it.'
         : '';
+      _scopeEnvRegistryRender(cap.registry);
     } else {
       text = JSON.stringify(v && Object.keys(v).length ? v : (Array.isArray(v) ? v : {}), null, 2);
     }
@@ -14137,6 +16500,44 @@ async function _boardOneSet(name, on) {
   }
 }
 
+// Who wrote the description and whether amux keeps it current
+// (runtime_jobs/desc_refresh.rs). The owner's own edit locks it; Revert puts
+// back the text the last change replaced.
+function _descNote(s) {
+  if (s.isolated) return 'Description for the owner; isolated workers are hidden from peers.';
+  const m = s.desc_meta || {};
+  const when = m.at ? ' ' + timeAgo(m.at) : '';
+  const by = m.by === 'auto' ? 'Updated by amux from recent work' + when
+    : m.by === 'owner' ? 'Written by you' + when
+    : m.by ? 'Written by ' + m.by + when : '';
+  const keep = m.locked ? 'Locked: amux will not change it.' : 'amux keeps it current with this worker\'s work.';
+  return (by ? by + (m.prev ? ', was "' + m.prev + '"' : '') + '. ' : '') + 'Used by people and peer-worker discovery. ' + keep;
+}
+
+function _descControls(s, q) {
+  if (s.isolated) return '';
+  const m = s.desc_meta || {};
+  const b = (fn, label, extra) => ' <button class="btn worker-config-btn"'
+    + (extra || '') + ' onclick="event.stopPropagation();' + fn + '(\'' + q + '\')">' + label + '</button>';
+  return (m.prev ? b('_descRevert', 'Revert', ' title="Restore: ' + esc(m.prev) + '"') : '')
+    + b('_descLockToggle', m.locked ? 'Unlock' : 'Lock', ' aria-pressed="' + !!m.locked + '" title="' + (m.locked ? 'Let amux keep it current' : 'Stop amux changing it') + '"');
+}
+
+async function _descPatch(name, body, done) {
+  const r = await apiCall(API + '/api/sessions/' + encodeURIComponent(name) + '/config', {
+    method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+  });
+  if (!r) return;  // apiCall already said why
+  const d = await r.json().catch(() => ({}));
+  showToast(d.message || done);
+  fetchSessions();
+}
+function _descRevert(name) { return _descPatch(name, { desc_revert: true }, 'Previous description restored'); }
+function _descLockToggle(name) {
+  const s = (sessions || []).find(x => x.name === name) || {};
+  return _descPatch(name, { desc_lock: !(s.desc_meta || {}).locked }, 'Saved');
+}
+
 function _workerConfigurationRow(key, label, value, note, controls) {
   return '<div class="worker-config-row" data-worker-config="' + esc(key) + '">'
     + '<div class="worker-config-copy"><div class="worker-config-label">'
@@ -14220,7 +16621,7 @@ function _workerPrimaryConfigurationsHTML(name) {
   const model = sessionConfiguredModel(s);
   const effort = flagValue(s.flags || '', '--effort') || ((s.flags || '').match(/model_reasoning_effort=["']?([a-z]+)/) || [])[1] || '';
   const q = escJs(name);
-  const edit = (field, current, extra) => '<button class="btn" style="font-size:var(--fs-2xs);min-height:32px;padding:var(--space-1) var(--space-2);"'
+  const edit = (field, current, extra) => '<button class="btn worker-config-btn"'
     + ' onclick="event.stopPropagation();editField(\'' + q + '\',\'' + field + '\',\''
     + escJs(current || '') + '\'' + (extra ? ',\'' + escJs(extra) + '\'' : '') + ')">Edit</button>';
   const sw = (on, fn, label) => '<button class="btn" role="switch" aria-checked="'
@@ -14229,7 +16630,7 @@ function _workerPrimaryConfigurationsHTML(name) {
     + (on ? 'On' : 'Off') + '</button>';
   const identity = [
     _workerConfigurationRow('name', 'Name', s.name || name, s.isolated ? 'Renaming preserves messages and worker identity.' : 'Renaming preserves tasks, messages, memory, and worker identity.', edit('name', s.name || name)),
-    _workerConfigurationRow('description', 'Description', s.desc || '', s.isolated ? 'Description for the owner; isolated workers are hidden from peers.' : 'Used by people and peer-worker discovery.', edit('desc', s.desc || '')),
+    _workerConfigurationRow('description', 'Description', s.desc || '', _descNote(s), edit('desc', s.desc || '') + _descControls(s, q)),
     _workerConfigurationRow('task_label', 'Task label override', s.task_override || '', s.isolated ? 'An owner-visible label; it does not create or select a board task.' : 'Blank returns the card to its board/source-derived label.', edit('task', s.task_override || '')),
     _workerConfigurationRow('groups', 'Groups', (s.tags || []).join(', '), 'Controls membership, inherited configuration, and default message reach.', edit('tags', (s.tags || []).join(', '))),
   ];
@@ -14964,6 +17365,12 @@ function _peekChatMenuItem(s) {
 }
 
 function setPeekTab(tab) {
+  // A chat worker has no companion Chat tab (_applyPeekTabVisibility): a remembered or
+  // linked 'chat' opens its own chat, the first tab.
+  if (tab === 'chat' && peekSession && _workerRenderer(peekSession) === 'chat') {
+    console.info('[peek] verdict=chat_tab_folded_into_primary worker=' + peekSession);
+    tab = 'terminal';
+  }
   _peekTab = tab;
   // CSS reads this to drop chrome a tab does not use (phone real estate).
   const _po = document.getElementById('peek-overlay'); if (_po) _po.dataset.peekTab = tab;
@@ -15048,6 +17455,12 @@ function setPeekTab(tab) {
   const steering = document.getElementById('peek-steering-panel');
   if (tab === 'steering') { steering.classList.add('active'); _steerHistLoadedFor = null; _steeringRender(); loadPeekInstructions(); }
   else { steering.classList.remove('active'); }
+  document.getElementById('peek-tab-computer')?.classList.toggle('active', tab === 'computer');
+  const cuP = document.getElementById('peek-computer-panel');
+  if (cuP) {
+    if (tab === 'computer') { cuP.classList.add('active'); _peekComputerStart(); }
+    else { cuP.classList.remove('active'); _peekComputerStop(); }
+  }
   document.getElementById('peek-tab-tasks')?.classList.toggle('active', tab === 'tasks');
   const tasksP = document.getElementById('peek-tasks-panel');
   if (tasksP) {
@@ -15057,6 +17470,12 @@ function setPeekTab(tab) {
   const messages = document.getElementById('peek-messages-panel');
   if (tab === 'messages') { messages.classList.add('active'); _peekMessagesLoad(); }
   else { messages.classList.remove('active'); }
+  document.getElementById('peek-tab-intent')?.classList.toggle('active', tab === 'intent');
+  const intentP = document.getElementById('peek-intent-panel');
+  if (intentP) {
+    if (tab === 'intent') { intentP.classList.add('active'); _peekConvsLoad(); }
+    else intentP.classList.remove('active');
+  }
   const costPanel = document.getElementById('peek-cost-panel');
   if (tab === 'cost') { costPanel.classList.add('active'); _peekCostLoad(); }
   else { costPanel.classList.remove('active'); }
@@ -16238,6 +18657,7 @@ async function togglePeekBoardPolicy(field, on) {
 function _renderPeekIssuesBody() {
   // Don't rebuild mid-drag — a board SSE refresh would destroy the active Sortable.
   if (document.body.classList.contains('board-dragging')) return;
+  if (_deferForSortableDrag(_renderPeekIssuesBody, 'peek-board')) return;
   // NOT LOADED IS NOT EMPTY (Ethan, 2026-08-06 — screenshot of the amux worker's
   // Board tab reading "No issues for this worker yet." while that worker owned 29
   // cards). This panel renders from the global boardItems and never fetched: open
@@ -16540,7 +18960,7 @@ async function _peekLoadSchedules() {
     _peekColorSchedBadge(sched);   // active/inactive two-number badge
   };
   try {
-    await Promise.all([fetchSchedules(), fetchSchedulerRuns()]);
+    await Promise.all([fetchSchedules(), fetchSchedulerRuns(), _evSubsFetch()]);
     if (!peekSession) return;
     _idb.set('schedules_all', schedules);   // cache for offline reads
     _paint();
@@ -17019,6 +19439,14 @@ try {
   if (asked && asked !== APP_VER && asked.indexOf('__') !== 0)
     window._clientDebug('asset-version-mismatch', { verdict: 'html_and_app_js_builds_differ', measured: true, n_considered: 1, html_ver: asked });
 } catch (e) {}
+// The same for app.css (index.html: /app.css?v=<ver>): a sheet from another
+// build styles the new markup with old rules and nothing errors. The sheet
+// stamps its build into --amux-asset-ver.
+try {
+  const cssVer = getComputedStyle(document.documentElement).getPropertyValue('--amux-asset-ver').trim().replace(/^["']|["']$/g, '');
+  if (APP_VER.indexOf('__') !== 0 && cssVer.indexOf('__') !== 0 && cssVer !== APP_VER)
+    window._clientDebug('asset-version-mismatch', { verdict: 'app_css_and_app_js_builds_differ', measured: true, n_considered: 1, css_ver: cssVer || 'none' });
+} catch (e) { console.warn('asset version check: could not read the stylesheet build', e); }
 // The dashboard's code ran, so a cache-clear pass reached it: reset the landing
 // page's loop guard (api/static_files.rs clear_sw_landing, AMUX-5385).
 try { sessionStorage.removeItem('amux_clear_sw_n'); } catch (e) {}
@@ -17399,7 +19827,8 @@ function _workerRenderer(name) {
 // re-parsed (settled markdown blocks are frozen DOM). The finished message is
 // rendered from its full text, so it is what a full re-render produces.
 const _chat = { name: null, es: null, messages: [], streaming: null, loadedAt: 0, busy: false, queued: 0, gen: 0,
-  cursor: '', stick: true, unseen: false, raf: 0, onScroll: null, live: null, offlineNote: '' };
+  cursor: '', stick: true, unseen: false, raf: 0, onScroll: null, live: null, offlineNote: '',
+  holdUntil: 0, holdCap: 0, held: 0, onRelease: null };
 
 // OFFLINE PARITY WITH CODING WORKERS (Ethan 2026-09-26: "make sure amux chat
 // has all the same offline capabilities as coding too"). A coding worker's
@@ -17447,6 +19876,8 @@ function _chatUnmount() {
   clearInterval(_chatWatchdog); _chatWatchdog = 0;
   const body = document.getElementById('peek-body');
   if (body && _chat.onScroll) body.removeEventListener('scroll', _chat.onScroll);
+  if (body && _chat.onRelease) for (const ev of ['touchstart', 'keydown', 'pointerdown']) body.removeEventListener(ev, _chat.onRelease);
+  _chat.onRelease = null; _chat.holdUntil = 0;
   _chat.es = null; _chat.name = null; _chat.messages = []; _chat.streaming = null; _chat.gen++;
   _chat.cursor = ''; _chat.stick = true; _chat.unseen = false; _chat.raf = 0; _chat.onScroll = null; _chat.live = null;
   _chat.loadedAt = 0; _chat.offlineNote = ''; _chat.pendingShown = 0;
@@ -17628,10 +20059,26 @@ function _chatMount(name) {
     // to read earlier output pins the view until they come back down.
     _chat.onScroll = () => {
       const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+      // A JUMP HOLDS THE BOTTOM BRIEFLY (owner, 2026-11-23: "when I click jump
+      // to bottom it still doesnt do it"). A reply streaming in grows the page
+      // between the jump and the scroll events it causes, and a trackpad's
+      // momentum keeps scrolling after the click, so the first scroll event
+      // read "not at the bottom" and turned following off: the view fell
+      // further behind each second. While scroll events keep coming (a
+      // momentum tail of any length, up to 3 s after the jump) it stays at the
+      // bottom, until the reader touches, presses a key or grabs the scrollbar.
+      if (!atBottom && Date.now() < _chat.holdUntil) {
+        body.scrollTop = body.scrollHeight;
+        _chat.held++;
+        _chat.holdUntil = Math.min(_chat.holdCap, Date.now() + 400);
+        return;
+      }
       _chat.stick = atBottom;
       if (atBottom && _chat.unseen) { _chat.unseen = false; _chatJumpPill(); }
     };
     body.addEventListener('scroll', _chat.onScroll, { passive: true });
+    _chat.onRelease = () => { _chat.holdUntil = 0; };
+    for (const ev of ['touchstart', 'keydown', 'pointerdown']) body.addEventListener(ev, _chat.onRelease, { passive: true });
   }
   // Same as a coding worker's open-time cache paint: show the saved
   // conversation at once; the live snapshot replaces it when it arrives.
@@ -17975,12 +20422,26 @@ async function _chatInterrupt(target) {
   }
 }
 
+// Every jump to the bottom of a chat comes here: the chat's own Latest pill and
+// the peek's Jump to bottom. It used to scroll smoothly, and during a streaming
+// reply each frame of that animation read "not at the bottom", so following
+// switched off and the view never arrived (2,400 px behind after 2 s, measured).
+// Now it lands at once and holds there while the scrolling settles (see _chat.onScroll).
 function _chatJumpToLatest() {
   const body = document.getElementById('peek-body');
   if (!body) return;
+  const gap = Math.round(body.scrollHeight - body.scrollTop - body.clientHeight);
   _chat.stick = true; _chat.unseen = false;
-  body.scrollTo({ top: body.scrollHeight, behavior: 'smooth' });
+  _chat.holdUntil = Date.now() + 1000; _chat.holdCap = Date.now() + 3000; _chat.held = 0;
+  body.scrollTop = body.scrollHeight;
   _chatJumpPill();
+  setTimeout(() => {
+    if (!document.contains(body)) return;
+    const left = Math.round(body.scrollHeight - body.scrollTop - body.clientHeight);
+    if (typeof _peekPollBeacon === 'function') _peekPollBeacon('chat-jump-to-latest', _chat.name || peekSession, {
+      gap_px: gap, left_px: left, held: _chat.held, streaming: !!_chat.live,
+      verdict: left < 80 ? 'chat_jump_landed' : 'chat_jump_fell_short', measured: true, n_considered: 1 });
+  }, 1100);
 }
 function _chatJumpPill() {
   const b = document.querySelector('#peek-body .chat-jump');
@@ -18158,7 +20619,18 @@ function _frozenWorker(next) {
   return true;
 }
 
+// A page opened on a #peek= address keeps the fleet hidden until the worker
+// opens (index.html adds boot-peek-pending): a tab returned to from a link
+// showed the Workers list first, then entered the worker (owner, 2026-11-23).
+function _peekBootReveal(verdict, name) {
+  const h = document.documentElement;
+  if (!h.classList.contains('boot-peek-pending')) return;
+  h.classList.remove('boot-peek-pending');
+  amuxTrack('peek_boot_reveal', { verdict, session: name || '', ms: Math.round(performance.now()), measured: true, n_considered: 1 });
+  if (verdict !== 'worker_opened') console.warn('[amux] peek_boot_reveal: ' + verdict + ', the Workers list shows instead of ' + (name || 'the worker'));
+}
 function openPeek(name, opts) {
+  _peekBootReveal('worker_opened', name);
   if (_frozenWorker(name)) return;
   _peekAgentsReset();
   _vxOnPeekOpen(name);   // switching worker ends another worker's live conversation
@@ -18183,6 +20655,7 @@ function openPeek(name, opts) {
     if (peekSession) _peekFilesStash(peekSession);
     _peekFilesRestore(name);
   }
+  _navVisit('worker', name, name);
   peekSession = name;
   _applyPeekTabVisibility();
   _syncComposerPending();
@@ -18575,7 +21048,7 @@ function closePeek() {
   }
   _peekPollStop('close');   // open-view poller stops when the view closes (beaconed)
   if (_transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
-  sessionStorage.removeItem('peekState');
+  if (!_isInTab) sessionStorage.removeItem('peekState');
   // An explicitly-closed peek must not resurrect after an iOS eviction: the
   // localStorage copy exists only for eviction restore, and leaving it here
   // meant close -> background -> relaunch reopened what the user dismissed.
@@ -18602,12 +21075,12 @@ function _savePeekState() {
       state.split = true;
       state.splitPath = _peekSplitPath || peekSessionDir || '/';
     }
-    sessionStorage.setItem('peekState', JSON.stringify(state));
+    if (!_isInTab) sessionStorage.setItem('peekState', JSON.stringify(state));
     // Also persist to localStorage (with a timestamp) so an open session peek
     // is restored after iOS evicts the backgrounded PWA, not just a soft reload.
     try { localStorage.setItem('amux_peek_state', JSON.stringify(Object.assign({ ts: Date.now() }, state))); } catch(e) {}
   } else {
-    sessionStorage.removeItem('peekState');
+    if (!_isInTab) sessionStorage.removeItem('peekState');
     try { localStorage.removeItem('amux_peek_state'); } catch(e) {}
   }
 }
@@ -18621,7 +21094,9 @@ function _savePeekState() {
 // 'pages' internally; #view=apps is the canonical address and #view=pages is
 // kept as an alias, because worker messages already carry those links.
 function _viewHashName(view) { return view === 'pages' ? 'apps' : view; }
-function _viewFromHashName(v) { return v === 'apps' ? 'pages' : v; }
+// Ideas and Goals were tabs until 2026-11-14; they are sections of Chat now,
+// so an old #view=ideas or #view=goals opens Chat.
+function _viewFromHashName(v) { return v === 'apps' ? 'pages' : (v === 'ideas' || v === 'goals') ? 'home' : v; }
 
 function _syncUrlHash() {
   if (window._peekSplitChild || window._peekEmbed) return;
@@ -18941,6 +21416,202 @@ function _peekFileBrowser() {
   if (_splitPaneOpen('#path=' + encodeURIComponent(peekSessionDir || '/'), 'files')) return;
   openExplore(peekSessionDir, peekSession);
 }
+// ── Computer tab: what a worker did in this Mac's apps (Athena sends each
+// step's screenshot into the chat; amux shows them on the worker). The rows
+// come from GET /api/computer/mac/activity, which the server writes on every
+// call, refused or not. Polled every 2s while the tab is shown, never otherwise.
+let _peekComputerTimer = null;
+let _peekComputerSig = null;   // null: nothing rendered yet (an empty feed's signature is '')
+let _peekComputerTicks = 0;
+let _peekComputerStatus = null;   // GET /api/computer/mac/status?session= for peekSession
+function _peekComputerStart() {
+  _peekComputerStop();
+  _peekComputerSig = null;
+  _peekComputerTicks = 0;
+  _peekComputerHeadLoad();
+  _peekComputerLoad();
+  _peekComputerTimer = setInterval(() => {
+    if (document.hidden || _peekTab !== 'computer') return;
+    _peekComputerLoad();
+    // The status asks the driver for its permissions: every 16s is enough.
+    if (++_peekComputerTicks % 8 === 0) _peekComputerHeadLoad();
+  }, 2000);
+}
+
+// ── The Computer tab's head: is computer use on, what macOS granted, which
+// apps this worker may use, and what it is waiting on you for, with the
+// buttons to answer it right here (owner, 2026-11-25: "the stuff is in the
+// computer use tab, this needs to be richer"). Allow goes through the same
+// approval the Needs-you card does; an app added by hand is a scope write.
+async function _peekComputerHeadLoad() {
+  const w = peekSession;
+  const host = document.getElementById('peek-computer-head');
+  if (!host || !w) return;
+  let d = null;
+  try {
+    const r = await fetch(API + '/api/computer/mac/status?session=' + encodeURIComponent(w), { headers: _authHeaders(), signal: AbortSignal.timeout(8000) });
+    d = await r.json().catch(() => null);
+    if (!r.ok) d = { error: (d && d.error) || ('HTTP ' + r.status) };
+  } catch (e) { d = { error: 'amux is unreachable' }; }
+  if (w !== peekSession) return;
+  _peekComputerStatus = d;
+  _peekComputerHeadRender();
+  // Refused rows offer Allow only while the app is still not allowed.
+  _peekComputerSig = null;
+  _peekComputerLoad();
+}
+function _pcuApps() {
+  const sw = (_peekComputerStatus && _peekComputerStatus.switches) || {};
+  return Array.isArray(sw.apps) ? sw.apps.filter(Boolean) : [];
+}
+function _pcuAllowed(app) {
+  const sw = (_peekComputerStatus && _peekComputerStatus.switches) || {};
+  if (sw.any_app) return true;
+  const want = String(app || '').toLowerCase();
+  return _pcuApps().some(a => a === '*' || want.includes('(' + a.toLowerCase() + ')') || want.split(' (')[0] === a.toLowerCase());
+}
+// "Slack (com.tinyspeck.slackmacgap)" -> "com.tinyspeck.slackmacgap"; a bare name stays a name.
+function _pcuAppId(label) {
+  const m = String(label || '').match(/\(([^)]+)\)\s*$/);
+  return m ? m[1] : String(label || '').trim();
+}
+function _pcuAppName(label) { return String(label || '').split(' (')[0] || label; }
+function _peekComputerHeadRender() {
+  const host = document.getElementById('peek-computer-head');
+  if (!host) return;
+  const d = _peekComputerStatus;
+  const w = peekSession;
+  if (!d) { host.innerHTML = '<p class="ui-help">Reading computer use…</p>'; return; }
+  if (d.error && !('up' in d)) { host.innerHTML = '<p class="ui-error" role="alert">Computer use status: ' + esc(d.error) + '</p>'; return; }
+  const perms = d.permissions || {};
+  const perm = (on, name) => '<span class="pcu-perm" data-on="' + (on ? '1' : '0') + '">' + (on ? '✓ ' : '✗ ') + esc(name) + '</span>';
+  const inApp = typeof _macSettingsBridge === 'function' && _macSettingsBridge();
+  const state = d.up
+    ? '<span class="pcu-state" data-up="1">On</span>' + perm(perms.accessibility, 'Accessibility') + perm(perms.screen_recording, 'Screen Recording')
+    : '<span class="pcu-state" data-up="0">Off</span><span class="ui-help">' + esc(d.why || 'the amux Mac app is not running computer use') + '</span>'
+      + (inApp ? '<button type="button" class="btn" id="pcu-turn-on" onclick="_macSettingsOpen()">Open This Mac settings</button>'
+               : '<span class="ui-help">Turn it on in the amux Mac app: Settings, This Mac, Computer use.</span>');
+  const sw = d.switches || {};
+  const apps = _pcuApps();
+  const chips = sw.any_app
+    ? '<span class="pcu-chip">Any app that is not blocked</span>'
+    : apps.length ? apps.map(a => '<span class="pcu-chip">' + esc(a)
+        + '<button type="button" class="pcu-chip-x" aria-label="Stop ' + esc(w) + ' using ' + esc(a) + '" title="Stop this worker using ' + esc(a) + '" onclick="_pcuRemoveApp(\'' + escJs(a) + '\')">×</button></span>').join('')
+    : '<span class="ui-help">None yet</span>';
+  const ask = d.ask;
+  const askRow = ask ? '<div class="pcu-ask" role="group" aria-label="Waiting on you"><span class="pcu-ask-what"><b>Waiting on you:</b> ' + esc(w) + ' asked to use '
+      + esc(ask.resource || 'an app') + (ask.asked_at ? ' · ' + esc(timeAgo(ask.asked_at)) : '') + '</span>'
+      + '<span class="pcu-ask-btns"><button type="button" class="btn primary" id="pcu-ask-allow" onclick="_pcuDecide(\'approve\')">Allow</button>'
+      + '<button type="button" class="btn" id="pcu-ask-keep" onclick="_pcuDecide(\'reject\')">Keep refused</button></span></div>' : '';
+  host.innerHTML = '<div class="pcu-status">' + state + '</div>'
+    + '<div class="pcu-apps"><span class="pcu-apps-label">Apps ' + esc(w) + ' may use:</span>' + chips
+    + (sw.any_app ? '' : '<button type="button" class="btn" id="pcu-add-app" onclick="_pcuAddApp()">Add an app…</button>') + '</div>'
+    + askRow;
+}
+// The worker's own apps, written at its worker scope (the owner's dashboard may; a worker may not).
+async function _pcuWriteApps(list, why) {
+  const w = peekSession;
+  const r = await fetch(API + '/api/scope', { method: 'PUT', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ level: 'worker', name: w, capability: 'env', value: { AMUX_MAC_APPS: list.join(',') } }), _skipOutbox: true });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { showToast('Not saved: ' + (d.error || ('HTTP ' + r.status))); return false; }
+  showToast(why);
+  await _peekComputerHeadLoad();
+  return true;
+}
+async function _pcuAllowApp(label) {
+  const id = _pcuAppId(label);
+  const d = _peekComputerStatus || {};
+  // The open ask for this same app: answer it, so its card closes and the worker is told.
+  if (d.ask && _pcuAppId(d.ask.resource) === id) return _pcuDecide('approve');
+  const apps = _pcuApps();
+  if (!apps.includes(id)) apps.push(id);
+  return _pcuWriteApps(apps, _pcuAppName(label) + ' allowed for ' + peekSession);
+}
+async function _pcuRemoveApp(app) {
+  return _pcuWriteApps(_pcuApps().filter(a => a !== app), peekSession + ' may no longer use ' + app);
+}
+async function _pcuAddApp() {
+  const v = await showPrompt('Let ' + peekSession + ' use an app (its name or bundle id). Terminals, password managers and System Settings stay off limits whatever you list.',
+    'e.g. Slack or com.tinyspeck.slackmacgap');
+  const id = (v || '').trim();
+  if (!id) return;
+  const apps = _pcuApps();
+  if (apps.includes(id)) { showToast(peekSession + ' may already use ' + id); return; }
+  apps.push(id);
+  return _pcuWriteApps(apps, id + ' allowed for ' + peekSession);
+}
+async function _pcuDecide(decision) {
+  const d = _peekComputerStatus || {};
+  if (!d.ask) return;
+  const w = peekSession;
+  const btns = document.querySelectorAll('#peek-computer-head .pcu-ask button');
+  btns.forEach(b => b.disabled = true);
+  try {
+    const r = await fetch(API + '/api/approvals/decide', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ approval_ref: d.ask.approval_ref, decision }), _skipOutbox: true, signal: AbortSignal.timeout(15000) });
+    const out = await r.json().catch(() => ({}));
+    if (!r.ok) { showToast('Not saved: ' + (out.error || ('HTTP ' + r.status))); return; }
+    showToast(decision === 'approve' ? _pcuAppName(d.ask.resource) + ' allowed for ' + w + '; it was told to retry' : 'Kept refused: ' + w + ' still may not use ' + _pcuAppName(d.ask.resource));
+  } catch (e) {
+    showToast('Not saved: ' + (e && e.name === 'TimeoutError' ? 'amux did not answer in 15s' : 'amux is unreachable'));
+  } finally {
+    btns.forEach(b => b.disabled = false);
+    await _peekComputerHeadLoad();
+  }
+}
+function _peekComputerStop() {
+  if (_peekComputerTimer) { clearInterval(_peekComputerTimer); _peekComputerTimer = null; }
+}
+async function _peekComputerLoad() {
+  const list = document.getElementById('peek-computer-list');
+  const count = document.getElementById('peek-computer-count');
+  const w = peekSession;
+  if (!list || !w) return;
+  let d;
+  try {
+    const r = await fetch(API + '/api/computer/mac/activity?limit=40&session=' + encodeURIComponent(w), { headers: _authHeaders(), signal: AbortSignal.timeout(6000) });
+    d = r.ok ? await r.json() : null;
+  } catch (e) { d = null; }
+  if (w !== peekSession) return;
+  if (!d || !d.measured) {
+    if (!list.children.length) list.innerHTML = '<li class="pcu-empty">Could not read the activity feed.</li>';
+    return;
+  }
+  const rows = d.rows || [];
+  const sig = rows.map(x => x.ts + x.verdict).join('|') + '#' + _pcuApps().join(',') + (_peekComputerStatus ? '' : '?');
+  if (sig === _peekComputerSig) return;
+  _peekComputerSig = sig;
+  count.textContent = rows.length ? rows.length + (rows.length >= 40 ? '+' : '') + ' steps' : '';
+  const badge = document.getElementById('peek-tab-computer-count');
+  if (badge) badge.textContent = rows.length ? String(rows.length) : '';
+  if (!rows.length) {
+    list.innerHTML = '<li class="pcu-empty">No computer use yet. When this worker reads or acts in an app on this Mac (amux computer mac), each step shows here with what it saw.</li>';
+    return;
+  }
+  // The newest screenshot is what the worker sees now: large, above the steps.
+  const latest = rows.find(x => x.screenshot);
+  list.innerHTML = (latest ? '<li class="pcu-now"><span class="pcu-now-label">Latest view · ' + esc(latest.apps || '') + ' · '
+      + esc(timeAgo(latest.ts / 1000)) + '</span><button type="button" class="pcu-shot pcu-shot-big" data-path="' + esc(latest.screenshot) + '" title="Open this screenshot"><img alt="What the worker saw last" src="'
+      + esc(_authUrl(API + '/api/file/raw?path=' + encodeURIComponent(latest.screenshot))) + '"></button></li>' : '')
+    + rows.map(x => {
+    const t = new Date(x.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const ok = x.verdict === 'called';
+    const what = ok ? 'done' : (x.code || x.verdict || 'refused').replace(/_/g, ' ');
+    const allow = x.code === 'app_not_allowed' && x.apps && _peekComputerStatus && !_pcuAllowed(x.apps)
+      ? '<button type="button" class="btn primary pcu-allow" onclick="_pcuAllowApp(\'' + escJs(x.apps) + '\')">Allow ' + esc(_pcuAppName(x.apps)) + '</button>' : '';
+    const detail = x.detail ? '<span class="pcu-detail">' + esc(x.detail) + '</span>' : '';
+    const ms = ok && x.ms ? '<span class="pcu-ms">' + (x.ms >= 1000 ? (x.ms / 1000).toFixed(1) + 's' : x.ms + 'ms') + '</span>' : '';
+    const shot = x.screenshot
+      ? '<button type="button" class="pcu-shot" data-path="' + esc(x.screenshot) + '" title="Open this screenshot"><img loading="lazy" alt="What the worker saw" src="' + esc(_authUrl(API + '/api/file/raw?path=' + encodeURIComponent(x.screenshot))) + '"></button>'
+      : '';
+    return '<li class="pcu-row' + (ok ? '' : ' pcu-refused') + '" data-verdict="' + esc(x.verdict || '') + '">'
+      + '<div class="pcu-line"><span class="pcu-time">' + esc(t) + '</span><code class="pcu-tool">' + esc(x.tool || '') + '</code>'
+      + '<span class="pcu-app">' + esc(x.apps || '') + '</span>' + detail + ms + '<span class="pcu-verdict">' + esc(what) + '</span>' + allow + '</div>' + shot + '</li>';
+  }).join('');
+  list.querySelectorAll('.pcu-shot').forEach(b => { b.onclick = () => openFilePreview(b.dataset.path); });
+}
+
 function togglePeekSplit() {
   if (_nativeSplit()) { _splitBeacon('split_pane_opened', { what: 'page' }); return; }
   _peekFileBrowser();
@@ -19818,13 +22489,68 @@ function _linkWrap(L, htmlText) {
   }
   const cls = /\.md(?::\d+)*$/i.test(L.value) ? 'md-link' : 'file-link';
   const title = typeof _resolveOutputPath === 'function' ? ' title="Open: ' + ea(_resolveOutputPath(L.value.replace(/(?::\d+){1,2}$/, ''))) + '"' : '';
-  return '<span class="' + cls + '" data-path="' + ea(L.value) + '"' + title + ' onclick="_openLinkedPath(this,event)">' + htmlText + '</span>';
+  return _outputFileLink(cls, L.value, title, htmlText);
 }
+// A PATH IN WORKER OUTPUT IS A REAL LINK (owner, 2026-11-21: "if there's a
+// relative path that is being sent back in a response, I can't
+// middle-mouse-button-click it to open a new tab"). It was a <span> with an
+// onclick, so a middle, ⌘ or ctrl click and "Open Link in New Tab" had no
+// address to open. It is an <a> whose href is this dashboard's #path= deep
+// link to the file. A plain click still opens it here (_openLinkedPath); any
+// other way of opening it is the browser's.
+//
+// A relative path names a file only against the worker's cwd, and the blind
+// join is wrong when the worker wrote it from an ancestor (AMUX-3511). So the
+// href starts as the blind join and is replaced with the server's answer
+// (/api/fs/resolve) when the pointer reaches the link, before any click can
+// land. Answers are kept per cwd, so a re-rendered link starts resolved.
+const _outputHrefCache = new Map();
+function _outputFileHref(p) {
+  // Guarded like _linkWrap's title: the render code is also loaded alone,
+  // without the resolver defined further down (e2e/peek-links.test.mjs).
+  if (typeof _resolveOutputPath !== 'function' || typeof _encodeHashPath !== 'function') return '';
+  const raw = String(p || '').replace(/(?::\d+){1,2}$/, '');
+  const cwd = (typeof peekSessionDir === 'string' && peekSessionDir) || '';
+  const full = _outputHrefCache.get(cwd + '\n' + raw) || _resolveOutputPath(raw);
+  if (!full.startsWith('/') && !full.startsWith('~/')) return '';
+  return location.origin + location.pathname + (typeof _linkViewerQuery === 'function' ? _linkViewerQuery() : '') + '#path=' + _encodeHashPath(full);
+}
+// labelHtml is already-escaped HTML (the visible path, possibly coloured).
+function _outputFileLink(cls, path, attrs, labelHtml) {
+  const ea = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const href = _outputFileHref(path);
+  return '<a class="' + cls + '"' + (href ? ' href="' + ea(href) + '"' : '') + ' data-path="' + ea(path) + '"'
+    + (attrs || '') + ' onclick="_openLinkedPath(this,event)">' + labelHtml + '</a>';
+}
+function _outputLinkResolve(e) {
+  const a = e.target && e.target.closest && e.target.closest('a.file-link[data-path], a.md-link[data-path]');
+  if (!a || a.dataset.resolved) return;
+  const raw = (a.dataset.path || '').replace(/(?::\d+){1,2}$/, '');
+  const cwd = (typeof peekSessionDir === 'string' && peekSessionDir) || '';
+  a.dataset.resolved = '1';
+  if (!raw || raw.startsWith('/') || raw.startsWith('~/') || !cwd) return;
+  const key = cwd + '\n' + raw;
+  if (_outputHrefCache.has(key)) { a.setAttribute('href', _outputFileHref(raw)); return; }
+  _resolveLinkedPath(raw).then(full => {
+    if (!full || (!full.startsWith('/') && !full.startsWith('~/'))) return;
+    const blind = _resolveOutputPath(raw);
+    if (_outputHrefCache.size > 2000) _outputHrefCache.clear();
+    _outputHrefCache.set(key, full);
+    a.setAttribute('href', _outputFileHref(raw));
+    if (full !== blind) console.info('[amux] output_link_href_resolved', { from: blind, to: full });
+  });
+}
+if (typeof document !== 'undefined') ['pointerover', 'pointerdown', 'focusin', 'contextmenu'].forEach(ev => document.addEventListener(ev, _outputLinkResolve, true));
 // Open a path from worker output through the one resolver every output link
 // uses (_openPathFromOutput: server-side resolve against the worker's cwd).
+// Only a plain primary click: a modifier click is the browser's new tab, and
+// the click must not reach a header or card toggle behind the link either.
 function _openLinkedPath(el, ev) {
-  if (window.getSelection && String(window.getSelection()) !== '') return;
+  if (ev.button || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) { ev.stopPropagation(); return; }
+  // A plain click never follows the href, even when it only ends a drag or
+  // double-click select (then it opens nothing): the link is an <a> now.
   ev.preventDefault(); ev.stopPropagation();
+  if (window.getSelection && String(window.getSelection()) !== '') return;
   const p = (el.dataset.path || '').replace(/(?::\d+){1,2}$/, '');
   if (p) _openPathFromOutput(p);
 }
@@ -20123,7 +22849,7 @@ async function _fileCtxRun(act) {
   if (act === 'window') {
     // Synchronous on purpose: after an await the browser no longer treats this
     // as the user's click and blocks the window.
-    window.open(location.origin + location.pathname + '#path=' + _encodeHashPath(c.full), '_blank');
+    window.open(location.origin + location.pathname + (c.output ? _linkViewerQuery() : '') + '#path=' + _encodeHashPath(c.full), '_blank');
     return;
   }
   if (c.ready) await c.ready;
@@ -20263,9 +22989,8 @@ function _linkifyPaths(safeHtml) {
       const cls = /\.md$/i.test(p) ? 'md-link' : 'file-link';
       const shown = p + (line || '');
       // data-path is what the right-click menu reads (_fileCtxMenu).
-      return pre + at + '<span class="' + cls + '" data-path="' + esc(p) + '" title="Open in the file browser: '
-        + esc(_resolveOutputPath(p)) + '" onclick="event.preventDefault();event.stopPropagation();'
-        + "_openPathFromOutput('" + escJs(p) + "')" + '">' + esc(shown) + '</span>'
+      // A real link (_outputFileLink): a middle or ⌘ click opens a tab.
+      return pre + at + _outputFileLink(cls, p, ' title="Open in the file browser: ' + esc(_resolveOutputPath(p)) + '"', esc(shown))
         + (dot ? '.' : '');
     });
   } catch (e) { return safeHtml; }
@@ -20477,8 +23202,21 @@ const _peekToolCollapsed = {};
 // does, and a single click toggles after a beat so a second click can cancel
 // it instead of collapsing the block under the selection.
 let _ptcClickTimer = 0;
+// A LINK IN THE HEADER IS A LINK, NOT A TOGGLE (owner, 2026-11-21: "if I
+// click a response that has a link in it, it collapses the response text").
+// A reply's first line is its header, so a URL, file path or card id on that
+// line bubbled its click here and folded the reply 250 ms after the link
+// opened. A click on a link or control inside the header does its own job.
+const _PTC_HEAD_OWN_CLICK = 'a[href], button, input, select, textarea, [role="link"], [onclick]';
 function _peekToggleTool(id, ev) {
-  const onCaret = !!(ev && ev.target && ev.target.closest && ev.target.closest('.ptc-caret'));
+  const t = ev && ev.target && ev.target.closest ? ev.target : null;
+  const own = t && t.closest(_PTC_HEAD_OWN_CLICK);
+  if (own && !own.classList.contains('ptc-head') && own.closest('.ptc-head')) {
+    clearTimeout(_ptcClickTimer);
+    console.info('[amux] ptc_toggle_skipped', { id, on: own.tagName.toLowerCase() });
+    return;
+  }
+  const onCaret = !!(t && t.closest('.ptc-caret'));
   if (ev && !onCaret) {
     clearTimeout(_ptcClickTimer);
     if (ev.detail > 1) return;
@@ -20506,8 +23244,25 @@ function _htmlPreviewUrl(filePath) {
   if (!p.startsWith('/')) return null;
   return '/api/file/raw-path' + p.split('/').map(encodeURIComponent).join('/');
 }
+// THE BLINKING DOT IS STILL A BLOCK (owner, 2026-11-22: "that circle icon
+// that shows at the start of the message flickers in and out as an agent is
+// currently working. It causes the terminal to do a layout shift"). While a
+// tool runs, Claude Code blinks its ⏺ by drawing a coloured space in the same
+// cell, about twice a second. The terminal does not move, but a block head is
+// found by its ⏺, so on the blank frames the running line ("  Updating the
+// README…") read as a continuation of the block above: the running block
+// vanished into the previous one (hidden with it when that one was folded) and
+// came back on the next frame, shifting everything below. A coloured lone
+// space at column 0 followed by text is that blank frame; a real continuation
+// line starts with plain spaces. It is drawn as a steady ⏺.
+const _PTC_BLINK_OFF_HEAD = /^(<span\b[^>]*>) (<\/span> (?! ))/;
+let _ptcBlinkSeen = 0;
 function _wrapToolCalls(html) {
-  const lines = html.split('\n');
+  const lines = html.split('\n').map(l => {
+    if (!_PTC_BLINK_OFF_HEAD.test(l)) return l;
+    if (!_ptcBlinkSeen++) console.info('[amux] ptc_blink_head', { verdict: 'blank_frame_kept_as_block', worker: peekSession || null });
+    return l.replace(_PTC_BLINK_OFF_HEAD, '$1⏺$2');
+  });
   const strip = s => s.replace(/<[^>]*>/g, '');
   const out = [];
   _peekToolSeq = 0;
@@ -21260,6 +24015,13 @@ function _peekScrollAffordance() {
   if (!overlay || !overlay.classList.contains('active')) return;
   if (_isScrolledToBottom(body)) { _hideScrollLockBadge(body); return; }
   _showScrollLockBadge(body, () => {
+    // A chat owns this body: its own follow state decides what happens next,
+    // so the jump has to go through it (a terminal-only jump left the chat
+    // not following, and the next streamed line left the view behind).
+    if (body.classList.contains('peek-chat') && typeof _chatJumpToLatest === 'function') {
+      _peekFollowBottom = true; _peekBufferedOutput = false; _peekScrollLocked = false;
+      _chatJumpToLatest(); _hideScrollLockBadge(body); return;
+    }
     _peekScrollLocked = false;
     _peekFollowBottom = true;
     _peekBufferedOutput = false;
@@ -22353,11 +25115,15 @@ function _peekHasBoardRef(text) {
 }
 // Both navigation and Find select message blocks with the same predicate.
 // Content filters inspect actual references, never guesses about task intent.
+// A web link that is not a file link. A file link's href is this page's own
+// https URL (`_outputFileHref`: origin + '#path='), so an https selector alone
+// counted every file path as a link once paths became real links (27807a7ef).
+const _PEEK_WEB_LINK = ['https://', 'http://'].map(p => `a[href^="${p}"]:not(.file-link):not(.md-link):not(.md-file-link)`).join(', ');
 function _peekPromptMatchesFilters(el) {
   if (!el || (_peekMsgNavKind !== 'all' && el.dataset.msgKind !== _peekMsgNavKind)) return false;
   if (_peekMsgNavContent === 'board') return _peekHasBoardRef(el.textContent);
   if (_peekMsgNavContent === 'files') return !!el.querySelector('.file-link, .md-link');
-  if (_peekMsgNavContent === 'links') return !!el.querySelector('a[href^="https://"], a[href^="http://"]');
+  if (_peekMsgNavContent === 'links') return !!el.querySelector(_PEEK_WEB_LINK);
   return true;
 }
 function _peekFilterSync() {
@@ -22712,11 +25478,11 @@ function peekMsgPrev(event) { _peekMsgMove(-1, event); }
 // are highlighted and up/down steps between them.
 const _PEEK_TAB_ITEMS = {
   chat: '.chat-msg', schedules: '.sx-row, .sx-fleet-run', messages: '.pm-row', logs: '.wlog-row',
-  commits: '.commits-item', shell: '.peek-shell-card', issues: '.peek-issue-item', dictation: '.dict-row',
+  commits: '.commits-item', shell: '.peek-shell-card', issues: '.peek-issue-item', dictation: '.dict-row', intent: '.home-row',
   scope: '.worker-config-row', cost: '.cost-row, .cost-day', tasks: '.board-card, .peek-issue-item',
 };
 const _PEEK_TAB_LABELS = { chat: 'chat', schedules: 'schedules and runs', messages: 'messages', logs: 'logs',
-  commits: 'commits', shell: 'shell runs', issues: 'board', dictation: 'dictation', scope: 'settings', tasks: 'tasks' };
+  commits: 'commits', shell: 'shell runs', issues: 'board', dictation: 'dictation', scope: 'settings', tasks: 'tasks', intent: 'conversations', computer: 'computer use' };
 let _peekTabIdx = -1, _peekTabObs = null, _peekTabObsRoot = null, _peekTabApplying = false, _peekTabTimer = 0;
 function _peekTabName() { return document.getElementById('peek-overlay')?.dataset.peekTab || 'terminal'; }
 function _peekTabRoot(tab = _peekTabName()) {
@@ -22737,7 +25503,7 @@ function _peekTabItemKeeps(el, q) {
   if (_peekMsgNavKind !== 'all' && el.dataset.msgKind && el.dataset.msgKind !== _peekMsgNavKind) return false;
   if (_peekMsgNavContent === 'board') return _peekHasBoardRef(el.textContent);
   if (_peekMsgNavContent === 'files') return !!el.querySelector('.file-link, .md-link, .md-file-link');
-  if (_peekMsgNavContent === 'links') return !!el.querySelector('a[href^="https://"], a[href^="http://"]');
+  if (_peekMsgNavContent === 'links') return !!el.querySelector(_PEEK_WEB_LINK);
   return true;
 }
 function _peekTabHighlight(root, q) {
@@ -24380,7 +27146,7 @@ async function peekLoadLogIntoSession() {
       if (d && typeof d.size === 'number') {
         const mb = d.size / (1024 * 1024);
         sizeNote = mb >= 1 ? ` (~${mb.toFixed(1)} MB)` : ` (~${Math.round(d.size/1024)} KB)`;
-        if (mb > 5 && !confirm('Your worker log is ' + mb.toFixed(1) + ' MB. Loading it will eat a lot of context. Continue?')) return;
+        if (mb > 5 && !(await showConfirm('Your worker log is ' + mb.toFixed(1) + ' MB. Loading it will eat a lot of context. Continue?'))) return;
       }
     }
   } catch(e) {}
@@ -24432,140 +27198,25 @@ async function peekShowTranscripts() {
   document.getElementById('modal-backdrop').classList.add('open');
 }
 
-// ── Channel drawer (session-to-session DM) ──
-let _channelMe = null;
-let _channelOther = null;
-let _channelPollTimer = null;
-let _channelLastTs = 0;
-
+// ── Two workers' direct message (was the channel drawer) ──
+// An @mention at the start of a worker's composer opens the Messages direct
+// message between that worker and the one named (`ww:<a>|<b>`), with the
+// drafted text in the composer, addressed to the worker named. The channel
+// drawer kept its own transcript files (api/channels.rs) beside Messages;
+// the primitive integrity audit (2026-11-26) folded it in.
+function _cvPairKey(a, b) { return 'ww:' + (a <= b ? a + '|' + b : b + '|' + a); }
 function channelOpen(me, other, prefillText) {
   if (!me || !other || me === other) {
-    showToast('Cannot open channel: ' + (!me?'no source':!other?'no target':'same worker'));
+    showToast('Cannot open a direct message: ' + (!me?'no source':!other?'no target':'same worker'));
     return;
   }
-  _channelMe = me;
-  _channelOther = other;
-  // Restore any offline-typed draft for this pair (AMUX-2209)
-  try {
-    const _cd = localStorage.getItem('amux_draft_channel_' + me + '_' + other);
-    const _ci = document.getElementById('channel-input');
-    if (_cd && _ci && !prefillText) setTimeout(() => { if (!_ci.value) _ci.value = _cd; }, 50);
-  } catch (e) {}
-  _channelLastTs = 0;
-  document.getElementById('channel-header-pair').textContent = me + ' ↔ ' + other;
-  document.getElementById('channel-thread').innerHTML =
-    '<div class="channel-empty">Loading…</div>';
-  const drawer = document.getElementById('channel-drawer');
-  drawer.classList.add('open');
-  // Suppress backdrop-close from the click that opened us — the original
-  // mousedown was on a card-input dropdown item, but the click event that
-  // follows may now land on this drawer's backdrop (since we're on top).
-  drawer.dataset.justOpened = '1';
-  drawer.dataset.bdMousedown = '';
-  setTimeout(() => { delete drawer.dataset.justOpened; }, 400);
-  const inp = document.getElementById('channel-input');
-  inp.value = prefillText || '';
-  setTimeout(() => inp.focus(), 100);
-  channelRefresh();
-  if (_channelPollTimer) clearInterval(_channelPollTimer);
-  _channelPollTimer = setInterval(channelRefresh, 2500);
-}
-
-function channelClose() {
-  const drawer = document.getElementById('channel-drawer');
-  drawer.classList.remove('open');
-  delete drawer.dataset.justOpened;
-  drawer.dataset.bdMousedown = '';
-  if (_channelPollTimer) { clearInterval(_channelPollTimer); _channelPollTimer = null; }
-  _channelMe = null; _channelOther = null;
-}
-
-async function channelRefresh() {
-  if (!_channelMe || !_channelOther) return;
-  try {
-    const r = await fetch(API + '/api/channels/' + encodeURIComponent(_channelMe) +
-      '/' + encodeURIComponent(_channelOther) + '/messages');
-    if (!r.ok) return;
-    const d = await r.json();
-    channelRender(d.messages || []);
-  } catch (e) { /* network blip — keep polling */ }
-}
-
-function channelRender(messages) {
-  const thread = document.getElementById('channel-thread');
-  if (!messages.length) {
-    thread.innerHTML =
-      '<div class="channel-empty">No messages yet.<br>Say hi to <b>@' +
-      esc(_channelOther) + '</b> — they will see your message in their terminal.</div>';
-    return;
-  }
-  // Skip re-render if nothing new
-  const newest = messages[messages.length - 1];
-  if (newest.ts === _channelLastTs && thread.children.length === messages.length) return;
-  _channelLastTs = newest.ts;
-  const html = messages.map(m => {
-    const mine = m.from === _channelMe;
-    const when = new Date((m.ts || 0) * 1000).toLocaleTimeString([],
-      { hour: 'numeric', minute: '2-digit' });
-    return '<div class="channel-msg ' + (mine ? 'mine' : 'theirs') + '">' +
-      '<div class="channel-msg-meta">' + esc(m.from) + ' · ' + when + '</div>' +
-      '<div class="channel-msg-bubble">' + esc(m.text || '') + '</div>' +
-      '</div>';
-  }).join('');
-  thread.innerHTML = html;
-  thread.scrollTop = thread.scrollHeight;
-}
-
-async function channelEnd() {
-  if (!_channelMe || !_channelOther) return;
-  const me = _channelMe, other = _channelOther;
-  const ok = await showConfirm(
-    `End channel with @${other}?\n\nThis clears the history and notifies @${other} that the conversation is over.`,
-    'End channel', true);
-  if (!ok) return;
-  try {
-    const r = await fetch(API + '/api/channels/' + encodeURIComponent(me) +
-      '/' + encodeURIComponent(other) + '/messages', { method: 'DELETE' });
-    const d = await r.json();
-    if (r.ok && d.ok) {
-      showToast('Channel with @' + other + ' ended');
-      channelClose();
-    } else {
-      showToast('End failed: ' + (d.error || r.status));
-    }
-  } catch (e) {
-    showToast('End error: ' + e.message);
-  }
-}
-
-async function channelSend() {
-  if (!_channelMe || !_channelOther) return;
-  const inp = document.getElementById('channel-input');
-  const text = inp.value.trim();
-  if (!text) return;
-  inp.value = '';
-  try { localStorage.removeItem('amux_draft_channel_' + (_channelMe||'') + '_' + (_channelOther||'')); } catch (e) {}
-  inp.style.height = 'auto';
-  const btn = document.getElementById('channel-send-btn');
-  btn.disabled = true;
-  try {
-    const r = await apiCall(API + '/api/channels/' + encodeURIComponent(_channelMe) +
-      '/' + encodeURIComponent(_channelOther) + '/messages',
-      { method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ text }) });
-    if (!r) { await channelRefresh(); return; }  // offline-queued (or error) — apiCall already toasted
-    const d = await r.json();
-    if (!d.ok) {
-      showToast('Send failed: ' + (d.error || r.status));
-    } else if (!d.delivered) {
-      showToast('Saved, but ' + _channelOther + ' is not running');
-    }
-    await channelRefresh();
-  } catch (e) {
-    showToast('Send error: ' + e.message);
-  } finally {
-    btn.disabled = false;
-    inp.focus();
+  const conv = _cvPairKey(me, other);
+  if (!_cvViewOn()) switchView('messages');
+  _cvSelect(conv);
+  const inp = document.getElementById('cv-input');
+  if (inp) {
+    inp.value = '@' + other + ' ' + (prefillText || '');
+    setTimeout(() => { inp.focus(); try { inp.setSelectionRange(inp.value.length, inp.value.length); } catch (e) {} }, 60);
   }
 }
 
@@ -25174,7 +27825,10 @@ async function _approvalsRefresh() {
       + 'title="' + (collapsed ? 'Show the drafts' : 'Collapse') + '">'
       + '<span style="display:inline-block;width:1em;transition:transform .12s;'
       + 'transform:rotate(' + (collapsed ? '-90' : '0') + 'deg);">&#x25BE;</span>'
-      + '<span>' + _apprHeadline(pending.length, grants.length) + '</span></div>';
+      + '<span>' + _apprHeadline(pending.length, grants.length) + '</span>'
+      // Every channel's held messages, emails among them, in one tab.
+      + (pending.length ? '<button class="appr-btn-outline appr-open-outbound" onclick="event.stopPropagation();switchView(\'outbound\')">Open in Outbound</button>' : '')
+      + '</div>';
     if (collapsed) {
       el.innerHTML = html + '</div>';
       el.style.display = 'block';
@@ -25273,6 +27927,8 @@ async function _approvalsRefresh() {
         + 'border-radius:var(--radius-md);padding:var(--space-2) var(--space-2-5);margin:var(--space-1-5) 0;font-size:var(--fs-md);max-height:320px;overflow:auto;">'
         + esc(_bodyText) + '</div>'
         + _apprAttachHtml(p)
+        + _apprLinksHtml(pv)
+        + _apprVoiceHtml(pv)
         + '<div id="appr-sched-' + esc(p.id) + '" class="appr-sched-row" data-send-at="' + (_sched ? _sched.send_at : '') + '" hidden></div>'
         + (p.schedule_failed ? '<div class="appr-sched-failed">'
           + 'It was scheduled for ' + esc(_apprWhenText(p.schedule_failed.send_at)) + ' and did not send. It is waiting for you again.</div>' : '')
@@ -25286,6 +27942,34 @@ async function _approvalsRefresh() {
     el.innerHTML = html;
     el.style.display = 'block';
   } catch (e) {}
+}
+// THE LINKS WERE CHECKED (Ethan, 2026-11-24: "make sure links are always
+// checked"). The server fetched every URL in the draft when it was held
+// (api/email_links.rs) and refused it on a dead one; this line says what it
+// found, so a bot-walled or slow link is seen before Approve.
+// The owner's voice and the /slop pass (Ethan, 2026-11-24: "everything should
+// use my founder voice and be run thru anti slop skill"): what the voice check
+// found when the draft was held, the worker's reason if it broke a rule, and
+// whether the drafter attested the /slop pass.
+function _apprVoiceHtml(pv) {
+  const v = pv.voice;
+  if (!v) return '';
+  let text;
+  if (v.measured !== true) text = 'Voice not checked (' + (v.why_unmeasured || 'unknown') + ')';
+  else if (!v.voice) text = 'Voice: none set';
+  else text = v.ok ? 'Voice: fits ' + v.voice : 'Voice: ' + (v.problems || []).join('; ');
+  if (v.override) text += ' (sent as written because: ' + v.override + ')';
+  text += v.slop === true ? ' · slop pass attested' : ' · slop pass NOT attested';
+  const bad = v.measured !== true || v.ok === false || v.slop !== true;
+  return '<div class="appr-links' + (bad ? ' appr-links-warn' : '') + '">' + esc(text) + '</div>';
+}
+function _apprLinksHtml(pv) {
+  const l = pv.links;
+  if (!l) return '';
+  const warn = l.measured === true && (l.warn || []).length;
+  const text = l.measured === true ? 'Links: ' + (l.summary || (l.checked + ' checked'))
+    : 'Links not checked (' + (l.why_unmeasured || 'unknown') + ')';
+  return '<div class="appr-links' + (warn || l.measured !== true ? ' appr-links-warn' : '') + '">' + esc(text) + '</div>';
 }
 // THE FILES GO OUT TOO (Ethan, 2026-11-09: "make sure amux supports
 // attachments too in the approval flow"). Each held attachment is a chip with
@@ -25366,17 +28050,20 @@ function _apprToggle() {
   localStorage.setItem('amuxApprCollapsed', now);
   _approvalsRefresh();
 }
-async function _apprReject(id, btn) {
+// `opts` (optional): {plain: true} words the toast without machinery names,
+// {after: fn} runs once the request settles (Chat's draft cards use both).
+async function _apprReject(id, btn, opts) {
   if (btn) { btn.disabled = true; btn.textContent = 'Discarding…'; }
   try {
     const r = await fetch(API + '/api/email/reject/' + encodeURIComponent(id), {
       method: 'POST', headers: { ..._authHeaders(), 'X-Amux-Approver': 'dashboard' },
     });
     const d = await r.json().catch(() => ({}));
-    if (r.ok) showToast('Discarded — nothing was sent' + (d.was_for_session ? ' (' + d.was_for_session + ')' : ''));
-    else showToast('Discard failed: ' + (d.error || r.status));
+    if (r.ok) showToast('Discarded — nothing was sent' + (d.was_for_session && !opts?.plain ? ' (' + d.was_for_session + ')' : ''));
+    else showToast((opts?.plain ? 'Not discarded: ' : 'Discard failed: ') + (d.error || r.status));
   } catch (e) { showToast('Discard failed: ' + e); }
   _approvalsRefresh();
+  if (opts?.after) opts.after();
 }
 /// Swap the frozen preview for a textarea holding the same text (AMUX-5021).
 ///
@@ -25428,7 +28115,7 @@ function _apprEditCancel(id) {
 /// is non-empty, so a poll cannot discard what someone is typing.
 const _apprEditing = new Set();
 
-async function _apprApprove(id, btn) {
+async function _apprApprove(id, btn, opts) {
   if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
   try {
     // AUTOD-48: approve now authorizes on a POSITIVE marker. Absence used to
@@ -25449,10 +28136,11 @@ async function _apprApprove(id, btn) {
     const r = await fetch(API + '/api/email/approve/' + encodeURIComponent(id), init);
     _apprEditing.delete(id);
     const d = await r.json().catch(() => ({}));
-    if (r.ok) showToast('Approved — sent for ' + (d.sent_for_session || 'worker'));
-    else showToast('Approve failed: ' + (d.error || r.status));
+    if (r.ok) showToast(opts?.plain ? 'Sent' : 'Approved — sent for ' + (d.sent_for_session || 'worker'));
+    else showToast((opts?.plain ? 'Not sent: ' : 'Approve failed: ') + (d.error || r.status));
   } catch (e) { showToast('Approve failed: ' + e); }
   _approvalsRefresh();
+  if (opts?.after) opts.after();
 }
 // "today 3:00 PM", "tomorrow 9:00 AM", "Tue, Nov 11, 9:00 AM": when a scheduled
 // draft goes out, in this device's time.
@@ -28619,7 +31307,7 @@ async function _peekMessagesLoad(more) {
 // with amux context (session names + your vocabulary) — the API key never
 // reaches this page. Result lands in the composer for review, never auto-sent.
 let _dictRecording = false, _dictRecorder = null, _dictChunks = [], _dictStream = null;
-let _dictStartedAt = 0, _dictSub = 'history';
+let _dictStartedAt = 0;
 let _dictItems = [], _dictWords = [], _dictTotalWords = 0, _dictCfg = null;
 let _dictCount = 0;   // history rows for peekSession — drives the tab badge without opening the tab
 
@@ -28630,6 +31318,7 @@ async function _dictLoad() {
       fetch(API + '/api/dictation/history?session=' + encodeURIComponent(asked), { headers: _authHeaders() }).then(r => r.json()),
       fetch(API + '/api/dictation/dict', { headers: _authHeaders() }).then(r => r.json()),
       fetch(API + '/api/dictation/config', { headers: _authHeaders() }).then(r => r.json()),
+      _dictSettingsLoad(),
     ]);
     if ((peekSession || '') !== asked) { _peekStale(asked, 'dictation'); return; }
     _dictItems = h.items || []; _dictTotalWords = h.total_words || 0;
@@ -28641,17 +31330,193 @@ async function _dictLoad() {
   _dictPendingBadge();
   _dictRender();
 }
-function _dictSetSub(s) {
-  _dictSub = s;
-  ['history','dict','settings'].forEach(k => document.getElementById('dict-subtab-' + k)?.classList.toggle('active', k === s));
-  const srch = document.getElementById('dict-search');
-  if (srch) srch.style.display = s === 'history' ? '' : 'none';
-  _dictRender();
+// Dictation settings live on the server (GET/PUT /api/dictation/settings), so the browser,
+// the Mac app and the phone dictate with the same microphone and the same context.
+// `mic` is a microphone's NAME: each device matches it against its own inputs.
+let _dictSettings = null, _dictSources = null, _dictSettingsAt = 0, _dictMicWarned = '';
+async function _dictSettingsLoad() {
+  try {
+    const r = await fetch(API + '/api/dictation/settings', { headers: _authHeaders() });
+    const d = await r.json();
+    if (d && d.settings) { _dictSettings = d.settings; _dictSources = d.sources || null; _dictSettingsAt = Date.now(); }
+  } catch (e) { console.warn('dictation: settings did not load', e); }
+  return _dictSettings;
 }
+// Before a take: the saved settings, refreshed in the background when older than a minute.
+async function _dictSettingsEnsure() {
+  if (!_dictSettings) await _dictSettingsLoad();
+  else if (Date.now() - _dictSettingsAt > 60000) _dictSettingsLoad();
+  return _dictSettings || { mic: '', context: '', workers: true, contacts: false };
+}
+// Saves run one at a time, and each carries every edit made so far: two quick changes (a
+// switch, then the context) sent at once could land out of order and the older one
+// overwrote the newer on the server.
+let _dictSettingsWant = null, _dictSettingsQueue = Promise.resolve();
+function _dictSettingsSave(patch) {
+  _dictSettingsWant = Object.assign({ mic: '', context: '', workers: true, contacts: false },
+    _dictSettingsWant || _dictSettings || {}, patch);
+  const next = Object.assign({}, _dictSettingsWant);
+  const run = _dictSettingsQueue.then(() => _dictSettingsPut(next));
+  _dictSettingsQueue = run.catch(() => false);
+  return run;
+}
+async function _dictSettingsPut(next) {
+  let d = null;
+  try {
+    const r = await fetch(API + '/api/dictation/settings', { method: 'PUT',
+      headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(next) });
+    d = await r.json();
+    if (!r.ok || !d.settings) throw new Error(d.error || ('HTTP ' + r.status));
+  } catch (e) {
+    showToast('Dictation settings were not saved: ' + e.message);
+    _dictSettingsWant = null;
+    // The controls show what was asked; put them back to what the server holds.
+    _dictRenderSettings();
+    return false;
+  }
+  const micChanged = (_dictSettings || {}).mic !== d.settings.mic;
+  _dictSettings = d.settings; _dictSettingsAt = Date.now();
+  // A warm stream is the old microphone: the next take opens the new one.
+  if (micChanged && _dictStream) {
+    try { _dictStream.getTracks().forEach(t => t.stop()); } catch (e) { console.warn('dictation: could not release the previous microphone', e); }
+    _dictStream = null;
+  }
+  _dictMicWarned = '';
+  showToast('Dictation settings saved');
+  // No repaint here: the controls already show the saved values, and a repaint would wipe
+  // context typed while this save was in flight.
+  return true;
+}
+// Microphone names this device can use: the Mac app's own inputs, and the browser's.
+// Browsers hide names until the microphone is allowed once; `hidden` says so.
+async function _dictMicNames() {
+  const names = new Set();
+  let hidden = false;
+  if (typeof _nativeRec !== 'undefined' && _nativeRec && Array.isArray(_nativeRec.inputs)) _nativeRec.inputs.forEach(n => n && names.add(n));
+  try {
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      for (const d of await navigator.mediaDevices.enumerateDevices()) {
+        if (d.kind !== 'audioinput' || d.deviceId === 'default' || d.deviceId === 'communications') continue;
+        if (d.label) names.add(d.label); else hidden = true;
+      }
+    }
+  } catch (e) { console.warn('dictation: could not list microphones', e); }
+  return { names: [...names].sort(), hidden };
+}
+async function _dictMicReveal() {
+  try {
+    const st = await navigator.mediaDevices.getUserMedia({ audio: true });
+    st.getTracks().forEach(t => t.stop());
+  } catch (e) { showToast('The microphone was not allowed, so its name cannot be shown.'); return; }
+  _dictRenderSettings();
+}
+// The microphone is this device's own choice (owner, 2026-11-20: "dictation mic
+// settings should be client specific not server saved"): a phone, a laptop and
+// the Mac app each keep theirs in localStorage. A device that never chose one
+// starts from the server's old shared value, so nobody's pick is lost.
+const _DICT_MIC_KEY = 'amux_dict_mic';
+function _dictMic() {
+  try {
+    const own = localStorage.getItem(_DICT_MIC_KEY);
+    if (own !== null) return own;
+  } catch (e) { console.warn('dictation: could not read this device\'s microphone', e); }
+  return ((_dictSettings || {}).mic || '');
+}
+function _dictSetMic(name) {
+  const was = _dictMic();
+  try { localStorage.setItem(_DICT_MIC_KEY, name || ''); }
+  catch (e) { showToast('This browser would not save the microphone'); return; }
+  // A warm stream is the old microphone: the next take opens the new one.
+  if (was !== (name || '') && _dictStream) {
+    try { _dictStream.getTracks().forEach(t => t.stop()); } catch (e) { console.warn('dictation: could not release the previous microphone', e); }
+    _dictStream = null;
+  }
+  _dictMicWarned = '';
+  showToast(name ? 'This device dictates with ' + name : 'This device dictates with its default microphone');
+}
+// One microphone under two spellings: the Mac app's input name, Chrome's label
+// with its "(0909:001a)" USB id, or the "Default - " entry.
+function _dictMicSame(label, want) {
+  const n = s => String(s || '').toLowerCase().replace(/^default\s*-\s*/, '').replace(/\s*\([0-9a-f]{4}:[0-9a-f]{4}\)\s*$/, '').trim();
+  return !!n(label) && n(label) === n(want);
+}
+async function _dictMicFind(want) {
+  try {
+    return (await navigator.mediaDevices.enumerateDevices()).find(d => d.kind === 'audioinput'
+      && d.deviceId !== 'default' && d.deviceId !== 'communications' && _dictMicSame(d.label, want)) || null;
+  } catch (e) { console.warn('dictation: could not list microphones', e); return null; }
+}
+// getUserMedia's audio constraint for the chosen microphone, matched by name. No
+// match yet is not "not connected": a page that has not opened the microphone
+// sees no names at all (the Mac app, 2026-11-25: the owner's connected
+// ATR2500x-USB was reported missing every take). _dictMicSettle decides once the
+// stream is open and the names can be read.
+async function _dictMicConstraint() {
+  const want = _dictMic().trim();
+  if (!want || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return {};
+  const dev = await _dictMicFind(want);
+  return dev ? { deviceId: { exact: dev.deviceId } } : {};
+}
+// After the default microphone opened: it may BE the chosen one; else the names
+// are readable now, so open the chosen one if it is here, and only when it is
+// not, say so once.
+async function _dictMicSettle(stream, audio) {
+  const want = _dictMic().trim();
+  if (!want || !stream || audio.deviceId) return stream;
+  const track = stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
+  if (track && _dictMicSame(track.label, want)) return stream;
+  const dev = await _dictMicFind(want);
+  if (!dev) { _dictMicMissing(want); return stream; }
+  const on = track && track.getSettings ? track.getSettings().deviceId : '';
+  if (on && on === dev.deviceId) return stream;
+  try {
+    const chosen = await navigator.mediaDevices.getUserMedia({ audio: Object.assign({}, audio, { deviceId: { exact: dev.deviceId } }) });
+    stream.getTracks().forEach(t => t.stop());
+    _dictBeacon('dict_mic_reopened', { native: false });
+    return chosen;
+  } catch (e) {
+    console.warn('dictation: could not open the chosen microphone', e);
+    _dictMicMissing(want);
+    return stream;
+  }
+}
+function _dictMicMissing(name) {
+  _dictBeacon('dict_mic_missing', { native: false });
+  if (_dictMicWarned === name) return;
+  _dictMicWarned = name;
+  showToast(name + ' is not connected here; dictating with the default microphone.');
+}
+// The dictionary and the settings are one server-wide value each, so they have their
+// own Dictation tab; a worker's Dictation tab shows only its own History.
 function _dictRender() {
-  if (_dictSub === 'history') _dictRenderHistory();
-  else if (_dictSub === 'dict') _dictRenderDict();
-  else _dictRenderSettings();
+  _dictRenderHistory();
+  _dictRenderGlobal();
+}
+function _dictGlobalShown() { return activeView === 'dictation' && !peekSession; }
+function _dictRenderGlobal() {
+  if (!_dictGlobalShown()) return;
+  _dictRenderDict();
+  _dictRenderSettings();
+}
+// The Dictation tab opened: the dictionary, key source and settings, fresh.
+async function _dictGlobalLoad() {
+  try {
+    const [d, c, tx] = await Promise.all([
+      fetch(API + '/api/dictation/dict', { headers: _authHeaders() }).then(r => r.json()),
+      fetch(API + '/api/dictation/config', { headers: _authHeaders() }).then(r => r.json()),
+      fetch(API + '/api/transcription', { headers: _authHeaders() }).then(r => r.json()).catch(() => null),
+      _dictSettingsLoad(),
+    ]);
+    _dictWords = Array.isArray(d) ? d : []; _dictCfg = c || {}; _dictTx = tx;
+  } catch (e) { console.warn('dictation: the dictionary did not load', e); }
+  _dictRenderDict();
+  _dictRenderSettings();
+}
+function _dictOpenSettings(section) {
+  // The Dictation tab is in the main tab strip, which a worker's view covers.
+  if (typeof peekSession !== 'undefined' && peekSession) closePeek();
+  if (activeView !== 'dictation') switchView('dictation');
+  if (section) document.getElementById(section)?.scrollIntoView({ block: 'start' });
 }
 
 // ── Recording ──
@@ -28680,20 +31545,44 @@ function _dictOpenPopup() {
   if (!pop) return;
   _dictPopupOpen = true;
   pop.classList.add('open');
+  pop.classList.toggle('dict-ptt', _dictPtt);
+  pop.classList.remove('dict-busy', 'dict-said');
+  _dictStatus('');
   _dictStartRec();
 }
 function _dictClosePopup(cancel) {
   const pop = document.getElementById('dict-popup');
   if (pop) pop.classList.remove('open');
   _dictPopupOpen = false;
-  if (cancel && _dictRecording) { _dictCancelled = true; _dictStopRec(); }
+  if (cancel && _dictNative) _dictNativeCancel();
+  else if (cancel && _dictRecording) { _dictCancelled = true; _dictStopRec(); }
+  _dictPtt = false;
   if (cancel && typeof _hkDictTarget !== 'undefined') _hkDictTarget = null;
   if (typeof _hkDictHome === 'function') _hkDictHome();
 }
 let _dictCancelled = false;
 
+// ONE TAKE PER CLIENT (owner, 2026-11-17: "There should also only be one
+// dictation running per amux client"). Each tab or pane is its own page with
+// its own recorder; starting a take here stops one running in any other page
+// of this browser or app, which inserts what it heard where it was started.
+const _dictTabId = Math.random().toString(36).slice(2);
+const _dictBus = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('amux-dictation') : null;
+if (_dictBus) _dictBus.onmessage = e => {
+  const m = e.data || {};
+  if (m.op !== 'start' || m.tab === _dictTabId || !_dictRecording) return;
+  _dictBeacon('dict_stopped_for_other_tab', {});
+  _dictStopRec();
+};
 async function _dictStartRec() {
   if (_dictRecording) return;
+  try { _dictBus?.postMessage({ op: 'start', tab: _dictTabId }); } catch (e) { console.warn('dictation: could not tell other tabs', e); }
+  const nat = _dictNativeBridge();
+  // Never wait on the settings read here: a take that started late let a quick
+  // hold-and-release of the Globe key land before its start, so the take ran on.
+  // They load at boot (below); a first take before that uses the default mic.
+  if (nat && !_dictSettings) _dictSettingsEnsure();
+  if (nat) { _dictNativeStart(nat); return; }
   if (!navigator.mediaDevices || !window.MediaRecorder) { showToast('Recording not supported in this browser'); return; }
   _dictCancelled = false;
   // Reuse a still-live stream. getUserMedia costs ~200-800ms on a phone, and the
@@ -28712,8 +31601,10 @@ async function _dictStartRec() {
       _dictBeacon('mic_permission_slow', { mac });
     }, 6000);
     try {
-      _dictStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: { ideal: 16000 } } });
+      await _dictSettingsEnsure();
+      const mic = await _dictMicConstraint();
+      const audio = Object.assign({ echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: { ideal: 16000 } }, mic);
+      _dictStream = await _dictMicSettle(await navigator.mediaDevices.getUserMedia({ audio }), audio);
     } catch(e) {
       showToast(mac ? 'The microphone is off for amux. Turn it on in System Settings → Privacy & Security → Microphone.' : 'Microphone access denied');
       _dictBeacon('mic_permission_refused', { mac, error: String(e && e.name || e).slice(0, 80) });
@@ -28737,7 +31628,8 @@ async function _dictStartRec() {
   // 2026-11-03). Storage runs its writes in order, so this clear still lands
   // before the first second is saved.
   _dictLiveClear();
-  _dictRecorder.ondataavailable = e => { if (e.data && e.data.size) { _dictChunks.push(e.data); _dictLiveSave(e.data); } };
+  const take = ++_dictTake;
+  _dictRecorder.ondataavailable = e => { if (e.data && e.data.size) { const first = !_dictChunks.length; _dictChunks.push(e.data); _dictLiveSave(e.data, take, first); } };
   _dictRecorder.onstop = () => { _dictStopMeter(); if (_dictCancelled) { _dictChunks = []; _dictLiveClear(); _dictStatus('Cancelled'); } else _dictUpload(); };
   // 1 s slices: each second reaches IndexedDB as it is spoken (see _dictLiveSave).
   _dictRecorder.start(1000);
@@ -28757,34 +31649,44 @@ function _dictStartMeter() {
     src.connect(_dictAnalyser);
   } catch(e) { return; }
   const data = new Uint8Array(_dictAnalyser.frequencyBinCount);
-  const bars = Array.from(document.querySelectorAll('#dict-wave .dict-bar'));
+  let last = 0;
   const draw = () => {
     if (!_dictRecording || !_dictAnalyser) return;
-    _dictAnalyser.getByteFrequencyData(data);
-    const n = bars.length || 1;
-    const per = Math.floor(data.length / n) || 1;
-    for (let i = 0; i < n; i++) {
+    const now = performance.now();
+    if (now - last > 66) {
+      last = now;
+      _dictAnalyser.getByteFrequencyData(data);
       let sum = 0;
-      for (let j = 0; j < per; j++) sum += data[i * per + j] || 0;
-      const level = Math.min(1, (sum / per) / 140);
-      bars[i].style.transform = 'scaleY(' + Math.max(0.12, level).toFixed(3) + ')';
+      for (let i = 0; i < data.length; i++) sum += data[i];
+      _dictLevel(Math.min(1, (sum / data.length) / 90));
     }
     _dictRafId = requestAnimationFrame(draw);
   };
   draw();
+}
+// The bars are the last few levels heard, newest on the right, so speech
+// scrolls across the pill (the app sends levels too: _dictNativeEvent).
+let _dictLevels = [];
+function _dictLevel(v) {
+  const bars = document.querySelectorAll('#dict-wave .dict-bar');
+  _dictLevels.push(v);
+  if (_dictLevels.length > bars.length) _dictLevels.splice(0, _dictLevels.length - bars.length);
+  const off = bars.length - _dictLevels.length;
+  bars.forEach((b, i) => { b.style.transform = 'scaleY(' + Math.max(0.15, i >= off ? _dictLevels[i - off] : 0).toFixed(3) + ')'; });
 }
 function _dictStopMeter() {
   if (_dictRafId) cancelAnimationFrame(_dictRafId);
   _dictRafId = 0; _dictAnalyser = null;
   try { _dictAudioCtx && _dictAudioCtx.close(); } catch(e) {}
   _dictAudioCtx = null;
-  document.querySelectorAll('#dict-wave .dict-bar').forEach(b => b.style.transform = 'scaleY(0.12)');
+  _dictLevels = [];
+  document.querySelectorAll('#dict-wave .dict-bar').forEach(b => b.style.transform = '');
 }
 function _dictTick() {
   if (!_dictRecording) return;
   const s = Math.floor((Date.now() - _dictStartedAt) / 1000);
   const clock = Math.floor(s/60) + ':' + String(s%60).padStart(2,'0');
-  _dictStatus('Listening… ' + clock + ' — tap to stop');
+  const el = document.getElementById('dict-rec-status'); if (el) el.textContent = 'Listening… ' + clock + ' — tap to stop';
   const t = document.getElementById('dict-popup-time'); if (t) t.textContent = clock;
   setTimeout(_dictTick, 500);
 }
@@ -28792,6 +31694,8 @@ function _dictStopRec() {
   if (!_dictRecording) return;
   _dictRecording = false;
   document.getElementById('dict-rec-btn')?.classList.remove('recording');
+  document.getElementById('dict-popup')?.classList.add('dict-busy');
+  if (_dictNative) { _dictNativeStop(); return; }
   try { _dictRecorder && _dictRecorder.state !== 'inactive' && _dictRecorder.stop(); } catch(e) {}
   // Keep the mic warm for a short window so a follow-up take is instant, then
   // release it — an indefinitely open mic leaves the browser's recording
@@ -28802,10 +31706,144 @@ function _dictStopRec() {
     _dictStream = null; _dictWarmTimer = 0;
   }, _DICT_WARM_MS);
 }
+// The tab's status line says every step; the pill only what you must know
+// (an error, or why it waits), so a take that works shows no words at all.
 function _dictStatus(t) {
   const el = document.getElementById('dict-rec-status'); if (el) el.textContent = t;
-  const p = document.getElementById('dict-popup-status'); if (p) p.textContent = t.replace(/ — tap to stop$/, '');
+  const p = document.getElementById('dict-popup-status');
+  if (p) p.textContent = /^(Listening|Transcribing|Added to the composer|Starting mic)/.test(t) ? '' : t;
 }
+// ── Dictation in the Mac app ──
+// The app listens and recognizes on device while you speak
+// (desktop/amux-dictation.swift), so the text is ready a fraction of a second
+// after you stop; the page then sends it and the audio to /api/dictate, which
+// fixes worker names and keeps both, and puts it where you were typing. When
+// the app cannot (macOS before 26, the speech model still downloading) it
+// answers "unavailable" and this page records the take itself, as in a browser.
+let _dictNative = null;        // the take the app is running: {at, stopAt}
+let _dictNativeOffUntil = 0;   // the app said it cannot; the page records until then
+let _dictPtt = false;          // started by holding 🌐: letting go ends it
+function _dictNativeBridge() {
+  if (Date.now() < _dictNativeOffUntil) return null;
+  return (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.amuxDictation) || null;
+}
+// Words the recognizer should expect: worker names and your dictionary.
+function _dictNativeHints() {
+  const useNames = !_dictSettings || _dictSettings.workers !== false;
+  const names = useNames ? (typeof sessions !== 'undefined' ? sessions : []).map(x => x && x.name).filter(Boolean) : [];
+  const words = (_dictWords || []).map(w => (w.correct || '').trim() || w.word).filter(Boolean);
+  return [...new Set(names.concat(words))].slice(0, 200);
+}
+function _dictNativeStart(bridge) {
+  _dictCancelled = false;
+  _dictNative = { at: Date.now() };
+  _dictRecording = true; _dictStartedAt = Date.now();
+  document.getElementById('dict-rec-btn')?.classList.add('recording');
+  _dictTick();
+  bridge.postMessage({ op: 'start', hints: _dictNativeHints(), input: _dictMic() });
+  if (_dictSettings && _dictSettings.mic) _dictSettingsEnsure();
+}
+function _dictNativeStop() {
+  if (_dictNative) _dictNative.stopAt = Date.now();
+  window.webkit.messageHandlers.amuxDictation.postMessage({ op: 'stop' });
+}
+function _dictNativeCancel() {
+  _dictNative = null; _dictRecording = false; _dictCancelled = true;
+  document.getElementById('dict-rec-btn')?.classList.remove('recording');
+  try { window.webkit.messageHandlers.amuxDictation.postMessage({ op: 'cancel' }); } catch (e) { console.warn('dictation: cancel did not reach the app', e); }
+  _dictStatus('Cancelled');
+}
+// The pill says what went wrong, then closes.
+function _dictPillSays(t, ms) {
+  const pop = document.getElementById('dict-popup');
+  pop?.classList.remove('dict-busy');
+  pop?.classList.add('dict-said');
+  _dictStatus(t);
+  setTimeout(() => { if (!_dictRecording && !_dictNative) _dictClosePopup(false); }, ms || 3500);
+}
+window._dictNativeEvent = function (ev) {
+  if (!ev || !ev.type) return;
+  if (ev.type === 'level') { if (_dictNative) _dictLevel(ev.v); return; }
+  if (ev.type === 'started') return;
+  // The app could not use the chosen microphone and took the default (amux-dictation-core.swift).
+  if (ev.type === 'notice') {
+    _dictBeacon('dict_mic_missing', { native: true });
+    if (_dictMicWarned !== String(ev.why)) { _dictMicWarned = String(ev.why); showToast(ev.why); }
+    return;
+  }
+  const take = _dictNative;
+  _dictNative = null;
+  if (ev.type === 'done') { _dictNativeDone(ev, take); return; }
+  _dictRecording = false;
+  document.getElementById('dict-rec-btn')?.classList.remove('recording');
+  if (ev.type === 'unavailable') {
+    // Recorded here instead; the app is asked again in a minute.
+    _dictNativeOffUntil = Date.now() + 60000;
+    _dictBeacon('dict_native_unavailable', { why: String(ev.why || '').slice(0, 120) });
+    if (take && !_dictCancelled) _dictStartRec();
+    return;
+  }
+  if (ev.type === 'busy') {
+    // The app runs one take at a time; another tab or pane holds it.
+    _dictBeacon('dict_native_busy', {});
+    _dictPillSays('Dictation is already running in another tab', 2500);
+    return;
+  }
+  _dictBeacon('dict_native_error', { error: String(ev.why || '').slice(0, 160) });
+  _dictPillSays(ev.why || 'Dictation failed');
+};
+// A microphone was plugged in or unplugged (the Mac app tells the page you are in:
+// MicWatch in desktop/amux-dictation.swift). The toast says whether dictation uses it:
+// the one chosen in Dictation settings when it is connected, else the system default.
+window._dictMicsChanged = function (ev) {
+  if (!ev) return;
+  const chosen = _dictMic(), inputs = ev.inputs || [], def = ev.default || 'the default microphone';
+  const using = chosen && inputs.includes(chosen) ? chosen : def;
+  const lines = [];
+  for (const m of ev.added || []) {
+    if (m === using) lines.push(m + ' connected. Dictation uses it.');
+    else lines.push(m + ' connected. Dictation keeps using ' + using + '.');
+  }
+  for (const m of ev.removed || []) {
+    if (m === chosen) lines.push(m + ' disconnected. Dictation uses ' + def + ' until it is back.');
+    else if (!chosen && m === ev.was_default) lines.push(m + ' disconnected. Dictation now uses ' + def + '.');
+    else lines.push(m + ' disconnected. Dictation did not use it.');
+  }
+  if (!lines.length) return;
+  _dictBeacon('dict_mic_changed', { added: (ev.added || []).length, removed: (ev.removed || []).length, uses_new: (ev.added || []).includes(using) });
+  showToast(lines.join(' '));
+};
+async function _dictNativeDone(ev, take) {
+  _dictRecording = false;
+  if (_dictCancelled) return;
+  let text = String(ev.text || '').trim();
+  if (!text) {
+    _dictBeacon('dict_native_empty', { ms: ev.ms });
+    _dictPillSays('Heard nothing', 1500);
+    return;
+  }
+  const heard = text, t0 = Date.now();
+  let saved = false;
+  try {
+    // Waits briefly for the names pass (a local call); the text goes in regardless.
+    const r = await fetch(API + '/api/dictate', { method: 'POST', _skipOutbox: true,
+      headers: _authHeaders({ 'Content-Type': 'application/json' }), signal: AbortSignal.timeout(1500),
+      body: JSON.stringify({ text, engine: 'apple', audio: ev.audio || '', mime: ev.mime || 'audio/mp4',
+        session: peekSession || '', dur_ms: ev.ms || 0 }) });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    if (d.text) text = d.text;
+    saved = true;
+  } catch (e) {
+    _dictBeacon('dict_native_save_failed', { error: String((e && e.message) || e).slice(0, 120) });
+  }
+  _dictInsert(text);
+  _dictClosePopup(false);
+  if (_peekTab === 'dictation') _dictLoad();
+  _dictBeacon('dict_native_done', { ms: ev.ms, finish_ms: ev.finish_ms, save_ms: Date.now() - t0,
+    stop_to_text_ms: Date.now() - ((take && take.stopAt) || t0), words: text.split(/\s+/).length, saved, names_fixed: text !== heard });
+}
+
 function _dictKB(b) { return b < 1024 ? b + ' B' : (b/1024).toFixed(b < 102400 ? 1 : 0) + ' KB'; }
 
 // ── Dictation outbox ────────────────────────────────────────────────────────
@@ -28828,7 +31866,10 @@ async function _dictOutbox() {
   let timer;
   try {
     return await Promise.race([
-      _idb.get('dict_pending').then(v => v || []),
+      // A clip is stored as its bytes (`bytes`) and handed to readers as a Blob,
+      // the way the upload outbox stores files. Older clips still carry `blob`.
+      _idb.get('dict_pending').then(v => (v || []).map(x => x && x.bytes && !x.blob
+        ? Object.assign({}, x, { blob: new Blob([x.bytes], { type: x.mime || 'audio/webm' }) }) : x)),
       new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('dict_read_timeout')), _DICT_READ_MS); }),
     ]);
   } catch (e) {
@@ -28854,11 +31895,23 @@ function _dictStoreHung(why) {
   _dictBeacon('dict_storage_hung', { why });
 }
 const _dictStoreDown = () => Date.now() < _dictStoreDownUntil;
-async function _dictLiveSave(chunk) {
+// The live copy belongs to ONE take. A chunk that finds no record of its take
+// starts one only if it is the take's first chunk: a later chunk alone has no
+// header, so a record made from it can never be decoded. And `last` dates the
+// final chunk, so a take recovered a day later says how long it really was
+// (AF-1361: 6.6 KB clips recovered as 24.8 h long, each refused as corrupt).
+let _dictTake = 0;
+async function _dictLiveSave(chunk, take, first) {
   if (_dictStoreDown()) return;
   try {
-    const live = (await _idb.get('dict_live')) || {started: _dictStartedAt, mime: chunk.type || 'audio/webm', session: peekSession || '', chunks: []};
+    const stored = await _idb.get('dict_live');
+    let live = stored && stored.take === take ? stored : null;
+    if (!live) {
+      if (!first || take !== _dictTake) { _dictBeacon('dict_live_orphan_chunk_dropped', { bytes: chunk.size || 0 }); return; }
+      live = {take, started: _dictStartedAt, mime: chunk.type || 'audio/webm', session: peekSession || '', chunks: []};
+    }
     live.chunks.push(chunk);
+    live.last = Date.now();
     await _idb.set('dict_live', live);
   } catch(e) {}
 }
@@ -28880,8 +31933,35 @@ async function _dictRecoverLive() {
   const blob = new Blob(live.chunks, {type: live.mime || 'audio/webm'});
   await _dictLiveClear();
   if (blob.size < 1200) return;
-  const id = await _dictOutboxAdd(blob, (live.mime || 'audio/webm').split(';')[0], Date.now() - (live.started || Date.now()));
-  await _dictOutboxPatch(id, {recovered: true, session: live.session || ''});
+  // RECOVERED ONCE, NOT ONCE PER WINDOW OR PER LOAD (AF-1361). Every window of
+  // the Mac app ran this on load, and a clear that timed out left the take to
+  // be recovered again on the next one: one take became clips in ten workers,
+  // each stamped with the time since it began (24.8 h). The take's start is
+  // its key, checked in this device's shared storage and in the outbox's own
+  // transaction; the length is the take's, from its last chunk.
+  const started = live.started || 0;
+  const key = 'amux_dict_recovered';
+  let seen = [];
+  try { seen = JSON.parse(localStorage.getItem(key) || '[]'); } catch (e) { seen = []; }
+  if (started && seen.includes(started)) { _dictBeacon('dict_live_recovered_again', { age_ms: Date.now() - started, where: 'device' }); return; }
+  try { localStorage.setItem(key, JSON.stringify(seen.concat([started]).slice(-20))); } catch (e) { console.warn('dictation: could not note the recovered take', e); }
+  const ms = Math.max(0, (live.last || (started + live.chunks.length * 1000)) - started);
+  const id = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  let dup = false;
+  try {
+    const bytes = await blob.arrayBuffer();
+    await _dictUpdate(q => {
+      dup = !!started && q.some(x => x.live_started === started);
+      return dup ? q : q.concat([{ id, bytes, mime: (live.mime || 'audio/webm').split(';')[0], ms, ts: Date.now(),
+        session: live.session || '', live_started: started, recovered: true,
+        state: 'pending', attempts: 0, last: 0, error: '', text: '' }]);
+    });
+  } catch (e) {
+    if (e && e.message === 'dict_write_timeout') _dictStoreHung('dict_write_timeout');
+    _dictBeacon('dict_live_recover_failed', { error: String((e && e.message) || e).slice(0, 120), bytes: blob.size });
+    return;
+  }
+  if (dup) { _dictBeacon('dict_live_recovered_again', { age_ms: Date.now() - started, where: 'outbox' }); return; }
   showToast('A dictation interrupted by a reload was saved; it will be transcribed');
   setTimeout(_dictFlushOffline, 1500);
 }
@@ -28909,10 +31989,15 @@ function _dictUpdate(mutate) {
 }
 // Returns the new clip's id, or null when this device could not save it (the
 // caller then sends the recording straight from memory).
+// The clip is stored as its BYTES. On iOS a Blob kept in IndexedDB is a file
+// reference that can stop being readable (owner's iPhone, 2026-11-18: a 104 s
+// clip read "Sending… Load failed" on every Retry and no request ever reached
+// the server, after a storage write had failed); bytes are kept in the record.
 async function _dictOutboxAdd(blob, mime, ms) {
   const id = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   try {
-    await _dictUpdate(q => q.concat([{ id, blob, mime, ms, ts: Date.now(), session: peekSession || '',
+    const bytes = await blob.arrayBuffer();
+    await _dictUpdate(q => q.concat([{ id, bytes, mime, ms, ts: Date.now(), session: peekSession || '',
       state: 'pending', attempts: 0, last: 0, error: '', text: '' }]));
     return id;
   } catch (e) {
@@ -28970,6 +32055,11 @@ async function _dictSendDirect(blob, mime, ms) {
     const r = await fetch(url, { method: 'POST', headers: _authHeaders({ 'Content-Type': mime || 'audio/webm' }),
       body: blob, signal: AbortSignal.timeout(120000) });
     const d = await r.json();
+    if (d.code === 'audio_unreadable') {
+      _dictStatus('The transcriber found no audio it could read in this recording.');
+      _dictBeacon('dict_clip_refused', { bytes: blob.size || 0, ms: ms || 0, unsaved: true });
+      return null;
+    }
     if (d.error) throw new Error(d.error);
     _dictStatus('Added to the composer — review, then send');
     _dictInsert(d.text);
@@ -28983,7 +32073,23 @@ async function _dictSendDirect(blob, mime, ms) {
 // One attempt against a stored clip. Never discards audio: a failure of ANY kind
 // leaves the item in the outbox with its error, so Retry re-sends the same
 // recording instead of asking you to say it again.
-async function _dictTrySend(id, interactive) {
+// One send per clip at a time. The background pass, the sync banner and a
+// Retry can each reach the same clip; a second caller joins the send already
+// in flight, so a clip is uploaded and transcribed once (AF-1289: the stored
+// clip went out twice, [3000, 3000]). dictation_send_joined counts the joins.
+const _dictInflight = new Map();
+function _dictTrySend(id, interactive) {
+  const running = _dictInflight.get(id);
+  if (running) {
+    try { amuxTrack('dictation_send_joined', {id, interactive: !!interactive, measured: true, n_considered: 1}); }
+    catch (e) { console.warn('dictation_send_joined not tracked', e); }
+    return running;
+  }
+  const p = _dictTrySendOnce(id, interactive).finally(() => _dictInflight.delete(id));
+  _dictInflight.set(id, p);
+  return p;
+}
+async function _dictTrySendOnce(id, interactive) {
   const q = await _dictOutbox();
   const it = q.find(x => x.id === id);
   if (!it || !it.blob) return null;
@@ -28991,7 +32097,46 @@ async function _dictTrySend(id, interactive) {
     await _dictOutboxPatch(id, { state: 'offline', error: 'no connection' });
     return null;
   }
-  await _dictOutboxPatch(id, { state: 'sending', sending_at: Date.now() });
+  // Read the audio before sending it. A clip whose stored copy can no longer be
+  // read made fetch reject at once ("Load failed") with nothing sent, so Retry
+  // could never work; it now says what happened, once.
+  // Bounded: on WebKit a broken stored file can hang a read instead of failing
+  // it, which held the send pass and blocked Retry ("Already sending queued
+  // recordings; this one is next", owner's iPhone, 2026-11-18).
+  let body, readTimer;
+  try {
+    body = await Promise.race([it.blob.arrayBuffer(), new Promise((_, reject) => {
+      readTimer = setTimeout(() => reject(Object.assign(new Error('the read did not finish'), { name: 'ReadTimeout' })), 15000);
+    })]);
+  }
+  catch (e) {
+    const why = String((e && (e.name || e.message)) || 'unreadable').slice(0, 80);
+    await _dictOutboxPatch(id, { state: 'unreadable', error: 'The recording on this device can no longer be read' });
+    _dictBeacon('dict_clip_unreadable', { id, bytes: it.blob.size || 0, why, stored_as: it.bytes ? 'bytes' : 'blob' });
+    if (interactive) _dictStatus('This recording can no longer be read on this device. Delete it.');
+    if (_peekTab === 'dictation') _dictRender();
+    return null;
+  } finally { clearTimeout(readTimer); }
+  // One window sends a clip. Each window of the Mac app runs its own send
+  // pass, and both sent the same clip in the same second (AF-1361: every
+  // refused clip on 2026-11-23 reached the server twice). The claim is made in
+  // the outbox's own transaction; a window that finds a fresh claim leaves it.
+  // A store that cannot record the claim sends anyway, as before.
+  let claimed = true;
+  try {
+    await _dictUpdate(q => { claimed = true; return q.map(x => {
+      if (x.id !== id) return x;
+      if (x.state === 'sending' && !_dictSendingStale(x)) { claimed = false; return x; }
+      return Object.assign({}, x, { state: 'sending', sending_at: Date.now() });
+    }); });
+  } catch (e) {
+    if (e && e.message === 'dict_write_timeout') _dictStoreHung('dict_write_timeout');
+  }
+  if (!claimed) {
+    _dictBeacon('dict_send_claimed_elsewhere', { id });
+    if (interactive) _dictStatus('Another window is sending this recording');
+    return null;
+  }
   if (interactive) _dictStatus('Transcribing… (' + _dictKB(it.blob.size) + ')');
   if (_peekTab === 'dictation') _dictRender();
   const url = API + '/api/dictate?session=' + encodeURIComponent(it.session || peekSession || '')
@@ -29000,9 +32145,20 @@ async function _dictTrySend(id, interactive) {
   const timer = setTimeout(() => ctl.abort(), 120000);   // slow links need room
   try {
     const r = await fetch(url, { method: 'POST', headers: _authHeaders({ 'Content-Type': it.mime || 'audio/webm' }),
-                                 body: it.blob, signal: ctl.signal });
+                                 body, signal: ctl.signal });
     clearTimeout(timer);
     const d = await r.json();
+    // The transcriber refused the audio itself; a retry sends the same bytes
+    // and is refused again (AF-1361: 24 refusals in 4 h from two clips). The
+    // clip is kept to play or delete, and nothing sends it again on its own.
+    if (d.code === 'audio_unreadable') {
+      await _dictOutboxPatch(id, { state: 'refused', last: Date.now(),
+        error: 'The transcriber found no audio it could read in this recording' });
+      _dictBeacon('dict_clip_refused', { id, bytes: it.blob.size || 0, ms: it.ms || 0, recovered: !!it.recovered });
+      if (interactive) _dictStatus('The transcriber found no audio it could read in this recording. Play it, or delete it.');
+      if (_peekTab === 'dictation') _dictRender();
+      return null;
+    }
     if (d.error) throw new Error(d.error);
     await _dictOutboxPatch(id, { state: 'done', text: d.text || '', error: '', last: Date.now() });
     await _dictPruneDone();
@@ -29076,7 +32232,38 @@ async function _dictFlushOffline() {
     }
   } finally { _dictFlushing = 0; }
 }
-async function _dictRetry(id) { await _dictOutboxPatch(id, { attempts: 0, last: 0 }); await _dictTrySend(id, true); }
+async function _dictRetry(id) {
+  await _dictOutboxPatch(id, { attempts: 0, last: 0 });
+  if (_dictFlushing) return showToast('Already sending queued recordings; this one is next');
+  await _dictTrySend(id, true);
+  await _dictPendingBadge();
+}
+
+// Try every clip that can still be sent, now, ignoring its backoff.
+async function _dictRetryAll() {
+  await _dictPendingBadge();
+  const ids = new Set(_dictPendingRows.filter(x => !_dictNoResend(x)).map(x => x.id));
+  if (!ids.size) return;
+  try { await _dictUpdate(q => q.map(x => ids.has(x.id) ? Object.assign({}, x, { attempts: 0, last: 0 }) : x)); }
+  catch (e) { showToast('This device could not update the recordings yet; try again'); return; }
+  _dictBeacon('dict_retry_all', { n: ids.size });
+  if (_dictFlushing) { showToast('Already sending queued recordings; these go next'); return; }
+  showToast('Sending ' + ids.size + ' recording' + (ids.size === 1 ? '' : 's') + '…');
+  await _dictFlushOffline();
+  if (_peekTab === 'dictation') _dictRender();
+}
+// Delete every clip that has not been transcribed, after one confirm.
+async function _dictClearAll() {
+  await _dictPendingBadge();
+  const n = _dictPendingRows.length;
+  if (!n) return;
+  const ok = await showConfirm('Delete the ' + n + ' recording' + (n === 1 ? '' : 's') + ' that ' + (n === 1 ? 'was' : 'were')
+    + ' not transcribed? The audio is removed from this device.', 'Delete ' + n, true);
+  if (!ok) return;
+  try { await _dictUpdate(q => q.filter(x => x.state === 'done')); _dictBeacon('dict_clear_all', { n }); }
+  catch (e) { showToast('This device could not delete the recordings yet; try again'); }
+  if (_peekTab === 'dictation') _dictRender();
+}
 
 // Play the stored audio back. You asked for it to feel like a recording — so the
 // clip is a thing you can hear before deciding to retry or bin it.
@@ -29090,10 +32277,43 @@ async function _dictPlay(id) {
   } catch(e) { showToast('Playback failed'); }
 }
 
+// The outbox's view of queued clips: kept in step by _dictPendingBadge, read
+// synchronously by the connection pill and its modal. `var`, because the pill
+// can render before this part of the file has run.
+var _dictPendingN = 0, _dictAttentionN = 0, _dictSyncPending = false, _dictPendingRows = [];
+// A clip nothing can send again: its stored copy is unreadable, or the
+// transcriber refused the audio itself, which a retry would send unchanged.
+const _dictNoResend = c => c.state === 'unreadable' || c.state === 'refused';
+function _dictClipLabel(c) {
+  const secs = Math.round((c.ms || 0) / 1000);
+  return 'Transcribe recording (' + secs + 's' + (c.session ? ', ' + c.session : '') + ')';
+}
+// Clips the sync pass should send now: not done, not mid-send, and (unless
+// someone asked) past their backoff. A clip left `sending` by a reload counts.
+async function _dictSyncClips(forced) {
+  const out = [];
+  for (const it of (await _dictOutbox())) {
+    if (it.state === 'done' || _dictNoResend(it) || !it.blob) continue;
+    if (it.state === 'sending' && !_dictSendingStale(it)) continue;
+    if (!forced && !_dictReady(it)) continue;
+    if (it.state === 'sending') {
+      try { amuxTrack('dictation_stale_sending_recovered', {id: it.id, age_ms: Date.now() - (it.sending_at || 0),
+        had_sending_at: !!it.sending_at, bytes: (it.blob && it.blob.size) || 0, measured: true, n_considered: 1}); } catch (e) { console.warn('dictation: stale-send beacon failed', e); }
+    }
+    out.push(it);
+  }
+  return out;
+}
 async function _dictPendingBadge() {
   let q = [];
   try { q = (await _idb.get('dict_pending')) || []; } catch(e) {}
   const n = q.filter(x => x.state !== 'done').length;
+  _dictPendingRows = q.filter(x => x.state !== 'done')
+    .map(({blob, bytes, ...rest}) => Object.assign(rest, { size: (bytes && bytes.byteLength) || (blob && blob.size) || 0 }));
+  _dictPendingN = n;
+  _dictSyncPending = n > 0;
+  _dictAttentionN = _dictPendingRows.filter(x => x.error || (x.attempts || 0) >= _DICT_MAX_AUTO || _dictSendingStale(x)).length;
+  try { updateConnectionStatus(); } catch (e) { console.warn('dictation: the pending count did not repaint', e); }
   // Repaint the shared badge too: a clip added or drained changes the ONE
   // pending count, and the Files/Explore surfaces have no other trigger for it.
   try { _upqRenderBadge(); } catch (e) {}
@@ -29124,27 +32344,41 @@ function _dictTabBadge(pending) {
 function _dictOutboxHTML(q) {
   const live = q.filter(x => x.state !== 'done');
   if (!live.length) return '';
-  let h = '<div class="dict-day">PENDING</div>';
+  // Every clip at once (owner, 2026-11-19: "I should have a way to clear, try
+  // again or whatever these"), on the heading's own row so a phone gets no new row.
+  const resend = live.filter(x => !_dictNoResend(x)).length;
+  let h = '<div class="dict-day dict-pending-head"><span>PENDING</span><span class="dict-pending-acts">'
+    + (resend ? '<button class="btn small" onclick="_dictRetryAll()">Try all again</button>' : '')
+    + '<button class="btn small" onclick="_dictClearAll()">Clear all</button></span></div>';
   for (const it of live.slice().reverse()) {
     const secs = Math.round((it.ms || 0) / 1000);
-    const label = { sending: 'Sending…', offline: 'Waiting for connection', failed: 'Failed', pending: 'Queued' }[it.state] || it.state;
+    const label = { sending: 'Sending…', offline: 'Waiting for connection', failed: 'Failed', pending: 'Queued',
+      unreadable: 'Can no longer be read', refused: 'No audio the transcriber can read' }[it.state] || it.state;
+    const gone = it.state === 'unreadable';   // nothing to play or re-send; only Delete helps
     const err = it.error ? '<div class="dict-err">' + esc(it.error) + '</div>' : '';
     const attempts = (it.attempts || 0) > 1 ? ' · ' + it.attempts + ' tries' : '';
     h += '<div class="dict-item dict-item-pending">'
       +  '<div class="dict-item-head"><span class="dict-state dict-state-' + esc(it.state) + '">' + label + '</span>'
-      +  '<span class="dict-meta">' + secs + 's · ' + _dictKB((it.blob && it.blob.size) || 0) + attempts + '</span></div>'
+      +  '<span class="dict-meta">' + secs + 's · ' + _dictKB(it.size || (it.blob && it.blob.size) || 0) + attempts + '</span></div>'
       +  err
       +  '<div class="dict-actions">'
-      +    '<button class="btn small" onclick="_dictPlay(\'' + it.id + '\')">▶ Play</button>'
-      +    '<button class="btn small primary" onclick="_dictRetry(\'' + it.id + '\')">Retry</button>'
+      +    (gone ? '' : '<button class="btn small" onclick="_dictPlay(\'' + it.id + '\')">▶ Play</button>'
+      +      (_dictNoResend(it) ? '' : '<button class="btn small primary" onclick="_dictRetry(\'' + it.id + '\')">Retry</button>'))
       +    '<button class="btn small" onclick="_dictOutboxDel(\'' + it.id + '\')">Delete</button>'
       +  '</div></div>';
   }
   return h;
 }
 
-window.addEventListener('online', () => { setTimeout(_dictFlushOffline, 1500); });
-setInterval(() => { if (typeof online === 'undefined' || online) _dictFlushOffline(); }, 45000);
+// Queued clips go out with the outbox's own pass (runSyncBanner), which already
+// runs on reconnect and on its backoff timer; this tick only wakes it for clips.
+window.addEventListener('online', () => { setTimeout(() => { if (_dictPendingN) runSyncBanner(true); }, 1500); });
+setInterval(() => { if ((typeof online === 'undefined' || online) && _dictPendingN) runSyncBanner(true); }, 45000);
+// The Mac app is told the saved microphone on each take's start; read it now so
+// the first take has it without waiting.
+if (typeof _dictNativeBridge === 'function' && _dictNativeBridge()) setTimeout(() => { _dictSettingsLoad(); }, 0);
+// A clip queued before this page loaded counts from the start, not from the first Dictation open.
+setTimeout(() => { _dictPendingBadge().then(() => { if (_dictPendingN && (typeof online === 'undefined' || online)) runSyncBanner(true); }); }, 2000);
 
 // Put text in the composer (append, don't clobber) — never auto-send.
 function _dictInsert(text) {
@@ -29152,8 +32386,108 @@ function _dictInsert(text) {
   if (typeof _hkDictDeliver === 'function' && _hkDictDeliver(text)) return;
   const inp = document.getElementById('peek-cmd-input');
   if (!inp) { navigator.clipboard?.writeText(text); showToast('Copied (composer not open)'); return; }
+  const was = inp.value;
   inp.value = inp.value && inp.value.trim() ? (inp.value.replace(/\s+$/,'') + ' ' + text) : text;
+  _dictWatchField(inp, text, was);
   inp.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+// ── Learn from a corrected dictation (Ethan, 2026-11-17: "if I have to change
+// or modify or edit or retype a word, it should prompt me to ask if that
+// change should be added to the dictionary so that it knows moving forward") ──
+// When dictated text lands in a field, the field is watched. A pause after an
+// edit that REPLACES dictated words (not one that only adds or deletes) offers
+// "<heard> -> <typed>" for the dictionary, through the shared confirm. A fix you
+// decline is not offered again; a fix already in the dictionary is not offered.
+const _dictWatched = new WeakMap();
+const _DICT_WATCH_MS = 10 * 60 * 1000;
+function _dictWatchField(el, dictated, before) {
+  if (!el || !dictated) return;
+  // A second dictation into a watched field adds to it: its first words can
+  // still be corrected (land review, 2026-11-17). An edit made before it
+  // arrived is settled first, against the value from just before the new
+  // text, or the new snapshot would swallow it.
+  const prev = _dictWatched.get(el), live = prev && Date.now() <= prev.until;
+  if (live) {
+    clearTimeout(prev.timer);
+    const fix = _dictCorrections(prev.dictated, prev.base, before ?? prev.base)[0];
+    if (fix) _dictAskFix(fix, el);
+  }
+  const w = { base: el.value, dictated: (live ? prev.dictated + ' ' : '') + String(dictated),
+    until: Date.now() + _DICT_WATCH_MS, timer: 0 };
+  _dictWatched.set(el, w);
+  if (el._dictWatchBound) return;
+  el._dictWatchBound = true;
+  // Asked as soon as the corrected word is finished (owner, 2026-11-17: "once
+  // I edit the word, it should immediately show that prompt"): a space,
+  // punctuation or a line break ends the word, and so does leaving the field.
+  // A pause of 2.5 s is the fallback for an edit with no word end.
+  el.addEventListener('input', e => {
+    const cur = _dictWatched.get(el);
+    if (!cur) return;
+    clearTimeout(cur.timer);
+    if (Date.now() > cur.until || !el.value.trim()) { _dictWatched.delete(el); return; }
+    const ended = e.inputType === 'insertLineBreak' || e.inputType === 'insertParagraph' || /[\s.,;:!?)]$/.test(e.data || '');
+    cur.timer = setTimeout(() => _dictOfferCorrection(el), ended ? 150 : 2500);
+  });
+  el.addEventListener('blur', () => {
+    const cur = _dictWatched.get(el);
+    if (!cur || cur.base === el.value) return;
+    clearTimeout(cur.timer);
+    _dictOfferCorrection(el);
+  });
+}
+function _dictWordKey(w) { return String(w || '').replace(/^[\s"'(\[{]+|[\s"'.,;:!?)\]}]+$/g, ''); }
+// The words an edit REPLACED in dictated text: one region, 1 to 3 words each
+// side, every replaced word from the dictation. [{from, to}] or [].
+function _dictCorrections(dictated, before, after) {
+  const a = String(before || '').split(/\s+/).filter(Boolean), b = String(after || '').split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  let ja = a.length, jb = b.length;
+  while (ja > i && jb > i && a[ja - 1] === b[jb - 1]) { ja--; jb--; }
+  const from = a.slice(i, ja).map(_dictWordKey).filter(Boolean), to = b.slice(i, jb).map(_dictWordKey).filter(Boolean);
+  if (!from.length || !to.length || from.length > 3 || to.length > 3) return [];
+  // Every word changed is new text, not a fixed word (live e2e, 2026-11-17:
+  // "send it please" -> "typed words" was offered). A one-word field is the
+  // exception: correcting it is a fix.
+  if (i === 0 && ja === a.length && a.length > 1) return [];
+  const heard = new Set(String(dictated || '').split(/\s+/).map(w => _dictWordKey(w).toLowerCase()));
+  if (!from.every(w => heard.has(w.toLowerCase()))) return [];
+  const f = from.join(' '), t = to.join(' ');
+  return f === t ? [] : [{ from: f, to: t }];
+}
+async function _dictOfferCorrection(el) {
+  const w = _dictWatched.get(el);
+  if (!w || !document.contains(el)) return;
+  const now = el.value;
+  const fixes = _dictCorrections(w.dictated, w.base, now);
+  w.base = now;
+  if (fixes.length) await _dictAskFix(fixes[0], el);
+}
+async function _dictAskFix({ from, to }, el) {
+  const key = from.toLowerCase() + '\u2192' + to.toLowerCase();
+  let declined = [];
+  try { declined = JSON.parse(localStorage.getItem('amux_dict_declined') || '[]'); } catch (e) { console.warn('dictation: unreadable declined list', e); }
+  if (declined.includes(key)) return;
+  try {
+    const d = await fetch(API + '/api/dictation/dict', { headers: _authHeaders() }).then(r => r.json());
+    const words = Array.isArray(d) ? d : (d.words || []);
+    if (words.some(x => String(x.word || '').toLowerCase() === from.toLowerCase())) return;
+  } catch (e) { console.warn('dictation: could not read the dictionary; offering the fix anyway', e); }
+  _dictBeacon('dict_correction_offered', { words: from.split(' ').length });
+  const ok = await showConfirm('You changed \u201c' + from + '\u201d to \u201c' + to + '\u201d. Add it to your dictionary so dictation gets it right next time?', 'Add to dictionary');
+  if (!ok) {
+    declined.push(key);
+    try { localStorage.setItem('amux_dict_declined', JSON.stringify(declined.slice(-200))); } catch (e) { console.warn('dictation: could not save the declined fix', e); }
+    _dictBeacon('dict_correction_declined', {});
+  } else {
+    const r = await fetch(API + '/api/dictation/dict', { method: 'POST',
+      headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ word: from, correct: to }) }).catch(() => null);
+    _dictBeacon(r && r.ok ? 'dict_correction_added' : 'dict_correction_add_failed', {});
+    showToast(r && r.ok ? 'Added to dictionary' : 'Could not add it to the dictionary');
+  }
+  try { if (document.contains(el)) el.focus(); } catch (e) { console.warn('dictation: could not refocus the field', e); }
 }
 
 // ── History ──
@@ -29162,10 +32496,13 @@ function _dictRenderHistory() {
   if (!body) return;
   // Pending clips render first and out-of-band: they are the ones needing a
   // decision (retry / play / bin), and they must show even when history is empty.
-  _dictOutbox().then(ob => {
-    const strip = _dictOutboxHTML(ob);
+  // From the rows the pending count read, not a second read: on the Mac app a
+  // slow store let the count answer "4 pending" while _dictOutbox() gave up
+  // after 5 s and the list showed none (owner, 2026-11-19, with
+  // dict_storage_hung beacons from that device).
+  _dictPendingBadge().then(() => {
     const host = document.getElementById('dict-outbox-strip');
-    if (host) host.innerHTML = strip;
+    if (host) host.innerHTML = _dictOutboxHTML(_dictPendingRows);
   });
   const q = (document.getElementById('dict-search')?.value || '').trim().toLowerCase();
   const items = q ? _dictItems.filter(i => (i.text||'').toLowerCase().includes(q)) : _dictItems;
@@ -29188,6 +32525,7 @@ function _dictRenderHistory() {
       + '<div class="dict-acts">'
       + '<button title="Copy" onclick="_dictCopy(' + it.id + ')">&#128203;</button>'
       + '<button title="Insert into composer" onclick="_dictInsertId(' + it.id + ')">&#8629;</button>'
+      + '<button title="Teach: correct a word it got wrong (select the word first)" onclick="_dictTeach(' + it.id + ')">&#128214;</button>'
       + '<button title="AI edit" onclick="_dictAiEdit(' + it.id + ')">&#10024;</button>'
       + (it.ai_edited ? '<button title="Undo AI edit" onclick="_dictUndo(' + it.id + ')">&#8630;</button>' : '')
       + '<button title="Delete" class="danger" onclick="_dictDelete(' + it.id + ')">&#128465;</button>'
@@ -29196,6 +32534,17 @@ function _dictRenderHistory() {
   body.innerHTML = html;
 }
 function _dictById(id) { return _dictItems.find(i => i.id === id); }
+// Teach the dictionary from a past dictation: the word selected in that row becomes the
+// misspelling to correct, and every later dictation applies the fix (server prompt).
+function _dictTeach(id) {
+  const it = _dictById(id);
+  if (!it) return;
+  const row = document.getElementById('dict-row-' + id);
+  const sel = window.getSelection && window.getSelection();
+  let word = '';
+  if (sel && row && sel.rangeCount && row.contains(sel.anchorNode)) word = String(sel).trim();
+  _dictAddWord(null, { word, heard: it.raw_text && it.raw_text !== it.text ? it.raw_text : '' });
+}
 function _dictCopy(id) { const it = _dictById(id); if (it) { navigator.clipboard?.writeText(it.text); showToast('Copied'); } }
 function _dictInsertId(id) { const it = _dictById(id); if (it) { _dictInsert(it.text); showToast('Added to composer'); } }
 async function _dictAiEdit(id) {
@@ -29223,7 +32572,7 @@ async function _dictDelete(id) {
 
 // ── Dictionary ──
 function _dictRenderDict() {
-  const body = document.getElementById('dict-body');
+  const body = document.getElementById('dict-dict-body');
   if (!body) return;
   let html = '<div class="dict-dictbar"><span class="dict-dicthint">Terms and names amux should always spell correctly '
     + 'in your dictation.</span><button class="btn primary" onclick="_dictAddWord()">Add new</button></div>';
@@ -29241,15 +32590,17 @@ function _dictRenderDict() {
   }
   body.innerHTML = html;
 }
-async function _dictAddWord(existing) {
+async function _dictAddWord(existing, teach) {
   const w = existing || null;
-  const isFix = w ? !!w.correct : false;
-  const html = '<div class="dict-modal-row"><label>Correct a misspelling</label>'
+  const t = teach || null;
+  const isFix = w ? !!w.correct : !!t;
+  const html = (t && t.heard ? '<div class="dict-sethint">Heard: ' + esc(t.heard) + '</div>' : '')
+    + '<div class="dict-modal-row"><label>Correct a misspelling</label>'
     + '<input type="checkbox" id="dictm-fix" ' + (isFix ? 'checked' : '') + ' onchange="_dictModalToggle()"></div>'
     + '<div id="dictm-single" style="' + (isFix ? 'display:none' : '') + '">'
     + '<input id="dictm-word" class="dict-modal-input" placeholder="Add a new word" value="' + (w && !isFix ? esc(w.word) : '') + '"></div>'
     + '<div id="dictm-pair" style="' + (isFix ? '' : 'display:none') + ';display:' + (isFix ? 'flex' : 'none') + ';gap:var(--space-2);align-items:center;">'
-    + '<input id="dictm-mis" class="dict-modal-input" placeholder="Misspelling" value="' + (w && isFix ? esc(w.word) : '') + '">'
+    + '<input id="dictm-mis" class="dict-modal-input" placeholder="Misspelling" value="' + (w && isFix ? esc(w.word) : t ? esc(t.word) : '') + '">'
     + '<span style="color:var(--dim)">&rarr;</span>'
     + '<input id="dictm-cor" class="dict-modal-input" placeholder="Correct spelling" value="' + (w && isFix ? esc(w.correct) : '') + '"></div>';
   const ok = await showFormModal(w ? 'Edit vocabulary' : 'Add to vocabulary', html, w ? 'Save' : 'Add word');
@@ -29265,7 +32616,7 @@ async function _dictAddWord(existing) {
     await fetch(API + '/api/dictation/dict', { method: 'POST',
       headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ word, correct }) });
   }
-  showToast(w ? 'Updated' : 'Added to vocabulary'); _dictLoad();
+  showToast(w ? 'Updated' : 'Added to vocabulary'); _dictGlobalLoad();
 }
 function _dictModalToggle() {
   const fix = document.getElementById('dictm-fix')?.checked;
@@ -29277,23 +32628,68 @@ function _dictEditWord(id) { const w = _dictWords.find(x => x.id === id); if (w)
 async function _dictDelWord(id) {
   await fetch(API + '/api/dictation/dict/' + id, { method: 'DELETE', headers: _authHeaders() });
   showToast('Word removed from dictionary');
-  _dictLoad();
+  _dictGlobalLoad();
 }
 
 // ── Settings (BYO key) ──
+// What actually transcribes, from GET /api/transcription (the same status the
+// server's engine choice reads), so the page cannot claim an engine that is
+// not the one running (owner, 2026-11-18: "make sure the dictation tab ... is
+// accurate").
+var _dictTx = null;
+function _dictEngineLabel(engine, model) {
+  const m = String(model || '').replace(/^mlx-community\//, '').replace(/ \(MLX\)$/, '');
+  if (engine === 'mlx-whisper') return 'Whisper ' + m.replace(/^whisper-/, '') + ' on this Mac (MLX, GPU)';
+  if (engine === 'whisper') return 'Whisper ' + m + ' on this Mac (CPU)';
+  if (engine === 'gemini') return 'Gemini (' + (_dictTx?.gemini?.model || 'cloud') + ')';
+  return '';
+}
+function _dictEngineRows() {
+  const tx = _dictTx;
+  if (!tx || !tx.dictate) return '<div class="dict-set-row"><b>Engine</b><span>Could not read the engine status</span></div>';
+  const uses = tx.dictate.uses || {}, local = tx.dictate.local || {}, gem = tx.gemini || {};
+  const keyFrom = gem.source === 'byo' ? 'your own key' : gem.source === 'server' ? "this server's key" : '';
+  const now = uses.available
+    ? (uses.engine === 'gemini' ? 'Gemini (' + esc(gem.model || '') + ', ' + keyFrom + ')' : esc(_dictEngineLabel(uses.engine, local.model)))
+    : 'Nothing can transcribe: ' + esc(uses.why_unavailable || 'no engine');
+  let fallback = '';
+  if (uses.engine !== 'gemini' && uses.available) {
+    fallback = tx.engine === 'local' ? 'None: the setting is Local only'
+      : gem.configured ? 'Gemini (' + esc(gem.model || '') + ', ' + keyFrom + ') when the local engine cannot answer'
+      : 'None: no Gemini key is set';
+  } else if (!local.available && local.why) {
+    fallback = 'Local engine unavailable: ' + esc(local.why);
+  }
+  return '<div class="dict-set-row dict-set-gap"><b>Browser and phone</b><span id="dict-engine-now">' + now + '</span></div>'
+    + (fallback ? '<div class="dict-set-row"><b>' + (uses.engine === 'gemini' ? 'Local' : 'Fallback') + '</b><span id="dict-engine-fallback">' + fallback + '</span></div>' : '')
+    + '<div class="dict-set-row"><b>Mac app</b><span>Apple on-device speech, then the same name and dictionary pass</span></div>';
+}
 function _dictRenderSettings() {
-  const body = document.getElementById('dict-body');
+  const body = document.getElementById('dict-set-body');
   if (!body) return;
   const c = _dictCfg || {};
-  const using = c.source === 'byo' ? 'your own Gemini key'
-    : c.source === 'server' ? "this amux server's Gemini key" : 'nothing configured';
+  const ds = _dictSettings || { mic: '', context: '', workers: true, contacts: false };
+  const src = _dictSources || {};
+  // A repaint (the tab's background reload) keeps context typed but not saved yet.
+  const prevCtx = document.getElementById('dict-context');
+  const typed = prevCtx && prevCtx.value !== (ds.context || '') ? prevCtx.value : null;
+  const count = (n, one, many) => (typeof n === 'number') ? ' <span class="dict-sethint">(' + n + ' ' + (n === 1 ? one : many) + ')</span>' : '';
   body.innerHTML =
     '<div class="dict-settings">'
-    + '<div class="dict-set-row"><b>Transcription</b><span>' + esc(c.model || '') + '</span></div>'
-    + '<div class="dict-set-row"><b>Currently using</b><span>' + using + '</span></div>'
+    + '<div class="dict-set-row"><b>Microphone</b><span id="dict-mic-host"><select id="dict-mic" class="input" disabled><option>Loading…</option></select></span></div>'
+    + '<div class="dict-sethint" id="dict-mic-note">Saved on this device only: each phone, laptop and Mac app keeps its own microphone.</div>'
+    + '<div class="dict-set-row"><b>What dictation knows</b><span></span></div>'
+    + '<label class="dict-set-row"><span><input type="checkbox" id="dict-src-workers"' + (ds.workers !== false ? ' checked' : '') + ' onchange="_dictSettingsSave({workers:this.checked})"> Worker names' + count(src.workers, 'worker', 'workers') + '</span></label>'
+    + '<label class="dict-set-row"><span><input type="checkbox" id="dict-src-contacts"' + (ds.contacts ? ' checked' : '') + ' onchange="_dictSettingsSave({contacts:this.checked})"> CRM contact names' + count(src.contacts, 'contact', 'contacts') + '</span></label>'
+    + '<div class="dict-set-row"><span><input type="checkbox" checked disabled> Dictionary' + count(src.dictionary, 'word', 'words') + '</span>'
+    + '<button type="button" class="btn" onclick="_dictOpenSettings(\'settings-dictionary-section\')">Edit</button></div>'
+    + '<div class="dict-sethint">About you and what you talk about: names, products, jargon. Dictation uses it to settle unclear words.</div>'
+    + '<textarea id="dict-context" class="input dict-context" rows="4" maxlength="4000" placeholder="e.g. I run Mixpeek; I talk about amux workers, Rust, GKE and our customers TubeScience and Wexus.">' + esc(ds.context || '') + '</textarea>'
+    + '<div class="dict-set-actions"><button class="btn primary" id="dict-context-save" onclick="_dictSettingsSave({context:(document.getElementById(\'dict-context\')||{}).value||\'\'})">Save context</button></div>'
+    + _dictEngineRows()
     + '<div class="dict-sethint">Which engine Dictate and Recordings use is one setting: '
     + '<button type="button" class="btn" onclick="_transcriptionOpenSettings()">Transcription settings</button></div>'
-    + '<div class="dict-sethint">Bring your own Gemini API key (optional). If set, amux uses it instead of the '
+    + '<div class="dict-sethint">Bring your own Gemini API key for the Gemini engine (optional). If set, amux uses it instead of the '
     + 'server\'s key. It is stored on the amux server and is <b>never sent back to any browser</b>. '
     + 'Get one at <span style="color:var(--accent)">aistudio.google.com/apikey</span>.</div>'
     + '<div style="display:flex;gap:var(--space-2);margin-top:var(--space-2);">'
@@ -29303,8 +32699,23 @@ function _dictRenderSettings() {
     + (c.source === 'byo' ? '<button class="btn" onclick="_dictClearKey()">Remove</button>' : '')
     + '</div>'
     + '<div class="dict-sethint" style="margin-top:var(--space-3-5);">Audio never touches this page’s JavaScript beyond the '
-    + 'recording itself — it is uploaded to your amux server, which calls Gemini and returns only text.</div>'
+    + 'recording itself: it is uploaded to your amux server, which transcribes it on this Mac (Gemini only when the engine above says so) and returns only text.</div>'
     + '</div>';
+  if (typed !== null) { const ta = document.getElementById('dict-context'); if (ta) ta.value = typed; }
+  _dictRenderMicPicker();
+}
+async function _dictRenderMicPicker() {
+  const host = document.getElementById('dict-mic-host');
+  if (!host) return;
+  const want = _dictMic();
+  const { names, hidden } = await _dictMicNames();
+  const opts = [''].concat(names);
+  if (want && !names.includes(want)) opts.push(want);
+  host.innerHTML = '<select id="dict-mic" class="input" onchange="_dictSetMic(this.value)">'
+    + opts.map(n => '<option value="' + esc(n) + '"' + (n === want ? ' selected' : '') + '>'
+      + esc(n ? (names.includes(n) ? n : n + ' (not connected here)') : 'Default microphone') + '</option>').join('')
+    + '</select>'
+    + (hidden ? ' <button type="button" class="btn" onclick="_dictMicReveal()">Show names</button>' : '');
 }
 async function _dictSaveKey() {
   const k = (document.getElementById('dict-key-input')?.value || '').trim();
@@ -29313,12 +32724,12 @@ async function _dictSaveKey() {
     headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ key: k }) });
   const d = await r.json();
   if (d.error) { showToast('Could not save key'); return; }
-  showToast('Using your Gemini key'); _dictLoad();
+  showToast('Using your Gemini key'); _dictGlobalLoad();
 }
 async function _dictClearKey() {
   await fetch(API + '/api/dictation/config', { method: 'POST',
     headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ key: '' }) });
-  showToast('Reverted to the server key'); _dictLoad();
+  showToast('Reverted to the server key'); _dictGlobalLoad();
 }
 
 // Peek Cost tab: this session's token/cost breakdown by task (reuses _costRender)
@@ -29343,7 +32754,9 @@ function _peekCostLoad() {
 // adds. Strip it when INSERTING back into a composer — resending would
 // otherwise stack a second timestamp onto the old one.
 function _msgStripPrefix(text) {
-  return String(text || '').replace(/^\[\d{1,2}:\d{2}\s?[AP]M[^\]]*\]\s*/i, '');
+  // 12- and 24-hour stamps, with or without seconds: the server's
+  // with_send_author keeps whichever form the sender's stamp used.
+  return String(text || '').replace(/^\[\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]\.?M\.?)?[^\]]*\]\s*/i, '');
 }
 // After inserting, GO TO the input: expand the send bar if collapsed, scroll the
 // composer into view, focus with the caret at the end — ready to edit/send.
@@ -29409,7 +32822,12 @@ function _cmdRecallBuild(session) {
     // sometimes lands in history alongside the same text without it, which made
     // recall show the identical prompt twice in a row. Only that glyph is
     // removed, never a leading '>' a person may have typed as a quote.
-    const t = (e.text || '').replace(/^\u276F\s*/, '').trim();
+    // Then the "[time author] " stamp the send path writes into the stored
+    // text (server with_send_author; the same shape _msgStripPrefix removes on
+    // edit). Without this, recall handed the stamp back to the composer, so a
+    // resend went out with the old timestamp still on it.
+    const t = (e.text || '').replace(/^\u276F\s*/, '')
+      .replace(/^\[\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]\.?M\.?)?[^\]]*\]\s*/i, '').trim();
     if (!t) continue;
     if (out.length && out[out.length - 1] === t) continue;   // collapse repeats
     out.push(t);
@@ -29601,6 +33019,7 @@ function resetGroupView() {
 function toggleTagFilter(tag) {
   const next = _nextTagState(tag, activeTag, hiddenTags);
   activeTag = next.active; hiddenTags = next.hidden;
+  if (activeTag === tag) _navVisit('group', tag, tag);
   render();
 }
 
@@ -29697,6 +33116,7 @@ function renderFilterOptions() {
     const n = live.filter(s => _modelClass(sessionConfiguredModel(s)) === m).length;
     return `<button class="filter-chip${on?' on':''}" onclick="toggleModelFilter('${escJs(m)}')">${esc(_mLabel(m))}<span class="filter-chip-n">${n}</span></button>`;
   }).join('') : '<span class="filter-hint">No workers.</span>';
+  renderListDefault();
 }
 function toggleProviderFilter(p) {
   if (filterProviders.has(p)) filterProviders.delete(p); else filterProviders.add(p);
@@ -29709,6 +33129,32 @@ function toggleStatusFilter(k) {
 function toggleModelFilter(m) {
   if (filterModels.has(m)) filterModels.delete(m); else filterModels.add(m);
   renderFilterOptions(); render(); renderActiveFilters();
+}
+// Save as default: this tab's filters become what new tabs start with. Pressed
+// again while they match the saved default, it clears the default. Clear all
+// empties this tab only, and never changes the default.
+function _listDefaultMatchesNow() {
+  const d = _listDefaultRead();
+  if (!d) return false;
+  return JSON.stringify(_listFiltersOf(d)) === JSON.stringify(_listFiltersOf(JSON.parse(_listViewSnapshot())));
+}
+function toggleListDefault() {
+  if (_listDefaultMatchesNow()) localStorage.removeItem(_LIST_DEFAULT_KEY);
+  else localStorage.setItem(_LIST_DEFAULT_KEY, JSON.stringify(_listFiltersOf(JSON.parse(_listViewSnapshot()))));
+  renderListDefault();
+}
+function renderListDefault() {
+  const btn = document.getElementById('filter-default-btn');
+  const hint = document.getElementById('filter-default-hint');
+  const has = !!_listDefaultRead();
+  const same = has && _listDefaultMatchesNow();
+  if (btn) {
+    btn.textContent = same ? 'Default ✓ (tap to clear)' : 'Save as default';
+    btn.classList.toggle('primary', !same);
+  }
+  if (hint) hint.textContent = same ? 'New tabs start with these filters.'
+    : has ? 'Another default is saved. Save as default replaces it.'
+    : 'No default. New tabs start with the filters of the tab you came from.';
 }
 function clearAllFilters() {
   filterProviders.clear(); filterModels.clear(); filterStatuses.clear();
@@ -30163,6 +33609,8 @@ function _fileMenuSync() {
   }
   const share = document.getElementById('file-tab-share');
   if (share) share.style.display = navigator.share ? '' : 'none';
+  const ask = document.getElementById('file-tab-askall'), mb = _mdAskBody();
+  if (ask) ask.hidden = !(mb && mb.querySelector('.md-worker-link'));
 }
 async function _fileRenameOpen() {
   const path = _fvNeedPath(); if (!path) return;
@@ -31440,6 +34888,7 @@ function _renderFileBody(data, mode) {
     _bindMdFileLinks(body);
     _fileBindAnchors(body);
     _bindReadPosDiv(body, data.path);
+    _mdAskPaint();
   } else if (data.is_html) {
     body.className = 'file-overlay-body file-html-preview';
     const iframe = document.createElement('iframe');
@@ -31566,6 +35015,7 @@ function _mdxShow(data, mode) {
     ta.value = data.content || '';
     // A file opens at its top, caret and scroll both.
     ta.setSelectionRange(0, 0);
+    _mdxHistReset(ta);
     ta.scrollTop = 0;
     _mdx.base = ta.value;
     _mdx.opened = ta.value;
@@ -31591,6 +35041,8 @@ function _mdxShow(data, mode) {
 function _mdxHide() {
   const { root, wrap, body } = _mdxEls();
   if (!root || root.hidden) return;
+  _mdxSlash = null;
+  _mdxMenuClose();
   const ov = document.getElementById('file-overlay');
   const search = document.getElementById('md-search-row');
   if (ov && body && search) search.after(body);
@@ -31657,6 +35109,7 @@ function _mdxRenderPreview() {
   _bindMdFileLinks(body);
   _fileBindAnchors(body);
   _mdxDecoratePreview(body);
+  _mdAskPaint();
   body.scrollTop = top;
   if (_mdSearchHits && _mdSearchHits.length) { const q = document.getElementById('md-search-input'); if (q && q.value) _mdSearchApply(q.value); }
 }
@@ -31819,7 +35272,10 @@ function _mdxStatus() {
   const col = at - (at > 0 ? v.lastIndexOf('\n', at - 1) : -1);
   document.getElementById('mdx-pos').textContent = 'Ln ' + ln + ', Col ' + col;
   const n = ta.value.length;
-  document.getElementById('mdx-chars').textContent = n.toLocaleString() + ' character' + (n === 1 ? '' : 's');
+  // Words are counted up to 200k characters; past that a keystroke would pay for the scan.
+  const w = n <= 200000 ? (v.match(/\S+/g) || []).length : -1;
+  document.getElementById('mdx-chars').textContent = (w >= 0 ? w.toLocaleString() + ' word' + (w === 1 ? '' : 's') + ' · ' : '')
+    + n.toLocaleString() + ' character' + (n === 1 ? '' : 's');
   const d = document.getElementById('mdx-dirty');
   const dirty = _fileEditDirty();
   if (!dirty) _mdx.base = ta.value;
@@ -31864,6 +35320,7 @@ async function _mdxFollow() {
   const at = ta.selectionStart;
   ta.value = text;
   try { ta.setSelectionRange(Math.min(at, text.length), Math.min(at, text.length)); } catch (e) {}
+  _mdxHistReset(ta);   // another writer's text: history starts again from it
   _fileData.content = text;
   _mdx.opened = text;
   if (etag) _fileData.etag = etag;
@@ -31879,10 +35336,58 @@ document.addEventListener('visibilitychange', () => { if (document.hidden && _md
 // ── Editing commands ──
 function _mdxIndent() { return parseInt(localStorage.getItem('amux_mdx_indent') || '2', 10) === 4 ? 4 : 2; }
 // Replace [start, end) with `text` through the browser's own editing, so ⌘Z undoes it.
+// THE EDITOR'S OWN UNDO HISTORY (owner, 2026-11-19: "Undo / redo doesnt work
+// in the markdown editor - fix it. The button should works and the
+// shortcuts"). The browser's stack undid one typed character per press in
+// Chromium and is emptied by any direct ta.value write (a file reload, the /
+// menu fallback), and the Mac app's Edit menu bypassed the page. So the editor
+// keeps the states itself: typing groups into one step until a pause or a word
+// ends, each tool is one step, and the buttons, the keys and the Edit menu
+// (beforeinput historyUndo/historyRedo) all step through it.
+const _MDX_UNDO_GAP_MS = 800, _MDX_UNDO_MAX = 300;
+function _mdxHistReset(ta) {
+  _mdx.undo = [{ v: ta.value, s: ta.selectionStart, e: ta.selectionEnd }];
+  _mdx.undoAt = 0; _mdx.undoOpen = false; _mdx.undoLast = 0;
+}
+function _mdxHistRecord(ta, e) {
+  if (!_mdx.undo) { _mdxHistReset(ta); return; }
+  const top = _mdx.undo[_mdx.undoAt];
+  if (top && top.v === ta.value) return;
+  const now = Date.now();
+  const typing = !_mdx.undoTool && e && /^(insertText|deleteContentBackward|deleteContentForward)$/.test(e.inputType || '');
+  const state = { v: ta.value, s: ta.selectionStart, e: ta.selectionEnd };
+  if (typing && _mdx.undoOpen && _mdx.undoAt > 0 && now - _mdx.undoLast < _MDX_UNDO_GAP_MS) {
+    _mdx.undo[_mdx.undoAt] = state;   // the same typing step, grown
+  } else {
+    _mdx.undo.length = _mdx.undoAt + 1;
+    _mdx.undo.push(state);
+    if (_mdx.undo.length > _MDX_UNDO_MAX) _mdx.undo.shift();
+    _mdx.undoAt = _mdx.undo.length - 1;
+  }
+  // A space or a line break ends the word, so the next key starts a new step.
+  _mdx.undoOpen = typing && !/\s$/.test((e && e.data) || '') && e.inputType !== 'insertLineBreak';
+  _mdx.undoLast = now;
+  _mdx.undoTool = false;
+}
+function _mdxHistStep(dir) {
+  const ta = document.getElementById('file-edit-ta');
+  if (!ta || ta.readOnly) return;
+  if (!_mdx.undo) _mdxHistReset(ta);
+  const to = _mdx.undoAt + dir;
+  ta.focus();
+  if (to < 0 || to >= _mdx.undo.length) { _mdxBeacon(dir < 0 ? 'undo_none' : 'redo_none', {}); return; }
+  const st = _mdx.undo[to];
+  _mdx.undoAt = to; _mdx.undoOpen = false;
+  ta.value = st.v;
+  try { ta.setSelectionRange(st.s, st.e); } catch (e) { console.warn('[mdx] undo could not place the caret', e); }
+  _mdxChanged();   // highlight, preview, and the save that undo owes the file
+  _mdxLevelSync();
+}
 function _mdxReplace(start, end, text, selStart, selEnd) {
   const ta = document.getElementById('file-edit-ta');
   if (!ta || ta.readOnly) return;
   ta.focus();
+  _mdx.undoTool = true;   // one undo step, apart from typing
   ta.setSelectionRange(start, end);
   let ok = false;
   try { ok = document.execCommand('insertText', false, text); } catch (e) {}
@@ -31914,14 +35419,6 @@ function _mdxPrefix(fn) {
   _mdxReplace(s, e, out, s, s + out.length);
 }
 const _mdxTools = {
-  heading() {
-    _mdxPrefix(ls => ls.map(l => {
-      const m = /^(#{1,6})\s+/.exec(l);
-      const n = m ? m[1].length : 0;
-      const rest = m ? l.slice(m[0].length) : l;
-      return n >= 3 ? rest : '#'.repeat(n + 1) + ' ' + rest;
-    }));
-  },
   bold() { _mdxWrap('**', '**', 'bold text'); },
   italic() { _mdxWrap('*', '*', 'italic text'); },
   ul() {
@@ -31966,11 +35463,303 @@ const _mdxTools = {
   },
 };
 
+// The editor's toolbar, its + menu and the / menu (owner, 2026-11-13: "Update the md editor
+// toolbar", from a mockup). One icon set and one list of blocks feed all three.
+const _MDX_SVG = {
+  undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/>',
+  redo: '<path d="m15 14 5-5-5-5"/><path d="M20 9H9a5 5 0 0 0 0 10h3"/>',
+  bold: '<path d="M7 5h6a3.5 3.5 0 0 1 0 7H7z"/><path d="M7 12h7a3.5 3.5 0 0 1 0 7H7z"/>',
+  italic: '<path d="M14 5h-4M14 19h-4M15 5 9 19" transform="translate(1 0)"/>',
+  strike: '<path d="M5 12h14"/><path d="M16 7.5C15.4 6 13.9 5 12 5c-2.5 0-4 1.3-4 3.2 0 1.5 1 2.4 3 3"/><path d="M8 16.5c.6 1.6 2.1 2.5 4 2.5 2.5 0 4-1.3 4-3.2 0-.6-.1-1.1-.4-1.6"/>',
+  code: '<path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 6l-3 12"/>',
+  ul: '<path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r=".9" fill="currentColor"/><circle cx="4.5" cy="12" r=".9" fill="currentColor"/><circle cx="4.5" cy="18" r=".9" fill="currentColor"/>',
+  ol: '<path d="M10 6h10M10 12h10M10 18h10"/><path d="M4 5l1.5-1v5M3.5 14.2c.3-.6.9-1 1.6-1 .9 0 1.5.6 1.5 1.3 0 1.2-3 2.2-3 3.5h3"/>',
+  task: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8.5 12 2.5 2.5 4.5-5"/>',
+  quote: '<path d="M10 7H6.5A1.5 1.5 0 0 0 5 8.5V12h4v1c0 2-1 3-3 3.5M19 7h-3.5A1.5 1.5 0 0 0 14 8.5V12h4v1c0 2-1 3-3 3.5"/>',
+  hr: '<path d="M4 12h16"/>',
+  link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+  image: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.6"/><path d="m20.5 16-5-5-9 8.5"/>',
+  table: '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M3.5 9.5h17M3.5 14.5h17M9.5 4.5v15M15 4.5v15"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  heading: '<path d="M6 5v14M18 5v14M6 12h12"/>',
+  callout: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/>',
+  details: '<path d="m9 6 6 6-6 6"/>',
+  worker: '<circle cx="12" cy="12" r="3.5"/><path d="M15.5 12v1.5a2.5 2.5 0 0 0 5 0V12a8.5 8.5 0 1 0-3.4 6.8"/>',
+  chev: '<path d="m7 10 5 5 5-5"/>',
+  next: '<path d="m10 7 5 5-5 5"/>',
+};
+function _mdxIcon(k) {
+  return '<svg class="mdx-svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (_MDX_SVG[k] || '') + '</svg>';
+}
+// The bar, in groups. '|' is a separator; 'block' is the heading dropdown; 'insert' the + menu.
+const _MDX_BAR = [
+  ['undo', 'Undo (⌘Z)'], ['redo', 'Redo (⇧⌘Z)'], '|',
+  ['block', 'Text style'], '|',
+  ['bold', 'Bold (⌘B)'], ['italic', 'Italic (⌘I)'], ['strike', 'Strikethrough (⇧⌘X)'], ['code', 'Code'], '|',
+  ['ul', 'Bulleted list'], ['ol', 'Numbered list'], ['task', 'Checklist'], ['quote', 'Blockquote'], ['hr', 'Divider'], '|',
+  ['link', 'Link (⌘K)'], ['image', 'Image'], ['table', 'Table'], '|',
+  ['insert', 'Insert a block (or type / on a new line)'],
+];
+const _MDX_CALLOUTS = [['NOTE', 'Note'], ['TIP', 'Tip'], ['IMPORTANT', 'Important'], ['WARNING', 'Warning'], ['CAUTION', 'Caution']];
+// What + and / offer. `sub` opens a second list beside the row.
+const _MDX_BLOCKS = [
+  { k: 'heading', icon: 'heading', label: 'Heading', sub: [1, 2, 3, 4, 5, 6].map(n => ({ k: 'h' + n, mark: 'H' + n, label: 'Heading ' + n })) },
+  { k: 'task', icon: 'task', label: 'Checklist' },
+  { k: 'ul', icon: 'ul', label: 'Bulleted list' },
+  { k: 'ol', icon: 'ol', label: 'Numbered list' },
+  '|',
+  { k: 'quote', icon: 'quote', label: 'Blockquote' },
+  { k: 'codeblock', icon: 'code', label: 'Code block' },
+  { k: 'hr', icon: 'hr', label: 'Divider' },
+  '|',
+  { k: 'table', icon: 'table', label: 'Table' },
+  { k: 'image', icon: 'image', label: 'Image' },
+  { k: 'callout', icon: 'callout', label: 'Callout', sub: _MDX_CALLOUTS.map(([t, l]) => ({ k: 'callout:' + t, icon: 'callout', label: l })) },
+  { k: 'details', icon: 'details', label: 'Collapsible section' },
+  { k: 'worker', icon: 'worker', label: 'Tag a worker' },
+];
+// A block on its own lines: a blank line before it unless the caret already starts one.
+function _mdxBlock(text, selOff, selLen) {
+  const ta = document.getElementById('file-edit-ta');
+  const a = ta.selectionStart, v = ta.value;
+  const ls = v.lastIndexOf('\n', a - 1) + 1;
+  const lineEmpty = !v.slice(ls, a).trim() && (v.indexOf('\n', a) === -1 ? !v.slice(a).trim() : !v.slice(a, v.indexOf('\n', a)).trim());
+  const start = lineEmpty ? ls : a, end = lineEmpty ? (v.indexOf('\n', a) === -1 ? v.length : v.indexOf('\n', a)) : ta.selectionEnd;
+  const pre = start === 0 ? '' : v.slice(0, start).endsWith('\n\n') ? '' : v.slice(0, start).endsWith('\n') ? '\n' : '\n\n';
+  const post = v.slice(end).startsWith('\n') ? '' : '\n';
+  const at = start + pre.length + (selOff || 0);
+  _mdxReplace(start, end, pre + text + post, at, at + (selLen || 0));
+}
+// Set the heading level of the selected lines: 0 is plain text.
+function _mdxSetLevel(n) {
+  const ta = document.getElementById('file-edit-ta');
+  const caret = ta.selectionStart === ta.selectionEnd;
+  _mdxPrefix(ls => ls.map(l => { const rest = l.replace(/^#{1,6}\s+/, ''); return n ? '#'.repeat(n) + ' ' + rest : rest; }));
+  // A caret stays a caret, at the end of the line: the next keystroke types the heading.
+  if (caret) ta.setSelectionRange(ta.selectionEnd, ta.selectionEnd);
+}
+function _mdxLevelAt() {
+  const ta = document.getElementById('file-edit-ta');
+  if (!ta) return 0;
+  const v = ta.value, s = v.lastIndexOf('\n', ta.selectionStart - 1) + 1;
+  const m = /^(#{1,6})\s/.exec(v.slice(s, s + 8));
+  return m ? m[1].length : 0;
+}
+Object.assign(_mdxTools, {
+  undo() { _mdxHistStep(-1); },
+  redo() { _mdxHistStep(1); },
+  strike() { _mdxWrap('~~', '~~', 'struck text'); },
+  quote() {
+    _mdxPrefix(ls => { const all = ls.every(l => /^\s*>/.test(l) || !l.trim()); return ls.map(l => !l.trim() ? l : all ? l.replace(/^(\s*)>\s?/, '$1') : '> ' + l); });
+  },
+  hr() { _mdxBlock('---', 4); },
+  codeblock() {
+    const ta = document.getElementById('file-edit-ta');
+    if (ta.selectionEnd > ta.selectionStart) { const sel = ta.value.slice(ta.selectionStart, ta.selectionEnd); if (!sel.includes('\n')) { _mdxReplace(ta.selectionStart, ta.selectionEnd, '```\n' + sel + '\n```\n', ta.selectionStart + 4, ta.selectionStart + 4 + sel.length); return; } this.code(); return; }
+    _mdxBlock('```\ncode\n```', 4, 4);
+  },
+  details() { _mdxBlock('<details>\n<summary>Summary</summary>\n\nContent\n\n</details>', 19, 7); },
+  callout(kind) { const k = kind || 'NOTE'; _mdxBlock('> [!' + k + ']\n> Text', k.length + 8, 4); },
+  table() { _mdxBlock('| Column | Column |\n| --- | --- |\n| Cell | Cell |', 2, 6); },
+});
+// Run a block key from either menu: h1..h6, callout:KIND, or a tool name.
+function _mdxRunBlock(k) {
+  const h = /^h([1-6])$/.exec(k);
+  if (h) _mdxSetLevel(+h[1]);
+  else if (k.startsWith('callout:')) _mdxTools.callout(k.slice(8));
+  else if (k === 'p') _mdxSetLevel(0);
+  else _mdxTools[k]?.();
+  _mdxBeacon('tool', { tool: k });
+  _mdxLevelSync();
+}
+function _mdxToolbar() {
+  const bar = document.getElementById('mdx-tools');
+  if (!bar || bar.childElementCount) return;
+  bar.innerHTML = _MDX_BAR.map(t => {
+    if (t === '|') return '<span class="mdx-tsep" aria-hidden="true"></span>';
+    const [k, title] = t;
+    if (k === 'block') return '<button type="button" class="mdx-level" data-menu="block" title="' + title + '" aria-label="' + title + '" aria-haspopup="menu"><span id="mdx-level">Text</span>' + _mdxIcon('chev') + '</button>';
+    if (k === 'insert') return '<button type="button" class="mdx-plus" data-menu="insert" title="' + title + '" aria-label="Insert" aria-haspopup="menu">' + _mdxIcon('plus') + '</button>';
+    return '<button type="button" data-t="' + k + '" title="' + title + '" aria-label="' + title.replace(/ \(.*/, '') + '">' + _mdxIcon(k) + '</button>';
+  }).join('');
+}
+function _mdxLevelSync() {
+  const el = document.getElementById('mdx-level');
+  if (el) { const n = _mdxLevelAt(); el.textContent = n ? 'H' + n : 'Text'; }
+}
+// One menu open at a time. `at` is the element (or a caret box) it hangs from.
+let _mdxMenu = null;
+function _mdxMenuClose() {
+  document.querySelectorAll('.mdx-menu').forEach(el => el.remove());
+  _mdxMenu = null;
+  document.querySelectorAll('#mdx-tools [data-menu]').forEach(b => b.setAttribute('aria-expanded', 'false'));
+}
+function _mdxMenuRow(it, active) {
+  if (it === '|') return '<div class="mdx-menu-sep" role="separator"></div>';
+  const lead = it.mark ? '<span class="mdx-mi-mark">' + it.mark + '</span>' : it.icon ? _mdxIcon(it.icon) : '<span class="mdx-mi-mark"></span>';
+  return '<button type="button" class="explore-menu-item mdx-menu-item' + (active ? ' on' : '') + '" role="menuitem" data-k="' + it.k + '"' + (it.sub ? ' aria-haspopup="menu"' : '') + '>'
+    + lead + '<span class="mdx-mi-label">' + esc(it.label) + '</span>' + (it.sub ? _mdxIcon('next') : '') + '</button>';
+}
+function _mdxMenuOpen(items, at, opts) {
+  opts = opts || {};
+  if (!opts.sub) _mdxMenuClose(); else document.querySelectorAll('.mdx-menu.mdx-sub').forEach(el => el.remove());
+  const m = document.createElement('div');
+  m.className = 'explore-menu-popup mdx-menu' + (opts.sub ? ' mdx-sub' : '');
+  m.setAttribute('role', 'menu');
+  m.innerHTML = items.map((it, i) => _mdxMenuRow(it, opts.active === i)).join('');
+  // Keep the textarea's selection (and a phone's keyboard) while the menu is used.
+  for (const ev of ['pointerdown', 'mousedown']) m.addEventListener(ev, e => e.preventDefault());
+  m.addEventListener('click', e => {
+    const b = e.target.closest('[data-k]');
+    if (!b) return;
+    const it = _mdxFlat(items).find(x => x.k === b.dataset.k);
+    if (it && it.sub) { _mdxMenuOpen(it.sub, b, { sub: true, side: true, onPick: opts.onPick }); return; }
+    _mdxMenuClose();
+    (opts.onPick || _mdxRunBlock)(b.dataset.k);
+  });
+  m.addEventListener('pointerover', e => {
+    const b = e.target.closest('[data-k]');
+    if (!b || e.pointerType === 'touch') return;
+    const it = _mdxFlat(items).find(x => x.k === b.dataset.k);
+    if (it && it.sub) _mdxMenuOpen(it.sub, b, { sub: true, side: true, onPick: opts.onPick });
+    else if (!opts.sub) document.querySelectorAll('.mdx-menu.mdx-sub').forEach(el => el.remove());
+  });
+  document.body.appendChild(m);
+  const r = at.getBoundingClientRect ? _cssRect(at) : at;
+  const z = _uiZoomFactor(), vw = window.innerWidth / z, vh = window.innerHeight / z;
+  const pw = m.offsetWidth, ph = m.offsetHeight;
+  // A phone has no room beside the row: the second list drops below it instead.
+  const side = opts.side && (r.right + 4 + pw <= vw - 8 || r.left - pw - 4 >= 8);
+  let left = side ? r.right + 4 : (opts.alignRight ? r.right - pw : opts.side ? r.left + 24 : r.left);
+  if (side && left + pw > vw - 8) left = r.left - pw - 4;
+  left = Math.max(8, Math.min(left, vw - pw - 8));
+  let top = side ? r.top - 4 : r.bottom + 4;
+  if (top + ph > vh - 8) top = side ? vh - ph - 8 : r.top - ph - 4;
+  m.style.left = left + 'px';
+  m.style.top = Math.max(8, top) + 'px';
+  if (!opts.sub) {
+    _mdxMenu = { el: m, items, opts };
+    // Esc closes the menu, not the file under it. The / menu handles its own keys.
+    // On window, in capture, from the start: the overlay's own Esc must not see it first.
+    const esc = e => {
+      if (!m.isConnected) { window.removeEventListener('keydown', esc, true); return; }
+      if (e.key !== 'Escape' || m.classList.contains('mdx-slash')) return;
+      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+      window.removeEventListener('keydown', esc, true);
+      _mdxMenuClose();
+    };
+    window.addEventListener('keydown', esc, true);
+    setTimeout(() => {
+      const off = () => document.removeEventListener('pointerdown', dismiss, true);
+      const dismiss = e => {
+        if (!m.isConnected) { off(); return; }
+        if (e.target.closest && (e.target.closest('.mdx-menu') || (opts.keepOn && opts.keepOn.contains(e.target)))) return;
+        off();
+        if (_mdxMenu && _mdxMenu.el === m) _mdxMenuClose();
+      };
+      document.addEventListener('pointerdown', dismiss, true);
+    }, 0);
+  }
+  return m;
+}
+function _mdxFlat(items) { return items.filter(x => x !== '|'); }
+const _MDX_LEVELS = [{ k: 'p', mark: '¶', label: 'Text' }].concat([1, 2, 3, 4, 5, 6].map(n => ({ k: 'h' + n, mark: 'H' + n, label: 'Heading ' + n })));
+
+// The / menu: a / at the start of a line opens the blocks at the caret; typing
+// narrows them, arrows move, Enter or Tab picks, Esc or a space closes.
+let _mdxSlash = null;   // { at: index of the '/', sel: highlighted row }
+function _mdxSlashItems(q) {
+  const all = [];
+  for (const it of _mdxFlat(_MDX_BLOCKS)) { if (it.sub) all.push(...it.sub.map(s => it.k === 'callout' ? Object.assign({}, s, { label: 'Callout: ' + s.label }) : s)); else all.push(it); }
+  q = q.toLowerCase();
+  if (!q) return _MDX_BLOCKS;
+  return all.filter(it => it.label.toLowerCase().split(/[\s:]+/).some(w => w.startsWith(q)) || it.label.toLowerCase().startsWith(q) || it.k === q);
+}
+function _mdxSlashRender() {
+  const ta = document.getElementById('file-edit-ta');
+  const q = ta.value.slice(_mdxSlash.at + 1, ta.selectionStart);
+  const items = _mdxSlashItems(q);
+  const flat = _mdxFlat(items);
+  if (!flat.length) { _mdxSlashClose(); return; }
+  _mdxSlash.sel = Math.min(_mdxSlash.sel, flat.length - 1);
+  const c = _caretXY(ta), tr = _cssRect(ta), z = _uiZoomFactor();
+  const box = { left: tr.left + c.x / z, right: tr.left + c.x / z, top: tr.top + c.y / z, bottom: tr.top + (c.y + c.h) / z };
+  const m = _mdxMenuOpen(items, box, { keepOn: ta, onPick: k => _mdxSlashPick(k) });
+  m.classList.add('mdx-slash');
+  const rows = m.querySelectorAll('[data-k]');
+  rows.forEach((b, i) => b.classList.toggle('on', i === _mdxSlash.sel));
+  rows[_mdxSlash.sel]?.scrollIntoView({ block: 'nearest' });
+}
+function _mdxSlashClose() { _mdxSlash = null; if (_mdxMenu && _mdxMenu.el.classList.contains('mdx-slash')) _mdxMenuClose(); }
+function _mdxSlashPick(k) {
+  const ta = document.getElementById('file-edit-ta');
+  const s = _mdxSlash;
+  _mdxSlash = null;
+  // Remove exactly the typed '/word'. WebKit's insertText of '' over a selection
+  // that starts a line also ate the newline before it, so the block landed on the
+  // line above. 'delete' removes the selection alone and keeps undo; if an engine
+  // still removes more, the text is put right and the editor beacon says so.
+  if (s) {
+    const end = ta.selectionStart, want = ta.value.slice(0, s.at) + ta.value.slice(end);
+    ta.focus();
+    ta.setSelectionRange(s.at, end);
+    let ok = false;
+    try { ok = document.execCommand('delete'); } catch (e) { console.warn('[mdx] delete failed', e); }
+    if (ta.value !== want) {
+      if (ok) _mdxBeacon('slash_delete_mismatch', { engine_removed: want.length - ta.value.length });
+      ta.value = want;
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    ta.setSelectionRange(s.at, s.at);
+  }
+  _mdxRunBlock(k);
+}
+// From the textarea's input: open on a '/' typed at a line start, re-filter while open.
+function _mdxSlashInput() {
+  const ta = document.getElementById('file-edit-ta');
+  const a = ta.selectionStart, v = ta.value;
+  if (_mdxSlash) {
+    if (a <= _mdxSlash.at || v[_mdxSlash.at] !== '/' || /\s/.test(v.slice(_mdxSlash.at + 1, a))) { _mdxSlashClose(); return; }
+    _mdxSlashRender();
+    return;
+  }
+  if (a > 0 && v[a - 1] === '/' && ta.selectionStart === ta.selectionEnd && !v.slice(v.lastIndexOf('\n', a - 2) + 1, a - 1).trim()) {
+    _mdxSlash = { at: a - 1, sel: 0 };
+    _mdxSlashRender();
+  }
+}
+// From the textarea's keydown; true when the menu took the key.
+function _mdxSlashKey(e) {
+  if (!_mdxSlash) return false;
+  const ta = e.target, flat = _mdxFlat(_mdxSlashItems(ta.value.slice(_mdxSlash.at + 1, ta.selectionStart)));
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    _mdxSlash.sel = (_mdxSlash.sel + (e.key === 'ArrowDown' ? 1 : -1) + flat.length) % flat.length;
+    _mdxSlashRender();
+    return true;
+  }
+  if (e.key === 'Enter' || e.key === 'Tab') {
+    const it = flat[_mdxSlash.sel];
+    if (!it) return false;
+    e.preventDefault();
+    if (it.sub) { const row = _mdxMenu?.el.querySelectorAll('[data-k]')[_mdxSlash.sel]; if (row) _mdxMenuOpen(it.sub, row, { sub: true, side: true, onPick: k => { _mdxMenuClose(); _mdxSlashPick(k); } }); return true; }
+    _mdxMenuClose();
+    _mdxSlashPick(it.k);
+    return true;
+  }
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _mdxSlashClose(); return true; }
+  return false;
+}
+
 // Enter carries a list on; Enter on an empty item ends it. Tab and ⇧Tab indent.
 function _mdxKeydown(e) {
   const ta = e.target;
   if (ta.readOnly) return;
+  if (_mdxSlashKey(e)) return;
   const mod = e.metaKey || e.ctrlKey;
+  if (mod && !e.altKey && e.key.toLowerCase() === 'z') { e.preventDefault(); _mdxHistStep(e.shiftKey ? 1 : -1); return; }
+  if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'y') { e.preventDefault(); _mdxHistStep(1); return; }
+  if (mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'x') { e.preventDefault(); _mdxTools.strike(); return; }
   if (mod && !e.altKey && !e.shiftKey) {
     const k = e.key.toLowerCase();
     if (k === 'b') { e.preventDefault(); _mdxTools.bold(); return; }
@@ -32010,6 +35799,34 @@ function _mdxKeydown(e) {
     _mdxReplace(a, a, next, a + next.length);
   }
 }
+
+// Tab in the file editor for files that are not markdown (owner, 2026-11-18:
+// "make sure the editor has the same kind of formatting stuff like tabbing to
+// indent"). Markdown gets _mdxKeydown; everything else got nothing, so Tab
+// left the editor. Tab inserts two spaces or indents the selected lines;
+// Shift+Tab outdents them. Undo keeps working (execCommand insertText).
+document.addEventListener('keydown', (e) => {
+  const ta = e.target;
+  if (!ta || ta.id !== 'file-edit-ta' || ta.readOnly || e.key !== 'Tab' || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (typeof _mdxActive === 'function' && _mdxActive()) return;
+  e.preventDefault();
+  const v = ta.value, a = ta.selectionStart, b = ta.selectionEnd, ind = '  ';
+  const put = (from, to, text, ca, cb) => {
+    ta.setSelectionRange(from, to);
+    if (!document.execCommand || !document.execCommand('insertText', false, text)) { ta.setRangeText(text, from, to, 'end'); ta.dispatchEvent(new Event('input', { bubbles: true })); }
+    ta.setSelectionRange(ca, cb);
+  };
+  if (a === b && !e.shiftKey) { put(a, b, ind, a + ind.length, a + ind.length); return; }
+  // A caret (no selection) outdents its whole line: wherever it sits, even
+  // inside the leading spaces (land review F1).
+  const lineEnd = v.indexOf('\n', b) < 0 ? v.length : v.indexOf('\n', b);
+  const s = v.lastIndexOf('\n', a - 1) + 1, end = a === b ? lineEnd : (v[b - 1] === '\n' ? b - 1 : b);
+  const lines = v.slice(s, end).split('\n');
+  const out = lines.map(l => e.shiftKey ? l.replace(/^( {1,2}|\t)/, '') : ind + l).join('\n');
+  const first = e.shiftKey ? (lines[0].match(/^( {1,2}|\t)/) || [''])[0].length * -1 : ind.length;
+  if (a === b) put(s, end, out, Math.max(s, a + first), Math.max(s, a + first));
+  else put(s, end, out, Math.max(s, a + first), s + out.length);
+}, true);
 
 // ── Diff ──
 // Line by line: the saved file (or a past commit) against the source now.
@@ -32073,13 +35890,14 @@ async function _mdxRenderHistory() {
   const alt = document.getElementById('mdx-alt');
   if (!alt || !_fileData) return;
   const path = _fileData.path;
-  if (_mdx.histFor && _mdx.histFor.path === path) { _mdxDrawHistory(_mdx.histFor.data); return; }
+  // Read again after 15 s: a commit or a land since the last read must show.
+  if (_mdx.histFor && _mdx.histFor.path === path && Date.now() - (_mdx.histFor.at || 0) < 15000) { _mdxDrawHistory(_mdx.histFor.data); return; }
   alt.innerHTML = '<div class="mdx-empty">Reading history…</div>';
   try {
     const r = await fetch(API + '/api/file/history?path=' + encodeURIComponent(path), { headers: _authHeaders() });
     const d = await r.json();
     if (!r.ok || d.measured === false) throw new Error(d.why_unmeasured || d.error || ('HTTP ' + r.status));
-    _mdx.histFor = { path, data: d };
+    _mdx.histFor = { path, data: d, at: Date.now() };
     if (_mdx.tab === 'history' && _fileData && _fileData.path === path) _mdxDrawHistory(d);
   } catch (e) {
     alt.innerHTML = '<div class="ui-error">History could not be read: ' + esc(e.message || String(e)) + '</div>';
@@ -32198,14 +36016,33 @@ function _mdxBind() {
   if (_mdxBound) return;
   _mdxBound = true;
   const ta = document.getElementById('file-edit-ta');
-  ta.addEventListener('input', e => { if (_mdxActive()) { if (e.isTrusted) _mdx.tickSaving = false; _mdxChanged(); } });
+  ta.addEventListener('input', e => { if (_mdxActive()) { if (e.isTrusted) _mdx.tickSaving = false; _mdxHistRecord(ta, e); _mdxChanged(); _mdxSlashInput(); } });
+  // The Mac app's Edit menu and a context menu's Undo reach the page as these.
+  ta.addEventListener('beforeinput', e => {
+    if (!_mdxActive() || (e.inputType !== 'historyUndo' && e.inputType !== 'historyRedo')) return;
+    e.preventDefault();
+    _mdxHistStep(e.inputType === 'historyUndo' ? -1 : 1);
+  });
   ta.addEventListener('scroll', () => { if (_mdxActive()) _mdxSyncScroll(); });
-  ['keyup', 'click', 'select'].forEach(ev => ta.addEventListener(ev, () => { if (_mdxActive()) _mdxStatus(); }));
+  ['keyup', 'click', 'select'].forEach(ev => ta.addEventListener(ev, () => { if (_mdxActive()) { _mdxStatus(); _mdxLevelSync(); } }));
+  ta.addEventListener('blur', () => { if (_mdxSlash) _mdxSlashClose(); });
+  _mdxToolbar();
   ta.addEventListener('keydown', e => { if (_mdxActive()) _mdxKeydown(e); });
   _atAttach(ta);   // @ offers the workers
   // Keep the selection, and on a phone the keyboard: a tap reaches pointerdown before mousedown.
-  for (const ev of ['pointerdown', 'mousedown']) document.getElementById('mdx-tools').addEventListener(ev, e => { if (e.target.closest('[data-t]')) e.preventDefault(); });
+  for (const ev of ['pointerdown', 'mousedown']) document.getElementById('mdx-tools').addEventListener(ev, e => { if (e.target.closest('[data-t],[data-menu]')) e.preventDefault(); });
   document.getElementById('mdx-tools').addEventListener('click', e => {
+    const mb = e.target.closest('[data-menu]');
+    if (mb && !ta.readOnly) {
+      if (_mdxMenu && _mdxMenu.opts.anchor === mb) { _mdxMenuClose(); return; }
+      if (_mdx.mode === 'preview') _mdxSetMode('edit', false);
+      _mdxSlash = null;
+      const block = mb.dataset.menu === 'block';
+      const m = _mdxMenuOpen(block ? _MDX_LEVELS : _MDX_BLOCKS, mb, { alignRight: !block, keepOn: mb, anchor: mb, active: block ? _mdxLevelAt() : undefined });
+      m.dataset.menu = mb.dataset.menu;
+      mb.setAttribute('aria-expanded', 'true');
+      return;
+    }
     const b = e.target.closest('[data-t]');
     if (!b || ta.readOnly) return;
     if (_mdx.mode === 'preview') _mdxSetMode('edit', false);
@@ -33695,6 +37532,7 @@ function _fileHashSync(path) {
 async function openFilePreview(path, options = {}) {
   if (options.readOnly && !/\.(md|json|txt|png|webm)$/i.test(path)) return;
   if (!/\.mdai$/i.test(path || '') || options.raw) _feRecordOpen(path);
+  if (!options.readOnly) _navVisit('file', path, String(path || '').split('/').pop());
   // .mdai files open in the dedicated MDAI viewer (Ethan, AMUX-3317): it shows
   // the node's metadata (model / date / cached), lets you scroll the run
   // versions, and RUNS THE CHAIN on open — none of which the generic file body
@@ -33951,6 +37789,15 @@ function _fileEditBeacon(verdict) {
         is_new: !!(_fileData && _fileData._isNew), measured: true, n_considered: 1, ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?') }) }).catch(() => {});
   } catch (e) {}
 }
+// THE PERSON CLOSING THE FILE (✕, Escape, swipe). closeFilePreview is also
+// called on the way somewhere else (Show in folder, rename and move reopening
+// the file, a worker link, Back); only a dismissal runs what follows a close:
+// the link viewer's return and clearing the address a #path= link opened.
+let _fileDismissPath = null;
+function dismissFilePreview() {
+  _fileDismissPath = (_fileData && _fileData.path) || '';
+  closeFilePreview();
+}
 function closeFilePreview() {
   if (_fileEditDirty()) {
     if (_fileIsScratchpad(_fileData.path)) {
@@ -33958,13 +37805,13 @@ function closeFilePreview() {
       // stays open with the text, so nothing is lost.
       _fileEditBeacon('scratchpad_saved_on_close');
       _fileSave().then(() => {
-        if (_fileEditDirty()) { _fileEditBeacon('scratchpad_save_on_close_failed'); showToast('Note not saved yet: it stays open so your text is kept'); return; }
+        if (_fileEditDirty()) { _fileDismissPath = null; _fileEditBeacon('scratchpad_save_on_close_failed'); showToast('Note not saved yet: it stays open so your text is kept'); return; }
         closeFilePreview();
       });
       return;
     }
     showConfirm('This file has unsaved edits. Close without saving?', 'Discard changes', true).then(ok => {
-      if (!ok || !_fileData) return;
+      if (!ok || !_fileData) { _fileDismissPath = null; return; }
       _fileEditBeacon('discarded_after_confirm');
       _fileData.content = document.getElementById('file-edit-ta').value;
       closeFilePreview();
@@ -33973,7 +37820,7 @@ function closeFilePreview() {
   }
   if (_xlsxEd && _xlsxEd.dirty) {
     showConfirm('This spreadsheet has unsaved changes. Close without saving?', 'Discard changes', true)
-      .then(ok => { if (ok && _xlsxEd) { _xlsxEd.dirty = false; closeFilePreview(); } });
+      .then(ok => { if (ok && _xlsxEd) { _xlsxEd.dirty = false; closeFilePreview(); } else _fileDismissPath = null; });
     return;
   }
   _xlsxEditorTeardown();
@@ -33999,12 +37846,38 @@ function closeFilePreview() {
   if (searchTab) searchTab.style.display = 'none';
   document.getElementById('file-edit-wrap').style.display = 'none';
   document.getElementById('file-body').style.display = '';
+  const closingPath = (_fileData && _fileData.path) || null;
   _fileData = null;
   _fileViewMode = 'preview';
   // A load still in flight belongs to a viewer that is gone: without this its
   // cache read or reply passed the generation check and set _fileData on a
   // closed overlay (2026-11-06).
   _filePreviewGen++;
+  // A link viewer has nothing behind the file: closing it goes back to where
+  // the link was clicked.
+  const dismissed = _fileDismissPath !== null && _fileDismissPath === (closingPath || '');
+  _fileDismissPath = null;
+  const boot = _fileBootLinkPath;
+  if (boot && boot === closingPath) _fileBootLinkPath = null;   // closed by any means, the link is spent
+  if (!dismissed) return;
+  if (_linkViewer) { _linkViewerReturn(); return; }
+  if (boot && boot === closingPath) _fileBootLinkClose();
+}
+// THE FILE A PAGE WAS OPENED ON LEAVES NO ADDRESS WHEN CLOSED (owner,
+// 2026-11-23: "if I close the file, the path param ... remains in my browser
+// URL"). A #path= link opens the Files view on the file's folder and the file
+// over it; the close rewrote the address to #path=<folder>, so the link's path
+// stayed in the bar. Dismissing that file now clears the address and lands
+// where an empty address does. Only that file, only a dismissal, and only
+// while the address is still a #path=: a file opened later, an internal close
+// (Show in folder), or a page moved elsewhere keeps the usual close.
+let _fileBootLinkPath = null;
+function _fileBootLinkClose() {
+  if (location.hash && !location.hash.startsWith('#path=')) return;
+  try { history.replaceState(history.state, '', location.pathname + location.search); } catch (e) { console.warn('[amux] file_link_close: address not cleared', e); return; }
+  console.info('[amux] file_link_close', { verdict: 'address_cleared' });
+  amuxTrack('file_link_close', { verdict: 'address_cleared', measured: true, n_considered: 1 });
+  switchView('sessions');
 }
 
 async function _downloadFileBytes(url, filename) {
@@ -34035,7 +37908,7 @@ async function _fileDownload() {
     setTimeout(() => { dlBtn.textContent = '⬇ Download'; }, 2000);
   } catch(e) {
     dlBtn.textContent = '⬇ Download';
-    alert('Download failed: ' + e.message);
+    await showAlert('Download failed: ' + e.message);
   }
 }
 
@@ -35393,7 +39266,7 @@ async function _fselDownload() {
 async function _fselMove() {
   const items = _fselSelected();
   const here = items.length ? items[0].path.slice(0, items[0].path.lastIndexOf('/')) || '/' : '/';
-  const dest = (prompt('Move ' + items.length + ' item' + (items.length === 1 ? '' : 's') + ' to folder:', here) || '').trim();
+  const dest = ((await showPrompt('Move ' + items.length + ' item' + (items.length === 1 ? '' : 's') + ' to folder:', '', here, { trim: false })) || '').trim();
   if (!dest || dest === here) return;
   const res = await _fselEach(items, async it => {
     const r = await fetch(API + '/api/fs/rename', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
@@ -35407,7 +39280,7 @@ async function _fselMove() {
 async function _fselDelete() {
   const items = _fselSelected();
   const names = items.slice(0, 5).map(e => e.path.split('/').pop() + (e.type === 'dir' ? '/' : '')).join('\n');
-  if (!confirm('Delete ' + items.length + ' item' + (items.length === 1 ? '' : 's') + '? This cannot be undone.\n\n' + names + (items.length > 5 ? '\n\u2026and ' + (items.length - 5) + ' more' : ''))) return;
+  if (!(await showConfirm('Delete ' + items.length + ' item' + (items.length === 1 ? '' : 's') + '? This cannot be undone.\n\n' + names + (items.length > 5 ? '\n\u2026and ' + (items.length - 5) + ' more' : ''), 'Delete', true))) return;
   const res = await _fselEach(items, async it => {
     const r = await fetch(API + '/api/fs/delete', { method: 'DELETE', headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ path: it.path }) });
     const d = await r.json().catch(() => ({}));
@@ -36015,7 +39888,11 @@ function _spHandlePaste(e, box) {
   const text = e.clipboardData?.getData('text/plain') || '';
   if (box && box.value.trim()) {
     // Typing: an image goes into the note, saved beside it (Ethan, 2026-11-08).
-    if (images.length) _pasteImagesIntoNote(e, box, _spPath.replace(/\/$/, ''));
+    // The folder is read only after the config answer (_spLoadRoot), as every
+    // other scratchpad write does: a paste made before it went to the fallback
+    // folder ("not a directory" on CI, AF-1261; the wrong folder on an install
+    // with a configured one).
+    if (images.length) _pasteImagesIntoNote(e, box, async () => { await _spLoadRoot(); return _spPath.replace(/\/$/, ''); });
     return;
   }
   if (!images.length && !text.trim()) return;
@@ -36045,7 +39922,8 @@ function _pasteImagesIntoNote(e, ta, dir) {
   ta.value = before + lead + ins + '\n' + ta.value.slice(en);
   ta.selectionStart = ta.selectionEnd = s + lead.length + ins.length + 1;
   ta.dispatchEvent(new Event('input', { bubbles: true }));
-  _uploadOrQueue(named, dir, 'file').then(({ queued, failed }) => {
+  // `dir` is a folder, or a function that resolves one once it is known.
+  Promise.resolve(typeof dir === 'function' ? dir() : dir).then(d => _uploadOrQueue(named, d, 'file')).then(({ queued, failed }) => {
     if (window._clientDebug) window._clientDebug('note-paste-image', { verdict: failed ? 'upload_failed' : 'queued', measured: true, n_considered: named.length, queued, failed });
     if (failed) showToast('Could not save the pasted image');
   });
@@ -36335,7 +40213,7 @@ let _mdaiRunCycle = null; // cycle chain array from a cycle error, or null
 let _mdaiLastRun = null;  // last successful RunResult (for the upstream-node chain note)
 
 // Resolve an mdai path to the absolute filesystem path the Files API expects. The
-// /api/files/mdai list returns root-relative paths (relative to AMUX_FILES_ROOT,
+// /api/mdai list returns root-relative paths (relative to AMUX_FILES_ROOT,
 // i.e. $HOME); the Files browser hands us absolute paths. Both are accepted by the
 // mdai run/history/connect endpoints, but /api/file needs the absolute form.
 function _mdaiAbs(p) {
@@ -37163,7 +41041,7 @@ function _connDrawerRender() {
   h += '<div class="cx-tabs">' + tab('overview', 'Overview') + tab('connections', 'Connections' + (_connAcctsState === 'ok' ? ' (' + s.rows.length + ')' : '')) + tab('config', 'Configuration') + tab('perms', 'Permissions') + '</div>';
   h += '<div class="cx-dbody">';
   if (_connOpenTab === 'overview') {
-    if (c.setup_note) h += '<p class="cx-p">' + esc(c.setup_note) + (c.docs ? ' <a href="' + esc(c.docs) + '" target="_blank" rel="noopener">Docs ↗</a>' : '') + '</p>';
+    if (c.setup_note) h += '<p class="cx-p">' + esc(c.setup_note) + (c.create_app ? ' <a href="' + esc(c.create_app) + '" target="_blank" rel="noopener">Create the app ↗</a>' : '') + (c.docs ? ' <a href="' + esc(c.docs) + '" target="_blank" rel="noopener">Docs ↗</a>' : '') + '</p>';
     const caps = c.group ? [].concat(...c.services.map(sv => _CONN_CAPS[sv.id] || [])) : (_CONN_CAPS[c.id] || []);
     for (const cap of caps) h += '<div class="cx-cap"><span class="cx-cap-dot">●</span><span><b>' + esc(cap[0]) + '</b><br><span class="cx-dim">' + esc(cap[1]) + '</span></span></div>';
     if (c.group) {
@@ -37250,7 +41128,7 @@ async function _connReconnect(family, account) {
       // The server live-probed Google and the grant WILL dead-end at the
       // mismatch wall (AMUX-3427) — surface the one console fix instead of
       // opening a tab that cannot succeed.
-      alert('Google rejects this app\'s redirect URI, so the grant cannot succeed yet.\n\nOne-time fix: ' + (d.fix_if_unregistered || 'register ' + d.redirect_uri + ' on the OAuth client'));
+      await showAlert('Google rejects this app\'s redirect URI, so the grant cannot succeed yet.\n\nOne-time fix: ' + (d.fix_if_unregistered || 'register ' + d.redirect_uri + ' on the OAuth client'));
       return;
     }
     if (d && d.authorize_url) {
@@ -37312,7 +41190,7 @@ async function _gmailReconnect(email) {
   if (email) _connReconnect('google', email);
 }
 async function _gmailAddAccount() {
-  const email = (prompt('Google account to connect:') || '').trim();
+  const email = ((await showPrompt('Google account to connect:', '', '', { trim: false })) || '').trim();
   // The full Google grant (mail + calendar + drive + docs). The gmail-only
   // grant left calendar unauthorized on every account added this way.
   if (email) _connReconnect('google', email);
@@ -37487,7 +41365,7 @@ async function _connectorTest(id, btn) {
 // keeps every run, including failures, with tokens and cost when the provider
 // reported them (mdai_runs). GET /graph says what a node reads and which nodes
 // read it.
-let _mdaiListData = null;      // last GET /api/files/mdai payload
+let _mdaiListData = null;      // last GET /api/mdai payload
 let _mdaiTab = 'preview';      // details tab: edit | preview | sources | runs | settings
 let _mdaiGraph = null;         // GET /graph for the open node
 let _mdaiShown = null;         // the run whose output Preview shows {id, ts, output, model, cached, status, error}
@@ -37513,7 +41391,7 @@ function _mdaiRunNo(run) {
 }
 
 // ---- Shared helpers -----------------------------------------------------------
-// The server owns the .mdai format (GET/PUT /api/files/mdai/doc): it parses with
+// The server owns the .mdai format (GET/PUT /api/mdai/doc): it parses with
 // the engine's own parser and writes one canonical layout, keeping keys this
 // page does not know. So every field below is a form control, and nothing here
 // parses YAML.
@@ -37676,7 +41554,7 @@ async function _mdaiTabLoad() {
   _mdaiShowPage('list');
   if (!_mdaiListData) body.innerHTML = '<div class="mdai-empty">Loading…</div>';
   try {
-    const r = await fetch(API + '/api/files/mdai', { signal: AbortSignal.timeout(15000) });
+    const r = await fetch(API + '/api/mdai', { signal: AbortSignal.timeout(15000) });
     const d = await r.json();
     if (!r.ok || d.error) { body.innerHTML = '<div class="mdai-empty">' + esc(d.error || ('HTTP ' + r.status)) + '</div>'; return; }
     _mdaiListData = d;
@@ -37797,7 +41675,7 @@ function _mdaiCreatePage(opts) {
   _mdaiSrcInit('new', opts.sources || []);
   _mdaiSrcRender('new');
   setTimeout(() => f('mdai-new-name').focus(), 30);
-  if (!_mdaiListData) fetch(API + '/api/files/mdai').then(r => r.json()).then(d => { _mdaiListData = d; _mdaiSrcSync('new'); _mdaiSrcRender('new'); }).catch(() => {});
+  if (!_mdaiListData) fetch(API + '/api/mdai').then(r => r.json()).then(d => { _mdaiListData = d; _mdaiSrcSync('new'); _mdaiSrcRender('new'); }).catch(() => {});
 }
 function _mdaiNewBodyMode(mode) {
   const ta = document.getElementById('mdai-new-body'), pv = document.getElementById('mdai-new-preview');
@@ -37831,7 +41709,7 @@ async function _mdaiCreateSubmit(run) {
   const path = (folder ? folder + '/' : '') + name;
   btns.forEach(b => b.disabled = true);
   try {
-    const { r, d } = await _mdaiJson('/api/files/mdai/doc', 'PUT', { path, doc, create: true });
+    const { r, d } = await _mdaiJson('/api/mdai/doc', 'PUT', { path, doc, create: true });
     if (_isLocallyQueued(r)) { errEl.textContent = 'The server could not be reached, so the node was not created.'; return; }
     if (!r.ok || d.error) { errEl.textContent = (d && d.error) || ('Could not create the node (HTTP ' + r.status + ').'); return; }
     showToast('Created ' + name);
@@ -37852,13 +41730,13 @@ async function _mdaiNewFile(dirOrOpts) {
   else if (dirOrOpts) { dir = dirOrOpts.dir || null; silent = !!dirOrOpts.silent; noOpen = !!dirOrOpts.noOpen; }
   if (!noOpen) { _mdaiCreatePage({ dir: dir || ((activeView === 'files' && _filesPath && !_exploreSession) ? _filesPath : null) }); return null; }
   if (!dir) dir = _mdaiRoot();
-  const raw = prompt('New .mdai node name (e.g. weekly-brief.mdai):', 'node.mdai');
+  const raw = (await showPrompt('New .mdai node name (e.g. weekly-brief.mdai):', '', 'node.mdai', { trim: false }));
   if (!raw || !raw.trim()) return null;
   let fname = raw.trim();
   if (!/\.mdai$/i.test(fname)) fname += '.mdai';
   if (/[\/\0]/.test(fname)) { showToast('Invalid file name'); return null; }
   const base = fname.replace(/\.mdai$/i, '');
-  const { r, d } = await _mdaiJson('/api/files/mdai/doc', 'PUT', { path: dir.replace(/\/+$/, '') + '/' + fname, create: true,
+  const { r, d } = await _mdaiJson('/api/mdai/doc', 'PUT', { path: dir.replace(/\/+$/, '') + '/' + fname, create: true,
     doc: { sources: [], refresh: 'manual', body: '# ' + base + '\n\nDescribe what this node should synthesize from its connected sources.\n' } }).catch(() => ({ r: null, d: {} }));
   if (!r || !r.ok || d.error) { showToast((d && d.error) || 'Could not create node'); return null; }
   if (!silent) showToast('Created ' + fname);
@@ -37886,7 +41764,7 @@ async function openMdaiNode(path, opts) {
   const node = _mdaiCur;
   await _mdaiLoadDoc();
   if (_mdaiCur !== node) return;
-  if (!_mdaiListData) fetch(API + '/api/files/mdai').then(r => r.json()).then(d => { _mdaiListData = d; }).catch(() => {});
+  if (!_mdaiListData) fetch(API + '/api/mdai').then(r => r.json()).then(d => { _mdaiListData = d; }).catch(() => {});
   await Promise.all([_mdaiLoadHistory(), _mdaiLoadGraph(), _mdaiLoadActive(), _mdaiLoadChat()]);
   if (_mdaiCur !== node) return;
   if (_mdaiHist.length && !_mdaiShown) await _mdaiShowRun(_mdaiHist.find(h => h.status === 'ok') || _mdaiHist[0], true);
@@ -37901,7 +41779,7 @@ async function openMdaiNode(path, opts) {
 async function _mdaiLoadDoc() {
   const node = _mdaiCur;
   try {
-    const r = await fetch(API + '/api/files/mdai/doc?path=' + encodeURIComponent(node.abs));
+    const r = await fetch(API + '/api/mdai/doc?path=' + encodeURIComponent(node.abs));
     const d = await r.json().catch(() => ({}));
     if (_mdaiCur !== node) return;
     if (!r.ok || d.error) { _mdaiRunError = d.error || ('Could not read the node (HTTP ' + r.status + ')'); return; }
@@ -37922,8 +41800,8 @@ function _mdaiApplyDoc(d) {
   if (!c.doc && _mdaiEditMode !== 'raw') _mdaiEditMode = 'raw';
 }
 function _mdaiApplyContent(text) { if (_mdaiCur) _mdaiCur.content = text; }
-function closeMdaiNode() {
-  if (_mdaiDirty() && !confirm('Discard unsaved changes to this node?')) return;
+async function closeMdaiNode() {
+  if (_mdaiDirty() && !(await showConfirm('Discard unsaved changes to this node?', 'Discard', true))) return;
   _mdaiStopPoll();
   document.getElementById('mdai-overlay').classList.remove('active');
   _mdaiCur = null; _mdaiHist = []; _mdaiLastRun = null; _mdaiShown = null; _mdaiDraft = null; _mdaiBodyDraft = null; _mdaiActive = null;
@@ -37942,7 +41820,7 @@ function closeMdaiNode() {
 async function _mdaiLoadHistory() {
   if (!_mdaiCur) return;
   try {
-    const r = await fetch(API + '/api/files/mdai/history?lite=1&limit=100&path=' + encodeURIComponent(_mdaiCur.abs));
+    const r = await fetch(API + '/api/mdai/history?lite=1&limit=100&path=' + encodeURIComponent(_mdaiCur.abs));
     const d = await r.json();
     _mdaiHist = (d && d.runs) || [];
     _mdaiCur.runsTotal = (d && d.total) || _mdaiHist.length;
@@ -37952,7 +41830,7 @@ async function _mdaiLoadHistory() {
 async function _mdaiLoadGraph() {
   if (!_mdaiCur) return;
   try {
-    const r = await fetch(API + '/api/files/mdai/graph?path=' + encodeURIComponent(_mdaiCur.abs));
+    const r = await fetch(API + '/api/mdai/graph?path=' + encodeURIComponent(_mdaiCur.abs));
     const d = await r.json();
     _mdaiGraph = r.ok && !d.error ? d : { error: d.error || ('HTTP ' + r.status) };
   } catch (e) { _mdaiGraph = { error: 'unreachable' }; }
@@ -37960,7 +41838,7 @@ async function _mdaiLoadGraph() {
 async function _mdaiLoadActive() {
   if (!_mdaiCur) return;
   try {
-    const r = await fetch(API + '/api/files/mdai/active?path=' + encodeURIComponent(_mdaiCur.abs));
+    const r = await fetch(API + '/api/mdai/active?path=' + encodeURIComponent(_mdaiCur.abs));
     _mdaiActive = r.ok ? await r.json() : null;
   } catch (e) { _mdaiActive = null; }
   _mdaiRunning = !!(_mdaiActive && _mdaiActive.running);
@@ -37970,7 +41848,7 @@ async function _mdaiShowRun(run, quiet) {
   if (!_mdaiCur || !run) return;
   if (run.output == null) {
     try {
-      const r = await fetch(API + '/api/files/mdai/history?limit=1&id=' + run.id + '&path=' + encodeURIComponent(_mdaiCur.abs));
+      const r = await fetch(API + '/api/mdai/history?limit=1&id=' + run.id + '&path=' + encodeURIComponent(_mdaiCur.abs));
       const d = await r.json();
       const full = (d.runs || [])[0];
       if (full) run.output = full.output;
@@ -37998,7 +41876,7 @@ async function _mdaiRun(opts) {
   _mdaiRunError = null; _mdaiRunCycle = null;
   _mdaiRender();
   try {
-    const r = await fetch(API + '/api/files/mdai/run', {
+    const r = await fetch(API + '/api/mdai/run', {
       method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ path: node.abs, wait: false }) });
     const d = await r.json().catch(() => ({}));
@@ -38055,7 +41933,7 @@ async function _mdaiPoll(node) {
 let _mdaiCancelPending = false;
 async function _mdaiCancel() {
   if (!_mdaiCur || !_mdaiRunning) return;
-  if (!confirm('Stop this run? The model call in progress is stopped and the run is recorded as cancelled.')) return;
+  if (!(await showConfirm('Stop this run? The model call in progress is stopped and the run is recorded as cancelled.', 'Stop run', true))) return;
   // Stop shows the moment Run is clicked, before the server has the run. A
   // cancel sent then found "nothing is running" and the run went ahead, so
   // it waits for the start to land and is sent from there.
@@ -38067,7 +41945,7 @@ async function _mdaiCancel() {
   await _mdaiCancelSend();
 }
 async function _mdaiCancelSend() {
-  const { r, d } = await _mdaiJson('/api/files/mdai/cancel', 'POST', { path: _mdaiCur.abs }).catch(() => ({ r: null, d: {} }));
+  const { r, d } = await _mdaiJson('/api/mdai/cancel', 'POST', { path: _mdaiCur.abs }).catch(() => ({ r: null, d: {} }));
   if (!r || !r.ok) { showToast((d && d.error) || 'Could not stop the run'); return; }
   showToast('Stopping…');
   if (_mdaiActive) _mdaiActive.cancel_requested = true;
@@ -38120,7 +41998,7 @@ async function _mdaiPutDoc(req) {
   // save's own render would then put the saved value back over it.
   const fields0 = _mdaiFieldValues();
   try {
-    const { r, d } = await _mdaiJson('/api/files/mdai/doc', 'PUT', req);
+    const { r, d } = await _mdaiJson('/api/mdai/doc', 'PUT', req);
     if (_isLocallyQueued(r)) { showToast('Offline: not saved'); return false; }
     if (!r.ok || d.error) {
       _mdaiFormErr = { field: d.field || 'doc', msg: d.error || ('HTTP ' + r.status) };
@@ -38269,9 +42147,9 @@ async function _mdaiDelete() {
   if (!_mdaiCur) return;
   const name = _mdaiCur.abs.split('/').pop();
   const users = (_mdaiGraph && _mdaiGraph.used_by) || [];
-  if (!confirm('Delete ' + name + '?' + (_mdaiRunning ? ' Its run in progress is stopped first.' : '') + (users.length ? ' ' + users.length + ' node(s) read it and will fail until you reconnect them.' : '') + ' Its run history stays in the database.')) return;
+  if (!(await showConfirm('Delete ' + name + '?' + (_mdaiRunning ? ' Its run in progress is stopped first.' : '') + (users.length ? ' ' + users.length + ' node(s) read it and will fail until you reconnect them.' : '') + ' Its run history stays in the database.', 'Delete', true))) return;
   try {
-    if (_mdaiRunning) await _mdaiJson('/api/files/mdai/cancel', 'POST', { path: _mdaiCur.abs }).catch(() => null);
+    if (_mdaiRunning) await _mdaiJson('/api/mdai/cancel', 'POST', { path: _mdaiCur.abs }).catch(() => null);
     const r = await fetch(API + '/api/fs/delete', { method: 'DELETE', headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ path: _mdaiCur.abs }) });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) { showToast('Delete failed: ' + (d.error || r.status)); return; }
@@ -38474,7 +42352,7 @@ function _mdaiPreviewHtml() {
   return h;
 }
 // ---- Chat: change the node by telling it what you want ---------------------------
-// POST /api/files/mdai/chat hands the model this file, the latest output and the
+// POST /api/mdai/chat hands the model this file, the latest output and the
 // message; the server validates and writes the revised node and answers with the
 // file before and after. The page shows the exchange with the changed lines, then
 // starts a run through the ordinary run flow so the output catches up.
@@ -38490,7 +42368,7 @@ async function _mdaiLoadChat() {
   if (!node) return;
   _mdaiChatLoadErr = null;
   try {
-    const r = await fetch(API + '/api/files/mdai/chat?path=' + encodeURIComponent(node.abs));
+    const r = await fetch(API + '/api/mdai/chat?path=' + encodeURIComponent(node.abs));
     const d = await r.json().catch(() => ({}));
     if (_mdaiCur !== node) return;
     if (!r.ok || d.error) { _mdaiChat = []; _mdaiChatLoadErr = d.error || ('HTTP ' + r.status); return; }
@@ -38528,7 +42406,7 @@ async function _mdaiChatSend(text) {
   _mdaiRender();
   let ok = false, changed = false;
   try {
-    const { r, d } = await _mdaiJson('/api/files/mdai/chat', 'POST', { path: node.abs, message: msg, base_mtime_ms: node.mtime });
+    const { r, d } = await _mdaiJson('/api/mdai/chat', 'POST', { path: node.abs, message: msg, base_mtime_ms: node.mtime });
     if (_mdaiCur !== node) return;
     if (_isLocallyQueued(r)) {
       _mdaiChatErr = 'The server could not be reached, so the message was not sent. Nothing changed.';
@@ -38557,7 +42435,7 @@ async function _mdaiChatSend(text) {
 async function _mdaiChatUndo(i) {
   const t = _mdaiChat[i];
   if (!_mdaiCur || !t || !t.changed || t.truncated || t.undone) return;
-  if (!confirm('Put the node back to how it was before this change?')) return;
+  if (!(await showConfirm('Put the node back to how it was before this change?'))) return;
   const ok = await _mdaiSerial(() => _mdaiPutDoc({ path: _mdaiCur.abs, raw: t.before, base_mtime_ms: _mdaiCur.mtime }));
   if (!ok) return;
   t.undone = true;
@@ -38926,8 +42804,9 @@ function _mdaiDownload(text) {
 function _mdaiOpenRaw() {
   if (!_mdaiCur) return;
   const abs = _mdaiCur.abs;
-  closeMdaiNode();
-  return openFilePreview(abs, {raw:true}).then(() => {
+  // closeMdaiNode asks first when the node has unsaved edits; open the raw
+  // view after that answer, as the native confirm() it replaced did.
+  return Promise.resolve(closeMdaiNode()).then(() => openFilePreview(abs, {raw:true})).then(() => {
     fetch('/api/client-debug', {method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({kind:'mdai-raw-view',verdict:_fileData?.content != null && _fileViewMode === 'raw' ? 'opened' : 'unavailable',measured:true,n:1,ver:APP_VER})}).catch(() => {});
   });
@@ -38956,7 +42835,7 @@ async function _mdaiConnectPicker(sourceAbs) {
     if (t) _mdaiDoConnect(sourceAbs, t);
   };
   try {
-    const r = await fetch(API + '/api/files/mdai');
+    const r = await fetch(API + '/api/mdai');
     const d = await r.json();
     const files = (d && d.files) || [];
     const listEl = document.getElementById('mdai-picker-list');
@@ -38983,7 +42862,7 @@ async function _mdaiDoConnect(sourceAbs, targetRel) {
   const targetDir = targetAbs.slice(0, targetAbs.lastIndexOf('/')) || '/';
   const sourceForEdge = _mdaiRelPath(sourceAbs, targetDir);   // portable, resolved from the node's dir
   try {
-    const r = await fetch(API + '/api/files/mdai/connect', {
+    const r = await fetch(API + '/api/mdai/connect', {
       method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ source: sourceForEdge, target: targetRel })
     });
@@ -39151,10 +43030,10 @@ async function setFilesSessionDir() {
     const lbl = document.getElementById('files-set-session-label');
     const olbl = document.getElementById('files-session-oitem-label');
     const sess = _exploreSession;
-    const confirm = () => setTimeout(() => { if (lbl) lbl.textContent = 'Set dir for ' + sess; if (olbl) olbl.textContent = 'Set dir for ' + sess; }, 2000);
+    const restoreLabel = () => setTimeout(() => { if (lbl) lbl.textContent = 'Set dir for ' + sess; if (olbl) olbl.textContent = 'Set dir for ' + sess; }, 2000);
     if (lbl) lbl.textContent = '✓ Set!';
     if (olbl) olbl.textContent = '✓ Set!';
-    confirm();
+    restoreLabel();
     await fetchSessions();
   } catch(e) { console.error('setFilesSessionDir:', e); }
 }
@@ -39193,7 +43072,7 @@ function _fmtSize(bytes) {
 }
 async function _fsRename(path, refresh) {
   const oldName = path.split('/').pop();
-  const entered = prompt('Rename "' + oldName + '" to:', oldName);
+  const entered = (await showPrompt('Rename "' + oldName + '" to:', '', oldName, { trim: false }));
   if (!entered || !entered.trim() || entered.trim() === oldName) return;
   const newName = entered.trim();
   if (/[\/\0]/.test(newName) || newName === '.' || newName === '..') { showToast('Invalid name'); return; }
@@ -39231,7 +43110,7 @@ function _showExploreMenu(path, btn, type) {
   delItem.onclick = async () => {
     popup.remove();
     const name = path.split('/').pop();
-    if (!confirm('Delete "' + name + '"? This cannot be undone.')) return;
+    if (!(await showConfirm('Delete "' + name + '"? This cannot be undone.', 'Delete', true))) return;
     try {
       const r = await fetch(API + '/api/fs/delete', { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ path }) });
       const d = await r.json();
@@ -39289,7 +43168,7 @@ function _showFilesMenu(path, btn, type) {
   popup.appendChild(linkItem);
   _filesPinItems(popup, path, type);
   // Connect to a .mdai node: make THIS file/folder a source of a chosen computed
-  // node. Picks from the GLOBAL list of .mdai files (GET /api/files/mdai) and POSTs
+  // node. Picks from the GLOBAL list of .mdai files (GET /api/mdai) and POSTs
   // /connect; the target gets a default edge prompt, editable in the node view after.
   const connItem = document.createElement('button');
   connItem.className = 'explore-menu-item';
@@ -39333,7 +43212,7 @@ function _showFilesMenu(path, btn, type) {
   delItem.onclick = async () => {
     popup.remove();
     const name = path.split('/').pop();
-    if (!confirm('Delete "' + name + '"? This cannot be undone.')) return;
+    if (!(await showConfirm('Delete "' + name + '"? This cannot be undone.', 'Delete', true))) return;
     try {
       const r = await fetch(API + '/api/fs/delete', { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ path }) });
       const d = await r.json();
@@ -39452,14 +43331,131 @@ document.addEventListener('click', e => {
   // A worker tagged in markdown has its own handler (_bindMdFileLinks): it
   // closes the file it sits in first, so the worker is not opened beneath it.
   if (a.classList.contains('md-worker-link')) return;
-  if (!_ownLinkHash(a.getAttribute('href'))) return;
-  e.preventDefault(); e.stopPropagation();
-  _openOwnLink(a.href, 'anchor');
+  // A path in worker output opens through its own handler (_openLinkedPath),
+  // which asks the server where a relative path really is.
+  if (a.matches('a.file-link[data-path], a.md-link[data-path]')) return;
+  if (_ownLinkHash(a.getAttribute('href'))) {
+    e.preventDefault(); e.stopPropagation();
+    _openOwnLink(a.href, 'anchor');
+    return;
+  }
+  if (_ownPageLink(a.href)) {
+    e.preventDefault(); e.stopPropagation();
+    _openOwnPage(a.href, 'anchor');
+  }
 }, true);
+// A NEW TAB FROM A LINK TO THIS AMUX STAYS ON THIS ADDRESS (owner, 2026-11-13:
+// a middle-clicked link opened in light mode). Workers write links on the
+// server's public address (the /api/deep-link base, e.g. https://amux.example.com)
+// while this tab may be on https://localhost:8824. A plain click opens such a
+// link here (above); a middle, ⌘ or ctrl click, or "Open Link in New Tab", let
+// the browser open the public address: another origin, so another
+// localStorage, without this one's theme, drafts, tab order or worker views
+// (and with its own sign-in). Just before the browser acts on the link, its
+// href is pointed at this origin, so every way of opening it lands here.
+function _ownLinkHere(href) {
+  const hash = _ownLinkHash(href);
+  if (!hash) return '';
+  try { if (new URL(href, location.href).origin === location.origin) return ''; } catch (_) { return ''; }
+  return location.origin + '/' + hash;
+}
+function _ownLinkRetarget(e) {
+  const a = e.target && e.target.closest && e.target.closest('a[href]');
+  if (!a || a.hasAttribute('download')) return;
+  const here = _ownLinkHere(a.getAttribute('href'));
+  if (!here) return;
+  a.setAttribute('href', here);
+  try {
+    fetch(API + '/api/client-debug', { method: 'POST', _skipOutbox: true, keepalive: true, headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'own-link', verdict: 'retargeted_to_this_origin', how: e.type, measured: true, n_considered: 1,
+        ver: typeof APP_VER !== 'undefined' ? APP_VER : '?' }) }).catch(() => {});
+  } catch (_) {}
+}
+['pointerdown', 'contextmenu', 'focusin'].forEach(ev => document.addEventListener(ev, _ownLinkRetarget, true));
 // The terminal's links (xterm's web-links addon) open the same way.
 function _termLinkOpen(e, uri) {
-  if (!(e && (e.metaKey || e.ctrlKey)) && _openOwnLink(uri, 'terminal')) return;
-  window.open(uri, '_blank');
+  const mod = !!(e && (e.metaKey || e.ctrlKey));
+  if (!mod && _openOwnLink(uri, 'terminal')) return;
+  if (!mod && _ownPageLink(uri)) { _openOwnPage(uri, 'terminal'); return; }
+  window.open(_ownLinkHere(uri) || uri, '_blank');
+}
+
+// A PAGE ON THIS AMUX THAT IS NOT THE DASHBOARD NEVER REPLACES IT IN THE APP.
+// In the iOS app (its web view loads window.open in place) and an installed
+// web app (a same-origin link opens inside the app window) there is no
+// browser Back. A worker's /pub/ link tapped in the terminal left the owner on
+// a bare "Link not found" page with no way back short of quitting the app
+// (Doron, 2026-11-12; the iOS back button from #410 only reaches new builds).
+// So in an app, a public link, an HTML page or an app on another port of this
+// host opens over the dashboard with a close bar, and a link still waiting for
+// approval opens Apps instead of a dead page. A browser tab keeps its new tab.
+function _inAppWindow() {
+  try {
+    return !!(navigator.standalone || /\bAmuxApp\b/.test(navigator.userAgent || '')
+      || (window.matchMedia && matchMedia('(display-mode: standalone)').matches));
+  } catch (_) { return false; }
+}
+// The link, as a URL, when it is a page on this amux outside the dashboard and
+// this is an app window; otherwise null.
+function _ownPageLink(href) {
+  if (!_inAppWindow()) return null;
+  let u;
+  try { u = new URL(href, location.href); } catch (_) { return null; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+  const hosts = [location.hostname];
+  try { if (_deepLinkBase) hosts.push(new URL(_deepLinkBase).hostname); } catch (e) { console.warn('[own-link] deep link base is not a URL', _deepLinkBase, e); }
+  if (!hosts.includes(u.hostname)) return null;
+  const ownOrigin = u.origin === location.origin || (_deepLinkBase && u.origin === _deepLinkBase.replace(/\/+$/, ''));
+  if (!ownOrigin) return u; // an app on another port of this host
+  return /^\/(pub|pages)\//.test(u.pathname) ? u : null;
+}
+function _ownPageBeacon(verdict, how) {
+  try {
+    fetch(API + '/api/client-debug', { method: 'POST', _skipOutbox: true, keepalive: true, headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'own-link', verdict, how, measured: true, n_considered: 1,
+        ver: typeof APP_VER !== 'undefined' ? APP_VER : '?' }) }).catch(() => {});
+  } catch (e) { console.warn('[own-link] beacon not sent', verdict, e); }
+}
+async function _openOwnPage(href, how) {
+  const u = _ownPageLink(href) || new URL(href, location.href);
+  const m = u.pathname.match(/^\/pub\/([^/]+)/);
+  if (m) {
+    let links = _pubLinks;
+    try { links = (await _pubFetch('')).links || []; _pubLinks = links; } catch (e) { console.warn('[own-link] published links not refreshed; using the cached list', e); }
+    const l = links.find(x => x.id === m[1] || (x.aliases || []).includes(m[1]));
+    if (l && l.pending) {
+      _ownPageBeacon('pending_shown_in_apps', how);
+      if (location.hash === '#view=apps') _pagesEnter(); else location.hash = '#view=apps';
+      showToast('Approve it first: "' + _pubName(l) + '" does not open until you do.');
+      return;
+    }
+  }
+  _ownPageBeacon('opened_over_dashboard', how);
+  _ownPageOverlay(u.href);
+}
+function _ownPageClose() {
+  const el = document.getElementById('own-page-overlay');
+  if (el) el.remove();
+  document.removeEventListener('keydown', _ownPageKey, true);
+}
+function _ownPageKey(e) { if (e.key === 'Escape') { e.stopPropagation(); _ownPageClose(); } }
+function _ownPageOverlay(url) {
+  _ownPageClose();
+  const el = document.createElement('div');
+  el.id = 'own-page-overlay';
+  el.className = 'own-page-overlay';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-label', 'Page opened from amux');
+  let shown = url;
+  try { const u = new URL(url); shown = (u.origin === location.origin ? '' : u.host) + u.pathname; } catch (e) { console.warn('[own-link] showing the raw URL', url, e); }
+  el.innerHTML = '<div class="own-page-bar">'
+    + '<button type="button" class="btn own-page-back" aria-label="Back to amux">&#x2039; amux</button>'
+    + '<span class="own-page-url" title="' + esc(url) + '">' + esc(shown) + '</span></div>'
+    + '<iframe class="own-page-frame" title="' + esc(shown) + '"></iframe>';
+  el.querySelector('.own-page-back').onclick = _ownPageClose;
+  el.querySelector('iframe').src = url;
+  document.body.appendChild(el);
+  document.addEventListener('keydown', _ownPageKey, true);
 }
 
 function _copyFileDeeplink(path) {
@@ -39649,7 +43645,7 @@ function _exploreSearchFilter(q) {
     const dyEnd = Math.abs(e.changedTouches[0].clientY - sy);
     if (dx > _SWIPE_CLOSE && dx > dyEnd * _SWIPE_RATIO) {
       el.style.transform = 'translateX(100%)';
-      setTimeout(() => { closeFilePreview(); el.style.transform = ''; el.style.transition = ''; }, 260);
+      setTimeout(() => { dismissFilePreview(); el.style.transform = ''; el.style.transition = ''; }, 260);
     } else {
       el.style.transform = '';
       setTimeout(() => { el.style.transition = ''; }, 260);
@@ -39938,6 +43934,231 @@ function closeCreate() {
   document.getElementById('ac-list').classList.remove('open');
   const gs = document.getElementById('create-groups-suggestions');
   if (gs) gs.classList.remove('open');
+}
+
+// ── Workflow wizard (#457, Doron) ──
+// A non-technical person describes a job one plain question at a time; the
+// answers become a workflow brief that the New Worker dialog starts a worker
+// on. No server side: the brief is the worker's first prompt, and the worker
+// saves it as WORKFLOW.md. A skipped question is listed as an open question
+// the worker asks about first, so "I don't know yet" is always honest.
+const _WFW_KEY = 'amux-workflow-wizard';
+const _WFW_STEPS = [
+  { id: 'outcome', title: 'Outcome', q: 'What outcome are you trying to achieve?', required: true,
+    help: 'Say what is true when the job is done, in your own words.',
+    ex: 'Every customer payment from last week is matched to its invoice, and anything that does not match is listed with the reason.' },
+  { id: 'success', title: 'How you will know it worked', q: 'How will you know it worked?',
+    help: 'A check, a number, or the person who signs off.',
+    ex: 'Elliot reviews the list and finds nothing missed. It takes him under 30 minutes instead of 8 hours.' },
+  { id: 'when', title: 'When it runs', q: 'When should it run, and how much work is it?',
+    help: 'Only when you ask, daily, weekly, or when something arrives. Roughly how many items each time.',
+    ex: 'Every Monday morning, about 200 payments.' },
+  { id: 'systems', title: 'Systems it needs', q: 'What systems does it need to get into?',
+    help: 'Pick any that apply, and say whether it only reads or can also change things.',
+    chips: ['Email', 'Calendar', 'Google Drive', 'Spreadsheets', 'Accounting software', 'CRM', 'A website', 'Files on this computer'],
+    ex: 'NetSuite, read only. The shared Google Sheet, can edit.' },
+  { id: 'inputs', title: 'Where the information comes from', q: 'Where does the information come from?',
+    help: 'The reports, emails, exports or files it starts from, and where they live.',
+    ex: 'The payments export from NetSuite and the invoices tab of the shared sheet.' },
+  { id: 'examples', title: 'Examples of good work', q: 'Are there examples of good work?',
+    help: 'Paste one, or say where past results are (a folder, a file name, a link).',
+    ex: 'Last month\'s finished sheet is in Drive under Reconciliations/October.' },
+  { id: 'rules', title: 'Rules', q: 'What rules must it always follow?',
+    help: 'One per line. The way you would explain the job to a new hire.',
+    ex: 'Amazon under $20 is office supplies.\nA payment that says "prior virtual payment" went to court.' },
+  { id: 'exceptions', title: 'Known exceptions', q: 'What are the known exceptions to those rules?',
+    help: 'Cases where the rules do not apply, and what to do instead.',
+    ex: 'Coeur Wine Co pays several invoices in one payment: split it by invoice amount.' },
+  { id: 'tools', title: 'Tools', q: 'What tools or software should it use?',
+    help: 'Anything it should use to do the work, or must not use.',
+    ex: 'Excel for the final file. No new software.' },
+  { id: 'approval', title: 'Needs your OK first', q: 'What needs your OK first, and what must it never do?',
+    help: 'Pick what it must ask you about first, and add anything it must never do.',
+    chips: ['Sending email or messages', 'Contacting customers', 'Spending money', 'Changing records', 'Deleting anything'],
+    ex: 'Never email a client directly. Never change an invoice in NetSuite.' },
+  { id: 'sensitive', title: 'Sensitive information', q: 'Does it handle sensitive information?',
+    help: 'So it knows what to keep private.',
+    chips: ['Personal details', 'Health information', 'Bank or card details', 'Passwords or logins', 'None'],
+    ex: 'Client names and amounts. Never paste them into an outside tool.' },
+  { id: 'output', title: 'Where the result goes', q: 'Where should the result go, and who should be told?',
+    help: 'A file, a spreadsheet, an email draft. Who hears when it is done.',
+    ex: 'A new tab in the shared sheet. Message me a two-line summary.' },
+  { id: 'stuck', title: 'When it gets stuck', q: 'If it gets stuck, what should it do?',
+    help: 'Who to ask, and whether to wait or carry on with the rest.',
+    ex: 'Ask me in Messages and carry on with the other payments.' },
+];
+let _wfw = null;   // { step, answers: {id: text}, chips: {id: [labels]}, name }
+
+function _wfwLoad() {
+  try { const s = JSON.parse(localStorage.getItem(_WFW_KEY) || 'null'); if (s && s.answers) return s; } catch (e) { console.warn('amux: workflow wizard draft unreadable, starting fresh', e); }
+  return { step: 0, answers: {}, chips: {}, name: '' };
+}
+function _wfwSave() { try { localStorage.setItem(_WFW_KEY, JSON.stringify(_wfw)); } catch (e) { console.warn('amux: workflow wizard draft not saved', e); } }
+
+function _wfwSlug(text) {
+  return String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+    .split('-').slice(0, 4).join('-');
+}
+
+// The brief, from the answers alone: pure, so a spec can check it directly.
+function _wfwBrief(answers, chips) {
+  answers = answers || {}; chips = chips || {};
+  const open = [];
+  const parts = ['# Workflow', '',
+    'Save this brief as WORKFLOW.md in your folder. Before you start, ask me about every item under "Open questions". '
+    + 'Do nothing listed under "Needs my OK first" without asking me, and if you are unsure whether something needs my OK, ask.', ''];
+  for (const s of _WFW_STEPS) {
+    const picked = (chips[s.id] || []).filter(Boolean);
+    const text = String(answers[s.id] || '').trim();
+    if (!picked.length && !text) { open.push(s.q); continue; }
+    parts.push('## ' + s.title);
+    if (picked.length) parts.push(picked.map(c => '- ' + c).join('\n'));
+    if (text) parts.push(text);
+    parts.push('');
+  }
+  parts.push('## Open questions');
+  parts.push(open.length ? open.map(q => '- ' + q).join('\n') : '- None. Confirm the brief back to me in two lines, then start.');
+  return parts.join('\n').trim() + '\n';
+}
+
+function openWorkflowWizard() {
+  if (typeof closeCreate === 'function') closeCreate();
+  _wfw = _wfwLoad();
+  document.getElementById('wfw-overlay').classList.add('active');
+  _wfwRender();
+}
+function closeWorkflowWizard() {
+  if (_wfw) _wfwCapture();
+  document.getElementById('wfw-overlay').classList.remove('active');
+}
+
+// Read the visible step's fields into the draft before moving away from it.
+function _wfwCapture() {
+  const s = _WFW_STEPS[_wfw.step];
+  const ta = document.getElementById('wfw-answer');
+  if (s && ta) _wfw.answers[s.id] = ta.value;
+  const nm = document.getElementById('wfw-name');
+  if (nm) _wfw.name = nm.value;
+  _wfwSave();
+}
+
+function _wfwRender() {
+  const body = document.getElementById('wfw-body');
+  const n = _WFW_STEPS.length;
+  if (_wfw.step >= n) {
+    const brief = _wfwBrief(_wfw.answers, _wfw.chips);
+    const name = _wfw.name || _wfwSlug(_wfw.answers.outcome);
+    body.innerHTML =
+      '<div class="field-optional" id="wfw-progress">Review</div>'
+      + '<h3 id="wfw-q">Here is your workflow</h3>'
+      + '<div class="field-optional">Read it through. Go back to change an answer, or start a worker on it.</div>'
+      + '<pre id="wfw-brief" class="wfw-brief">'
+      + esc(brief) + '</pre>'
+      + '<div class="field-group"><label class="field-label" for="wfw-name">Worker name</label>'
+      + '<input id="wfw-name" type="text" autocomplete="off" autocorrect="off" value="' + esc(name) + '"></div>'
+      + '<div class="edit-actions wfw-actions">'
+      + '<button type="button" class="btn" onclick="_wfwBack()">Back</button>'
+      + '<button type="button" class="btn" onclick="_wfwCopy()">Copy</button>'
+      + '<button type="button" class="btn" onclick="_wfwDownload()">Download</button>'
+      + '<button type="button" class="btn primary" id="wfw-create" onclick="_wfwCreateWorker()">Create worker</button>'
+      + '</div>'
+      + '<div class="wfw-start-over"><button type="button" class="btn" onclick="_wfwStartOver()">Start over</button></div>';
+    return;
+  }
+  const s = _WFW_STEPS[_wfw.step];
+  const picked = _wfw.chips[s.id] || [];
+  const chips = s.chips ? '<div id="wfw-chips" class="wfw-chips">'
+    + s.chips.map((c, i) => '<button type="button" class="btn provider-btn wfw-chip' + (picked.includes(c) ? ' selected' : '')
+      + '" aria-pressed="' + picked.includes(c) + '" onclick="_wfwToggleChip(' + i + ')">' + esc(c) + '</button>').join('')
+    + '</div>' : '';
+  body.innerHTML =
+    '<div class="field-optional" id="wfw-progress">Step ' + (_wfw.step + 1) + ' of ' + n + '</div>'
+    + '<h3 id="wfw-q">' + esc(s.q) + '</h3>'
+    + '<div class="field-optional wfw-help">' + esc(s.help) + '</div>'
+    + chips
+    + '<textarea id="wfw-answer" class="wfw-answer" rows="5" placeholder="' + esc('For example: ' + s.ex) + '"'
+    + ' onkeydown="if(event.key===\'Enter\'&&(event.metaKey||event.ctrlKey)){event.preventDefault();_wfwNext();}">'
+    + esc(_wfw.answers[s.id] || '') + '</textarea>'
+    + '<div id="wfw-error" class="field-optional wfw-error" hidden></div>'
+    + '<div class="edit-actions wfw-actions">'
+    + (_wfw.step > 0 ? '<button type="button" class="btn" onclick="_wfwBack()">Back</button>' : '<button type="button" class="btn" onclick="closeWorkflowWizard()">Cancel</button>')
+    + (s.required ? '' : '<button type="button" class="btn" id="wfw-skip" onclick="_wfwSkip()">I don\'t know yet</button>')
+    + '<button type="button" class="btn primary" id="wfw-next" onclick="_wfwNext()">Next</button>'
+    + '</div>';
+  setTimeout(() => { const ta = document.getElementById('wfw-answer'); if (ta && matchMedia('(min-width: 601px)').matches) ta.focus({ preventScroll: true }); }, 50);
+}
+
+function _wfwToggleChip(i) {
+  const s = _WFW_STEPS[_wfw.step];
+  _wfwCapture();
+  const cur = _wfw.chips[s.id] || [];
+  const c = s.chips[i];
+  _wfw.chips[s.id] = cur.includes(c) ? cur.filter(x => x !== c) : cur.concat([c]);
+  _wfwSave();
+  _wfwRender();
+}
+function _wfwNext() {
+  _wfwCapture();
+  const s = _WFW_STEPS[_wfw.step];
+  if (s && s.required && !String(_wfw.answers[s.id] || '').trim()) {
+    const er = document.getElementById('wfw-error');
+    er.textContent = 'This one is needed: everything else follows from it. A sentence is enough.';
+    er.hidden = false;
+    return;
+  }
+  _wfw.step = Math.min(_wfw.step + 1, _WFW_STEPS.length);
+  _wfwSave();
+  _wfwRender();
+}
+function _wfwSkip() {
+  const s = _WFW_STEPS[_wfw.step];
+  _wfw.answers[s.id] = ''; _wfw.chips[s.id] = [];
+  const ta = document.getElementById('wfw-answer'); if (ta) ta.value = '';
+  _wfwNext();
+}
+function _wfwBack() {
+  _wfwCapture();
+  _wfw.step = Math.max(0, _wfw.step - 1);
+  _wfwSave();
+  _wfwRender();
+}
+function _wfwStartOver() {
+  showConfirm('Clear all your answers and start over?', 'Start over', true).then(ok => {
+    if (!ok) return;
+    _wfw = { step: 0, answers: {}, chips: {}, name: '' };
+    _wfwSave();
+    _wfwRender();
+  });
+}
+function _wfwCopy() {
+  const brief = _wfwBrief(_wfw.answers, _wfw.chips);
+  (navigator.clipboard ? navigator.clipboard.writeText(brief) : Promise.reject())
+    .then(() => showToast('Workflow copied'), () => showToast('Could not copy. Select the text and copy it instead.'));
+}
+function _wfwDownload() {
+  _wfwCapture();
+  const blob = new Blob([_wfwBrief(_wfw.answers, _wfw.chips)], { type: 'text/markdown' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (_wfw.name || _wfwSlug(_wfw.answers.outcome) || 'workflow') + '-WORKFLOW.md';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+// Hand off to the New Worker dialog (A8: one way to create a worker), with
+// the name and the brief as its first prompt. The person still picks the
+// folder there. The draft is kept until they start over, so cancelling the
+// dialog loses nothing.
+function _wfwCreateWorker() {
+  _wfwCapture();
+  const name = _wfwSlug(_wfw.name) || _wfwSlug(_wfw.answers.outcome) || 'workflow';
+  const brief = _wfwBrief(_wfw.answers, _wfw.chips);
+  document.getElementById('wfw-overlay').classList.remove('active');
+  openCreate();
+  const nm = document.getElementById('create-name');
+  nm.value = name; _createNameChanged(name);
+  document.getElementById('create-prompt').value = brief;
+  if (typeof amuxTrack === 'function') amuxTrack('workflow_wizard_handoff', { answered: _WFW_STEPS.filter(s => String(_wfw.answers[s.id] || '').trim() || (_wfw.chips[s.id] || []).length).length,
+    of: _WFW_STEPS.length, measured: true });
 }
 
 function _showGroupSuggestions() {
@@ -40984,7 +45205,7 @@ document.addEventListener('keydown', (e) => {
       // cancels a cell edit or closes a panel, and never closes the workbook
       // (closing on Escape threw away a half-typed cell, 2026-10-26). The ✕ closes.
       if (_xlsxEd) return;
-      closeFilePreview();
+      dismissFilePreview();
     }
     return;
   }
@@ -41046,6 +45267,172 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+// ── Key mode: the keyboard does what the key chips do ─────────────────────
+// Answering a picker or a yes/no prompt meant reaching for the ↑ ↓ Enter Esc
+// chips (2026-11-17). Ctrl+; in the worker view turns key mode on: arrows,
+// Enter, Esc, Tab, Space, Backspace and y/n/1/2/3 go to the worker's pane
+// through the same keys endpoint the chips use, in the order pressed. Any other
+// key turns it off and reaches the composer as usual; so do Ctrl+; again,
+// closing the worker view and 10s without a key (a setting on the hotkey can
+// keep it on while idle). The badge on the composer
+// says it is on, because Esc here goes to the worker instead of closing the view.
+// The toggle is the `key_mode` hotkey (Hotkeys tab), so it can be rebound; the
+// badge and the hint shown on the focused composer name whatever it is bound to.
+const _KM_IDLE_MS = 10000;
+const _KM_MAP = { ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right', Enter: 'Enter',
+  Escape: 'Escape', Tab: 'Tab', ' ': 'Space', Backspace: 'BSpace', Home: 'Home', End: 'End',
+  PageUp: 'PageUp', PageDown: 'PageDown' };
+const _KM_CHARS = new Set(['y', 'n', '1', '2', '3']);
+const _KM_GLYPH = { Up: '↑', Down: '↓', Left: '←', Right: '→', Enter: '↵', Escape: 'Esc', Tab: 'Tab', BTab: '⇧Tab',
+  Space: 'Space', BSpace: '⌫' };
+const _KM_MODIFIERS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'OS', 'CapsLock', 'Fn']);
+let _km = null; // { session, timer, sent, chain }
+
+// The enabled key_mode hotkeys, and whether this keydown is one of them.
+function _kmBindings() {
+  return (typeof _hkList !== 'undefined' ? _hkList : [])
+    .filter(h => h.action === 'key_mode' && h.type === 'keys' && h.enabled && !h.deleted);
+}
+function _kmIsToggle(e) {
+  const combo = typeof _hkComboFromEvent === 'function' ? _hkComboFromEvent(e) : '';
+  return !!combo && _kmBindings().some(h => h.trigger === combo);
+}
+// The first binding as glyphs (⌃; on a Mac, Ctrl+; elsewhere), or ''.
+function _kmComboLabel() {
+  const h = _kmBindings()[0];
+  if (!h) return '';
+  const mac = typeof _HK_IS_MAC !== 'undefined' && _HK_IS_MAC;
+  const glyph = mac ? { Mod: '⌘', Ctrl: '⌃', Alt: '⌥', Shift: '⇧', Globe: '🌐' } : { Mod: 'Ctrl', Alt: 'Alt', Shift: 'Shift', Globe: '🌐' };
+  const parts = String(h.trigger).split(/[+ ]/).filter(Boolean).map(k => glyph[k] || k);
+  return parts.join(mac ? '' : '+');
+}
+function _kmToggle() {
+  const ov = document.getElementById('peek-overlay');
+  if (!(ov && ov.classList.contains('active') && peekSession)) { showToast('Key mode works in a worker: open one first'); return; }
+  if (_km) _kmExit('toggle'); else _kmEnter(peekSession);
+}
+// The hint on a focused, empty composer: how to turn key mode on. Only with a
+// fine pointer that can hover (a desktop): a touch-only phone has no arrow keys
+// to send, so it never gets the element (the CSS rule is the same test).
+const _KM_HINT_MQ = '(hover: hover) and (pointer: fine)';
+function _kmHintRender() {
+  const wrap = document.querySelector('#peek-overlay .peek-composer-input');
+  if (!wrap) return;
+  const label = window.matchMedia && window.matchMedia(_KM_HINT_MQ).matches ? _kmComboLabel() : '';
+  let hint = document.getElementById('peek-keymode-hint');
+  if (!label) { if (hint) hint.remove(); return; }
+  if (!hint) {
+    hint = document.createElement('kbd');
+    hint.id = 'peek-keymode-hint';
+    hint.className = 'keymode-hint-idle';
+    wrap.appendChild(hint);
+  }
+  hint.textContent = label + ' keys';
+  hint.title = 'Press ' + label + ' to send arrows, Enter and Esc straight to the worker. Change it in the Hotkeys tab.';
+}
+document.addEventListener('focusin', (e) => { if (e.target && e.target.id === 'peek-cmd-input') _kmHintRender(); });
+// The tmux key name for a keydown, or null when key mode does not forward it.
+function _kmKeyName(e) {
+  if (e.metaKey || e.altKey || e.ctrlKey) return null;
+  if (e.key === 'Tab' && e.shiftKey) return 'BTab';
+  if (e.shiftKey && e.key !== 'Tab' && !/^Arrow|^Page|^Home$|^End$/.test(e.key)) return null;
+  if (_KM_MAP[e.key]) return _KM_MAP[e.key];
+  if (_KM_CHARS.has(e.key)) return e.key;
+  return null;
+}
+function _kmRender(lastKey) {
+  const wrap = document.querySelector('#peek-overlay .peek-composer-input');
+  if (!wrap) return;
+  let badge = document.getElementById('peek-keymode-badge');
+  if (!_km) {
+    wrap.classList.remove('key-mode');
+    if (badge) badge.remove();
+    return;
+  }
+  wrap.classList.add('key-mode');
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.id = 'peek-keymode-badge';
+    badge.className = 'keymode-badge';
+    badge.setAttribute('role', 'status');
+    badge.title = 'Arrows, Enter, Esc, Tab, Space, Backspace and y/n/1/2/3 go to the worker. '
+    + (_kmComboLabel() ? _kmComboLabel() + ' or a' : 'A') + 'ny other key to stop.';
+    wrap.appendChild(badge);
+  }
+  badge.innerHTML = '<span class="keymode-label">⌨ Keys → worker</span>'
+    + (lastKey ? '<kbd class="keymode-last">' + esc(_KM_GLYPH[lastKey] || lastKey) + '</kbd>' : '')
+    + '<span class="keymode-hint">' + esc(_kmComboLabel() || 'Any other key') + ' to stop</span>';
+}
+// The idle turn-off is a setting on the Key mode hotkey (on unless unticked).
+function _kmIdleOff() {
+  const h = _kmBindings()[0];
+  return !h || h.idle_off !== false;
+}
+function _kmArm() {
+  clearTimeout(_km.timer);
+  if (_kmIdleOff()) _km.timer = setTimeout(() => _kmExit('idle'), _KM_IDLE_MS);
+}
+function _kmEnter(session) {
+  if (_workerRenderer(session) !== 'terminal') { showToast('Key mode needs a terminal worker'); return; }
+  _km = { session, timer: 0, sent: 0, chain: Promise.resolve() };
+  _kmArm();
+  _kmRender();
+  if (typeof amuxTrack === 'function') amuxTrack('key_mode', { on: true, session, idle_off: _kmIdleOff(), ver: APP_VER, measured: true, n_considered: 1 });
+}
+function _kmExit(reason) {
+  if (!_km) return;
+  clearTimeout(_km.timer);
+  const { session, sent } = _km;
+  _km = null;
+  _kmRender();
+  if (typeof amuxTrack === 'function') amuxTrack('key_mode', { on: false, reason, session, keys_sent: sent, ver: APP_VER, measured: true, n_considered: 1 });
+}
+// Keys go one after another so a fast ↓ ↓ Enter lands in that order.
+function _kmSend(keys) {
+  const session = _km.session;
+  _km.sent++;
+  _stopKeyBeacon(session, keys, 'key-mode');
+  _km.chain = _km.chain.then(() => doKeys(session, keys)).then((r) => {
+    if (r && !r.accepted) showToast(`${keys} was not sent${r.message ? ': ' + r.message : ''}`);
+    _refreshPeekSoon();
+  }).catch((err) => console.warn('amux: key mode send failed', err));
+}
+function _kmKeydown(e) {
+  if (e.isComposing || e.keyCode === 229) return;
+  const ov = document.getElementById('peek-overlay');
+  const open = !!(ov && ov.classList.contains('active') && peekSession);
+  if (_km && (!open || _km.session !== peekSession)) _kmExit('peek-closed');
+  if (!open) return;
+  if (_kmIsToggle(e)) return; // the Hotkeys dispatcher runs _kmToggle
+  if (!_km || _KM_MODIFIERS.has(e.key)) return;
+  const k = _kmKeyName(e);
+  if (!k) { _kmExit('typing'); return; } // falls through to the composer
+  e.preventDefault(); e.stopImmediatePropagation();
+  _kmArm();
+  _kmRender(k);
+  _kmSend(k);
+}
+// Capture on window runs before the composer's own keydown (history, newline)
+// and the document handler that closes the view on Escape.
+window.addEventListener('keydown', _kmKeydown, true);
+
+// ⌃F outside a text box opens the Mac app's Find bar (desktop/amux-find.swift);
+// in a text box it stays the Mac's move-forward and a terminal gets it as
+// usual. ⌘F reaches the app's Edit > Find on its own. A Hotkey bound to ⌃F
+// wins: it has already prevented the default by the time this runs.
+function _hkFindKey(e) {
+  if (e.defaultPrevented || !e.ctrlKey || e.metaKey || e.altKey || e.shiftKey || (e.key !== 'f' && e.key !== 'F')) return false;
+  let h = null;
+  try { h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.amuxFind; } catch (err) { console.warn('amux: no find bridge', err); }
+  if (!h) return false;
+  const a = document.activeElement;
+  if (a && (a.isContentEditable || a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT')) return false;
+  e.preventDefault();
+  try { h.postMessage({ op: 'show' }); } catch (err) { console.warn('amux: could not open the find bar', err); }
+  return true;
+}
+document.addEventListener('keydown', _hkFindKey);
+
 // ── Escape closes the topmost modal, whatever it is ───────────────────────
 // The handler above knows five overlay ids BY NAME and hard-returns unless
 // peek is open, so it can never reach a dialog app.js appends to <body>: 12
@@ -41101,18 +45488,23 @@ let _workersPerRow = localStorage.getItem('amux_workers_per_row') || 'auto';
 let sortMode = localStorage.getItem('amux_sort_mode') || 'status';
 // A mode persisted by an older build (or hand-edited) must not leave the
 // list sorting by a comparator that no longer exists.
-if (!['natural','human','alpha','status'].includes(sortMode)) sortMode = 'status';
+if (!['natural','human','alpha','status','manual'].includes(sortMode)) sortMode = 'status';
 if (document.body) setTimeout(() => _sortBtnSync(), 0);
 else document.addEventListener('DOMContentLoaded', () => _sortBtnSync());
 let cardOrder = JSON.parse(localStorage.getItem('amux_card_order') || '[]');
-let _frozen = localStorage.getItem('amux_frozen') === '1';
+// Freeze was a manual order behind a snowflake button; the Manual sort replaced
+// it. A device that had frozen its list keeps that order as its Manual order.
+if (localStorage.getItem('amux_frozen') === '1') {
+  localStorage.removeItem('amux_frozen');
+  if (cardOrder.length) { sortMode = 'manual'; localStorage.setItem('amux_sort_mode', 'manual'); }
+}
 let _sortable = null;
 let _tileJustDragged = false; // keep for toggle() guard
 
-// Natural sort: pinned first, then most recently active
-// Sort that matches the server's list_sessions() order:
-// pinned > running > status priority (active/waiting=0, idle/none=1) > last_activity desc
-const _STATUS_PRI = {active: 0, waiting: 0, idle: 1, '': 1};
+// "Recent activity": pinned > running > last_activity desc. No status tier:
+// ranking working/waiting above idle first meant a worker you had just started
+// and that went idle sat below every busy lane, under a label that promises
+// recency (ha-bed-lights, 2026-11-24). Status order is the 'status' sort's job.
 // Status sorting and grouping share the same keys as the displayed filters.
 // Pins cannot move an idle worker into the working group (AMUX-4237).
 const _WORKER_STATUS_GROUPS = [
@@ -41131,16 +45523,30 @@ const _WORKER_STATUS_PRI = Object.fromEntries(_WORKER_STATUS_GROUPS.map((g, i) =
 let _workerStatusOrderVerdict = '';
 function _naturalSortSessions(a, b) {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-  if (a.running !== b.running) return a.running ? -1 : 1;
-  const ap = _STATUS_PRI[a.status] ?? 1, bp = _STATUS_PRI[b.status] ?? 1;
-  if (ap !== bp) return ap - bp;
-  return (b.last_activity || 0) - (a.last_activity || 0);
+  if (!!a.running !== !!b.running) return a.running ? -1 : 1;
+  return (b.last_activity || 0) - (a.last_activity || 0)
+    || (a.name || '').localeCompare(b.name || '');
 }
 
 // Alphabetical sort: pinned first, then by name — stable across activity changes
 function _alphaSortSessions(a, b) {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
   return (a.name || '').localeCompare(b.name || '');
+}
+
+// Manual: the owner's dragged order (cardOrder). Pins stay above the rest, and
+// a worker the owner has not placed yet (a new one) joins at the bottom, oldest
+// first, so it never pushes an arranged card out of its spot.
+function _manualSortSessions(a, b) {
+  if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+  const ia = cardOrder.indexOf(a.name), ib = cardOrder.indexOf(b.name);
+  if (ia !== ib) {
+    if (ia < 0) return 1;
+    if (ib < 0) return -1;
+    return ia - ib;
+  }
+  return (a.session_created || 0) - (b.session_created || 0)
+    || (a.name || '').localeCompare(b.name || '');
 }
 
 // Last message a PERSON sent, newest first. Schedulers and inter-session
@@ -41173,7 +45579,7 @@ function _statusSortSessions(a, b) {
 }
 
 function _checkWorkerStatusOrder() {
-  if (sortMode !== 'status' || _frozen) return;
+  if (sortMode !== 'status') return;
   // Read the rendered snapshot, not a newer SSE payload while a menu/input
   // intentionally holds the previous cards on screen.
   // Pinned cards are hoisted above the status ordering ON PURPOSE, so they are
@@ -41198,45 +45604,10 @@ function _checkWorkerStatusOrder() {
 
 function _sortFnFor(mode) {
   return mode === 'alpha'  ? _alphaSortSessions
+       : mode === 'manual' ? _manualSortSessions
        : mode === 'human'  ? _humanSortSessions
        : mode === 'status' ? _statusSortSessions
        : _naturalSortSessions;
-}
-
-// Sort by frozen cardOrder; sessions not in the list go to the end in natural order
-function _sortByCardOrder(arr) {
-  const idx = Object.fromEntries(cardOrder.map((n, i) => [n, i]));
-  return [...arr].sort((a, b) => {
-    const ia = idx[a.name] ?? Infinity;
-    const ib = idx[b.name] ?? Infinity;
-    if (ia !== ib) return ia - ib;
-    return _naturalSortSessions(a, b);
-  });
-}
-
-function toggleFreeze() {
-  if (_frozen) {
-    _frozen = false;
-    localStorage.removeItem('amux_frozen');
-    cardOrder = [];
-    localStorage.removeItem('amux_card_order');
-  } else {
-    // Freeze what the user actually sees. Rebuilding status buckets here put
-    // pinned workers back below active workers in group view on the same tap.
-    const rendered = [...document.querySelectorAll('#cards .card[data-session]')]
-      .map(card => card.dataset.session);
-    const remaining = sessions.filter(s => !s.archived && !_workerLifecycleInactive(s) && !rendered.includes(s.name))
-      .sort(_sortFnFor(sortMode)).map(s => s.name);
-    cardOrder = [...new Set([...rendered, ...remaining])];
-    fetch(API + '/api/client-debug', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ kind: 'worker-freeze-order', verdict: 'captured-rendered-order',
-        measured: true, n_considered: rendered.length, layout: layoutMode, ver: APP_VER }) }).catch(() => {});
-    localStorage.setItem('amux_card_order', JSON.stringify(cardOrder));
-    _frozen = true;
-    localStorage.setItem('amux_frozen', '1');
-  }
-  _updateResetBtn();
-  render();
 }
 
 function _resetPillHtml() {
@@ -41257,8 +45628,6 @@ function _updateResetBtn() {
   _syncResetPill();
   const eb = document.getElementById('tile-expand-btn');
   if (eb) eb.classList.toggle('active', expanded.size > 0);
-  const fb = document.getElementById('tile-freeze-btn');
-  if (fb) fb.classList.toggle('active', _frozen);
 }
 
 function setLayoutMode(mode) {
@@ -41322,8 +45691,9 @@ const _SORT_OPTS = [
   { id: 'human',   label: 'Last message from me', hint: 'Ignores schedulers and session-to-session' },
   { id: 'alpha',   label: 'Name (A–Z)',      hint: 'Stable — the order stops shifting under you' },
   { id: 'status',  label: 'Status',               hint: 'Working, needs input, errors, rate limited, idle, stopped' },
+  { id: 'manual',  label: 'Manual',               hint: 'Drag the grip to arrange; new workers join at the bottom' },
 ];
-const _SORT_GLYPH = { natural: '⇅', human: '●', alpha: 'A↓', status: '☷' };
+const _SORT_GLYPH = { natural: '⇅', human: '●', alpha: 'A↓', status: '☷', manual: '⠿' };
 
 function _sortLabel(id) {
   const o = _SORT_OPTS.find(x => x.id === id);
@@ -41361,32 +45731,47 @@ function setSortMode(mode) {
   localStorage.setItem('amux_sort_mode', sortMode);
   closeSortMenu();
   _sortBtnSync();
-  // Sorting is an explicit act, so it must beat the frozen card order that
-  // otherwise pins the list to whatever it looked like when you froze it.
-  _frozen = false;
-  try { localStorage.removeItem('amux_frozen'); localStorage.removeItem('amux_card_order'); } catch (e) {}
-  cardOrder = [];
-  if (typeof showToast === 'function') showToast('Sorted by ' + _sortLabel(sortMode).toLowerCase());
+  // The first switch to Manual starts from the order on screen, so choosing it
+  // moves nothing; after that the saved arrangement comes back unchanged.
+  if (sortMode === 'manual' && !cardOrder.length) {
+    cardOrder = [...document.querySelectorAll('#cards .card[data-session]')].map(c => c.dataset.session);
+    try { localStorage.setItem('amux_card_order', JSON.stringify(cardOrder)); } catch (e) { console.warn('manual order: could not save the seeded card order', e); }
+  }
+  if (typeof showToast === 'function') showToast(sortMode === 'manual'
+    ? 'Manual order: drag the grip to arrange' : 'Sorted by ' + _sortLabel(sortMode).toLowerCase());
   render();
 }
 
 function toggleSortMode() {   // legacy entry point; cycles through the options
   const i = _SORT_OPTS.findIndex(o => o.id === sortMode);
   setSortMode(_SORT_OPTS[(i + 1) % _SORT_OPTS.length].id);
-  const btn = document.getElementById('tile-sort-btn');
-  if (btn) btn.classList.toggle('active', sortMode !== 'natural');
-  if (sortMode !== 'natural') destroySortable();   // computed order — manual drag would fight it
-  render();
 }
 
+// Dragging exists only under the Manual sort, where the order IS what you drag;
+// under a computed sort a drop would be undone by the next render. Grouped
+// layout buckets by status, where a manual position has no meaning.
+function _manualDragOn() {
+  return sortMode === 'manual' && layoutMode !== 'group';
+}
 function initSortable() {
-  if (typeof Sortable === 'undefined') return;
-  if (sortMode !== 'natural') { destroySortable(); return; }
-  destroySortable();
+  if (_deferForSortableDrag(initSortable, 'worker-cards')) return;
   const cards = document.querySelector('.cards');
-  if (!cards) return;
+  if (cards) cards.classList.toggle('manual-order', _manualDragOn());
+  destroySortable();
+  if (typeof Sortable === 'undefined' || !cards || !_manualDragOn()) return;
   _sortable = Sortable.create(cards, {
     handle: '.card-drag-handle',
+    draggable: '.card[data-session]',
+    // Pointer events, not the browser's native drag and drop: the same choice
+    // and reason as the tab menu (_tabMenuSortableCreate). Native DnD is an
+    // AppKit drag session in the Mac app, and a touch drag on a phone takes
+    // this path anyway, so every engine now drags the same way. Scrolls the
+    // page near its edges so a card can travel past the fold.
+    forceFallback: true, fallbackTolerance: 4,
+    scroll: true, scrollSensitivity: 56, scrollSpeed: 14, bubbleScroll: true,
+    // A drop never pins or unpins: pinned cards reorder among themselves only.
+    onMove: evt => !!evt.related?.dataset?.session
+      && evt.related.dataset.pinned === evt.dragged.dataset.pinned,
     animation: 120,
     easing: 'cubic-bezier(0.2, 0, 0, 1)',
     ghostClass: 'sortable-ghost',
@@ -41403,10 +45788,17 @@ function initSortable() {
     onEnd: function(evt) {
       document.body.classList.remove('session-dragging');
       _tileJustDragged = evt.oldIndex !== evt.newIndex;
-      const allCards = cards.querySelectorAll('.card[data-session]');
-      cardOrder = Array.from(allCards).map(c => c.dataset.session);
+      if (!_tileJustDragged) return;
+      // The visible cards take the slots the visible names held, so a worker
+      // hidden by a search or group filter keeps its place in the order.
+      const shown = Array.from(cards.querySelectorAll('.card[data-session]')).map(c => c.dataset.session);
+      const visible = new Set(shown);
+      const full = [...cardOrder, ...shown.filter(n => !cardOrder.includes(n))];
+      let k = 0;
+      cardOrder = full.map(n => visible.has(n) ? shown[k++] : n);
       localStorage.setItem('amux_card_order', JSON.stringify(cardOrder));
-      _updateResetBtn();
+      try { window._clientDebug && window._clientDebug('worker-manual-order', { verdict: 'manual-order-saved',
+        moved: evt.item?.dataset?.session || '', measured: true, n_considered: shown.length }); } catch (e) { console.warn('manual order: debug beacon failed', e); }
     }
   });
 }
@@ -41441,8 +45833,6 @@ document.addEventListener('DOMContentLoaded', function() {
   _applyWorkersPerRow();
   const sortBtn = document.getElementById('tile-sort-btn');
   if (sortBtn) sortBtn.classList.toggle('active', sortMode !== 'natural');
-  const freezeBtn = document.getElementById('tile-freeze-btn');
-  if (freezeBtn) freezeBtn.classList.toggle('active', _frozen);
 });
 
 // ═══════ REPORTS ═══════
@@ -42180,8 +46570,59 @@ function statusStyle(id) {
 }
 
 // ═══════ CHROME TABS ═══════
+// The hashes that name where to land. Restoring the last screen must not run
+// over any of them (the screen restore and the tab bar read this one list).
+// reconnect joined it on 2026-11-08: a connector alert's link opened
+// Connectors and its prompt, then the restore reopened the last worker over
+// them.
+const _DEEPLINK_HASH_RE = /^#(?:peek|issue|menu|view|path|edit|browser|bq|task|reconnect)=/;
 const _isInTab = new URLSearchParams(location.search).has('_tab');
 if (_isInTab) document.body.classList.add('in-tab');
+// A LINK OPENED IN A NEW BROWSER TAB IS A VIEWER, NOT A WINDOW (owner,
+// 2026-11-23: a middle-clicked path "shows the markdown under one of your
+// existing tabs ... that may not even correlate with where the relative link
+// came from"). A worker-output link carries ?_viewer=1 plus the worker and the
+// in-page tab it was clicked in (_linkViewerQuery). Such a page shows the file
+// with no tab bar and no nav, reads and writes no tab state, and on close
+// (_linkViewerReturn) becomes the full page on the tab the link came from, or
+// a new tab on that worker when that tab is gone.
+let _linkViewer = null;
+(function _linkViewerBoot() {
+  const q = new URLSearchParams(location.search);
+  if (_isInTab || !q.has('_viewer')) return;
+  _linkViewer = { session: q.get('_from') || '', tab: parseInt(q.get('_from_tab'), 10) || 0 };
+  document.body.classList.add('link-viewer');
+})();
+// EACH TAB OF THE IN-PAGE TAB BAR KEEPS ITS OWN PLACE (owner, 2026-11-13:
+// "the other tab will then also become that session"). Tabs after the first
+// are iframes, rebuilt after any reload of the page (a deploy, Chrome
+// discarding it) from a bare /?_tab=1, so each came back on whatever worker
+// another tab opened last. A tab now writes its address (#peek=, #view=,
+// #path=, ...) under its own key, and the bar rebuilds it on that address.
+// The key is in sessionStorage: a browser tab and the iframes inside it share
+// it, and another browser tab of amux does not, so two amux windows no longer
+// overwrite each other's tabs (owner, 2026-11-13).
+const _CHROME_TAB_VIEW_KEY = 'amux_chrome_tab_view:';
+function _chromeTabSavedHash(id) {
+  let h = '';
+  try { h = sessionStorage.getItem(_CHROME_TAB_VIEW_KEY + id) || ''; } catch (e) {}
+  return h.charAt(0) === '#' ? h : '';
+}
+if (_isInTab) {
+  const _inTabId = new URLSearchParams(location.search).get('_tab');
+  let _inTabLast = null;
+  const _inTabRemember = () => {
+    const h = location.hash || '';
+    if (h === _inTabLast) return;
+    _inTabLast = h;
+    try { sessionStorage.setItem(_CHROME_TAB_VIEW_KEY + _inTabId, h); } catch (e) {}
+  };
+  // Most moves replace the address without a hashchange (_syncUrlHash), so
+  // it is read on a timer as well as on every event that can end the page.
+  setInterval(_inTabRemember, 1000);
+  window.addEventListener('hashchange', _inTabRemember);
+  window.addEventListener('pagehide', _inTabRemember);
+}
 // The Mac app has real windows and tabs (Cmd-N, Cmd-T), so the in-page strip
 // is hidden there and the page always shows its own first tab (Ethan,
 // 2026-10-19: "this is much cleaner, you can get rid of this now").
@@ -42206,8 +46647,65 @@ if (_nativePaneBridge()) {
   if (b) { b.title = 'Split: this page again in a new pane on the right'; b.removeAttribute('aria-haspopup'); }
 }
 
-let _chromeTabs = JSON.parse(localStorage.getItem('amux_chrome_tabs2') || 'null') || [{id:1, name:'Tab 1'}];
-let _chromeActiveId = (_nativeTabs ? null : parseInt(localStorage.getItem('amux_chrome_active2'))) || _chromeTabs[0]?.id || 1;
+// THE TAB BAR BELONGS TO ITS BROWSER TAB (owner, 2026-11-13: "the tab
+// navigation is very screwed up"). The list and the open tab were in
+// localStorage, shared by every amux window and read once at load: a second
+// window opened on the first one's tabs, each window's saves overwrote the
+// other's, and both handed out the same new tab id. Each browser tab now keeps
+// its own bar in sessionStorage (it survives a reload and a discarded tab).
+// localStorage keeps a snapshot, addresses included, only so a browser tab
+// with no bar of its own (a new one, or a PWA iOS evicted) starts from the
+// tabs last used. A tab's iframe reads nothing and seeds nothing here.
+const _CHROME_STATE_KEY = 'amux_chrome_state';
+function _chromeLoad() {
+  const one = { tabs: [{id: 1, name: 'Tab 1'}], active: 1, page: 1 };
+  if (_isInTab || _linkViewer) return one;
+  try {
+    const s = JSON.parse(sessionStorage.getItem(_CHROME_STATE_KEY) || 'null');
+    if (s && Array.isArray(s.tabs) && s.tabs.length) return { tabs: s.tabs, active: s.active, page: s.page };
+  } catch (e) {}
+  let snap = null;
+  try { snap = JSON.parse(localStorage.getItem('amux_chrome_tabs2') || 'null'); } catch (e) {}
+  if (!Array.isArray(snap) || !snap.length) return one;
+  // A snapshot from before the page tab was named had the page first.
+  const pageTab = snap.find(t => t && t.page) || snap[0];
+  snap.forEach(t => {
+    if (t && t !== pageTab && typeof t.hash === 'string' && t.hash.charAt(0) === '#') {
+      try { sessionStorage.setItem(_CHROME_TAB_VIEW_KEY + t.id, t.hash); } catch (e) {}
+    }
+  });
+  return { tabs: snap.map(t => ({ id: t.id, name: t.name || '' })), active: parseInt(localStorage.getItem('amux_chrome_active2')), page: pageTab && pageTab.id };
+}
+const _chromeLoaded = _chromeLoad();
+let _chromeTabs = _chromeLoaded.tabs;
+// THE PAGE IS ONE TAB, WHEREVER IT SITS (owner, 2026-11-23: after a drag,
+// going back to a tab "loads like the worker screen and then quickly loads
+// your session ... is there any way to have it persist"). One tab is this page
+// itself and every other is an iframe. That tab was always the first, so a
+// drag that put another tab first moved the page to it and rebuilt the old
+// first as a new iframe, which loaded the list and then its worker. The page
+// tab is now named by id and keeps its place in the order, so a drag only
+// moves labels: every tab keeps its live page.
+let _chromePageId = parseInt(_chromeLoaded.page);
+if (!_chromeTabs.some(t => t.id === _chromePageId)) _chromePageId = _chromeTabs[0].id;
+let _chromeActiveId = (_nativeTabs ? null : parseInt(_chromeLoaded.active)) || _chromePageId;
+if (!_chromeTabs.some(t => t.id === _chromeActiveId)) _chromeActiveId = _chromePageId;
+// A BROWSER TAB OPENED ON A LINK SHOWS THE LINK (owner, 2026-11-22: a
+// middle-clicked path "did open a new tab but it did not deep link into that
+// JSONL file"). The page is its own tab and the link is its address; the bar
+// a new browser tab starts from had a later tab open, whose iframe covered
+// the page and the file it opened. A reload or a discarded tab coming back
+// keeps the tab that was open: only a fresh navigation is a link.
+(function _chromeBootOnLink() {
+  if (_isInTab || _nativeTabs || _chromeActiveId === _chromePageId) return;
+  if (!_DEEPLINK_HASH_RE.test(location.hash) && !/[?&]view=/.test(location.search)) return;
+  let nav = '';
+  try { nav = (performance.getEntriesByType('navigation')[0] || {}).type || ''; } catch (e) { console.warn('[amux] chrome_tab_link_boot: navigation type unreadable, keeping the saved tab', e); }
+  if (nav !== 'navigate' || document.wasDiscarded) return;
+  const from = _chromeActiveId;
+  _chromeActiveId = _chromePageId;
+  console.info('[amux] chrome_tab_link_boot', { verdict: 'link_shown_on_page_tab', from, link: location.hash.slice(0, location.hash.indexOf('=') + 1) });
+})();
 let _chromeNextId = Math.max(..._chromeTabs.map(t => t.id), 0) + 1;
 let _chromeCollapsed = localStorage.getItem('amux_chrome_collapsed') === '1';
 
@@ -42225,10 +46723,52 @@ function _chromeRender() {
     h += '<div class="chrome-tab'+cls+'" onclick="_chromeSwitchTab('+t.id+')" onmousedown="if(event.button===1){event.preventDefault();_chromeCloseTab('+t.id+')}" ondblclick="event.stopPropagation();_chromeRenameTab('+t.id+')" data-tab-id="'+t.id+'"><span class="chrome-tab-label">'+label+'</span>'+close+'</div>';
   }
   h += '<button class="chrome-tab-add" onclick="_chromeAddTab()" title="New tab" style="margin:0 var(--space-1) var(--space-1) var(--space-1);">+</button>';
-  h += '<button class="chrome-tab-collapse" onclick="_chromeToggleCollapse()" title="'+(_chromeCollapsed?'Show tabs':'Hide tabs')+'">'+(_chromeCollapsed?'&#x25BC;':'&#x25B2;')+'</button>';
+  // One chevron, turned by CSS: up hides the strip, down (on the pull tab
+  // left at the top edge) shows it again.
+  h += '<button class="chrome-tab-collapse" onclick="_chromeToggleCollapse()" title="'+(_chromeCollapsed?'Show tabs':'Hide tabs')+'" aria-label="'+(_chromeCollapsed?'Show tabs':'Hide tabs')+'"><svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M2.5 7.5 6 4l3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>';
   bar.innerHTML = h;
   _chromeShowActive();
   _chromeUpdateOffsets();
+}
+
+// DRAG A TAB TO REORDER THE STRIP (owner, 2026-11-23: "Dragging to order tabs
+// in Amux on the web is not working"). The strip never had a drag; only the ⊞
+// menus did. It uses the menus' pointer-driven Sortable (_tabMenuSortableCreate),
+// so the click a drop would send is swallowed and ✕ and the rename box stay
+// clicks. It is bound once to the bar, which every render keeps (only its
+// children are replaced). Sortable loads after this script, so setup waits for
+// the page's load event. Drags are beaconed as kind=tabcust-drag which=chrome and
+// each reorder as chrome_tab_reordered.
+function _chromeTabDragSetup(bar) {
+  if (_isInTab || _nativeTabs || bar._chromeSortable) return;
+  if (!window.Sortable && document.readyState !== 'complete') {
+    if (!bar._chromeSortableWait) {
+      bar._chromeSortableWait = true;
+      window.addEventListener('load', () => _chromeTabDragSetup(bar), { once: true });
+    }
+    return;
+  }
+  bar._chromeSortable = _tabMenuSortableCreate(bar, 'chrome', '.chrome-tab', () => {
+    const ids = [...bar.querySelectorAll('.chrome-tab[data-tab-id]')].map(el => parseInt(el.dataset.tabId, 10));
+    _chromeReorder(ids);
+  });
+}
+
+// A drop only reorders the strip. The page tab and every iframe stay as they
+// are, so no tab reloads (see _chromePageId).
+function _chromeReorder(ids) {
+  const byId = new Map(_chromeTabs.map(t => [t.id, t]));
+  const next = ids.map(id => byId.get(id)).filter(Boolean);
+  if (next.length !== _chromeTabs.length) {
+    // A strip that does not match the list (a render mid-drag) is put back, not saved.
+    amuxTrack('chrome_tab_reordered', {verdict: 'strip_mismatch', strip: ids.length, tabs: _chromeTabs.length, measured: true, n_considered: ids.length});
+    _chromeRender();
+    return;
+  }
+  amuxTrack('chrome_tab_reordered', {verdict: 'reordered', page_tab_at: next.findIndex(t => t.id === _chromePageId), measured: true, n_considered: next.length});
+  _chromeTabs = next;
+  _chromeRender();
+  _chromeSave();
 }
 
 function _chromeShowActive() {
@@ -42237,8 +46777,7 @@ function _chromeShowActive() {
   if (!fc) return;
   const tab = _chromeTabs.find(t => t.id === _chromeActiveId);
   if (!tab) return;
-  const isFirst = _chromeTabs[0] && _chromeTabs[0].id === _chromeActiveId;
-  if (isFirst) {
+  if (_chromeActiveId === _chromePageId) {
     fc.classList.remove('active');
   } else {
     fc.classList.add('active');
@@ -42246,7 +46785,10 @@ function _chromeShowActive() {
     if (!iframe) {
       iframe = document.createElement('iframe');
       iframe.dataset.tabId = String(_chromeActiveId);
-      iframe.src = '/?_tab=1';
+      iframe.addEventListener('load', () => { iframe.dataset.loaded = '1'; });
+      const saved = _chromeTabSavedHash(_chromeActiveId);
+      iframe.src = '/?_tab=' + _chromeActiveId + saved;
+      amuxTrack('chrome_tab_rebuilt', {verdict: saved ? 'own_address' : 'no_saved_address', measured: true, n_considered: 1});
       fc.appendChild(iframe);
     }
     fc.querySelectorAll('iframe').forEach(f => f.classList.toggle('hidden', f.dataset.tabId !== String(_chromeActiveId)));
@@ -42353,8 +46895,13 @@ function _chromeUpdateOffsets() {
   });
 }
 
+// The tab you are leaving is the one a new tab copies when no default is saved.
+function _chromeNoteLastTab() {
+  try { sessionStorage.setItem(_LIST_LAST_TAB_KEY, _listKeyOfTab(_chromeActiveId)); } catch (e) { console.warn('[tabs] last tab not noted; a new tab starts clean', e); }
+}
 function _chromeSwitchTab(id) {
   if (_chromeActiveId === id) return;
+  _chromeNoteLastTab();
   _chromeActiveId = id;
   _chromeRender();
   _chromeSave();
@@ -42362,17 +46909,63 @@ function _chromeSwitchTab(id) {
 
 function _chromeAddTab() {
   const tab = {id: _chromeNextId++, name: ''};
+  _chromeNoteLastTab();
   _chromeTabs.push(tab);
   _chromeActiveId = tab.id;
   _chromeRender();
   _chromeSave();
 }
 
+// Where a tab is now: its iframe's own address once it has loaded, else the
+// one it saved (written within a second of every move). Not before its load
+// event: reading a just-inserted iframe's location in the same tick stalled
+// its script in Chromium about 1 load in 15 (the tab came up with no app).
+function _chromeTabLiveHash(id) {
+  const f = document.querySelector('#chrome-tab-frames iframe[data-tab-id="' + id + '"]');
+  if (f && f.dataset.loaded === '1') {
+    try { return f.contentWindow.location.hash || ''; } catch (e) {}
+  }
+  return _chromeTabSavedHash(id);
+}
+// One tab is this page itself; every other is an iframe. Closing the page
+// tab made the next one first, and the bar showed it AS this page,
+// which still held the closed tab's worker (owner, 2026-11-13: "the next tab,
+// which replaces the now-closed tab, becomes the session of the tab I
+// closed"). The page now moves to that tab's own place and its iframe goes.
+function _chromePageGoTo(hash) {
+  try { if (peekSession) closePeek(); } catch (e) { console.warn('[tabs] could not close the closed tab\'s worker', e); }
+  if (hash) {
+    if (location.hash === hash) _handleDeeplink(hash); else location.hash = hash;
+  } else {
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+    switchView('sessions');
+  }
+}
 function _chromeCloseTab(id) {
   if (_chromeTabs.length <= 1) return;
   const idx = _chromeTabs.findIndex(t => t.id === id);
+  if (idx < 0) return;
   const fc = document.getElementById('chrome-tab-frames');
+  let moveTo = null;
+  const closingPage = id === _chromePageId;
+  if (closingPage) {
+    // The page moves to the tab beside it, which stops being an iframe.
+    const next = _chromeTabs[idx + 1] || _chromeTabs[idx - 1];
+    moveTo = _chromeTabLiveHash(next.id);
+    _chromePageId = next.id;
+    if (fc) { const nf = fc.querySelector('iframe[data-tab-id="' + next.id + '"]'); if (nf) nf.remove(); }
+    try { sessionStorage.removeItem(_CHROME_TAB_VIEW_KEY + next.id); } catch (e) {}
+    try { _takeTabListView(next.id); } catch (e) { console.warn('[tabs] could not carry the next tab\'s list view', e); }
+    try { sessionStorage.removeItem(_LIST_VIEW_TAB_KEY + next.id); } catch (e) {}
+  }
   if (fc) { const iframe = fc.querySelector('iframe[data-tab-id="'+id+'"]'); if (iframe) iframe.remove(); }
+  try { sessionStorage.removeItem(_CHROME_TAB_VIEW_KEY + id); } catch (e) {}
+  // A closed tab's list view goes with it: ids are reused (max + 1), so a later
+  // tab would otherwise open on the closed one's search and filters.
+  try { sessionStorage.removeItem(_LIST_VIEW_TAB_KEY + id); } catch (e) {}
+  try { if (sessionStorage.getItem(_LIST_LAST_TAB_KEY) === _LIST_VIEW_TAB_KEY + id) sessionStorage.removeItem(_LIST_LAST_TAB_KEY); } catch (e) { console.warn('[tabs] last-tab pointer not cleared for a closed tab', e); }
+  amuxTrack('chrome_tab_closed', {verdict: closingPage ? 'page_tab_page_moved_to_next' : 'iframe_tab_closed', has_address: moveTo ? 1 : 0, measured: true, n_considered: 1});
+  if (moveTo !== null) _chromePageGoTo(moveTo);
   _chromeTabs.splice(idx, 1);
   if (_chromeActiveId === id) {
     const ni = Math.min(idx, _chromeTabs.length - 1);
@@ -42382,11 +46975,102 @@ function _chromeCloseTab(id) {
   _chromeSave();
 }
 
+// The snapshot a browser tab with no bar of its own starts from.
+let _chromeSnapLast = '';
+function _chromeSnapshot() {
+  // A link viewer has no bar: its one placeholder tab must not overwrite the
+  // snapshot of the window it came from, which _linkViewerReturn reads.
+  if (_linkViewer) return;
+  const snap = JSON.stringify(_chromeTabs.map(t => t.id === _chromePageId
+    ? { id: t.id, name: t.name || '', hash: location.hash || '', page: true }
+    : { id: t.id, name: t.name || '', hash: _chromeTabLiveHash(t.id) }));
+  if (snap === _chromeSnapLast) return;
+  _chromeSnapLast = snap;
+  localStorage.setItem('amux_chrome_tabs2', snap);
+  localStorage.setItem('amux_chrome_active2', String(_chromeActiveId));
+}
 function _chromeSave() {
+  if (_isInTab || _linkViewer) return;
   try {
-    localStorage.setItem('amux_chrome_tabs2', JSON.stringify(_chromeTabs));
-    localStorage.setItem('amux_chrome_active2', String(_chromeActiveId));
+    sessionStorage.setItem(_CHROME_STATE_KEY, JSON.stringify({ tabs: _chromeTabs, active: _chromeActiveId, page: _chromePageId }));
+    _chromeSnapLast = '';
+    _chromeSnapshot();
   } catch(e) {}
+}
+// The query a worker-output link opens with in a new browser tab: the worker
+// and the in-page tab it was clicked in (the page itself is the first tab; an
+// iframe tab knows its id from ?_tab=).
+function _linkViewerQuery() {
+  const q = new URLSearchParams();
+  q.set('_viewer', '1');
+  const s = (typeof peekSession === 'string' && peekSession) || '';
+  if (s) q.set('_from', s);
+  let tab = 0;
+  try {
+    if (_isInTab) tab = parseInt(new URLSearchParams(location.search).get('_tab'), 10) || 0;
+    else if (!_nativeTabs && _chromeTabs.length) tab = _chromeTabs[0].id;
+  } catch (e) { console.warn('[amux] link_viewer: origin tab unreadable', e); }
+  if (tab) q.set('_from_tab', String(tab));
+  return '?' + q.toString();
+}
+// Whether a tab's address shows this worker (#peek=<name>, optionally &tab=).
+function _hashShowsSession(h, s) {
+  const p = '#peek=' + encodeURIComponent(s);
+  return typeof h === 'string' && (h === p || h.startsWith(p + '&'));
+}
+// Leave the link viewer: this browser tab becomes the full page, its bar
+// rebuilt from the snapshot of the window the link came from, on the tab the
+// link was clicked in when it still shows that worker, else on another tab
+// showing it, else on a new tab opened on the worker. In place, no reload.
+function _linkViewerReturn() {
+  const lv = _linkViewer;
+  if (!lv) return false;
+  _linkViewer = null;
+  document.body.classList.remove('link-viewer');
+  const peekHash = lv.session ? '#peek=' + encodeURIComponent(lv.session) : '';
+  let verdict = 'native_window', firstHash = peekHash;
+  if (!_nativeTabs) {
+    let snap = null;
+    try { snap = JSON.parse(localStorage.getItem('amux_chrome_tabs2') || 'null'); } catch (e) { console.warn('[amux] link_viewer: tab snapshot unreadable', e); }
+    const tabs = (Array.isArray(snap) ? snap : []).filter(t => t && Number.isInteger(t.id))
+      .map(t => ({ id: t.id, name: t.name || '', page: t.page === true, hash: (typeof t.hash === 'string' && t.hash.charAt(0) === '#') ? t.hash : '' }));
+    const shows = t => !lv.session || _hashShowsSession(t.hash, lv.session);
+    let target = tabs.find(t => t.id === lv.tab && shows(t));
+    verdict = 'origin_tab';
+    if (!target && lv.session) { target = tabs.find(shows); verdict = 'tab_showing_worker'; }
+    if (!target) {
+      target = { id: Math.max(0, ...tabs.map(t => t.id)) + 1, name: '', hash: peekHash };
+      tabs.push(target);
+      verdict = tabs.length === 1 ? 'new_window' : 'new_tab';
+    }
+    // The page is the tab the snapshot marks as the page, wherever it sits
+    // (as _chromeLoad reads it); a snapshot from before that had it first.
+    const pageTab = tabs.find(t => t.page) || tabs[0];
+    tabs.filter(t => t !== pageTab).forEach(t => {
+      try { if (t.hash) sessionStorage.setItem(_CHROME_TAB_VIEW_KEY + t.id, t.hash); else sessionStorage.removeItem(_CHROME_TAB_VIEW_KEY + t.id); } catch (e) { console.warn('[amux] link_viewer: tab ' + t.id + ' address not saved, it opens bare', e); }
+    });
+    firstHash = pageTab.hash;
+    _chromeTabs = tabs.map(t => ({ id: t.id, name: t.name }));
+    _chromePageId = pageTab.id;
+    _chromeActiveId = target.id;
+    _chromeNextId = Math.max(..._chromeTabs.map(t => t.id), 0) + 1;
+    const fc = document.getElementById('chrome-tab-frames');
+    if (fc) fc.querySelectorAll('iframe').forEach(f => f.remove());
+  }
+  console.info('[amux] link_viewer_return', { verdict, from_tab: lv.tab, has_worker: !!lv.session });
+  amuxTrack('link_viewer_return', { verdict, measured: true, n_considered: 1 });
+  try { history.replaceState(null, '', location.pathname + location.hash); } catch (e) { console.warn('[amux] link_viewer: viewer query not cleared from the address', e); }
+  _chromePageGoTo(firstHash);
+  _chromeRender();
+  _chromeSave();
+  return true;
+}
+// Addresses move without a save (a worker opened inside a tab), so the
+// snapshot follows them, written only when it changed, and when the page is
+// left; a window opened next starts on what each tab shows now.
+if (!_isInTab) {
+  window.addEventListener('pagehide', _chromeSave);
+  setInterval(() => { try { _chromeSnapshot(); } catch (e) {} }, 2000);
 }
 
 function switchView(view) {
@@ -42398,6 +47082,8 @@ function switchView(view) {
   // The Projects tab is removed; a saved #view=projects lands on the Board,
   // where new work starts, instead of a blank screen.
   if (view === 'projects') view = 'board';
+  _navVisit('view', view, ((document.querySelector('[id^="tab-"][onclick*="switchView(\'' + view + '\')"]') || {}).textContent || view)
+    .replace(/[^\p{L}\p{N} &'-]/gu, ' ').replace(/\s+/g, ' ').trim());
   // Explicit navigation supersedes a pending restore of an older worker.
   if (typeof _peekOpenGeneration !== 'undefined' && !peekSession) _peekOpenGeneration++;
   if (document.getElementById('grid-view').classList.contains('active')) exitGridMode();
@@ -42405,7 +47091,9 @@ function switchView(view) {
   _zoomFontModeSync(view);
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
-  try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
+  // sessionStorage too: this tab's own copy, which its reload restores rather
+  // than the shared one another tab last wrote (_restoreScreen).
+  try { const _uv = JSON.stringify({ v: view, ts: Date.now() }); localStorage.setItem('amux_ui_view', _uv); if (!_isInTab) sessionStorage.setItem('amux_ui_view', _uv); } catch(e) {}
   if (!peekSession) _syncUrlHash();
   // ONE ROW PER VIEW: [domIdPrefix, tabName, display]. This was three PARALLEL
   // ARRAYS that had to stay index-aligned, and the alignment had already failed
@@ -42423,10 +47111,12 @@ function switchView(view) {
     ['files', 'files', 'flex'], ['scratchpad', 'scratchpad', 'flex'], ['record', 'record', 'flex'], ['mdai', 'mdai', 'flex'],
     ['logs', 'logs', 'flex'], ['messages', 'messages', 'flex'], ['skills', 'skills', 'flex'],
     ['sql', 'sql', 'flex'], ['map', 'map', 'flex'], ['metrics', 'metrics', 'flex'],
-    ['cost', 'cost', 'flex'], ['scoreboard', 'scoreboard', 'flex'], ['disk', 'disk', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', 'flex'],
+    ['cost', 'cost', 'flex'], ['disk', 'disk', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', 'flex'],
     ['browser', 'browser', 'flex'], ['graph', 'graph', 'flex'],
     ['email', 'email', 'flex'], ['connectors', 'connectors', 'flex'], ['draw', 'draw', 'flex'], ['vault', 'vault', 'flex'], ['tasks', 'tasks', 'flex'],
     ['pages', 'pages', 'flex'], ['hotkeys', 'hotkeys', 'flex'], ['photos', 'photos', 'flex'],
+    ['calls', 'calls', 'flex'], ['outbound', 'outbound', 'flex'], ['dictation', 'dictation', 'flex'], ['crm', 'crm', 'flex'],
+    ['home', 'home', 'flex'],
   ];
   for (const [domId, name, display] of _svViews) {
     const ve = document.getElementById(domId + '-view');
@@ -42434,6 +47124,7 @@ function switchView(view) {
     const te = document.getElementById('tab-' + name);
     if (te) te.classList.toggle('active', view === name);
   }
+  if (_HOME_VIEWS[view]) _homeEnter(view); else _homeLeave();
   if (view === 'groups') { _renderGroupsTab(); fetchBoard().then(() => _renderGroupsTab()); }
   if (view === 'calendar') { fetchBoard().then(() => { _fcInit(); }); }
   if (view === 'torrents') _torrentLoad(); else _torrentStopTimer();
@@ -42442,7 +47133,6 @@ function switchView(view) {
   if (view === 'map') { _mapLoad(); _mapInit(); if (_mapSwState()) _mapSwToggle(true); }
   if (view === 'metrics') { _metricsLoad(); _metricsApplySidebarState(); try { const m = localStorage.getItem('amux_metrics_mode'); if (m && ['system','host','resources','velocity','disk'].includes(m)) _metricsSetMode(m); } catch(e) {} } // always refresh on tab switch
   if (view === 'cost') _costLoad();
-  if (view === 'scoreboard') _sbLoad(); else _sbStop();
   if (view === 'disk') _reclaimLoad(); else { if (typeof _reclaimStopPolling === 'function') _reclaimStopPolling(); if (typeof _tierStopPolling === 'function') _tierStopPolling(); }
   if (view === 'browser') _bwInit(); else if (typeof _bwStopLive === 'function') _bwStopLive();
 
@@ -42457,6 +47147,7 @@ function switchView(view) {
   if (view === 'pages') _pagesEnter(); else if (typeof _pagesLeave === 'function' && _pagesCur) _pagesLeave();
   if (view === 'tasks') _tasksLoad('main', true);
   if (view === 'hotkeys') _hkEnter();
+  if (view === 'dictation') _dictGlobalLoad();
   // The Messages TAB is a fleet-wide view reached from the main session list —
   // it opens unfiltered. It used to inherit `peekSession || _lastPeekedSession`,
   // so tapping Messages showed one session's history scoped by whichever peek
@@ -42470,6 +47161,12 @@ function switchView(view) {
   if (view === 'record') _recorderInit();
   if (view === 'mdai') _mdaiTabLoad();
   if (view === 'email') _emailLoad();
+  if (view === 'calls') _callsLoad(); else if (typeof _callsClose === 'function' && _callsOpenId) _callsClose();
+  if (view === 'outbound') _obEnter(); else if (typeof _obLeave === 'function') _obLeave();
+  // The Outbound tab shows every held message itself; the approvals banner
+  // above it would show the same emails a second time.
+  document.body.classList.toggle('view-outbound', view === 'outbound');
+  if (view === 'crm') _crmLoad(); else if (typeof _crmClose === 'function' && _crm.open) _crmClose();
   if (view === 'connectors') _connectorsTabLoad();
   if (view === 'photos') _photosEnter(); else if (typeof _photosLeave === 'function') _photosLeave();
   if (view !== 'map' && typeof _mapMeStop === 'function') _mapMeStop();   // live location only while the map is open
@@ -42494,7 +47191,7 @@ function switchView(view) {
     // Only poll if SSE is not active (SSE pushes board updates)
     if (_sseFallback && !boardTimer) boardTimer = setInterval(fetchBoard, 5000);
   } else if (view === 'scheduler') {
-    Promise.all([fetchSchedules(), fetchSchedulerRuns(), fetchSchedulerAudit()])
+    Promise.all([fetchSchedules(), fetchSchedulerRuns(), fetchSchedulerAudit(), _evSubsFetch()])
       .then(() => { renderScheduler(); renderSchedulerAudit(); });
     // amux's own background jobs live under the user's schedules. Fetched
     // separately because they are a separate thing (see renderSystemJobs), and
@@ -42507,6 +47204,1282 @@ function switchView(view) {
     if (boardTimer) { clearInterval(boardTimer); boardTimer = null; }
   }
   if (view !== 'scheduler') _stopSysJobsTimer();
+}
+
+// ── Calls tab (api/calls.rs, docs/design/phone-calls.md) ─────────────────────
+// Every call a worker asked for, newest first. A held call waits for the
+// owner's Approve here; a row opens a drawer with the goal and transcript.
+// Filters are client-side over one fetch: one row of chips that scrolls
+// sideways on a phone (css-mobile rule: one control row per view).
+let _callsData = null;
+let _callsWorker = '';
+let _callsStatus = '';
+let _callsOpenId = '';
+const _CALLS_PILL = {
+  completed: 'cx-ok', held: 'cx-warn', requested: 'cx-warn', approved: 'cx-warn', dialing: 'cx-warn',
+  in_progress: 'cx-warn', no_answer: 'cx-bad', busy: 'cx-bad', failed: 'cx-bad', canceled: 'cx-idle', declined: 'cx-idle',
+};
+
+// The page body is not a flex column, so flex:1 alone left the Calls view only as
+// tall as its rows (314px of a 667px phone). Like Messages (_cvFit), it is sized
+// from where it starts to the bottom of the screen.
+function _callsFit() {
+  const view = document.getElementById('calls-view');
+  if (!view || view.style.display === 'none') return;
+  requestAnimationFrame(() => { window.scrollTo(0, 0); view.style.setProperty('--calls-top', Math.max(0, view.getBoundingClientRect().top) + 'px'); });
+}
+window.addEventListener('resize', _callsFit);
+async function _callsLoad() {
+  _callsFit();
+  try {
+    const r = await fetch(API + '/api/calls?limit=500', { headers: _authHeaders() });
+    const d = await r.json().catch(() => ({}));
+    _callsData = r.ok ? d : { calls: [], error: d.error || ('HTTP ' + r.status) };
+  } catch (e) {
+    _callsData = { calls: [], error: e.message };
+  }
+  _callsRender();
+  if (_callsOpenId) _callsDrawerRender();
+}
+
+function _callsWho(c) { return c.contact_name || c.to_number || ''; }
+
+function _callsFilterSet(kind, v) {
+  if (kind === 'all') { _callsWorker = ''; _callsStatus = ''; }
+  else if (kind === 'worker') _callsWorker = _callsWorker === v ? '' : v;
+  else _callsStatus = _callsStatus === v ? '' : v;
+  _callsRender();
+}
+
+function _callsRender() {
+  const list = document.getElementById('calls-list');
+  const fl = document.getElementById('calls-filters');
+  const note = document.getElementById('calls-note');
+  if (!list || !fl || !note) return;
+  const d = _callsData || { calls: [] };
+  const all = d.calls || [];
+  const workers = [...new Set(all.map(c => c.worker || 'owner'))].sort();
+  const statuses = [...new Set(all.map(c => c.status))].sort();
+  const chip = (kind, v, label, on) => '<button class="cx-filter calls-chip' + (on ? ' on' : '') + '" data-kind="' + kind
+    + '" data-v="' + esc(v) + '" onclick="_callsFilterSet(this.dataset.kind,this.dataset.v)">' + esc(label) + '</button>';
+  fl.innerHTML = chip('all', '', 'All', !_callsWorker && !_callsStatus)
+    + statuses.map(s => chip('status', s, s.replace('_', ' '), _callsStatus === s)).join('')
+    + '<span class="calls-sep" aria-hidden="true"></span>'
+    + workers.map(w => chip('worker', w, w, _callsWorker === w)).join('');
+  const rows = all.filter(c => (!_callsWorker || (c.worker || 'owner') === _callsWorker) && (!_callsStatus || c.status === _callsStatus));
+  const notes = [];
+  if (d.error) notes.push('Could not load calls: ' + d.error);
+  else if (d.bridge_configured === false) notes.push('No call bridge is configured (AMUX_CALL_BRIDGE_URL under Connectors, Phone calls), so an approved call fails.');
+  note.textContent = notes.join(' ');
+  note.classList.toggle('calls-hidden', !notes.length);
+  if (!rows.length) {
+    list.innerHTML = '<div class="calls-empty">' + (all.length ? 'No calls match this filter.' : 'No calls yet. A worker places one with <code>amux call &lt;number&gt; --stdin</code>.') + '</div>';
+    return;
+  }
+  list.innerHTML = rows.map(c => {
+    const held = c.status === 'held';
+    const dur = c.duration_s != null ? fmtDuration(c.duration_s) : '';
+    return '<div class="calls-row' + (held ? ' calls-held' : '') + '" role="button" tabindex="0" data-id="' + esc(c.id) + '"'
+      + ' onclick="_callsOpen(this.dataset.id)" onkeydown="if(event.key===\'Enter\')_callsOpen(this.dataset.id)">'
+      + '<div class="calls-main">'
+      + '<div class="calls-line"><span class="calls-who">' + esc(_callsWho(c)) + '</span>'
+      + '<span class="cx-pill ' + (_CALLS_PILL[c.status] || 'cx-idle') + '">' + esc(c.status.replace('_', ' ')) + '</span></div>'
+      + '<div class="calls-goal">' + esc(c.goal || '') + '</div>'
+      + '<div class="calls-meta">' + esc(timeAgo(c.requested_at)) + ' · ' + esc(c.worker || 'owner')
+      + (dur ? ' · ' + esc(dur) : '') + (c.outcome ? ' · ' + esc(c.outcome) : (c.error ? ' · ' + esc(c.error) : '')) + '</div>'
+      + '</div>'
+      + (held ? '<div class="calls-actions">'
+        + '<button class="btn primary calls-approve" data-id="' + esc(c.id) + '" onclick="event.stopPropagation();_callsDecide(this.dataset.id,\'approve\')">Approve</button>'
+        + '<button class="btn calls-decline" data-id="' + esc(c.id) + '" onclick="event.stopPropagation();_callsDecide(this.dataset.id,\'decline\')">Decline</button>'
+        + '</div>' : '')
+      + '</div>';
+  }).join('');
+}
+
+async function _callsDecide(id, verb) {
+  const r = await fetch(API + '/api/calls/' + encodeURIComponent(id) + '/' + verb, {
+    method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }), body: '{}',
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    showToast((verb === 'approve' ? 'Not approved: ' : 'Not declined: ') + (d.error || ('HTTP ' + r.status)));
+  } else if (verb === 'approve' && d.call && d.call.status === 'failed') {
+    showToast('Approved, but the call failed: ' + (d.call.error || 'unknown'));
+  } else {
+    showToast(verb === 'approve' ? 'Call approved' : 'Call declined');
+  }
+  await _callsLoad();
+}
+
+function _callsOpen(id) { _callsOpenId = id; _callsDrawerRender(); }
+
+function _callsClose() {
+  _callsOpenId = '';
+  const el = document.getElementById('calls-drawer');
+  if (el) el.remove();
+}
+
+async function _callsDrawerRender() {
+  const id = _callsOpenId;
+  if (!id) return;
+  let el = document.getElementById('calls-drawer');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'calls-drawer';
+    el.className = 'cx-drawer-wrap';
+    el.onclick = (e) => { if (e.target === el) _callsClose(); };
+    el.onkeydown = (e) => { if (e.key === 'Escape') _callsClose(); };
+    el.tabIndex = -1;
+    document.body.appendChild(el);
+    el.focus();
+  }
+  let c = null;
+  try {
+    const r = await fetch(API + '/api/calls/' + encodeURIComponent(id), { headers: _authHeaders() });
+    if (r.ok) c = await r.json();
+  } catch (e) {
+    console.warn('[calls] drawer fetch failed', e);
+  }
+  if (_callsOpenId !== id) return;
+  if (!c) { el.innerHTML = '<div class="cx-drawer" role="dialog" aria-label="Call"><div class="cx-dbody">This call could not be loaded.</div></div>'; return; }
+  const sec = (title, body) => body ? '<div class="cx-sec">' + title + '</div><div class="calls-text">' + esc(body) + '</div>' : '';
+  const turns = (c.transcript || []).map(t => '<div class="calls-turn"><span class="calls-turn-who">' + esc(t.who || '?') + '</span>'
+    + '<span class="calls-turn-text">' + esc(t.text || '') + '</span></div>').join('');
+  let h = '<div class="cx-drawer" role="dialog" aria-label="Call ' + esc(c.id) + '">';
+  h += '<div class="cx-dhead calls-dhead"><span class="calls-who">' + esc(_callsWho(c)) + '</span>'
+    + '<span class="cx-pill ' + (_CALLS_PILL[c.status] || 'cx-idle') + '">' + esc(c.status.replace('_', ' ')) + '</span>'
+    + '<button class="cx-x" aria-label="Close" onclick="_callsClose()">&#x2715;</button></div>';
+  h += '<div class="cx-dbody">';
+  h += '<div class="calls-meta">' + esc(c.to_number) + ' · ' + esc(c.worker || 'owner') + ' · ' + esc(timeAgo(c.requested_at))
+    + (c.duration_s != null ? ' · ' + esc(fmtDuration(c.duration_s)) : '') + '</div>';
+  if (c.worker) h += '<div class="calls-links"><button class="btn" data-w="' + esc(c.worker) + '" onclick="_callsClose();openPeek(this.dataset.w)">Open worker</button></div>';
+  h += sec('Goal', c.goal) + sec('Outcome', c.outcome) + sec('Summary', c.summary) + sec('Error', c.error) + sec('Context', c.context);
+  h += '<div class="cx-sec">Transcript</div><div class="calls-transcript">' + (turns || '<div class="calls-empty">No transcript yet.</div>') + '</div>';
+  if (c.transcript_path) h += '<div class="calls-meta">Saved to ' + esc(c.transcript_path) + '</div>';
+  h += '</div></div>';
+  el.innerHTML = h;
+}
+
+// ── CRM tab ──────────────────────────────────────────────────────────────────
+// docs/design/crm.md (owner, 2026-11-23): one place for every relationship,
+// Mixpeek, amux and personal. People, companies, deals and follow-ups over
+// /api/crm; each person and company carries its contact info, ICP grade (A to
+// D, with reasons) and lookalikes. Any change, from this page, another device
+// or a worker, arrives as a crm_* state event and the open view reloads.
+// People and companies come 200 at a time; "Show more" asks for the next 200.
+const _CRM_PAGE = 200;
+// Sections, in the rail's order: [id, label, glyph, what it is for].
+const _CRM_VIEWS = [
+  ['outbound', 'Outbound', '↗', 'Drafts from workers waiting for you, and what you already decided.'],
+  ['people', 'People', '☺', 'Reachable channels, watched sources and a brief on each person.'],
+  ['companies', 'Companies', '▦', 'Account fit, domains and lookalike companies.'],
+  ['deals', 'Deals', '◇', 'Opportunities opened by signups and outbound replies.'],
+  ['followups', 'Follow-ups', '◷', 'What is due across channels: follow-ups and approved touches to do.'],
+  ['sequences', 'Sequences', '≡', 'Multi-step outreach that workers draft and you approve.'],
+  ['funnel', 'Funnel', '▽', 'How each sequence is doing, from enrolled to won: per sequence or per cohort.'],
+  ['activity', 'Activity', '⌁', 'The CRM events workers subscribe to, newest first.'],
+];
+const _crmSavedView = (() => { try { const v = localStorage.getItem('amux_crm_view'); return _CRM_VIEWS.some(x => x[0] === v) ? v : 'outbound'; } catch (_) { return 'outbound'; } })();
+const _crm = { view: _crmSavedView, q: '', grade: '', status: '', stage: '', data: {}, summary: null, open: null, err: '', timer: 0, limit: _CRM_PAGE,
+  ob: { tab: 'pending', channel: '' }, act: '', editing: '', busy: false, settleUntil: 0, seqs: null };
+const _CRM_STATUSES = ['lead', 'active', 'customer', 'partner', 'personal', 'do_not_contact'];
+const _CRM_STAGES = ['lead', 'qualification', 'demo', 'trial', 'proposal', 'won', 'lost'];
+const _CRM_TYPES = ['email', 'call', 'meeting', 'dm', 'note', 'event', 'other'];
+// The record opens beside the list from this width; below it, over the list.
+const _CRM_WIDE = '(min-width: 1000px)';
+const _crmWide = () => window.matchMedia(_CRM_WIDE).matches;
+// Sequences and Activity use the whole width for their list; a record opened from them comes over it.
+const _crmPaneOn = () => _crmWide() && !['sequences', 'activity', 'funnel'].includes(_crm.view);
+
+function _crmFit() {
+  const view = document.getElementById('crm-view');
+  if (!view || view.style.display === 'none') return;
+  requestAnimationFrame(() => { window.scrollTo(0, 0); view.style.setProperty('--crm-top', Math.max(0, view.getBoundingClientRect().top) + 'px'); });
+}
+window.addEventListener('resize', () => {
+  _crmFit();
+  // Crossing the width where the record moves between the pane and the overlay re-homes it.
+  const el = document.getElementById('crm-drawer');
+  if (el && _crm.open && (el.classList.contains('crm-pane') !== _crmPaneOn())) { el.remove(); _crm.shown = ''; _crmDrawerRender(); }
+});
+
+async function _crmApi(path, opts = {}) {
+  const r = await fetch(API + '/api/crm' + path, { ...opts, headers: _authHeaders(opts.body ? { 'Content-Type': 'application/json' } : {}) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(d.error || ('HTTP ' + r.status)); e.status = r.status; e.data = d; throw e; }
+  return d;
+}
+
+async function _crmLoad() {
+  _crmFit();
+  const qs = (o) => { const p = new URLSearchParams(); for (const [k, v] of Object.entries(o)) if (v) p.set(k, v); const s = p.toString(); return s ? '?' + s : ''; };
+  const want = {
+    people: () => _crmApi('/contacts' + qs({ q: _crm.q, grade: _crm.grade, status: _crm.status, limit: _crm.limit })),
+    companies: () => _crmApi('/accounts' + qs({ q: _crm.q, grade: _crm.grade, limit: _crm.limit })),
+    deals: () => _crmApi('/deals' + qs({ stage: _crm.stage })),
+    followups: () => Promise.all([_crmApi('/followups'), _crmApi('/touches?status=approved&limit=500')]).then(([fu, touches]) => ({ fu, touches })),
+    // Every touch, drafts first: the views below are filters over one list.
+    outbound: () => Promise.all([_crmApi('/touches?limit=1000'), _crmApi('/sequences')]).then(([t, s]) => { _crm.seqs = s; return t; }),
+    sequences: () => _crmApi('/sequences'),
+    activity: () => _crmApi('/activity?limit=300'),
+    funnel: () => _crmApi('/funnel' + (_crm.funnelBy === 'cohort' ? '?group=cohort' : '')),
+  };
+  const view = _crm.view;
+  try {
+    const [summary, rows] = await Promise.all([_crmApi('/summary'), want[view]()]);
+    _crm.summary = summary; _crm.data[view] = rows; _crm.err = '';
+    if (view === 'sequences') _crm.seqs = rows;
+  } catch (e) {
+    _crm.err = 'Could not load the CRM: ' + e.message;
+    console.warn('[crm] load failed', e);
+  }
+  if (view !== _crm.view) return;
+  _crmRender();
+  // The review queue opens its first draft beside the list, as the Outbound tab does.
+  if (view === 'outbound' && !_crm.open && _crmWide()) {
+    const first = _crmObList()[0];
+    if (first) _crmOpen('touch', first.id);
+  }
+  // A refresh from elsewhere (another device, a worker) never rebuilds the
+  // record under the owner's cursor: what they are typing saves on blur, and
+  // the next refresh catches up.
+  if (_crm.open && !_crmEditing()) _crmDrawerRender();
+}
+
+function _crmEditing() {
+  const a = document.activeElement, d = document.getElementById('crm-drawer');
+  return !!(a && d && d.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+}
+
+// A crm_* write anywhere: reload what is on screen, once per burst.
+function _crmOnEvent() {
+  if (activeView !== 'crm') return;
+  clearTimeout(_crm.timer);
+  _crm.timer = setTimeout(_crmLoad, 400);
+}
+
+function _crmSearch(v) {
+  _crm.q = v.trim(); _crm.limit = _CRM_PAGE;
+  clearTimeout(_crm.timer);
+  // Outbound and Activity filter what is already loaded; the rest ask the server.
+  if (_crm.view === 'outbound' || _crm.view === 'activity') { _crmRender(); return; }
+  _crm.timer = setTimeout(_crmLoad, 250);
+}
+
+function _crmSet(kind, v) {
+  _crm.limit = _CRM_PAGE;
+  if (kind === 'view') {
+    if (v === 'approvals') v = 'outbound';
+    if (_crm.view !== v && _crm.open) _crmClose();
+    _crm.view = v; _crm.stage = '';
+    try { localStorage.setItem('amux_crm_view', v); } catch (e) { console.warn('[crm] could not remember the section', e); }
+  }
+  else if (kind === 'grade') _crm.grade = _crm.grade === v ? '' : v;
+  else if (kind === 'status') _crm.status = _crm.status === v ? '' : v;
+  else if (kind === 'stage') _crm.stage = _crm.stage === v ? '' : v;
+  else if (kind === 'ob') { _crm.ob.tab = v; if (_crm.open && _crm.open.kind === 'touch') _crmClose(); _crmRender(); _crmAutoOpen(); return; }
+  else if (kind === 'act') { _crm.act = _crm.act === v ? '' : v; _crmRender(); return; }
+  else if (kind === 'funnel') _crm.funnelBy = v;
+  _crmLoad();
+}
+
+function _crmAutoOpen() {
+  if (_crm.view !== 'outbound' || _crm.open || !_crmWide()) return;
+  const first = _crmObList()[0];
+  if (first) _crmOpen('touch', first.id);
+}
+
+function _crmGrade(g) { return '<span class="crm-grade" data-g="' + esc(g || '') + '" title="' + (g ? 'ICP grade ' + esc(g) : 'Not graded') + '">' + esc(g || '–') + '</span>'; }
+function _crmLabel(s) { return String(s || '').replace(/_/g, ' '); }
+function _crmToday() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+function _crmInitials(name) {
+  const w = String(name || '?').trim().split(/\s+/).filter(Boolean);
+  return ((w[0] || '?')[0] + (w.length > 1 ? w[w.length - 1][0] : '')).toUpperCase();
+}
+function _crmAvatar(name) { return '<span class="crm-av" aria-hidden="true">' + esc(_crmInitials(name)) + '</span>'; }
+
+// ── Outbound: the drafts workers wrote, as one review queue ──
+// A draft is blocked when it cannot go out as it stands: its voice check
+// failed, or the person opted out, bounced or is do-not-contact. Same
+// predicate as the server's summary.blocked (api/crm_accounts.rs summary).
+function _crmVoice(t) {
+  let v = t.voice_check;
+  if (typeof v === 'string') { try { v = JSON.parse(v); } catch (_) { v = null; } }
+  return v || null;
+}
+function _crmBlockedWhy(t) {
+  if (t.status !== 'drafted') return '';
+  if (t.contact_unsubscribed_at) return 'They unsubscribed';
+  if (t.contact_bounced_at) return 'Their email bounced';
+  if (t.contact_status === 'do_not_contact') return 'Marked do not contact';
+  if (t.channel === 'email' && t.contact_email_check) {
+    let c = null;
+    try { c = JSON.parse(t.contact_email_check); } catch (e) { console.warn('[crm] unreadable email_check', e); }
+    if (c && c.ok === false) return 'Their address failed its check: ' + (c.why || '');
+  }
+  const v = _crmVoice(t);
+  // A worker that kept a draft past the voice check said why (voice_override): it comes to review.
+  if (v && v.ok === false && !v.override) return 'Voice: ' + ((v.problems || []).join('; ') || 'does not fit');
+  return '';
+}
+const _CRM_OB_TABS = [['pending', 'Pending'], ['blocked', 'Blocked'], ['history', 'History'], ['all', 'All touches']];
+const _CRM_DECIDED = ['approved', 'done', 'skipped', 'failed'];
+function _crmObIn(t, tab) {
+  if (tab === 'pending') return t.status === 'drafted' && !_crmBlockedWhy(t);
+  if (tab === 'blocked') return !!_crmBlockedWhy(t);
+  if (tab === 'history') return _CRM_DECIDED.includes(t.status);
+  return true;
+}
+function _crmSubject(t) {
+  const body = String(t.body || '');
+  const m = body.match(/^\s*subject:\s*(.+)$/im);
+  if (m) return m[1].trim();
+  // No subject (a DM, a comment): the first line that says something, past a greeting like "Hi Sam,".
+  const lines = body.split('\n').map(s => s.trim()).filter(Boolean);
+  const line = lines.find(l => !/^(hi|hey|hello|dear|yo|hiya|good (morning|afternoon|evening))\b[^.!?]{0,40}[,!.:]?$/i.test(l)) || lines[0];
+  return line ? (line.length > 80 ? line.slice(0, 79) + '…' : line) : (t.action + ' on ' + t.channel);
+}
+function _crmChannelName(c) { return ({ x: 'X', linkedin: 'LinkedIn', email: 'Email', github: 'GitHub', youtube: 'YouTube', tiktok: 'TikTok', sms: 'SMS', whatsapp: 'WhatsApp', in_person: 'In person' })[c] || _crmLabel(c).replace(/^./, s => s.toUpperCase()); }
+const _CRM_STATUS_WORD = { planned: 'Planned', drafted: 'Pending', approved: 'Approved', done: 'Sent', skipped: 'Declined', failed: 'Failed' };
+function _crmTouchPill(t) {
+  const blocked = _crmBlockedWhy(t);
+  return '<span class="cx-pill ' + (blocked ? 'cx-bad' : (_CRM_TOUCH_PILL[t.status] || 'cx-idle')) + '">' + esc(blocked ? 'Blocked' : (_CRM_STATUS_WORD[t.status] || t.status)) + '</span>';
+}
+function _crmObList(tab) {
+  const all = _crm.data.outbound || [];
+  const q = _crm.q.toLowerCase(), ch = _crm.ob.channel;
+  return all.filter(t => _crmObIn(t, tab || _crm.ob.tab) && (!ch || t.channel === ch)
+    && (!q || [t.contact_name, t.account_name, t.body, t.channel, t.assignee, t.contact_email].join(' ').toLowerCase().includes(q)));
+}
+// The counts are the server's (summary covers every touch); the list is the first 1000.
+function _crmObCounts() {
+  const s = _crm.summary || {};
+  const to = s.to_approve || 0, bl = s.blocked || 0;
+  return { pending: Math.max(0, to - bl), blocked: bl, history: s.decided || 0, all: (_crm.data.outbound || []).length };
+}
+
+function _crmHeadHtml() {
+  const v = _CRM_VIEWS.find(x => x[0] === _crm.view) || _CRM_VIEWS[0];
+  let h = '<div class="crm-eyebrow">CRM / ' + esc(v[1]) + '</div><div class="crm-title-row"><h2 class="crm-title">' + esc(v[1]) + '</h2>'
+    + (_crm.view === 'outbound' ? '<span class="cx-pill cx-idle crm-rule" title="A worker drafts; nothing a person outside the company reads goes out until you approve it">You approve every send</span>' : '')
+    + '</div><div class="crm-sub">' + esc(v[3]) + '</div>';
+  if (_crm.view === 'outbound') {
+    const c = _crmObCounts();
+    const card = (tab, label, n, hint) => '<button class="crm-stat' + (_crm.ob.tab === tab ? ' on' : '') + '" data-v="' + tab + '" onclick="_crmSet(\'ob\',this.dataset.v)" title="' + esc(hint) + '">'
+      + '<span class="crm-stat-l">' + esc(label) + '</span><span class="crm-stat-n">' + esc(n) + '</span></button>';
+    h += '<div class="crm-stats">' + card('pending', 'Pending review', c.pending, 'Drafts ready for your approve')
+      + card('blocked', 'Needs attention', c.blocked, 'Drafts that cannot go out as they stand')
+      + card('history', 'Approval history', c.history, 'Touches you approved, declined, or a worker recorded')
+      + '</div>';
+  }
+  return h;
+}
+
+function _crmNavHtml() {
+  const s = _crm.summary || {};
+  const badge = { outbound: s.to_approve, followups: s.followups_due };
+  return '<div class="crm-nav-h">Relationships</div>' + _CRM_VIEWS.map(([id, label, glyph]) =>
+    '<button class="crm-nav-item' + (_crm.view === id ? ' on' : '') + '" data-v="' + id + '" onclick="_crmSet(\'view\',this.dataset.v)"' + (_crm.view === id ? ' aria-current="page"' : '') + '>'
+    + '<span class="crm-nav-g" aria-hidden="true">' + glyph + '</span><span class="crm-nav-l">' + esc(label) + '</span>'
+    + (badge[id] ? '<span class="crm-nav-n">' + esc(badge[id]) + '</span>' : '') + '</button>').join('')
+    + '<div class="crm-nav-foot">Workers draft, research and watch; you approve. <button class="crm-link" onclick="_crmSet(\'view\',\'activity\')">See their events</button></div>';
+}
+
+function _crmRender() {
+  const chips = document.getElementById('crm-chips'), list = document.getElementById('crm-list'), note = document.getElementById('crm-note');
+  if (!chips || !list) return;
+  const nav = document.getElementById('crm-nav'), head = document.getElementById('crm-head');
+  if (nav) nav.innerHTML = _crmNavHtml();
+  if (head) head.innerHTML = _crmHeadHtml();
+  const view = document.getElementById('crm-view');
+  if (view) view.dataset.view = _crm.view;
+  const s = _crm.summary || {};
+  const chip = (kind, v, label, on, n) => '<button class="cx-filter' + (on ? ' on' : '') + '" data-kind="' + kind + '" data-v="' + esc(v)
+    + '" onclick="_crmSet(this.dataset.kind,this.dataset.v)">' + esc(label) + (n != null ? '<span class="crm-chip-n">' + esc(n) + '</span>' : '') + '</button>';
+  // On a phone the rail is hidden and the sections are the first chips of the one row.
+  const vcount = { people: s.people, companies: s.companies, deals: s.deals, followups: s.followups_due || null, outbound: s.to_approve || null };
+  let h = _CRM_VIEWS.map(([id, label]) => chip('view', id, label, _crm.view === id, vcount[id] != null ? vcount[id] : null).replace('class="cx-filter', 'class="cx-filter crm-vchip')).join('')
+    + '<span class="crm-sep crm-vchip" aria-hidden="true"></span>';
+  if (_crm.view === 'outbound') {
+    const c = _crmObCounts();
+    h += _CRM_OB_TABS.map(([id, label]) => chip('ob', id, label, _crm.ob.tab === id, c[id])).join('');
+    const chans = [...new Set((_crm.data.outbound || []).map(t => t.channel))].sort();
+    h += '<select class="input crm-status" aria-label="Channel" onchange="_crm.ob.channel=this.value;_crmRender()"><option value="">All channels</option>'
+      + chans.map(c => '<option value="' + esc(c) + '"' + (_crm.ob.channel === c ? ' selected' : '') + '>' + esc(_crmChannelName(c)) + '</option>').join('') + '</select>';
+  }
+  if (_crm.view === 'funnel') {
+    h += chip('funnel', 'sequence', 'By sequence', _crm.funnelBy !== 'cohort') + chip('funnel', 'cohort', 'By cohort', _crm.funnelBy === 'cohort');
+  }
+  if (_crm.view === 'activity') {
+    const types = Object.entries((_crm.data.activity || {}).types || {}).sort((a, b) => b[1] - a[1]);
+    h += types.map(([t, n]) => chip('act', t, t.replace(/^crm\./, ''), _crm.act === t, n)).join('');
+  }
+  if (_crm.view === 'people' || _crm.view === 'companies') {
+    h += ['A', 'B', 'C', 'D'].map(g => chip('grade', g, 'ICP ' + g, _crm.grade === g)).join('');
+  }
+  // Status is one select, not six chips: the row stays short enough to read whole on a laptop.
+  if (_crm.view === 'people') h += '<select class="input crm-status" aria-label="Status" onchange="_crm.status=this.value;_crmLoad()">'
+    + '<option value="">Any status</option>' + _CRM_STATUSES.map(st => '<option value="' + st + '"' + (_crm.status === st ? ' selected' : '') + '>' + esc(_crmLabel(st)) + '</option>').join('') + '</select>';
+  if (_crm.view === 'deals') h += _CRM_STAGES.map(st => chip('stage', st, st, _crm.stage === st, (s.stages || {})[st] || null)).join('');
+  chips.innerHTML = h;
+  note.textContent = _crm.err;
+  const q = document.getElementById('crm-q');
+  if (q) q.placeholder = 'Search ' + ((_CRM_VIEWS.find(x => x[0] === _crm.view) || [])[1] || '').toLowerCase();
+  _crmDetailIdle();
+  const rows = _crm.data[_crm.view];
+  const sel = (kind, id) => _crm.open && _crm.open.kind === kind && _crm.open.id === id ? ' on' : '';
+  const row = (kind, id, inner, extra = '') => '<div class="crm-row' + sel(kind, id) + extra + '" role="button" tabindex="0" data-kind="' + kind + '" data-id="' + esc(id) + '"'
+    + ' onclick="_crmOpen(this.dataset.kind,this.dataset.id)" onkeydown="if(event.key===\'Enter\')_crmOpen(this.dataset.kind,this.dataset.id)">' + inner + '</div>';
+  const empty = (msg) => { list.innerHTML = '<div class="crm-empty">' + (_crm.err ? '' : msg) + '</div>'; };
+  const filtered = _crm.q || _crm.grade || _crm.status || _crm.stage;
+  if (_crm.view === 'outbound') {
+    const items = _crmObList();
+    if (!items.length) {
+      empty(_crm.q || _crm.ob.channel ? 'Nothing matches.' : _crm.ob.tab === 'pending' ? 'Nothing waiting for you. Workers put drafts here when a sequence step comes due.'
+        : _crm.ob.tab === 'blocked' ? 'Nothing blocked.' : 'Nothing yet.');
+      return;
+    }
+    const bulk = _crm.ob.tab === 'pending';
+    if (!_crm.sel) _crm.sel = new Set();
+    for (const id of [..._crm.sel]) if (!items.some(t => t.id === id)) _crm.sel.delete(id);
+    list.innerHTML = (bulk ? _crmBulkBar(items) : '') + items.map(t => row('touch', t.id, (bulk ? '<input type="checkbox" class="crm-pick" aria-label="Select" data-id="' + esc(t.id) + '"' + (_crm.sel.has(t.id) ? ' checked' : '') + ' onclick="event.stopPropagation()" onchange="_crmPick(this.dataset.id,this.checked)">' : '') + _crmAvatar(t.contact_name || t.account_name)
+      + '<div class="crm-main"><div class="crm-line"><span class="crm-name">' + esc(t.contact_name || t.account_name || 'Unknown') + '</span>'
+      + (t.contact_name && t.account_name ? '<span class="crm-meta crm-co">' + esc(t.account_name) + '</span>' : '') + '</div>'
+      + '<div class="crm-meta crm-subj">' + esc(_crmSubject(t)) + '</div>'
+      + '<div class="crm-meta">' + esc([_crmChannelName(t.channel) + (t.action && t.action !== t.channel ? ' ' + t.action : ''), t.due_date ? 'due ' + t.due_date : '', t.assignee ? 'by ' + t.assignee : ''].filter(Boolean).join(' · ')) + '</div></div>'
+      + _crmTouchPill(t), ' crm-obrow')).join('')
+      + (items.length >= 1000 ? '<div class="crm-meta crm-capnote">Showing the first 1000 touches.</div>' : '');
+    return;
+  }
+  if (_crm.view === 'funnel') { list.innerHTML = _crmFunnelHtml(rows); _crmFunnelBars(); return; }
+  if (_crm.view === 'activity') {
+    const d = rows || {};
+    const q = _crm.q.toLowerCase();
+    const evs = (d.events || []).filter(e => (!_crm.act || e.type === _crm.act) && (!q || (e.type + ' ' + _crmEventLine(e)).toLowerCase().includes(q)));
+    if (!evs.length) { empty(filtered || _crm.act ? 'Nothing matches.' : 'No CRM events yet. They appear as workers draft, the owner approves, people reply and watched pages change.'); return; }
+    list.innerHTML = evs.map(e => {
+      const who = (e.data || {}).contact_id || '';
+      return '<div class="crm-act' + (who ? '' : ' crm-act-static') + '"' + (who ? ' role="button" tabindex="0" data-id="' + esc(who) + '" onclick="_crmOpen(\'person\',this.dataset.id)"' : '') + '>'
+        + '<code class="crm-act-type">' + esc(e.type) + '</code><div class="crm-act-line">' + esc(_crmEventLine(e)) + '</div>'
+        + '<div class="crm-meta">' + esc(timeAgo(e.ts)) + '</div></div>';
+    }).join('') + ((d.total || 0) > (d.events || []).length ? '<div class="crm-meta crm-capnote">The newest ' + (d.events || []).length + ' of ' + d.total + ' events.</div>' : '')
+      + '<div class="crm-meta crm-capnote">A worker wakes on any of these with <code>amux subscribe</code>.</div>';
+    return;
+  }
+  if (_crm.view === 'followups') {
+    const d = rows || {};
+    const today = _crmToday();
+    const items = [...(d.fu || []).map(f => ({ kind: 'fu', date: f.follow_up_date, f })), ...(d.touches || []).map(t => ({ kind: 'touch', date: t.due_date || '', t }))]
+      .filter(x => !_crm.q || JSON.stringify(x).toLowerCase().includes(_crm.q.toLowerCase()))
+      .sort((a, b) => (a.date || '9999').localeCompare(b.date || '9999'));
+    if (!items.length) { empty(_crm.q ? 'Nothing matches.' : 'Nothing due. Follow-ups and approved touches waiting to be done land here.'); return; }
+    list.innerHTML = items.map(x => {
+      if (x.kind === 'fu') {
+        const f = x.f;
+        return row('person', f.id, '<div class="crm-main"><div class="crm-line"><span class="crm-tag">' + esc(f.follow_up_note || 'Follow up') + '</span>'
+          + '<span class="cx-pill ' + (f.follow_up_date <= today ? 'cx-bad' : 'cx-idle') + '">' + esc(f.follow_up_date) + '</span></div>'
+          + '<div class="crm-meta">' + esc([f.name, f.company].filter(Boolean).join(' · ')) + '</div></div>');
+      }
+      const t = x.t;
+      return '<div class="crm-row crm-furow" data-id="' + esc(t.id) + '"><div class="crm-main"><div class="crm-line"><span class="crm-tag">' + esc(_crmSubject(t)) + '</span>'
+        + (t.due_date ? '<span class="cx-pill ' + (t.due_date <= today ? 'cx-bad' : 'cx-idle') + '">' + esc(t.due_date) + '</span>' : '') + '</div>'
+        + '<div class="crm-meta">' + esc([t.contact_name || t.account_name, t.account_name && t.contact_name ? t.account_name : '', _crmChannelName(t.channel) + ' ' + t.action, t.assignee ? t.assignee + ' does it' : ''].filter(Boolean).join(' · ')) + '</div>'
+        + '<div class="crm-actions crm-actions-tight"><button class="btn" data-id="' + esc(t.id) + '" onclick="event.stopPropagation();_crmTouchDone(this.dataset.id)">Mark complete</button>'
+        + '<button class="btn" data-id="' + esc(t.contact_id) + '" onclick="event.stopPropagation();_crmOpen(\'person\',this.dataset.id)">Open person</button></div></div></div>';
+    }).join('');
+    return;
+  }
+  if (!rows || !rows.length) {
+    empty(filtered ? 'Nothing matches.' : _crm.view === 'sequences' ? 'No sequences yet. A worker makes one with amux crm sequence.' : 'Nothing here yet. Add one with + New, or ask a worker to.');
+    return;
+  }
+  if (_crm.view === 'people') {
+    list.innerHTML = rows.map(p => row('person', p.id, _crmAvatar(p.name)
+      + '<div class="crm-main"><div class="crm-line"><span class="crm-name">' + esc(p.name) + '</span>'
+      + (p.status ? '<span class="cx-pill cx-idle">' + esc(_crmLabel(p.status)) + '</span>' : '') + '</div>'
+      + '<div class="crm-meta">' + esc([p.role, p.account_name || p.company].filter(Boolean).join(' · ') || p.email || '') + '</div>'
+      + '<div class="crm-meta">' + esc([p.last_date ? 'last ' + p.last_date : 'no contact yet', p.next_followup ? 'follow up ' + p.next_followup : ''].filter(Boolean).join(' · ')) + '</div>'
+      + '</div>' + _crmGrade(p.icp_grade))).join('') + _crmMore(rows.length);
+  } else if (_crm.view === 'companies') {
+    list.innerHTML = rows.map(a => row('company', a.id, _crmAvatar(a.name)
+      + '<div class="crm-main"><div class="crm-line"><span class="crm-name">' + esc(a.name) + '</span>'
+      + (a.open_deals ? '<span class="cx-pill cx-warn">' + esc(a.open_deals) + ' open deal' + (a.open_deals > 1 ? 's' : '') + '</span>' : '') + '</div>'
+      + '<div class="crm-meta">' + esc([a.domain, a.industry, a.people + ' ' + (a.people === 1 ? 'person' : 'people')].filter(Boolean).join(' · ')) + '</div>'
+      + '</div>' + _crmGrade(a.icp_grade))).join('') + _crmMore(rows.length);
+  } else if (_crm.view === 'deals') {
+    const by = {};
+    for (const d of rows) (by[d.stage] = by[d.stage] || []).push(d);
+    list.innerHTML = _CRM_STAGES.filter(st => by[st]).map(st => '<div class="crm-stage-h">' + esc(st) + ' · ' + by[st].length + '</div>'
+      + by[st].map(d => row('deal', d.id, '<div class="crm-main"><div class="crm-line"><span class="crm-name">' + esc(d.title) + '</span>'
+        + '<span class="cx-pill cx-idle">' + esc(d.stage) + '</span>'
+        + (d.amount != null ? '<span class="cx-pill cx-ok">' + esc((d.currency || 'USD') + ' ' + Number(d.amount).toLocaleString()) + '</span>' : '') + '</div>'
+        + '<div class="crm-meta">' + esc([d.account_name, d.next_step, d.close_date ? 'close ' + d.close_date : ''].filter(Boolean).join(' · ')) + '</div></div>')).join('')).join('');
+  } else if (_crm.view === 'sequences') {
+    // Outbound sequences (api/crm_outbound.rs): who is in each and how it is going.
+    list.innerHTML = rows.map(q => '<div class="crm-row crm-seq" data-id="' + esc(q.id) + '"><div class="crm-main"><div class="crm-line"><span class="crm-name crm-seq-name">' + esc(q.name) + '</span>'
+      + (q.active ? '<span class="cx-pill cx-warn">' + esc(q.active) + ' active</span>' : '')
+      + (q.replied ? '<span class="cx-pill cx-ok">' + esc(q.replied) + ' replied</span>' : '') + '</div>'
+      + (q.goal ? '<div class="crm-seq-goal">' + esc(q.goal) + '</div>' : '')
+      + '<div class="crm-meta">' + esc(_crmSteps(q.steps)) + '</div>'
+      + '<div class="crm-meta">' + esc([q.enrolled + ' enrolled', q.assignee ? 'drafted by ' + q.assignee : '', 'reachability, the voice check and your approval before each touch'].filter(Boolean).join(' · ')) + '</div></div></div>').join('');
+  }
+}
+
+// One sentence per CRM event, from the fields event_subs.rs documents for it.
+function _crmEventLine(e) {
+  const d = e.data || {};
+  const who = d.contact_name || d.name || d.owner_name || d.account_name || '';
+  const ch = d.channel ? _crmChannelName(d.channel) + (d.action ? ' ' + d.action : '') : '';
+  switch (e.type) {
+    case 'crm.touch.approved': return [who, ch + ' approved', d.assignee ? d.assignee + ' does it' : ''].filter(Boolean).join(' · ');
+    case 'crm.touch.done': return [who, ch + ' ' + (d.status || 'done'), d.result].filter(Boolean).join(' · ');
+    case 'crm.touch.due': return [who, ch + ' due ' + (d.due_date || ''), d.next].filter(Boolean).join(' · ');
+    case 'crm.contact.replied': return [who + ' replied' + (d.channel ? ' on ' + _crmChannelName(d.channel) : ''), d.subject || d.snippet].filter(Boolean).join(' · ');
+    case 'crm.channel.changed': return [who, (d.kind || '') + ': ' + (d.summary || (d.n_added || 0) + ' new')].filter(Boolean).join(' · ');
+    case 'crm.signup': return [who + ' signed up', d.account_name, d.change || d.status].filter(Boolean).join(' · ');
+    case 'crm.contact.booked': return [who, 'booked a meeting'].filter(Boolean).join(' · ');
+    default: return who || Object.keys(d).slice(0, 4).join(', ');
+  }
+}
+
+// A full page means there may be more: one row asks for the next 200.
+function _crmMore(n) {
+  if (n < _crm.limit) return '';
+  const total = (_crm.summary || {})[_crm.view === 'companies' ? 'companies' : 'people'];
+  return '<button class="btn crm-more" onclick="_crm.limit+=_CRM_PAGE;_crmLoad()">Show ' + _CRM_PAGE + ' more'
+    + (total && !_crm.q && !_crm.grade && !_crm.status ? ' (' + n + ' of ' + total + ')' : '') + '</button>';
+}
+
+// The pane beside the list when nothing is open in it.
+function _crmDetailIdle() {
+  const pane = document.getElementById('crm-detail');
+  if (!pane || document.getElementById('crm-drawer')) return;
+  const hint = { outbound: 'Pick a draft to review it.', people: 'Pick a person to see their brief, channels and touches.', companies: 'Pick a company to see its fit, people and lookalikes.',
+    deals: 'Pick a deal.', followups: 'Mark a touch complete, or open the person.', sequences: 'Workers enroll people; each step comes to Outbound for your approve.', activity: 'Tap an event to open the person.' }[_crm.view] || '';
+  pane.innerHTML = '<div class="crm-detail-idle">' + esc(hint) + '</div>';
+}
+
+// ── Channels and touches (the agent side: api/crm_agent.rs) ──
+const _CRM_KINDS = ['linkedin', 'x', 'instagram', 'website', 'careers', 'email', 'phone', 'youtube', 'tiktok', 'github', 'sms', 'whatsapp', 'slack', 'discord', 'community', 'post', 'event', 'in_person', 'other'];
+const _CRM_ACTIONS = ['dm', 'comment', 'connect', 'email', 'follow', 'like', 'call', 'note', 'text', 'voicemail', 'letter', 'gift', 'meet', 'invite', 'intro', 'visit'];
+const _CRM_TOUCH_PILL = { planned: 'cx-idle', drafted: 'cx-warn', approved: 'cx-ok', done: 'cx-ok', skipped: 'cx-idle', failed: 'cx-bad' };
+
+function _crmChannels(list, ownerKind, ownerId) {
+  const rows = (list || []).map(c => {
+    const href = c.url ? (/^https?:\/\//i.test(c.url) ? c.url : 'https://' + c.url) : '';
+    const meta = [c.watch ? 'watched every ' + (c.check_every_min >= 60 ? Math.round(c.check_every_min / 60) + 'h' : c.check_every_min + 'm') + ' by ' + (c.how === 'fetch' ? 'amux' : 'a worker') : '',
+      c.last_changed_at ? 'changed ' + timeAgo(c.last_changed_at) : (c.last_checked_at ? 'checked ' + timeAgo(c.last_checked_at) : ''), c.last_error].filter(Boolean).join(' · ');
+    return '<div class="crm-ch"><span class="cx-pill cx-idle">' + esc(c.kind) + '</span>'
+      + (href ? '<a class="crm-link crm-ch-where" target="_blank" rel="noopener" href="' + esc(href) + '">' + esc(c.handle || c.url) + '</a>' : '<span class="crm-ch-where">' + esc(c.handle) + '</span>')
+      + '<label class="crm-ch-watch"><input type="checkbox" data-id="' + esc(c.id) + '"' + (c.watch ? ' checked' : '') + (c.url ? '' : ' disabled title="A url is needed to watch"')
+      + ' onchange="_crmWatch(this.dataset.id,this.checked)"> Watch</label>'
+      + (meta ? '<span class="crm-meta crm-ch-meta">' + esc(meta) + '</span>' : '') + '</div>';
+  }).join('');
+  return '<div class="cx-sec">Channels</div><div class="crm-stack">' + (rows || '<div class="crm-meta">None yet: add where to reach or watch them.</div>')
+    + '<div class="crm-form-row crm-form"><select id="crm-ch-kind" class="input" aria-label="Channel">' + _CRM_KINDS.map(k => '<option>' + k + '</option>').join('') + '</select>'
+    + '<input id="crm-ch-where" class="input" placeholder="URL or @handle" aria-label="URL or handle">'
+    + '<label class="crm-ch-watch"><input id="crm-ch-w" type="checkbox"> Watch</label>'
+    + '<button class="btn" data-kind="' + ownerKind + '" data-id="' + esc(ownerId) + '" onclick="_crmAddChannel(this.dataset.kind,this.dataset.id)">Add</button></div></div>';
+}
+
+async function _crmAddChannel(ownerKind, ownerId) {
+  const kind = document.getElementById('crm-ch-kind').value, where = document.getElementById('crm-ch-where').value.trim();
+  const watch = document.getElementById('crm-ch-w').checked;
+  if (!where) { showToast('Give a URL or handle', true); return; }
+  const isUrl = /[/.]/.test(where.replace(/^@/, ''));
+  try {
+    await _crmApi('/channels', { method: 'POST', body: JSON.stringify({ owner_kind: ownerKind, owner_id: ownerId, kind, watch, [isUrl ? 'url' : 'handle']: where }) });
+    showToast(watch ? 'Watching ' + kind : 'Channel added');
+    _crmDrawerRender();
+  } catch (e) { showToast('Not added: ' + e.message, true); }
+}
+
+async function _crmWatch(id, on) {
+  try { await _crmApi('/channels/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ watch: on }) }); showToast(on ? 'Watching' : 'Not watching'); }
+  catch (e) { showToast('Not changed: ' + e.message, true); }
+}
+
+// A touch: its channel and action, the text, who does it, and the owner's buttons.
+// "1 email · day 3 linkedin dm · day 7 post letter": a sequence's steps on one line.
+function _crmSteps(steps) {
+  let list = steps;
+  if (typeof list === 'string') { try { list = JSON.parse(list); } catch (_) { list = []; } }
+  return (list || []).map((x, i) => (i ? 'day ' + (x.day || 0) + ' ' : '') + x.channel + ' ' + x.action).join(' · ');
+}
+
+// The voice check of the text (api/crm_voice.rs; Ethan, 2026-11-24: "a voice
+// that we're able to capture and adhere to"): what broke, a worker's reason
+// for sending it anyway, and what the link check found.
+function _crmVoiceLine(t) {
+  let v = t.voice_check;
+  if (typeof v === 'string') { try { v = JSON.parse(v); } catch (_) { v = null; } }
+  if (!v || !t.body) return '';
+  const links = v.links || {};
+  const linkText = links.measured === true ? 'links: ' + (links.summary || links.checked + ' checked') : 'links not checked yet';
+  const head = v.ok ? 'Voice: fits' + (v.rule ? ' ' + v.rule : '') : 'Voice: ' + (v.problems || []).join('; ');
+  const slop = v.slop === true ? 'slop pass attested' : 'slop pass NOT attested';
+  return '<span class="crm-meta crm-voice' + (v.ok && v.slop === true ? '' : ' crm-voice-bad') + '">' + esc(head)
+    + (v.override ? ' · sent as written because: ' + esc(v.override) : '') + ' · ' + esc(linkText) + ' · ' + esc(slop) + '</span>';
+}
+
+function _crmTouchCard(t, withWho) {
+  const open = ['planned', 'drafted', 'approved'].includes(t.status);
+  const who = withWho ? '<button class="crm-link" data-id="' + esc(t.contact_id || t.account_id) + '" data-kind="' + (t.contact_id ? 'person' : 'company') + '" onclick="_crmOpen(this.dataset.kind,this.dataset.id)">' + esc(t.contact_name || t.account_name) + '</button> · ' : '';
+  return '<div class="crm-ix crm-touch" data-id="' + esc(t.id) + '"><span class="crm-ix-head">' + who + esc([t.channel, t.action, t.sequence ? t.sequence + ' step ' + t.step : '', t.due_date ? 'due ' + t.due_date : '', t.assignee ? 'by ' + t.assignee : ''].filter(Boolean).join(' · '))
+    + ' <span class="cx-pill ' + (_CRM_TOUCH_PILL[t.status] || 'cx-idle') + '">' + esc(t.status) + '</span></span>'
+    + (open && t.status !== 'approved'
+      ? '<textarea class="input crm-ta" aria-label="Touch text" data-id="' + esc(t.id) + '" onchange="_crmTouchText(this.dataset.id,this.value)">' + esc(t.body || '') + '</textarea>'
+      : (t.body ? '<span class="crm-ix-text">' + esc(t.body) + '</span>' : ''))
+    + _crmVoiceLine(t)
+    // A worker writes result_url: only an http(s) link becomes a link (never javascript:).
+    + (t.result || t.result_url ? '<span class="crm-meta">' + esc(t.result || '') + (/^https?:\/\//i.test(t.result_url || '') ? ' · <a class="crm-link" target="_blank" rel="noopener" href="' + esc(t.result_url) + '">link</a>' : '') + '</span>' : '')
+    + (open ? '<div class="crm-actions">'
+      + (t.status === 'drafted' ? '<button class="btn primary" data-id="' + esc(t.id) + '" onclick="_crmTouchApprove(this.dataset.id)">Approve</button>' : '')
+      // An approved touch that happens off a screen (a call, a letter, a meeting) is recorded here.
+      + (t.status === 'approved' ? '<button class="btn" data-id="' + esc(t.id) + '" onclick="_crmTouchDone(this.dataset.id)">Done</button>' : '')
+      + '<button class="btn" data-id="' + esc(t.id) + '" onclick="_crmTouchSkip(this.dataset.id)">Skip</button></div>' : '')
+    + '</div>';
+}
+
+function _crmTouches(list, ownerKind, ownerId) {
+  const workers = (typeof sessions !== 'undefined' ? sessions : []).filter(s => !s.archived).map(s => s.name).sort();
+  const pref = workers.includes('gtm-engine') ? 'gtm-engine' : workers[0] || '';
+  return '<div class="cx-sec">Touches</div><div class="crm-stack">' + ((list || []).map(t => _crmTouchCard(t, false)).join('') || '<div class="crm-meta">No touches planned.</div>')
+    + '<div class="crm-form"><div class="crm-form-row"><select id="crm-t-ch" class="input" aria-label="Channel">' + _CRM_KINDS.map(k => '<option>' + k + '</option>').join('') + '</select>'
+    + '<select id="crm-t-act" class="input" aria-label="Action">' + _CRM_ACTIONS.map(k => '<option>' + k + '</option>').join('') + '</select>'
+    + '<input id="crm-t-due" class="input" type="date" aria-label="Due"></div>'
+    + '<div class="crm-form-row"><select id="crm-t-who" class="input" aria-label="Worker that does it">' + workers.map(w => '<option' + (w === pref ? ' selected' : '') + '>' + esc(w) + '</option>').join('') + '</select></div>'
+    + '<textarea id="crm-t-body" class="input crm-ta" placeholder="Text (optional: the worker can draft it)" aria-label="Touch text"></textarea>'
+    + '<button class="btn" data-kind="' + ownerKind + '" data-id="' + esc(ownerId) + '" onclick="_crmAddTouch(this.dataset.kind,this.dataset.id)">Plan touch</button></div></div>';
+}
+
+async function _crmAddTouch(ownerKind, ownerId) {
+  const v = (id) => (document.getElementById(id) || {}).value || '';
+  try {
+    await _crmApi('/touches', { method: 'POST', body: JSON.stringify({ [ownerKind === 'account' ? 'account_id' : 'contact_id']: ownerId, channel: v('crm-t-ch'), action: v('crm-t-act'),
+      due_date: v('crm-t-due'), assignee: v('crm-t-who'), body: v('crm-t-body') }) });
+    showToast('Touch planned');
+    _crmDrawerRender(); _crmLoad();
+  } catch (e) { showToast('Not planned: ' + e.message, true); }
+}
+
+async function _crmTouchText(id, body) {
+  try { await _crmApi('/touches/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ body }) }); showToast('Saved'); }
+  catch (e) { showToast('Not saved: ' + e.message, true); }
+}
+
+async function _crmTouchApprove(id) {
+  try {
+    const d = await _crmApi('/touches/' + encodeURIComponent(id) + '/approve', { method: 'POST' });
+    showToast('Approved' + (d.touch && d.touch.assignee ? ': ' + d.touch.assignee + ' does it now' : ''));
+    _crmLoad(); if (_crm.open) _crmDrawerRender();
+  } catch (e) { showToast('Not approved: ' + e.message, true); }
+}
+
+async function _crmTouchDone(id) {
+  try { await _crmApi('/touches/' + encodeURIComponent(id) + '/done', { method: 'POST', body: JSON.stringify({ result: 'done (recorded in the CRM tab)' }) }); }
+  catch (e) { showToast('Could not record it: ' + e.message, true); return; }
+  showToast('Recorded');
+  _crmLoad(); if (_crm.open) _crmDrawerRender();
+}
+
+async function _crmTouchSkip(id) {
+  try { await _crmApi('/touches/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ status: 'skipped' }) }); showToast('Skipped'); _crmLoad(); if (_crm.open) _crmDrawerRender(); }
+  catch (e) { showToast('Not skipped: ' + e.message, true); }
+}
+
+// ── One draft under review (the Outbound pane) ──
+// What it says, who it is for (the person's brief: api/crm_outbound.rs brief),
+// where it sits in its sequence, and the checks it passed. The buttons decide;
+// after a decision the next draft opens, and its buttons stay off for a moment
+// so a double tap cannot decide it too.
+const _CRM_SETTLE_MS = 700;
+function _crmTouchById(id) { return (_crm.data.outbound || []).find(t => t.id === id) || ((_crm.data.followups || {}).touches || []).find(t => t.id === id); }
+
+async function _crmTouchHtml(t) {
+  let brief = null;
+  if (t.contact_id) { try { brief = await _crmApi('/contacts/' + encodeURIComponent(t.contact_id) + '/brief'); } catch (e) { console.warn('[crm] brief failed', e); } }
+  const v = _crmVoice(t), blocked = _crmBlockedWhy(t);
+  const seq = (_crm.seqs || []).find(s => s.id === t.sequence);
+  let steps = seq && seq.steps; if (typeof steps === 'string') { try { steps = JSON.parse(steps); } catch (_) { steps = []; } }
+  const person = (brief && brief.person) || {}, company = (brief && brief.company) || {};
+  const open = t.status === 'drafted' || t.status === 'planned';
+  const settling = Date.now() < _crm.settleUntil;
+  const dis = (_crm.busy || settling) ? ' disabled' : '';
+  const editing = _crm.editing === t.id;
+  const chk = (ok, label, why) => '<span class="crm-check ' + (ok === true ? 'ok' : ok === false ? 'bad' : 'unk') + '"' + (why ? ' title="' + esc(why) + '"' : '') + '>'
+    + (ok === true ? '✓ ' : ok === false ? '✕ ' : '? ') + esc(label) + '</span>';
+  let h = '<div class="cx-drawer crm-touch-detail" role="dialog" aria-label="' + esc(_crmSubject(t)) + '"><div class="cx-dhead crm-dhead">'
+    + _crmTouchPill(t) + '<span class="cx-pill cx-idle">' + esc(_crmChannelName(t.channel)) + (t.action && t.action !== t.channel ? ' ' + esc(t.action) : '') + '</span>'
+    + '<span class="crm-dspacer"></span><button class="cx-x" aria-label="Close" onclick="_crmClose()">&#x2715;</button></div><div class="cx-dbody">';
+  h += '<button class="btn crm-back" onclick="_crmClose()">&#x2039; All drafts</button>';
+  h += '<h3 class="crm-dtitle">' + esc(_crmSubject(t)) + '</h3>';
+  h += '<div class="crm-meta crm-dmeta">' + esc([t.contact_name || t.account_name, t.account_name && t.contact_name ? t.account_name : '', t.due_date ? 'due ' + t.due_date : '', t.created ? 'drafted ' + timeAgo(t.created) : ''].filter(Boolean).join(' · ')) + '</div>';
+  if (blocked) h += '<div class="crm-blocked">' + esc(blocked) + '. ' + (v && v.ok === false ? 'Edit the draft, or ask its worker to redraft.' : 'It cannot go out; decline it so the worker moves on.') + '</div>';
+  // The message.
+  h += '<section class="crm-card"><div class="crm-card-h">Message preview</div>'
+    + (editing ? '<textarea id="crm-edit-body" class="input crm-ta crm-ta-tall" aria-label="Draft text">' + esc(t.body || '') + '</textarea>'
+      : '<div class="crm-ix-text crm-msg">' + esc(t.body || '(no text yet: its worker drafts it)') + '</div>')
+    + (t.target_url ? '<div class="crm-meta">Goes to <a class="crm-link" target="_blank" rel="noopener" href="' + esc(/^https?:\/\//i.test(t.target_url) ? t.target_url : '#') + '">' + esc(t.target_url) + '</a></div>' : '')
+    + (t.result ? '<div class="crm-meta">' + esc(t.result) + '</div>' : '') + '</section>';
+  // Who it is for.
+  const tags = [person.icp_grade ? 'ICP ' + person.icp_grade : (company.icp_grade ? 'ICP ' + company.icp_grade : ''), person.status ? _crmLabel(person.status) : '', person.role, person.source ? 'from ' + person.source : ''].filter(Boolean);
+  const last = brief && brief.last_inbound && brief.last_inbound.date ? brief.last_inbound : null;
+  const signal = brief && (brief.signals || [])[0];
+  h += '<section class="crm-card"><div class="crm-card-h">Contact brief</div>'
+    + '<div class="crm-brief-who">' + esc([t.contact_name || t.account_name, person.role, company.name || t.account_name].filter(Boolean).join(' · ')) + (t.contact_email ? ' · ' + esc(t.contact_email) : '') + '</div>'
+    + (person.notes ? '<div class="crm-ix-text crm-brief-notes">' + esc(String(person.notes).slice(0, 400)) + (String(person.notes).length > 400 ? '…' : '') + '</div>' : '')
+    + (company.icp_reasons || person.icp_reasons ? '<div class="crm-meta crm-wrap">Fit: ' + esc(person.icp_reasons || company.icp_reasons) + '</div>' : '')
+    + (last ? '<div class="crm-meta crm-wrap">Last heard from them ' + esc(last.date) + (last.subject ? ': ' + esc(last.subject) : '') + '</div>' : '')
+    + (signal ? '<div class="crm-meta crm-wrap">Recent signal: ' + esc((signal.kind || '') + ' ' + (signal.summary || '')) + '</div>' : '')
+    + (tags.length ? '<div class="crm-tags">' + tags.map(x => '<span class="crm-tag">' + esc(x) + '</span>').join('') + '</div>' : '')
+    + (t.contact_id ? '<div class="crm-actions crm-actions-tight"><button class="btn" data-id="' + esc(t.contact_id) + '" onclick="_crmOpen(\'person\',this.dataset.id)">Open person</button>'
+      + (person.account_id ? '<button class="btn" data-id="' + esc(person.account_id) + '" onclick="_crmOpen(\'company\',this.dataset.id)">Open company</button>' : '') + '</div>' : '')
+    + '</section>';
+  // Where it sits and what it passed.
+  const reach = brief && brief.can_reach;
+  const links = v && v.links;
+  h += '<section class="crm-card"><div class="crm-card-h">Sequence and checks</div>'
+    + '<div class="crm-meta crm-wrap">' + esc([seq ? seq.name : (t.sequence || 'One-off touch'), t.step ? 'Step ' + t.step + (steps && steps.length ? ' of ' + steps.length : '') : '', t.assignee ? 'drafted by ' + t.assignee : ''].filter(Boolean).join(' · ')) + '</div>'
+    + '<div class="crm-checks">'
+    + chk(v ? v.ok === true : null, v ? (v.ok ? (v.rule || v.voice || 'Voice') + ' passed' : 'Voice: ' + ((v.problems || []).join('; ') || 'does not fit')) : 'Voice not checked', v ? '' : 'This draft was written before the voice check, or with no text')
+    + chk(v ? v.slop === true : null, v && v.slop === true ? 'Slop pass attested' : 'Slop pass not attested')
+    + (links ? chk(links.measured === true ? !/broken|fail|dead/i.test(links.summary || '') : null, links.measured === true ? 'Links: ' + (links.summary || links.checked + ' checked') : 'Links not checked') : '')
+    + chk(reach ? reach.ok === true : null, reach ? (reach.ok ? 'Channel verified' : 'Cannot reach') : 'Reach not checked', reach && !reach.ok ? reach.why : '')
+    + '</div>' + (v && v.override ? '<div class="crm-meta crm-wrap">Sent as written because: ' + esc(v.override) + '</div>' : '') + '</section>';
+  // The decision: a footer under the scrolling record, so it is always in reach.
+  h += '</div>';
+  let foot = '';
+  if (open) {
+    const id = esc(t.id);
+    foot += '<div class="crm-actions crm-decide">'
+      + (editing
+        ? '<button class="btn primary" data-id="' + id + '" onclick="_crmSaveDraft(this.dataset.id)"' + dis + '>Save draft</button><button class="btn" onclick="_crm.editing=\'\';_crmDrawerRender()">Cancel</button>'
+        : (t.status === 'drafted' ? '<button class="btn primary crm-approve" data-id="' + id + '" onclick="_crmDecide(this.dataset.id,\'approve\')"' + (blocked ? ' disabled title="' + esc(blocked) + '"' : dis) + '>&#x2713; Approve<span class="crm-long"> touch</span></button>' : '')
+          + '<button class="btn" data-id="' + id + '" onclick="_crm.editing=this.dataset.id;_crmDrawerRender()"' + dis + '>Edit<span class="crm-long"> draft</span></button>'
+          + '<button class="btn" data-id="' + id + '" onclick="_crmDecide(this.dataset.id,\'decline\')"' + dis + '>Decline</button>'
+          + (t.assignee ? '<button class="btn" data-id="' + id + '" onclick="_crmRedraft(this.dataset.id)"' + dis + ' title="Ask ' + esc(t.assignee) + ' to redraft it, with your note">Redraft</button>' : ''))
+      + '</div>';
+  } else if (t.status === 'approved') {
+    foot += '<div class="crm-decide"><div class="crm-meta crm-wrap">Approved' + (t.approved_at ? ' ' + esc(timeAgo(t.approved_at)) : '') + (t.assignee ? '; ' + esc(t.assignee) + ' does it and records it done.' : '.') + '</div>'
+      + '<div class="crm-actions crm-actions-tight"><button class="btn" data-id="' + esc(t.id) + '" onclick="_crmTouchDone(this.dataset.id)">Mark complete</button></div></div>';
+  } else {
+    foot += '<div class="crm-decide"><div class="crm-meta crm-wrap">' + esc((_CRM_STATUS_WORD[t.status] || t.status) + (t.done_at ? ' ' + timeAgo(t.done_at) : '') + (t.approved_by ? ' · approved by ' + t.approved_by : '')) + '</div></div>';
+  }
+  return h + foot + '</div>';
+}
+
+// The next draft in the list after this one (or before it, at the end).
+function _crmNextAfter(id) {
+  const list = _crmObList();
+  const i = list.findIndex(t => t.id === id);
+  if (i < 0) return '';
+  return (list[i + 1] || list[i - 1] || {}).id || '';
+}
+
+async function _crmDecide(id, how) {
+  if (_crm.busy) return;
+  if (Date.now() < _crm.settleUntil) { console.info('[crm] crm_decide_ignored_after_advance', id); return; }
+  let reason = '';
+  if (how === 'decline') {
+    const r = await showPrompt('Decline this draft? Say why if you like: its worker reads it.', 'Why (optional)');
+    if (r === null) return;
+    reason = String(r || '').trim();
+  }
+  const next = _crmNextAfter(id);
+  _crm.busy = true; _crmDrawerRender();
+  try {
+    if (how === 'approve') {
+      const d = await _crmApi('/touches/' + encodeURIComponent(id) + '/approve', { method: 'POST' });
+      showToast('Approved' + (d.touch && d.touch.assignee ? ': ' + d.touch.assignee + ' does it now' : ''));
+    } else {
+      await _crmApi('/touches/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ status: 'skipped', result: 'declined by the owner' + (reason ? ': ' + reason : '') }) });
+      showToast('Declined');
+    }
+  } catch (e) {
+    _crm.busy = false;
+    showToast((how === 'approve' ? 'Not approved: ' : 'Not declined: ') + e.message, true);
+    _crmDrawerRender();
+    return;
+  }
+  _crm.busy = false; _crm.editing = '';
+  const t = _crmTouchById(id);
+  if (t) t.status = how === 'approve' ? 'approved' : 'skipped';
+  if (_crm.view === 'outbound' && next) { _crm.settleUntil = Date.now() + _CRM_SETTLE_MS; _crm.open = { kind: 'touch', id: next }; setTimeout(() => { if (_crm.open && _crm.open.id === next) _crmDrawerRender(); }, _CRM_SETTLE_MS + 20); }
+  else _crmClose();
+  _crmRender();
+  if (_crm.open) _crmDrawerRender();
+  _crmLoad();
+}
+
+async function _crmSaveDraft(id) {
+  const ta = document.getElementById('crm-edit-body');
+  if (!ta) return;
+  try {
+    const d = await _crmApi('/touches/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ body: ta.value }) });
+    _crm.editing = '';
+    const t = _crmTouchById(id);
+    if (t) { t.body = ta.value; if (d && d.touch) Object.assign(t, d.touch); }
+    showToast('Draft saved');
+    _crmLoad();
+  } catch (e) {
+    // A voice refusal names what broke; the text stays in the box to fix.
+    showToast('Not saved: ' + e.message, true);
+  }
+}
+
+// Agentic loop: the owner's note goes to the worker that wrote the draft.
+async function _crmRedraft(id) {
+  const t = _crmTouchById(id);
+  if (!t || !t.assignee) return;
+  const note = await showPrompt('What should ' + t.assignee + ' change?', 'Shorter, mention their recent post, ...');
+  if (note === null || !String(note).trim()) return;
+  const text = 'Redraft CRM touch ' + t.id + ' (' + _crmChannelName(t.channel) + ' ' + t.action + ' to ' + (t.contact_name || t.account_name) + '). The owner says: ' + String(note).trim()
+    + '\nRead the person first (GET /api/crm/contacts/' + t.contact_id + '/brief), then PATCH /api/crm/touches/' + t.id + ' with the new body. It comes back to the owner for approval.';
+  try {
+    const r = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(t.assignee) + '/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + r.status));
+    showToast(String(d.message || '').startsWith('queued') ? 'Queued for ' + t.assignee : 'Sent to ' + t.assignee);
+  } catch (e) { showToast('Not sent: ' + e.message, true); }
+}
+
+// A person's sequences: enroll them in one (the sequence's worker drafts each step).
+function _crmEnrollHtml(personId, seqs, inSeqs) {
+  const have = new Set((inSeqs || []).map(s => s.sequence_id));
+  const opts = (seqs || []).filter(s => !have.has(s.id));
+  const cur = (inSeqs || []).map(s => '<div class="crm-meta">' + esc(s.name + ' · ' + s.status + (s.step ? ' · step ' + s.step : '')) + '</div>').join('');
+  return '<div class="cx-sec">Sequences</div><div class="crm-stack">' + (cur || '<div class="crm-meta">Not in a sequence.</div>')
+    + (opts.length ? '<div class="crm-form-row crm-form"><select id="crm-enroll-seq" class="input" aria-label="Sequence">' + opts.map(s => '<option value="' + esc(s.id) + '">' + esc(s.name) + '</option>').join('') + '</select>'
+      + '<button class="btn" data-id="' + esc(personId) + '" onclick="_crmEnroll(this.dataset.id)">Enroll in sequence</button></div>' : '') + '</div>';
+}
+
+async function _crmEnroll(personId) {
+  const sid = (document.getElementById('crm-enroll-seq') || {}).value;
+  if (!sid) return;
+  try {
+    const d = await _crmApi('/sequences/' + encodeURIComponent(sid) + '/enroll', { method: 'POST', body: JSON.stringify({ contact_ids: [personId] }) });
+    const n = (d.enrolled || []).length;
+    const skipped = (d.skipped || []).map(x => x.why || x.reason || x.verdict).filter(Boolean);
+    showToast(n ? 'Enrolled: the first step comes to Outbound for your approve' : 'Not enrolled' + (skipped.length ? ': ' + skipped.join('; ') : ''), !n);
+    _crmDrawerRender(); _crmLoad();
+  } catch (e) { showToast('Not enrolled: ' + e.message, true); }
+}
+
+function _crmOpen(kind, id) {
+  if (!(_crm.open && _crm.open.kind === kind && _crm.open.id === id)) _crm.editing = '';
+  _crm.open = { kind, id };
+  _crmMarkOpen();
+  _crmDrawerRender();
+}
+function _crmClose() {
+  _crm.open = null; _crm.editing = '';
+  const el = document.getElementById('crm-drawer'); if (el) el.remove();
+  _crmMarkOpen();
+  _crmDetailIdle();
+}
+// The open record's row reads as selected, without rebuilding the list.
+function _crmMarkOpen() {
+  const o = _crm.open;
+  document.querySelectorAll('#crm-list .crm-row.on').forEach(r => r.classList.remove('on'));
+  if (!o) return;
+  const r = [...document.querySelectorAll('#crm-list .crm-row')].find(x => x.dataset.kind === o.kind && x.dataset.id === o.id);
+  if (r) r.classList.add('on');
+}
+
+// On a desktop the record lives in the pane beside the list; on a phone it
+// opens over the list. Same element id either way.
+function _crmDrawerEl() {
+  let el = document.getElementById('crm-drawer');
+  const wide = _crmPaneOn(), pane = document.getElementById('crm-detail');
+  if (el && el.classList.contains('crm-pane') !== (wide && !!pane)) { el.remove(); el = null; }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'crm-drawer';
+    el.onkeydown = (e) => { if (e.key === 'Escape') _crmClose(); };
+    el.tabIndex = -1;
+    if (wide && pane) {
+      el.className = 'crm-pane';
+      pane.innerHTML = '';
+      pane.appendChild(el);
+    } else {
+      el.className = 'cx-drawer-wrap';
+      el.onclick = (e) => { if (e.target === el) _crmClose(); };
+      document.body.appendChild(el);
+      el.focus();
+    }
+  }
+  return el;
+}
+
+// Contact links: mail, phone, LinkedIn, X, website. Each opens the app for it.
+function _crmContactLinks(o) {
+  const out = [];
+  if (o.email) out.push('<a class="btn" href="mailto:' + esc(o.email) + '">Email</a>');
+  if (o.phone) out.push('<a class="btn" href="tel:' + esc(String(o.phone).replace(/[^\d+]/g, '')) + '">Call</a>');
+  const web = (u) => /^https?:\/\//i.test(u) ? u : 'https://' + u;
+  if (o.linkedin) out.push('<a class="btn" target="_blank" rel="noopener" href="' + esc(web(o.linkedin)) + '">LinkedIn</a>');
+  if (o.twitter) out.push('<a class="btn" target="_blank" rel="noopener" href="' + esc(web(/^@/.test(o.twitter) ? 'x.com/' + o.twitter.slice(1) : o.twitter)) + '">X</a>');
+  if (o.website || o.domain) out.push('<a class="btn" target="_blank" rel="noopener" href="' + esc(web(o.website || o.domain)) + '">Website</a>');
+  return out.join('');
+}
+
+// An editable field: saved on change, by PATCH to `path`.
+function _crmField(label, key, value, path, type = 'text') {
+  const id = 'crmf-' + key;
+  return '<dt><label for="' + id + '">' + esc(label) + '</label></dt><dd><input id="' + id + '" class="input" type="' + type + '" value="' + esc(value || '')
+    + '" data-path="' + esc(path) + '" data-key="' + key + '" onchange="_crmSave(this.dataset.path,this.dataset.key,this.value)"></dd>';
+}
+
+async function _crmSave(path, key, value) {
+  try {
+    await _crmApi(path, { method: 'PATCH', body: JSON.stringify({ [key]: value }) });
+    showToast('Saved');
+    _crmLoad();
+  } catch (e) { showToast('Not saved: ' + e.message, true); }
+}
+
+function _crmGradePicker(path, g, reasons) {
+  return '<div class="cx-sec">ICP grade</div><div class="crm-grades">'
+    + ['A', 'B', 'C', 'D', ''].map(x => '<button class="cx-filter' + ((g || '') === x ? ' on' : '') + '" data-path="' + esc(path) + '" data-g="' + x
+      + '" onclick="_crmSave(this.dataset.path,\'icp_grade\',this.dataset.g)">' + (x || 'None') + '</button>').join('') + '</div>'
+    + '<textarea class="input crm-ta" aria-label="Why this grade" placeholder="Why this grade" data-path="' + esc(path)
+    + '" onchange="_crmSave(this.dataset.path,\'icp_reasons\',this.value)">' + esc(reasons || '') + '</textarea>';
+}
+
+function _crmLookalikes(list, fromId) {
+  const rows = (list || []).map(l => '<div class="crm-row" role="button" tabindex="0" data-id="' + esc(l.id) + '" onclick="_crmOpen(\'company\',this.dataset.id)">'
+    + _crmGrade(l.icp_grade) + '<div class="crm-main"><span class="crm-name">' + esc(l.name) + '</span>'
+    + '<span class="crm-meta">' + esc([l.domain, l.score ? Math.round(l.score * 100) + '% alike' : '', l.reason].filter(Boolean).join(' · ')) + '</span></div></div>').join('');
+  return '<div class="cx-sec">Lookalikes</div><div class="crm-stack">' + (rows || '<div class="crm-meta">None yet. Add one, or ask a worker to find companies like this one.</div>')
+    + '<div class="crm-form-row crm-form"><input id="crm-look-name" class="input" placeholder="Company like this (name)" aria-label="Lookalike company name">'
+    + '<input id="crm-look-domain" class="input" placeholder="domain.com" aria-label="Lookalike domain">'
+    + '<button class="btn" data-from="' + esc(fromId) + '" onclick="_crmAddLookalike(this.dataset.from)">Add lookalike</button></div></div>';
+}
+
+async function _crmAddLookalike(fromId) {
+  const name = (document.getElementById('crm-look-name') || {}).value || '';
+  const domain = (document.getElementById('crm-look-domain') || {}).value || '';
+  if (!name.trim()) { showToast('Name the company', true); return; }
+  try {
+    let toId;
+    try { toId = (await _crmApi('/accounts', { method: 'POST', body: JSON.stringify({ name, domain, status: 'lead', source: 'lookalike:' + fromId }) })).id; }
+    catch (e) { if (e.status === 409 && e.data && e.data.id) toId = e.data.id; else throw e; }
+    await _crmApi('/lookalikes', { method: 'POST', body: JSON.stringify({ kind: 'account', from_id: fromId, to_id: toId, score: 0.7, reason: 'added by the owner' }) });
+    showToast('Lookalike added');
+    _crmDrawerRender(); _crmLoad();
+  } catch (e) { showToast('Not added: ' + e.message, true); }
+}
+
+function _crmTimeline(items) {
+  return '<div class="cx-sec">Activity</div><div class="crm-stack">' + ((items || []).map(i => '<div class="crm-ix"><span class="crm-ix-head">'
+    + esc([i.date, i.type, i.direction, i.contact_name].filter(Boolean).join(' · ')) + (i.intent ? ' <span class="cx-pill ' + (_CRM_INTENT_PILL[i.intent] || 'cx-idle') + '" title="' + esc(i.intent_why || '') + '">' + esc(_crmLabel(i.intent)) + '</span>' : '') + '</span>'
+    + (i.subject ? '<span class="crm-ix-text"><b>' + esc(i.subject) + '</b></span>' : '')
+    + '<span class="crm-ix-text">' + esc(i.notes || '') + '</span>'
+    + (i.follow_up_date ? '<span class="crm-meta">Follow up ' + esc(i.follow_up_date) + (i.follow_up_note ? ': ' + esc(i.follow_up_note) : '') + '</span>' : '')
+    + '</div>').join('') || '<div class="crm-meta">No activity yet.</div>') + '</div>';
+}
+
+function _crmLogForm(contactId) {
+  return '<div class="cx-sec">Log</div><div class="crm-form">'
+    + '<div class="crm-form-row"><select id="crm-ix-type" class="input" aria-label="Kind">' + _CRM_TYPES.map(t => '<option>' + t + '</option>').join('') + '</select>'
+    + '<input id="crm-ix-fu" class="input" type="date" aria-label="Follow up on"></div>'
+    + '<textarea id="crm-ix-notes" class="input crm-ta" placeholder="What happened" aria-label="What happened"></textarea>'
+    + '<input id="crm-ix-funote" class="input" placeholder="Follow-up note (optional)" aria-label="Follow-up note">'
+    + '<button class="btn primary" data-id="' + esc(contactId) + '" onclick="_crmLog(this.dataset.id)">Log it</button></div>';
+}
+
+async function _crmLog(contactId) {
+  const v = (id) => (document.getElementById(id) || {}).value || '';
+  if (!v('crm-ix-notes').trim() && !v('crm-ix-fu')) { showToast('Say what happened, or set a follow-up', true); return; }
+  try {
+    await _crmApi('/contacts/' + encodeURIComponent(contactId) + '/interactions', { method: 'POST',
+      body: JSON.stringify({ type: v('crm-ix-type'), notes: v('crm-ix-notes'), follow_up_date: v('crm-ix-fu'), follow_up_note: v('crm-ix-funote') }) });
+    showToast('Logged');
+    _crmDrawerRender(); _crmLoad();
+  } catch (e) { showToast('Not logged: ' + e.message, true); }
+}
+
+// Hand a person or company to a worker: research, grade, find lookalikes, draft outreach.
+function _crmAskForm(kind, id, name) {
+  const workers = (typeof sessions !== 'undefined' ? sessions : []).filter(s => !s.archived).map(s => s.name).sort();
+  const pref = workers.includes('gtm-engine') ? 'gtm-engine' : workers[0] || '';
+  return '<div class="cx-sec">Ask a worker</div><div class="crm-form"><select id="crm-ask-w" class="input" aria-label="Worker">'
+    + workers.map(w => '<option' + (w === pref ? ' selected' : '') + '>' + esc(w) + '</option>').join('') + '</select>'
+    + '<textarea id="crm-ask-t" class="input crm-ta" aria-label="What to ask">' + esc('For CRM ' + kind + ' ' + id + ' (' + name + '): research them, set the ICP grade with reasons (PATCH /api/crm/' + (kind === 'company' ? 'accounts' : 'contacts') + '/' + id + '), and add lookalike companies (POST /api/crm/lookalikes).') + '</textarea>'
+    + '<button class="btn" onclick="_crmAsk()">Send</button></div>';
+}
+
+async function _crmAsk() {
+  const w = (document.getElementById('crm-ask-w') || {}).value, text = (document.getElementById('crm-ask-t') || {}).value || '';
+  if (!w || !text.trim()) return;
+  try {
+    const r = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(w) + '/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + r.status));
+    showToast(String(d.message || '').startsWith('queued') ? 'Queued for ' + w : 'Sent to ' + w);
+  } catch (e) { showToast('Not sent: ' + e.message, true); }
+}
+
+// The top of a record: who this is and how to reach them, in a few lines,
+// before the fields. Reach is the contact fields and channels; watch is what
+// amux or a worker checks for news.
+const _CRM_LOST_REASONS = ['no_budget', 'no_need', 'timing', 'competitor', 'no_response', 'other'];
+const _CRM_INTENT_PILL = { interested: 'cx-ok', book_later: 'cx-warn', objection: 'cx-warn', not_interested: 'cx-bad', referral: 'cx-ok' };
+
+// The address check before a first cold email (api/crm_close.rs check_email).
+function _crmEmailCheckLine(raw) {
+  if (!raw) return '';
+  let c = null;
+  try { c = JSON.parse(raw); } catch (e) { console.warn('[crm] unreadable email_check', e); return ''; }
+  if (!c) return '';
+  if (c.ok === false) return 'Address failed its check: ' + (c.why || '');
+  return 'Address checked' + (c.role ? ' (a role address)' : '') + (c.measured === false ? ', mail server not looked up' : '');
+}
+
+// The funnel (GET /api/crm/funnel, contract crm.funnel.v1): each group's steps
+// with the share that moved on, and what it won.
+function _crmFunnelHtml(d) {
+  if (d && d.measured === false) return '<div class="crm-empty">The funnel could not be read: ' + esc(d.why_unmeasured || '') + '</div>';
+  const groups = (d && d.groups) || [];
+  if (!groups.length) return '<div class="crm-empty">Nobody enrolled yet. Enroll people in a sequence and the funnel fills as they move.</div>';
+  const steps = [['enrolled', 'Enrolled', ''], ['contacted', 'Contacted', 'contacted_per_enrolled'], ['replied', 'Replied', 'replied_per_contacted'],
+    ['booked', 'Booked', 'booked_per_replied'], ['demoed', 'Demoed', 'demoed_per_booked'], ['won', 'Won', 'won_per_demoed']];
+  const pct = (v) => v == null ? '' : Math.round(v * 100) + '%';
+  return groups.map(g => {
+    const top = Math.max(1, g.enrolled || 0), conv = g.conversion || {};
+    const title = g.key === '(none)' ? 'No cohort' : (g.name || g.key);
+    return '<section class="crm-card crm-funnel" data-key="' + esc(g.key) + '"><div class="crm-line"><span class="crm-name">' + esc(title) + '</span>'
+      + (g.won_amount_usd ? '<span class="cx-pill cx-ok">' + esc('$' + Number(g.won_amount_usd).toLocaleString() + ' signed') + '</span>' : '')
+      + (g.mrr_usd ? '<span class="cx-pill cx-idle">' + esc('$' + Number(g.mrr_usd).toLocaleString() + '/mo recurring') + '</span>' : '')
+      + (g.lost ? '<span class="cx-pill cx-idle">' + esc(g.lost) + ' lost</span>' : '') + '</div>'
+      + '<div class="crm-steps">' + steps.map(([k, label, c]) => '<div class="crm-step" data-step="' + k + '">'
+        + '<span class="crm-step-l">' + esc(label) + '</span>'
+        + '<span class="crm-step-track"><span class="crm-step-bar" data-w="' + Math.round(((g[k] || 0) / top) * 100) + '"></span></span>'
+        + '<span class="crm-step-n">' + esc(g[k] || 0) + '</span><span class="crm-step-c">' + esc(c ? pct(conv[c]) : '') + '</span></div>').join('') + '</div>'
+      + '<div class="crm-meta crm-wrap">' + esc('won ' + (pct(conv.won_per_enrolled) || '0%') + ' of enrolled') + '</div></section>';
+  }).join('') + '<div class="crm-meta crm-capnote">Each person counts once per step · ' + esc(d.n_considered) + ' enrollments · ' + esc(d.contract || '') + '</div>';
+}
+
+// Bar widths from data-w (the slop ratchet refuses inline styles).
+function _crmFunnelBars() {
+  document.querySelectorAll('#crm-list .crm-step-bar[data-w]').forEach(b => { b.style.width = Math.min(100, Number(b.dataset.w) || 0) + '%'; });
+}
+
+// Bulk decisions on the Pending list (desktop; a phone decides one at a time).
+function _crmBulkBar(items) {
+  const n = _crm.sel.size, all = items.length > 0 && items.every(t => _crm.sel.has(t.id));
+  return '<div class="crm-bulk"><label class="crm-bulk-all"><input type="checkbox" aria-label="Select all"' + (all ? ' checked' : '') + ' onchange="_crmPickAll(this.checked)"> '
+    + (n ? esc(n) + ' selected' : 'Select all') + '</label>'
+    + '<button class="btn primary" onclick="_crmBulk(\'approve\')"' + (n ? '' : ' disabled') + '>Approve ' + (n || '') + '</button>'
+    + '<button class="btn" onclick="_crmBulk(\'decline\')"' + (n ? '' : ' disabled') + '>Decline ' + (n || '') + '</button></div>';
+}
+function _crmPick(id, on) { if (on) _crm.sel.add(id); else _crm.sel.delete(id); _crmRender(); }
+function _crmPickAll(on) { _crm.sel = new Set(on ? _crmObList().map(t => t.id) : []); _crmRender(); }
+
+async function _crmBulk(how) {
+  const ids = [..._crm.sel];
+  if (!ids.length || _crm.busy) return;
+  let reason = '';
+  if (how === 'decline') {
+    const r = await showPrompt('Decline ' + ids.length + ' drafts? Say why if you like: their workers read it.', 'Why (optional)');
+    if (r === null) return;
+    reason = String(r || '').trim();
+  } else if (!(await showConfirm('Approve ' + ids.length + ' drafts? Each worker sends its own.', 'Approve ' + ids.length))) return;
+  _crm.busy = true;
+  let ok = 0;
+  const refused = [];
+  for (const id of ids) {
+    try {
+      if (how === 'approve') await _crmApi('/touches/' + encodeURIComponent(id) + '/approve', { method: 'POST' });
+      else await _crmApi('/touches/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ status: 'skipped', result: 'declined by the owner' + (reason ? ': ' + reason : '') }) });
+      ok++;
+    } catch (e) { refused.push(e.message); }
+  }
+  _crm.busy = false;
+  _crm.sel.clear();
+  console.info('[crm] crm_bulk_decided', { how, ok, refused: refused.length });
+  showToast((how === 'approve' ? 'Approved ' : 'Declined ') + ok + (refused.length ? '; ' + refused.length + ' refused: ' + refused[0] : ''), refused.length > 0);
+  _crmLoad();
+}
+
+function _crmPersonBrief(x, chans, brief) {
+  const reach = [x.email ? 'Email' : '', x.phone ? 'Phone' : '', x.linkedin ? 'LinkedIn' : '', x.twitter ? 'X' : '']
+    .concat((chans || []).filter(c => !c.watch).map(c => _crmChannelName(c.kind))).filter(Boolean);
+  const watch = (chans || []).filter(c => c.watch).map(c => _crmChannelName(c.kind));
+  const open = ((brief && brief.touches) || []).filter(t => ['planned', 'drafted', 'approved'].includes(t.status));
+  const sig = brief && (brief.signals || [])[0];
+  const lines = [
+    [x.role, x.account ? x.account.name : x.company].filter(Boolean).join(' · '),
+    reach.length ? 'Reach on ' + [...new Set(reach)].join(', ') : 'No way to reach them yet',
+    watch.length ? 'Watched on ' + [...new Set(watch)].join(', ') : '',
+    open.length ? open.length + ' open touch' + (open.length > 1 ? 'es' : '') + ': ' + open.map(t => _crmChannelName(t.channel) + ' ' + t.action + ' (' + (_CRM_STATUS_WORD[t.status] || t.status).toLowerCase() + ')').join(', ') : '',
+    sig ? 'Latest signal: ' + (sig.kind || '') + ' ' + (sig.summary || '') : '',
+    _crmEmailCheckLine(x.email_check),
+  ].filter(Boolean);
+  return '<section class="crm-card crm-brief"><div class="crm-card-h">Brief</div>' + lines.map(l => '<div class="crm-meta crm-wrap">' + esc(l) + '</div>').join('')
+    + (x.notes ? '<div class="crm-ix-text crm-brief-notes">' + esc(String(x.notes).slice(0, 300)) + (String(x.notes).length > 300 ? '…' : '') + '</div>' : '') + '</section>';
+}
+
+function _crmCompanyFit(x, chans) {
+  const look = (x.lookalikes || []).map(l => l.name).slice(0, 4);
+  const watch = (chans || []).filter(c => c.watch).map(c => _crmChannelName(c.kind));
+  const lines = [
+    [x.domain, x.industry, x.size].filter(Boolean).join(' · '),
+    x.icp_grade ? 'ICP grade ' + x.icp_grade + (x.icp_reasons ? ': ' + x.icp_reasons : '') : 'Not graded yet: ask a worker below',
+    look.length ? 'Lookalikes: ' + look.join(', ') + ((x.lookalikes || []).length > 4 ? ' and ' + ((x.lookalikes || []).length - 4) + ' more' : '') : '',
+    watch.length ? 'Watched on ' + [...new Set(watch)].join(', ') : '',
+    (x.people || []).length + ' ' + ((x.people || []).length === 1 ? 'person' : 'people') + ((x.deals || []).length ? ' · ' + x.deals.length + ' deal' + (x.deals.length > 1 ? 's' : '') : ''),
+  ].filter(Boolean);
+  return '<section class="crm-card crm-brief"><div class="crm-card-h">Account fit</div>' + lines.map(l => '<div class="crm-meta crm-wrap">' + esc(l) + '</div>').join('') + '</section>';
+}
+
+async function _crmDrawerRender() {
+  const o = _crm.open;
+  if (!o) return;
+  const gen = _crm.drawerGen = (_crm.drawerGen || 0) + 1;
+  const el = _crmDrawerEl();
+  if (o.kind === 'new') { _crm.shown = 'new'; el.innerHTML = _crmNewHtml(o.id); return; }
+  if (o.kind === 'touch') {
+    let t = _crmTouchById(o.id);
+    if (!t) { try { t = ((await _crmApi('/touches?limit=1000')) || []).find(x => x.id === o.id); } catch (e) { console.warn('[crm] touch load failed', e); } }
+    if (!_crm.seqs) { try { _crm.seqs = await _crmApi('/sequences'); } catch (_) { _crm.seqs = []; } }
+    const html = t ? await _crmTouchHtml(t) : '<div class="cx-drawer" role="dialog"><div class="cx-dhead"><span class="crm-name">Not found</span><button class="cx-x" aria-label="Close" onclick="_crmClose()">&#x2715;</button></div></div>';
+    if (!_crm.open || _crm.open.id !== o.id || gen !== _crm.drawerGen) return;
+    const key = 'touch:' + o.id;
+    if (_crm.shown === key && _crmEditing()) return;
+    _crm.shown = key;
+    el.innerHTML = html;
+    return;
+  }
+  const path = o.kind === 'person' ? '/contacts/' : o.kind === 'company' ? '/accounts/' : '/deals';
+  let x, chans = [], touches = [], brief = null, stages = [];
+  try {
+    if (o.kind === 'deal') {
+      [x, stages] = await Promise.all([_crmApi('/deals/' + encodeURIComponent(o.id)).catch(() => null), _crmApi('/deals/' + encodeURIComponent(o.id) + '/stages').then(r => r.stages || []).catch(() => [])]);
+    }
+    else {
+      const ok = o.kind === 'person' ? 'contact' : 'account';
+      [x, chans, touches, brief] = await Promise.all([_crmApi(path + encodeURIComponent(o.id)),
+        _crmApi('/channels?owner_kind=' + ok + '&owner_id=' + encodeURIComponent(o.id)),
+        _crmApi('/touches?' + (ok === 'contact' ? 'contact_id' : 'account_id') + '=' + encodeURIComponent(o.id)),
+        ok === 'contact' ? _crmApi('/contacts/' + encodeURIComponent(o.id) + '/brief').catch(() => null) : Promise.resolve(null)]);
+      if (ok === 'contact' && !_crm.seqs) _crm.seqs = await _crmApi('/sequences').catch(() => []);
+    }
+  } catch (e) { console.warn('[crm] drawer load failed', e); }
+  if (!_crm.open || _crm.open.id !== o.id || gen !== _crm.drawerGen) return;
+  // The owner may have started typing while this fetched (CI 45299042749: a
+  // refresh wiped a lookalike name typed during it). A re-render of the record
+  // already on screen yields to them; opening another record still renders.
+  const key = o.kind + ':' + o.id;
+  if (_crm.shown === key && _crmEditing()) return;
+  _crm.shown = key;
+  if (!x) { el.innerHTML = '<div class="cx-drawer" role="dialog"><div class="cx-dhead"><span class="crm-name">Not found</span><button class="cx-x" aria-label="Close" onclick="_crmClose()">&#x2715;</button></div></div>'; return; }
+  const p = (o.kind === 'deal' ? '/deals/' : path) + encodeURIComponent(o.id);
+  let h = '<div class="cx-drawer" role="dialog" aria-label="' + esc(x.name || x.title) + '"><div class="cx-dhead">'
+    + (o.kind !== 'deal' ? _crmGrade(x.icp_grade) : '') + '<span class="crm-name crm-dname">' + esc(x.name || x.title) + '</span>'
+    + '<button class="cx-x" aria-label="Close" onclick="_crmClose()">&#x2715;</button></div><div class="cx-dbody">';
+  if (o.kind === 'person') {
+    h += '<div class="crm-meta">' + esc([x.id, x.source ? 'added by ' + x.source : ''].filter(Boolean).join(' · ')) + '</div>';
+    h += _crmPersonBrief(x, chans, brief);
+    h += '<div class="crm-actions">' + _crmContactLinks(x) + '</div>';
+    if (x.unsubscribed_at || x.bounced_at) h += '<div class="crm-note">' + (x.unsubscribed_at ? 'Unsubscribed. ' : '') + (x.bounced_at ? 'Email bounced.' : '') + '</div>';
+    h += '<div class="cx-sec">Contact info</div><dl class="crm-kv">' + _crmField('Name', 'name', x.name, p) + _crmField('Email', 'email', x.email, p, 'email')
+      + _crmField('Phone', 'phone', x.phone, p, 'tel') + _crmField('Role', 'role', x.role, p) + _crmField('LinkedIn', 'linkedin', x.linkedin, p)
+      + _crmField('X', 'twitter', x.twitter, p) + _crmField('Location', 'location', x.location, p) + _crmField('Company', 'company', x.company, p)
+      + '<dt><label for="crmf-status">Status</label></dt><dd><select id="crmf-status" class="input" data-path="' + esc(p) + '" onchange="_crmSave(this.dataset.path,\'status\',this.value)">'
+      + ['', ..._CRM_STATUSES].map(st => '<option value="' + st + '"' + ((x.status || '') === st ? ' selected' : '') + '>' + (st ? esc(_crmLabel(st)) : 'Not set') + '</option>').join('') + '</select></dd></dl>';
+    if (x.account) h += '<div class="crm-meta">At <button class="crm-link" data-id="' + esc(x.account.id) + '" onclick="_crmOpen(\'company\',this.dataset.id)">' + esc(x.account.name) + '</button></div>';
+    h += _crmGradePicker(p, x.icp_grade, x.icp_reasons);
+    if ((x.tags || []).length) h += '<div class="cx-sec">Tags</div><div class="crm-meta">' + x.tags.map(esc).join(', ') + '</div>';
+    if ((x.deals || []).length) h += '<div class="cx-sec">Deals</div><div class="crm-stack">' + x.deals.map(d => '<div class="crm-row" role="button" tabindex="0" data-id="' + esc(d.id) + '" onclick="_crmOpen(\'deal\',this.dataset.id)"><div class="crm-main"><span class="crm-name">' + esc(d.title) + '</span><span class="crm-meta">' + esc(d.stage) + '</span></div></div>').join('') + '</div>';
+    if (x.account) h += _crmLookalikes(x.lookalikes, x.account.id);
+    h += _crmChannels(chans, 'contact', x.id) + _crmTouches(touches, 'contact', x.id);
+    h += _crmEnrollHtml(x.id, _crm.seqs, brief && brief.sequences);
+    h += _crmTimeline(x.interactions) + _crmLogForm(x.id);
+    if (x.notes) h += '<div class="cx-sec">Notes</div><div class="crm-ix-text">' + esc(x.notes) + '</div>';
+    h += _crmAskForm('person', x.id, x.name);
+  } else if (o.kind === 'company') {
+    h += '<div class="crm-meta">' + esc([x.id, x.source ? 'added by ' + x.source : ''].filter(Boolean).join(' · ')) + '</div>';
+    h += _crmCompanyFit(x, chans);
+    h += '<div class="crm-actions">' + _crmContactLinks(x) + '</div>';
+    h += '<div class="cx-sec">Company</div><dl class="crm-kv">' + _crmField('Name', 'name', x.name, p) + _crmField('Domain', 'domain', x.domain, p)
+      + _crmField('Industry', 'industry', x.industry, p) + _crmField('Size', 'size', x.size, p) + _crmField('Location', 'location', x.location, p)
+      + _crmField('LinkedIn', 'linkedin', x.linkedin, p) + '</dl>';
+    h += _crmGradePicker(p, x.icp_grade, x.icp_reasons);
+    h += '<div class="cx-sec">People</div><div class="crm-stack">' + ((x.people || []).map(pp => '<div class="crm-row" role="button" tabindex="0" data-id="' + esc(pp.id) + '" onclick="_crmOpen(\'person\',this.dataset.id)">'
+      + _crmGrade(pp.icp_grade) + '<div class="crm-main"><span class="crm-name">' + esc(pp.name) + '</span><span class="crm-meta">' + esc(pp.role || pp.email || '') + '</span></div></div>').join('') || '<div class="crm-meta">No people yet.</div>') + '</div>';
+    if ((x.deals || []).length) h += '<div class="cx-sec">Deals</div><div class="crm-stack">' + x.deals.map(d => '<div class="crm-row" role="button" tabindex="0" data-id="' + esc(d.id) + '" onclick="_crmOpen(\'deal\',this.dataset.id)"><div class="crm-main"><span class="crm-name">' + esc(d.title) + '</span><span class="crm-meta">' + esc(d.stage) + '</span></div></div>').join('') + '</div>';
+    h += _crmChannels(chans, 'account', x.id) + _crmTouches(touches, 'account', x.id);
+    h += _crmLookalikes(x.lookalikes, x.id) + _crmTimeline(x.activity) + _crmAskForm('company', x.id, x.name);
+  } else {
+    h += '<div class="crm-meta">' + esc([x.id, x.account_name, x.source ? 'added by ' + x.source : ''].filter(Boolean).join(' · ')) + '</div>';
+    h += '<dl class="crm-kv">' + _crmField('Title', 'title', x.title, p)
+      + '<dt><label for="crmf-stage">Stage</label></dt><dd><select id="crmf-stage" class="input" data-path="' + esc(p) + '" onchange="_crmSave(this.dataset.path,\'stage\',this.value)">'
+      + _CRM_STAGES.map(st => '<option' + (x.stage === st ? ' selected' : '') + '>' + st + '</option>').join('') + '</select></dd>'
+      + '<dt><label for="crmf-amount">Contract value</label></dt><dd><input id="crmf-amount" class="input" type="number" value="' + esc(x.amount != null ? x.amount : '') + '" data-path="' + esc(p) + '" onchange="_crmSave(this.dataset.path,\'amount\',this.value===\'\'?null:Number(this.value))"></dd>'
+      + '<dt><label for="crmf-mrr">MRR, if a subscription</label></dt><dd><input id="crmf-mrr" class="input" type="number" value="' + esc(x.mrr_usd != null ? x.mrr_usd : '') + '" data-path="' + esc(p) + '" onchange="_crmSave(this.dataset.path,\'mrr_usd\',this.value===\'\'?null:Number(this.value))"></dd>'
+      + _crmField('Close date', 'close_date', x.close_date, p, 'date') + _crmField('Next step', 'next_step', x.next_step, p) + _crmField('Owner', 'owner', x.owner, p)
+      + '<dt><label for="crmf-lost">Lost reason</label></dt><dd><select id="crmf-lost" class="input" data-path="' + esc(p) + '" onchange="_crmSave(this.dataset.path,\'lost_reason\',this.value)">'
+      + ['', ..._CRM_LOST_REASONS].map(r => '<option value="' + r + '"' + ((x.lost_reason || '') === r ? ' selected' : '') + '>' + (r ? esc(_crmLabel(r)) : 'Not lost') + '</option>').join('') + '</select></dd>'
+      + _crmField('App link', 'asset_url', x.asset_url, p, 'url') + '</dl>';
+    h += '<div class="crm-meta crm-wrap">A won deal needs its contract value and close date; a lost one, its reason. Proposal and won are the owner\'s to set.</div>';
+    if (/^https?:\/\//i.test(x.asset_url || '')) h += '<div class="crm-actions"><a class="btn" target="_blank" rel="noopener" href="' + esc(x.asset_url) + '">Open the app</a></div>';
+    if (stages.length) h += '<div class="cx-sec">Stage history</div><div class="crm-stack">' + stages.map(st => '<div class="crm-meta crm-wrap crm-stage-row">'
+      + esc([new Date(st.at * 1000).toLocaleDateString(), (st.from_stage ? st.from_stage + ' to ' : '') + st.to_stage, st.by, st.why].filter(Boolean).join(' · ')) + '</div>').join('') + '</div>';
+    if (x.account_id) h += '<div class="crm-actions"><button class="btn" data-id="' + esc(x.account_id) + '" onclick="_crmOpen(\'company\',this.dataset.id)">Open company</button></div>';
+    h += '<div class="cx-sec">Notes</div><textarea class="input crm-ta" aria-label="Deal notes" data-path="' + esc(p) + '" onchange="_crmSave(this.dataset.path,\'notes\',this.value)">' + esc(x.notes || '') + '</textarea>';
+  }
+  h += '</div></div>';
+  el.innerHTML = h;
+}
+
+// + New: what kind is on screen decides the form (a person, a company or a deal).
+function _crmNew() {
+  _crmOpen('new', _crm.view === 'companies' ? 'company' : _crm.view === 'deals' ? 'deal' : 'person');
+}
+
+function _crmNewHtml(kind) {
+  const f = (id, ph, type = 'text') => '<input id="crm-new-' + id + '" class="input" type="' + type + '" placeholder="' + esc(ph) + '" aria-label="' + esc(ph) + '">';
+  let body = kind === 'company' ? f('name', 'Company name') + f('domain', 'domain.com') + f('industry', 'Industry')
+    : kind === 'deal' ? f('title', 'Deal title') + f('account', 'Company name') + f('amount', 'Amount (USD)', 'number')
+    : f('name', 'Full name') + f('email', 'Email', 'email') + f('phone', 'Phone', 'tel') + f('company', 'Company') + f('role', 'Role') + f('linkedin', 'LinkedIn URL');
+  return '<div class="cx-drawer" role="dialog" aria-label="New ' + kind + '"><div class="cx-dhead"><span class="crm-name crm-dname">New ' + kind + '</span>'
+    + '<button class="cx-x" aria-label="Close" onclick="_crmClose()">&#x2715;</button></div><div class="cx-dbody"><div class="crm-form">' + body
+    + '<button class="btn primary" data-kind="' + kind + '" onclick="_crmCreate(this.dataset.kind)">Add</button></div></div></div>';
+}
+
+// The company for a name: the existing one (by name), else a new one.
+async function _crmAccountFor(name) {
+  name = (name || '').trim();
+  if (!name) return '';
+  const found = ((await _crmApi('/accounts?q=' + encodeURIComponent(name))) || []).find(a => a.name.toLowerCase() === name.toLowerCase());
+  if (found) return found.id;
+  return (await _crmApi('/accounts', { method: 'POST', body: JSON.stringify({ name }) })).id;
+}
+
+async function _crmCreate(kind) {
+  const v = (id) => ((document.getElementById('crm-new-' + id) || {}).value || '').trim();
+  try {
+    let id;
+    if (kind === 'company') {
+      if (!v('name')) throw new Error('name it');
+      id = (await _crmApi('/accounts', { method: 'POST', body: JSON.stringify({ name: v('name'), domain: v('domain'), industry: v('industry') }) })).id;
+    } else if (kind === 'deal') {
+      if (!v('title')) throw new Error('give it a title');
+      id = (await _crmApi('/deals', { method: 'POST', body: JSON.stringify({ title: v('title'), account_id: await _crmAccountFor(v('account')), amount: v('amount') ? Number(v('amount')) : null }) })).id;
+    } else {
+      if (!v('name')) throw new Error('name them');
+      id = (await _crmApi('/contacts', { method: 'POST', body: JSON.stringify({ name: v('name'), email: v('email'), phone: v('phone'), company: v('company'),
+        role: v('role'), linkedin: v('linkedin'), account_id: await _crmAccountFor(v('company')) }) })).id;
+    }
+    showToast('Added');
+    _crmOpen(kind === 'company' ? 'company' : kind === 'deal' ? 'deal' : 'person', id);
+    _crmLoad();
+  } catch (e) {
+    if (e.status === 409 && e.data && e.data.id) { showToast('Already in the CRM: opening it'); _crmOpen(kind === 'company' ? 'company' : 'person', e.data.id); return; }
+    showToast('Not added: ' + e.message, true);
+  }
 }
 
 // ── Habits tab ───────────────────────────────────────────────────────────────
@@ -42620,7 +48593,7 @@ async function _habitsToggle(idx, btn) {
 }
 
 async function _habitsAdd() {
-  const name = prompt('Habit name:');
+  const name = (await showPrompt('Habit name:', '', '', { trim: false }));
   if (!name || !name.trim()) return;
   _habits.push({ name: name.trim(), log: [], created: _habitsTodayKey() });
   _habitsRender();
@@ -42630,7 +48603,7 @@ async function _habitsAdd() {
 async function _habitsEdit(idx) {
   const h = _habits[idx];
   if (!h) return;
-  const name = prompt('Edit habit name:', h.name);
+  const name = (await showPrompt('Edit habit name:', '', h.name, { trim: false }));
   if (name === null) return;
   if (!name.trim()) return;
   h.name = name.trim();
@@ -42641,7 +48614,7 @@ async function _habitsEdit(idx) {
 async function _habitsDelete(idx) {
   const h = _habits[idx];
   if (!h) return;
-  if (!confirm('Delete "' + h.name + '"?')) return;
+  if (!(await showConfirm('Delete "' + h.name + '"?', 'Delete', true))) return;
   _habits.splice(idx, 1);
   _habitsRender();
   await _habitsSave();
@@ -43619,7 +49592,7 @@ function _mapSavePin() {
   const lat = parseFloat(document.getElementById('map-pin-lat').value);
   const lng = parseFloat(document.getElementById('map-pin-lng').value);
   if (!name) { document.getElementById('map-pin-name').focus(); return; }
-  if (isNaN(lat) || isNaN(lng)) { alert('Please enter valid coordinates.'); return; }
+  if (isNaN(lat) || isNaN(lng)) { showAlert('Please enter valid coordinates.'); return; }
   const tags = Array.from(document.querySelectorAll('#map-pin-tags-row input[type=checkbox]:checked')).map(function(cb) { return cb.value; });
   const status = document.getElementById('map-pin-status').value;
   const ratingV = document.getElementById('map-pin-rating').value;
@@ -43642,8 +49615,8 @@ function _mapSavePin() {
   _mapPutPin(pin);
 }
 
-function _mapDeletePin() {
-  if (!_mapEditingPin || !confirm('Delete this pin?')) return;
+async function _mapDeletePin() {
+  if (!_mapEditingPin || !(await showConfirm('Delete this pin?', 'Delete', true))) return;
   const id = _mapEditingPin;
   _mapClosePinModal();
   _mapRemovePin(id);
@@ -43693,8 +49666,8 @@ function _mapSaveTag() {
   _mapSave(); _mapCloseTagModal(); _mapRenderTags(); _mapRenderPins(); _mapRenderMarkers();
 }
 
-function _mapDeleteTag() {
-  if (!_mapEditingTag || !confirm('Delete this group? It will be removed from all pins.')) return;
+async function _mapDeleteTag() {
+  if (!_mapEditingTag || !(await showConfirm('Delete this group? It will be removed from all pins.', 'Delete', true))) return;
   const tagId = _mapEditingTag;
   const ids = _mapPins.filter(function(p) { return (p.tags||[]).indexOf(tagId) !== -1; }).map(function(p) { return p.id; });
   _mapTags = _mapTags.filter(function(t) { return t.id !== tagId; });
@@ -43788,9 +49761,9 @@ function _mapSaveList() {
   showToast('Saved list “' + name + '”');
 }
 
-function _mapDeleteList() {
+async function _mapDeleteList() {
   const l = _mapLists.find(function(x) { return x.id === _mapActiveList; });
-  if (!l || !confirm('Delete the list “' + l.name + '”? Its pins stay.')) return;
+  if (!l || !(await showConfirm('Delete the list “' + l.name + '”? Its pins stay.', 'Delete', true))) return;
   apiCall(API + '/api/map/lists/' + encodeURIComponent(l.id) + '/share', { method: 'DELETE' });
   _mapLists = _mapLists.filter(function(x) { return x.id !== l.id; });
   _mapActiveList = '';
@@ -43823,7 +49796,7 @@ async function _mapShareToggle() {
     await apiCall(API + '/api/map/lists/' + encodeURIComponent(id) + '/share', { method: 'DELETE' });
     showToast('Link turned off');
   } else {
-    if (!confirm('Anyone with the link will see this list’s pins: names, descriptions, groups, status and rating. Notes and visits stay private. Create the link?')) return;
+    if (!(await showConfirm('Anyone with the link will see this list’s pins: names, descriptions, groups, status and rating. Notes and visits stay private. Create the link?'))) return;
     // A list saved a moment ago may still be on its way to the server; sharing
     // before it lands answers "no saved list" (CI, 2026-10-24).
     if (_mapMetaSaving) await Promise.resolve(_mapMetaSaving).catch(function() {});
@@ -43895,9 +49868,9 @@ function _mapRenderBulkBar() {
 }
 
 function _mapBulkApply(op, value) { _mapBulk(Array.from(_mapSelected), op, value); }
-function _mapBulkDelete() {
+async function _mapBulkDelete() {
   const n = _mapSelected.size;
-  if (!n || !confirm('Delete ' + n + ' pin' + (n === 1 ? '' : 's') + '? Each one stays in the pin history.')) return;
+  if (!n || !(await showConfirm('Delete ' + n + ' pin' + (n === 1 ? '' : 's') + '? Each one stays in the pin history.', 'Delete', true))) return;
   _mapBulk(Array.from(_mapSelected), 'delete');
 }
 
@@ -43909,11 +49882,11 @@ async function _mapMerge(keep, drop) {
   return !!r;
 }
 
-function _mapMergeSelected() {
+async function _mapMergeSelected() {
   const ids = Array.from(_mapSelected);
   if (ids.length !== 2) return;
   const a = _mapPins.find(function(p) { return p.id === ids[0]; }), b = _mapPins.find(function(p) { return p.id === ids[1]; });
-  if (!a || !b || !confirm('Merge “' + b.name + '” into “' + a.name + '”? Groups and notes are combined.')) return;
+  if (!a || !b || !(await showConfirm('Merge “' + b.name + '” into “' + a.name + '”? Groups and notes are combined.', 'Merge', false))) return;
   _mapMerge(a.id, b.id);
 }
 
@@ -44011,7 +49984,7 @@ async function _mapPinHistory() {
 async function _mapLinkAllPlaces() {
   const n = _mapPins.filter(function(p) { return !p.placeId && !(p.placeLink && p.placeLink.status === 'no_match'); }).length;
   if (!n) { showToast('Every pin is already linked or checked'); return; }
-  if (!confirm('Look up ' + n + ' pin' + (n === 1 ? '' : 's') + ' on Google? Each is one Google Places request on your API key.')) return;
+  if (!(await showConfirm('Look up ' + n + ' pin' + (n === 1 ? '' : 's') + ' on Google? Each is one Google Places request on your API key.'))) return;
   const r = await apiCall(API + '/api/map/places/link', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ limit: n }) });
   const d = r ? await r.json().catch(function() { return null; }) : null;
   if (d) showToast('Linked ' + d.linked + ', no match ' + d.no_match + (d.failed ? ', failed ' + d.failed : ''));
@@ -45291,6 +51264,12 @@ function _schedAuditRow(r, live) {
     const gonePill = gone
       ? ' <span style="font-size:var(--fs-4xs);color:var(--red);border:1px solid var(--red);border-radius:var(--radius-sm);padding:0 var(--space-1);" title="This schedule no longer exists — visible only here">gone</span>'
       : '';
+    // The ledger record (P2 fold): who the server PROVED made the change.
+    // `by_who` is only what the write claimed; an anonymous record proves nothing.
+    const proven = r.ledger && r.ledger.actor && r.ledger.actor !== 'anonymous' ? r.ledger.actor : '';
+    const provenHtml = proven
+      ? ' <span class="sx-audit-proven" title="Ledger record #' + esc(String(r.ledger.seq)) + ': the actor the server verified">(proven: ' + esc(proven) + ')</span>'
+      : '';
     const diff = (r.old_value || r.new_value)
       ? '<div style="color:var(--dim);font-size:var(--fs-3xs);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">'
         + (r.old_value ? esc(String(r.old_value).slice(0, 60)) + ' \u2192 ' : '')
@@ -45299,7 +51278,7 @@ function _schedAuditRow(r, live) {
     return '<div style="padding:var(--space-1) 0;border-bottom:1px solid var(--border);font-size:var(--fs-xs);">'
       + '<div style="display:flex;gap:var(--space-1-5);align-items:baseline;flex-wrap:wrap;">'
       + '<span style="font-weight:600;">' + esc(r.title || r.schedule_id || '?') + '</span>' + gonePill
-      + '<span style="color:var(--dim);">' + label + ' by </span>' + whoHtml
+      + '<span style="color:var(--dim);">' + label + ' by </span>' + whoHtml + provenHtml
       + '<span style="color:var(--dim);margin-left:auto;">' + timeAgo(Number(r.ts) || 0) + '</span>'
       + '</div>' + diff + '</div>';
 }
@@ -45527,7 +51506,9 @@ function _sxStatus(s, runs) {
   // disabled_reason / lock_reason (0125): say WHY it is off, and that a
   // worker cannot turn an owner-locked schedule back on.
   if (!s.enabled) return { key: 'paused', label: (s.sched_type === 'once' && s.last_run) ? 'Done' : 'Paused',
-    why: s.locked_by ? ('Disabled by the owner and locked: a worker cannot re-enable it. ' + (s.lock_reason || '')) : (s.disabled_reason || '') };
+    why: s.locked_by ? ('Disabled by the owner and locked: a worker cannot re-enable it. ' + (s.lock_reason || ''))
+      : s.disabled_reason === 'goal_check_worker_stopped' ? 'Paused while its worker is stopped; it resumes when the worker runs'
+      : (s.disabled_reason || '') };
   if (_sxClass(s) === 'unknown') return { key: 'unparsed', label: 'Unparsed' };
   // Pass/fail (schedule_check.rs): the check, not the delivery, says whether
   // the work is done, so a failing check outranks a delivered run.
@@ -45812,8 +51793,23 @@ function _sxToldHTML(s) {
     + (n.delivery ? '; ' + n.delivery : '');
   return `<span class="sx-told sx-sub" data-route="${esc(n.route || '')}" title="${esc(tip)}">${esc(t)}</span>`;
 }
+// A schedule a configuration key keeps in step (managed_by, migration 0181):
+// which key, and where the owner changes its command or interval.
+const _SX_MANAGED = {
+  'goal-check': { key: 'AMUX_GOAL_CHECK', what: 'Goal check',
+    how: 'Created by AMUX_GOAL_CHECK. Change the check or AMUX_GOAL_CHECK_INTERVAL_S in the worker\'s Scope tab; clearing the key removes this schedule. Pause, resume and Run now work here.' },
+};
+function _sxManaged(s) {
+  const m = s && s.managed_by;
+  return m ? (_SX_MANAGED[m] || { key: m, what: m, how: 'Kept in step with ' + m + '.' }) : null;
+}
+function _sxManagedHTML(s) {
+  const m = _sxManaged(s);
+  return m ? `<span class="sx-managed sx-sub" title="${esc(m.how)}">${esc(m.key)}</span>` : '';
+}
 function _sxSearchHay(s) {
-  return [s.title, s.session, s.command, s.schedule_expr, s.recurrence, s.id, _sxFreq(s), s.kind === 'shell' ? 'shell command' : 'worker prompt']
+  const m = _sxManaged(s);
+  return [s.title, s.session, s.command, s.schedule_expr, s.recurrence, s.id, _sxFreq(s), s.kind === 'shell' ? 'shell command' : 'worker prompt', m && m.key, m && m.what]
     .filter(Boolean).join(' ').toLowerCase();
 }
 
@@ -45826,7 +51822,7 @@ function _sxRowHTML(s, runMap, sessMap, scoped) {
   return `<div class="sx-row sched-item${sel ? ' selected' : ''}" data-sched-id="${id}" data-status="${st.key}" role="button" tabindex="0"
       onclick="openSchedDetail('${idJs}')" onkeydown="if(event.key==='Enter'&&event.target===this)openSchedDetail('${idJs}')">
     <label class="sx-cell sx-sel" onclick="event.stopPropagation()"><input type="checkbox" ${sel ? 'checked' : ''} onchange="_sxToggleSel('${idJs}',this.checked)" aria-label="Select ${esc(s.title)}"></label>
-    <div class="sx-cell sx-name">${_sxTypeIcon(s)}<div class="sx-name-text"><span class="sx-title">${esc(s.title)}</span><code class="sched-id-badge" title="Schedule id: click to copy" onclick="event.stopPropagation();_copySchedId('${idJs}')">${id}</code>${_sxToldHTML(s)}</div></div>
+    <div class="sx-cell sx-name">${_sxTypeIcon(s)}<div class="sx-name-text"><span class="sx-title">${esc(s.title)}</span><code class="sched-id-badge" title="Schedule id: click to copy" onclick="event.stopPropagation();_copySchedId('${idJs}')">${id}</code>${_sxManagedHTML(s)}${_sxToldHTML(s)}</div></div>
     ${scoped ? '' : `<div class="sx-cell sx-worker">${_sxWorkerChip(s, sessMap)}</div>`}
     <div class="sx-cell sx-freq"><span title="${esc(freqTitle)}">${esc(_sxFreq(s))}</span>${_schedLastRunHTML(s)}</div>
     <div class="sx-cell sx-nextc">${_sxNextCell(s, st)}</div>
@@ -45994,7 +51990,7 @@ function renderScheduler(opts) {
       <div class="sx-empty-ico">&#x23F0;</div>
       <div class="sx-empty-title">No schedules yet</div>
       <div>Run a shell command or send a worker a message on a timer.</div>
-      <button class="btn primary" onclick="${main ? 'openSchedModal()' : '_peekNewSchedule()'}">+ New schedule</button>
+      <button class="btn primary" onclick="${main ? '_sxNew()' : '_sxNew(peekSession)'}">+ New schedule</button>
     </div>`;
   } else if (main && f.group === 'system') {
     listEl.innerHTML = '';
@@ -46060,6 +52056,223 @@ function renderScheduler(opts) {
     }).join('');
   }
   if (_sxDetailId && document.getElementById('sched-detail') && !document.getElementById('sched-detail').hidden) _sxRenderDetail();
+  _evRender({ session: sessionFilter });
+}
+
+// ── Event subscriptions in the Scheduler (docs/design/event-subscriptions.md) ──
+// A subscription is a schedule whose trigger is an event instead of a time, so
+// it lives here: its own section under the schedules, the same New button, a
+// third type in the filter, and each worker's Schedules tab shows the ones that
+// wake it. The words are compiled and backtested by the server (dry_run) and
+// shown before anything is saved.
+let _evSubs = [];
+async function _evSubsFetch() {
+  const r = await apiCall(API + '/api/subscriptions');
+  if (!r) return;
+  const d = await r.json().catch(() => ({}));
+  _evSubs = d.subscriptions || [];
+}
+
+// Who a subscription is for: a worker it wakes, or the owner it tells.
+function _evWho(x) {
+  return x.action === 'send' ? x.action_target : (x.action === 'notify' ? '' : x.owner);
+}
+function _evThen(x) {
+  if (x.action === 'send') return 'wakes ' + x.action_target;
+  if (x.action === 'notify') return 'tells you';
+  return x.action + ' ' + x.action_target;
+}
+
+function _evRender(opts) {
+  opts = opts || {};
+  // In a worker's Schedules tab the section goes INSIDE the scrolling list,
+  // after the schedules: as a sibling box it sat on top of them (Ethan's
+  // screenshot, 2026-11-11, "in the way").
+  let el = document.getElementById('scheduler-events');
+  if (opts.session) {
+    const list = document.getElementById('peek-schedules-list');
+    if (!list) return;
+    el = list.querySelector(':scope > .sx-ev-wrap');
+    if (!el) { el = document.createElement('div'); el.className = 'sx-ev-wrap'; list.appendChild(el); }
+  }
+  if (!el) return;
+  const type = opts.session ? '' : (_sxFilters.type || '');
+  if (!opts.session && type === 'event') {
+    const list = document.getElementById('scheduler-list');
+    if (list) list.innerHTML = '';
+  }
+  if (type && type !== 'event') { el.innerHTML = ''; return; }
+  const q = ((opts.session ? _peekSchedSearch : schedSearchQuery) || '').trim().toLowerCase();
+  const rows = _evSubs.filter(x => (!opts.session || _evWho(x) === opts.session)
+    && (!q || ((x.criteria || '') + ' ' + x.name + ' ' + x.pattern).toLowerCase().includes(q)));
+  const target = opts.session ? '\'' + escJs(opts.session) + '\'' : '';
+  const newBtn = '<button class="btn sx-ev-new" onclick="_evNew(' + target + ')">+ New</button>';
+  if (!rows.length && type !== 'event') {
+    // None yet: one line, not a section that takes half a phone screen.
+    el.innerHTML = '<section class="sx-ev-empty" data-group="events">'
+      + '<span class="sx-ev-empty-text"><span aria-hidden="true">&#x26A1;</span> When something happens'
+      + (q ? ': nothing matches' : ' &middot; none yet') + '</span>' + newBtn + '</section>';
+    return;
+  }
+  el.innerHTML = '<section class="sx-group" data-group="events">'
+    + '<header class="sx-group-head"><span class="sx-group-ico" aria-hidden="true">&#x26A1;</span>'
+    + '<div class="sx-group-text"><h3>When something happens <span class="sx-count">' + rows.length + '</span></h3>'
+    + '<p>Runs when an event matches, not on a clock.</p></div>' + newBtn + '</header>'
+    + (rows.length ? rows.map(_evRowHTML).join('')
+      : '<div class="sx-group-empty">' + (q ? 'Nothing matches.' : 'None yet. Say what should start work, in plain words.') + '</div>')
+    + '</section>';
+}
+
+function _evRowHTML(x) {
+  const last = x.last_fired_at ? ' &middot; last ' + esc(timeAgo(x.last_fired_at)) : '';
+  return '<div class="sx-ev-row' + (x.enabled ? '' : ' sx-ev-off') + '" data-sub="' + x.id + '">'
+    + '<button class="sx-ev-main" onclick="_evOpen(' + x.id + ')">'
+    + '<span class="sx-ev-title">' + esc(x.criteria || x.name) + '</span>'
+    + '<span class="sx-ev-sub">' + esc(_evThen(x)) + ' &middot; fired ' + x.fire_count + '&times;' + last + (x.enabled ? '' : ' &middot; off') + '</span>'
+    + '</button>'
+    + '<button class="btn sx-ev-toggle" role="switch" aria-checked="' + !!x.enabled + '" aria-label="' + (x.enabled ? 'Turn off' : 'Turn on') + '"'
+    + ' onclick="_evSet(' + x.id + ',' + !x.enabled + ')">' + (x.enabled ? 'On' : 'Off') + '</button>'
+    + '</div>';
+}
+
+async function _evRefresh() {
+  await _evSubsFetch();
+  renderScheduler();
+  if (peekSession) _peekRenderSchedules();
+}
+
+async function _evSet(id, enabled) {
+  const r = await apiCall(API + '/api/subscriptions/' + id, {
+    method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ enabled }),
+  });
+  if (!r) return;
+  showToast(enabled ? 'Turned on' : 'Turned off');
+  _evRefresh();
+}
+
+async function _evRemove(id) {
+  if (!await showConfirm('Remove this subscription and its history?', 'Remove', true)) return;
+  const r = await apiCall(API + '/api/subscriptions/' + id, { method: 'DELETE' });
+  if (!r) return;
+  showToast('Subscription removed');
+  _evRefresh();
+}
+
+// New: a time or an event. The time path is the existing schedule dialog.
+async function _sxNew(worker) {
+  const pick = await new Promise(resolve => {
+    window._sxNewPick = (v) => { resolve(v); _modalClose(false); };
+    showFormModal('New', '<div class="sx-ev-choice">'
+      + '<button class="btn sx-ev-choice-btn" onclick="_sxNewPick(\'time\')"><b>&#x23F1; At a time</b><span>every day at 9, every 15 minutes, once on Friday</span></button>'
+      + '<button class="btn sx-ev-choice-btn" onclick="_sxNewPick(\'event\')"><b>&#x26A1; When something happens</b><span>a browser hits a CAPTCHA, a card moves to done</span></button>'
+      + '</div>', 'Cancel').then(() => resolve(null));
+  });
+  if (pick === 'time') return worker ? _peekNewSchedule() : openSchedModal();
+  if (pick === 'event') return _evNew(worker);
+}
+
+const _EV_EXAMPLES = [
+  'a browser hits a captcha and cannot continue',
+  'a card on my board moves to done',
+  'a worker finishes its turn',
+  'a new build goes live',
+  'a worker is low on context',
+];
+
+async function _evNew(worker) {
+  const workers = (sessions || []).filter(s => !s.isolated && !s.archived).map(s => s.name).sort();
+  const opt = (n) => '<option value="' + esc(n) + '"' + (n === worker ? ' selected' : '') + '>' + esc(n) + '</option>';
+  const ok = await showFormModal('When something happens',
+    '<label class="sx-ev-label" for="ev-words">When…</label>'
+    + '<input id="ev-words" class="input sx-ev-input" list="ev-examples" placeholder="a browser hits a captcha" autocomplete="off">'
+    + '<datalist id="ev-examples">' + _EV_EXAMPLES.map(e => '<option value="' + esc(e) + '">').join('') + '</datalist>'
+    + '<div class="sx-ev-label">Then</div>'
+    + '<label class="sx-ev-radio"><input type="radio" name="ev-then" value="notify"' + (worker ? '' : ' checked') + '> tell me</label>'
+    + '<label class="sx-ev-radio"><input type="radio" name="ev-then" value="send"' + (worker ? ' checked' : '') + '> wake worker '
+    + '<select id="ev-worker" class="input" onfocus="document.querySelector(\'input[name=ev-then][value=send]\').checked=true">' + workers.map(opt).join('') + '</select></label>'
+    + '<label class="sx-ev-radio"><input type="checkbox" id="ev-judge"> the helper model checks each match against my words</label>'
+    + '<a href="#" class="sx-ev-browse" onclick="event.preventDefault();_evCatalog()">Browse all events</a>',
+    'Preview');
+  if (!ok) return;
+  const words = (document.getElementById('ev-words')?.value || '').trim();
+  const then = (document.querySelector('input[name=ev-then]:checked') || {}).value || 'notify';
+  const who = document.getElementById('ev-worker')?.value || '';
+  const judge = !!document.getElementById('ev-judge')?.checked;
+  if (!words) { showToast('Say when, in plain words'); return; }
+  const base = { criteria: words, judge };
+  if (then === 'send') Object.assign(base, { action: 'send', action_target: who });
+  else Object.assign(base, { action: 'notify', action_target: 'owner' });
+  showToast('Reading “' + words + '”…');
+  // Not through the offline outbox (apiCall): the compile takes 15-20 s and the
+  // outbox aborted it and queued it for a replay (live, 2026-11-11: "Queued (1
+  // pending)" with no preview). A preview has to answer now, and a replayed
+  // save would add a second subscription.
+  const post = async (extra) => {
+    try {
+      const r = await fetch(API + '/api/subscriptions', { method: 'POST', _skipOutbox: true,
+        headers: _authHeaders({'Content-Type': 'application/json'}), body: JSON.stringify(Object.assign({}, base, extra)) });
+      if (!r.ok) { showToast(await _apiErrText(r)); return null; }
+      return r;
+    } catch (e) {
+      showToast('Could not reach amux: ' + (e.message || e));
+      return null;
+    }
+  };
+  const r = await post({ dry_run: true });
+  if (!r) return;
+  const d = await r.json().catch(() => ({}));
+  const c = d.compiled || {};
+  const b = d.backtest || {};
+  const ex = (b.examples || []).map(e => '<li>' + esc(new Date(e.ts * 1000).toLocaleString()) + ' &middot; '
+    + esc([e.event.session, e.event.title, e.event.url, e.event.status].filter(Boolean).join(' · ')) + '</li>').join('');
+  const save = await showFormModal('Save this?',
+    '<div class="sx-ev-preview">'
+    + '<div><b>' + esc(c.summary || words) + '</b></div>'
+    + '<div class="sx-ev-reads">Reads as: <code>' + esc(d.pattern) + '</code>'
+    + (d.filter && Object.keys(d.filter).length ? ' where <code>' + esc(JSON.stringify(d.filter)) + '</code>' : '') + '</div>'
+    + (b.measured ? '<div>Last 7 days: <b>' + b.matched + '</b> of ' + b.n_considered + ' events matched</div>' : '')
+    + (ex ? '<ul class="sx-ev-examples">' + ex + '</ul>' : '')
+    + (c.judge || judge ? '<div>The helper model checks each match against your words.</div>' : '')
+    + '<div>Then it ' + (then === 'send' ? 'wakes ' + esc(who) : 'tells you in #general') + '.</div>'
+    + '</div>', 'Save');
+  if (!save) return;
+  // Save exactly what was shown: a second compile could differ.
+  const r2 = await post({ pattern: d.pattern, filter: d.filter, judge: judge || !!c.judge, dedupe_key: c.dedupe_key || '' });
+  if (!r2) return;
+  showToast('Subscribed: ' + words);
+  _evRefresh();
+}
+
+async function _evOpen(id) {
+  const x = _evSubs.find(s => s.id === id);
+  if (!x) return;
+  const r = await apiCall(API + '/api/subscriptions/fires?limit=20&subscription_id=' + id);
+  const fires = r ? ((await r.json().catch(() => ({}))).fires || []) : [];
+  const hist = fires.length ? fires.map(f => {
+    const e = f.event_data || {};
+    return '<li><span class="sx-ev-when">' + esc(new Date(f.fired_at * 1000).toLocaleString()) + '</span> '
+      + esc([f.event_type, e.worker || e.session || e.lane, e.title, e.url].filter(Boolean).join(' · ')) + ' &rarr; ' + esc(f.outcome) + '</li>';
+  }).join('') : '<li>Not fired yet.</li>';
+  showFormModal(x.criteria || x.name,
+    '<div class="sx-ev-preview">'
+    + '<div>Reads as: <code>' + esc(x.pattern) + '</code>' + (x.filter && Object.keys(x.filter).length ? ' where <code>' + esc(JSON.stringify(x.filter)) + '</code>' : '') + '</div>'
+    + '<div>Then it ' + esc(_evThen(x)) + (x.judge ? '; the helper model checks each match' : '') + '.</div>'
+    + '<div>Fired ' + x.fire_count + '&times; &middot; ' + (x.enabled ? 'on' : 'off') + ' &middot; by ' + esc(x.owner || x.created_by || 'owner') + '</div>'
+    + '<div class="sx-ev-label">History</div><ul class="sx-ev-examples">' + hist + '</ul>'
+    + '<div class="sx-ev-actions">'
+    + '<button class="btn" onclick="_modalClose(false);_evSet(' + x.id + ',' + !x.enabled + ')">' + (x.enabled ? 'Turn off' : 'Turn on') + '</button> '
+    + '<button class="btn danger" onclick="_modalClose(false);_evRemove(' + x.id + ')">Remove</button>'
+    + '</div></div>', 'Done');
+}
+
+async function _evCatalog() {
+  const r = await apiCall(API + '/api/subscriptions/catalog');
+  if (!r) return;
+  const d = await r.json().catch(() => ({}));
+  const rows = (d.types || []).map(t => '<li><b>' + esc(t.type) + '</b> <span class="sx-ev-when">' + t.count + ' in 7 days</span>'
+    + (t.meaning ? '<div>' + esc(t.meaning) + '</div>' : '') + '</li>').join('');
+  showFormModal('Every event amux records', '<p>' + (d.count || 0) + ' types, ' + (d.n_considered || 0)
+    + ' events in the last 7 days. Describe one in plain words and amux matches it.</p><ul class="sx-ev-examples sx-ev-catalog">' + rows + '</ul>', 'Done');
 }
 
 // ── Row / detail "more" menu ────────────────────────────────────────────────
@@ -46266,6 +52479,8 @@ function _sxRenderDetail() {
       ['Last run', _sxFmtWhen(s.last_run)],
       ['Total runs', esc(String(s.run_count || 0))],
     ];
+    const managed = _sxManaged(s);
+    if (managed) rows.push(['Managed by', `<span class="sx-managed">${esc(managed.key)}</span><div class="sx-dim sx-sub">${esc(managed.how)}</div>`]);
     if (_sxToldText(s)) rows.push(['Failure notice', _sxToldHTML(s)]);
     if (s.last_delivery) rows.push(['Last delivery', esc(s.last_delivery)]);
     if (s.last_refusal_reason) rows.push(['Last refusal', `<span class="sx-bad">${esc(s.last_refusal_reason)}</span>`]);
@@ -47100,6 +53315,12 @@ function _bindMdFileLinks(container) {
       return;
     }
     const w = e.target.closest && e.target.closest('.md-worker-link');
+    if (w && container.contains(w) && w.dataset.worker && !(e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      e.stopPropagation();
+      _mdTaskOpen(w);
+      return;
+    }
     if (w && container.contains(w) && w.dataset.worker) {
       e.preventDefault();
       e.stopPropagation();
@@ -47238,7 +53459,31 @@ function _mdUseWikiLinks() {   // and math (the same marked.use call)
       return { type: 'workerMention', raw: m[0], name: m[1] };
     },
     renderer(t) {
-      return '<a href="#peek=' + encodeURIComponent(t.name) + '" class="md-worker-link" data-worker="' + esc(t.name) + '" title="Open ' + esc(t.name) + '">@' + esc(t.name) + '</a>';
+      return '<a href="#peek=' + encodeURIComponent(t.name) + '" class="md-worker-link" data-worker="' + esc(t.name) + '" title="Status and ask ' + esc(t.name) + ' (⌘-click opens it)">'
+        + '<span class="md-worker-dot" data-status="' + esc(_mdWorkerDotStatus(t.name)) + '" aria-hidden="true"></span>@' + esc(t.name) + '</a>';
+    },
+  }, {
+    // A file path written as plain text in a file's preview is a link to that
+    // file (owner, 2026-11-18: "file path is clickable and on mouseover shows
+    // a preview"). Absolute or ~/ paths only; trailing punctuation stays text.
+    // Same gate as @worker: a preview asked for it.
+    name: 'filePath', level: 'inline',
+    start(src) {
+      if (!_mdWorkerLinks) return undefined;
+      const m = /(^|[\s(])(?:~|\/(?:Users|home|Volumes|private|opt|tmp|var|etc))\//.exec(src);
+      return m ? m.index + m[1].length : undefined;
+    },
+    tokenizer(src) {
+      if (!_mdWorkerLinks) return undefined;
+      const m = /^(?:~|\/(?:Users|home|Volumes|private|opt|tmp|var|etc))\/[^\s<>()\[\]"'`]+/.exec(src);
+      if (!m) return undefined;
+      const path = m[0].replace(/[.,;:!?]+$/, '');
+      if (path.split('/').filter(Boolean).length < 2) return undefined;
+      return { type: 'filePath', raw: path, path };
+    },
+    renderer(t) {
+      const isDir = t.path.endsWith('/');
+      return '<a href="#" class="md-file-link md-path-link" data-file="' + esc(t.path) + '"' + (isDir ? ' data-dir="1"' : '') + ' title="' + esc(t.path) + '">' + esc(t.path) + '</a>';
     },
   }, {
     // #tag in the editor's preview: a chip, and a click finds the others.
@@ -48738,10 +54983,10 @@ async function _colMigrateAll(from, to, lane) {
   if (!n) { showToast('"' + fl + '" has no cards to migrate'); return; }
   // SAY HOW MANY, and say it is not undoable in one action — the same rule
   // AMUX-2491 set for the column delete dialog. The count is the decision.
-  if (!confirm('Migrate all ' + n + ' card' + (n === 1 ? '' : 's')
+  if (!(await showConfirm('Migrate all ' + n + ' card' + (n === 1 ? '' : 's')
       + (lane ? ' belonging to ' + lane : ' across ALL workers')
       + ' from "' + fl + '" to "' + tl + '"?\n\nEach move is recorded on the card, but there '
-      + 'is no single undo; reversing this means migrating them back.')) return;
+      + 'is no single undo; reversing this means migrating them back.'))) return;
   try {
     const r = await fetch(API + '/api/board/bulk-migrate', {
       method: 'POST',
@@ -49826,6 +56071,7 @@ function renderBoard() {
   _boardEnsureFull();
   // Skip re-render while a drag is in progress — queue it for when drag ends
   if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
+  if (_deferForSortableDrag(renderBoard, 'board')) return;
   renderBoardFilters();
   const container = document.getElementById('board-columns');
   // Global columns scroll horizontally. Keep activity above them, outside the
@@ -51225,6 +57471,7 @@ async function openBoardDetail(id) {
   }
   if (!detailIdentityCurrent()) return;
   boardDetailId = id;
+  _navVisit('card', id, item.title || id);
   // Render instantly from cache, then correct it from the server. Blocking the
   // modal on a fetch would make every card open feel slow for a field most
   // opens never edit.
@@ -52836,13 +59083,13 @@ async function _saveEventOnce(id) {
   try {
     const url = API + '/api/cal-events' + (id ? '/' + id : '');
     const r = await fetch(url, { method: id ? 'PATCH' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (!r.ok) { const e = await r.json().catch(() => ({})); alert(e.error || 'Save failed'); return; }
-  } catch (e) { alert('Save failed: ' + e.message); return; }
+    if (!r.ok) { const e = await r.json().catch(() => ({})); await showAlert(e.error || 'Save failed'); return; }
+  } catch (e) { await showAlert('Save failed: ' + e.message); return; }
   closeEventModal();
   await fetchCalEvents();
 }
 async function deleteEvent(id) {
-  if (!confirm('Delete this event?')) return;
+  if (!(await showConfirm('Delete this event?', 'Delete', true))) return;
   try { await fetch(API + '/api/cal-events/' + id, { method: 'DELETE' }); showToast('Event deleted'); } catch (e) { showToast('Delete failed'); }
   closeEventModal();
   await fetchCalEvents();
@@ -54378,6 +60625,9 @@ function connectSSE() {
           if (a.type === 'steering_delivered' && a.session === peekSession) { if (_peekTab === 'steering') _steeringRender(); else _steeringUpdateBadge(); }
         }
       } else if (msg.type === 'state' && msg.payload && msg.payload.entity_type
+                 && msg.payload.entity_type.kind === 'other' && /^crm_/.test(msg.payload.entity_type.data || '')) {
+        _crmOnEvent();
+      } else if (msg.type === 'state' && msg.payload && msg.payload.entity_type
                  && msg.payload.entity_type.kind === 'other' && msg.payload.entity_type.data === 'conversation') {
         let ev = {};
         try { ev = JSON.parse(msg.payload.entity_id || '{}'); } catch (_) { ev = {}; }
@@ -54678,6 +60928,9 @@ loadBranding();
 
 // Initialize chrome tabs
 _chromeRender();
+{ const _ctb = document.getElementById('chrome-tabs-bar'); if (_ctb) _chromeTabDragSetup(_ctb); }
+// This browser tab owns its bar from its first load, so its reload reads its own.
+_chromeSave();
 _chromeUpdateOffsets();
 window.addEventListener('resize', _chromeUpdateOffsets);
 window.addEventListener('orientationchange', () => setTimeout(_chromeUpdateOffsets, 100));
@@ -56171,6 +62424,7 @@ function _vaultGroupsOf(i) { return String(i.target || '').split(',').map(g => g
 const _vault = { items: [], workers: [], groups: [], keystore: '', tab: 'secrets', q: '', scope: '', group: '',
   worker: '', sort: 'name', prov: null, revealed: {}, timers: {}, loadErr: '' };
 const _VAULT_ICONS = {
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   key: '<circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M16 7l3 3M13.5 9.5l2 2"/>',
   card: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18"/>',
   shield: '<path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/>',
@@ -56218,7 +62472,6 @@ function _vaultEnsurePage() {
       <div class="vault-tabs" role="tablist" aria-label="Vault sections">
         <button class="vault-tab" role="tab" id="vault-tab-secrets" aria-controls="vault-panel-secrets" onclick="_vaultTab('secrets')">${_vaultIcon('key')}Secrets</button>
         <button class="vault-tab" role="tab" id="vault-tab-payments" aria-controls="vault-panel-payments" onclick="_vaultTab('payments')">${_vaultIcon('card')}Payment Methods<span id="vault-pending-count" class="vault-chip vault-chip-global" hidden></span></button>
-        <button class="vault-tab" role="tab" id="vault-tab-apikeys" aria-controls="vault-panel-apikeys" onclick="_vaultTab('apikeys')">${_vaultIcon('key')}API Keys</button>
       </div>
       <div class="vault-body">
         <div id="vault-panel-secrets" role="tabpanel" aria-labelledby="vault-tab-secrets">
@@ -56244,13 +62497,6 @@ function _vaultEnsurePage() {
           <p class="ui-help">Cards workers can use without seeing. amux types the card into the worker's checkout page; the number never reaches a prompt or a log. A charge above a card's approval threshold waits for your approval in the approvals banner. A charge that would pass a daily, monthly or yearly spending limit is refused outright.</p>
           <div class="vault-actions-row"><button class="btn primary" id="vault-card-add-btn" onclick="_vaultCardAdd()">${_vaultIcon('plus')}Add Payment Method</button></div>
           <div id="vault-items">Loading…</div>
-        </div>
-        <div id="vault-panel-apikeys" role="tabpanel" aria-labelledby="vault-tab-apikeys" hidden>
-          <div id="vault-apikeys-custom">
-            <p class="ui-help">API keys are key/value secrets: encrypted, scoped to everyone, chosen groups or one worker, and injected as environment variables when a worker starts. They follow the same scope, reveal, rotation and audit rules as every other secret.</p>
-            <div class="vault-actions-row"><button class="btn primary" id="vault-apikey-add-btn" onclick="_vaultEdit(null,'add',{kind:'api_key'})">${_vaultIcon('plus')}Add API Key</button></div>
-            <div id="vault-apikeys-table" aria-live="polite"></div>
-          </div>
         </div>
       </div>
     </section>`;
@@ -56294,7 +62540,6 @@ function _vaultPendingRender(items) {
 function _vaultLeave() {
   if (!document.getElementById('vault-view')?.firstElementChild) return;
   _vaultMaskAll();
-  _vaultApiKeysHome();
   document.querySelectorAll('.vault-sub').forEach(el => el.remove());
 }
 // Open the Vault tab on a given section, optionally filtered to a worker or
@@ -56304,7 +62549,7 @@ function openVault(tab, filter) {
   _vault.q = ''; _vault.scope = ''; _vault.group = ''; _vault.worker = ''; _vault.prov = null;
   if (filter && filter.group) _vault.group = String(filter.group).toLowerCase();
   if (filter && filter.worker) _vault.worker = filter.worker;
-  _vault.tab = ['payments', 'apikeys'].includes(tab) ? tab : 'secrets';
+  _vault.tab = tab === 'payments' ? tab : 'secrets';
   const q = document.getElementById('vault-q'); if (q) q.value = '';
   if (activeView !== 'vault') switchView('vault');
   else _vaultEnter();
@@ -56326,7 +62571,7 @@ function closeVault() {
 }
 function _vaultTab(name) {
   _vault.tab = name;
-  for (const t of ['secrets', 'payments', 'apikeys']) {
+  for (const t of ['secrets', 'payments']) {
     const on = t === name;
     const b = document.getElementById('vault-tab-' + t);
     if (b) { b.classList.toggle('active', on); b.setAttribute('aria-selected', String(on)); b.tabIndex = on ? 0 : -1; }
@@ -56334,23 +62579,6 @@ function _vaultTab(name) {
     if (p) p.hidden = !on;
   }
   if (name === 'payments') _vaultLoad();
-  if (name === 'apikeys') {
-    // Settings no longer shows API Keys (b15e61d9); the section's markup and
-    // handlers stay in #settings-moved-out, and this tab borrows the node so
-    // every id its scripts look up keeps working.
-    const sec = document.getElementById('settings-apikeys-section');
-    const panel = document.getElementById('vault-panel-apikeys');
-    if (sec && panel && sec.parentElement !== panel) panel.appendChild(sec);
-    loadApiKeys();
-    _vaultApiKeysRender();
-  }
-}
-// Return the borrowed API Keys section before the overlay is removed, or the
-// next openVault would find nothing to borrow.
-function _vaultApiKeysHome() {
-  const sec = document.getElementById('settings-apikeys-section');
-  const home = document.getElementById('settings-moved-out');
-  if (sec && home && sec.parentElement !== home) home.appendChild(sec);
 }
 async function _vaultSecretsLoad() {
   const table = document.getElementById('vault-secrets-table');
@@ -56447,7 +62675,6 @@ function _vaultVisible() {
 }
 function _vaultRender() {
   _vaultWorkerPanel();
-  _vaultApiKeysRender();
   const table = document.getElementById('vault-secrets-table');
   if (!table) return;
   if (_vault.loadErr) {
@@ -56464,8 +62691,6 @@ function _vaultRender() {
   if (!list.length) { table.innerHTML = '<div class="vault-empty"><b>No secrets match</b><p>Change the search or filters.</p></div>'; return; }
   table.innerHTML = _vaultTableHtml(list, 'vault-val-');
 }
-// One table markup for every list of secrets (the Secrets tab and the API
-// Keys tab), so a row action works the same wherever the row is shown.
 function _vaultTableHtml(list, idPrefix) {
   const effective = new Map((_vault.prov?.resolved || []).map(x => [x.id, x]));
   return '<table class="vault-table"><thead><tr><th scope="col">Name</th><th scope="col">Value</th><th scope="col">Scope</th><th scope="col">Provisioned to</th><th scope="col">Updated</th><th scope="col"><span class="sr-only">Actions</span><span aria-hidden="true">Actions</span></th></tr></thead><tbody>'
@@ -56473,25 +62698,18 @@ function _vaultTableHtml(list, idPrefix) {
       const shown = Object.prototype.hasOwnProperty.call(_vault.revealed, i.id);
       const forWorker = _vault.worker && _vault.prov ? (effective.has(i.id) ? _vaultStateBadge(effective.get(i.id).state) : _vaultStateBadge('overridden')) : '';
       return '<tr class="vault-row" data-id="' + esc(i.id) + '">'
-        + '<td data-label="Name"><div class="vault-name"><code>' + esc(i.key) + '</code>' + _vaultIdBadge(i.id) + (i.kind === 'api_key' ? '<span class="vault-chip vault-chip-apikey">API key</span>' : '') + (i.note ? '<span class="ui-help">' + esc(i.note) + '</span>' : '') + '</div></td>'
+        + '<td data-label="Name"><div class="vault-name"><code>' + esc(i.key) + '</code>' + _vaultIdBadge(i.id) + (i.note ? '<span class="ui-help">' + esc(i.note) + '</span>' : '') + '</div></td>'
         + '<td data-label="Value"><div class="vault-value"><span class="vault-mask' + (shown ? ' revealed' : '') + '" id="' + idPrefix + esc(i.id) + '">' + (shown ? esc(_vault.revealed[i.id]) : '••••••••••••') + '</span>'
-        + '<button class="vault-icon-btn" aria-label="' + (shown ? 'Hide ' : 'Reveal ') + esc(i.key) + '" aria-pressed="' + shown + '" title="' + (shown ? 'Hide' : 'Reveal (recorded in the audit log)') + '" onclick="_vaultReveal(\'' + escJs(i.id) + '\')">' + _vaultIcon(shown ? 'eyeOff' : 'eye') + '</button></div></td>'
+        + '<button class="vault-icon-btn" aria-label="' + (shown ? 'Hide ' : 'Reveal ') + esc(i.key) + '" aria-pressed="' + shown + '" title="' + (shown ? 'Hide' : 'Reveal (recorded in the audit log)') + '" onclick="_vaultReveal(\'' + escJs(i.id) + '\')">' + _vaultIcon(shown ? 'eyeOff' : 'eye') + '</button>'
+        // Copy only while revealed (owner, 2026-11-18): it reads the value by id, never from the markup.
+        + (shown ? '<button class="vault-icon-btn vault-copy" aria-label="Copy ' + esc(i.key) + '" title="Copy the value" onclick="_vaultCopy(\'' + escJs(i.id) + '\')">' + _vaultIcon('copy') + '</button>' : '')
+        + '</div></td>'
         + '<td data-label="Scope">' + _vaultChip(i.scope) + '</td>'
         + '<td data-label="Provisioned to">' + _vaultProvisionedTo(i) + forWorker + '</td>'
         + '<td data-label="Updated"><span title="' + esc(new Date((i.updated || 0) * 1000).toLocaleString()) + '">' + esc(timeAgo(i.updated)) + '</span><span class="ui-help"> · v' + esc(String(i.version || 1)) + '</span></td>'
         + '<td data-label="Actions" class="vault-actions-cell"><button class="vault-icon-btn vault-more" aria-haspopup="menu" aria-expanded="false" aria-label="Actions for ' + esc(i.key) + '" onclick="_vaultMenu(event,\'' + escJs(i.id) + '\')">' + _vaultIcon('more') + '</button></td>'
         + '</tr>';
     }).join('') + '</tbody></table>';
-}
-// API Keys tab: the secrets filed as kind api_key. Same store, same scope,
-// same reveal, rotate, access and audit actions as any secret.
-function _vaultApiKeysRender() {
-  const el = document.getElementById('vault-apikeys-table');
-  if (!el) return;
-  if (_vault.loadErr) { el.innerHTML = '<div class="vault-empty" role="alert"><b>API keys unavailable</b><p>' + esc(_vault.loadErr) + '</p></div>'; return; }
-  const list = _vault.items.filter(i => i.kind === 'api_key').sort((a, b) => a.key.localeCompare(b.key));
-  el.innerHTML = list.length ? _vaultTableHtml(list, 'vault-akval-')
-    : '<div class="vault-empty"><b>No API keys yet</b><p>Add a key name and value, then choose which workers receive it.</p></div>';
 }
 function _vaultMenuClose() {
   document.querySelectorAll('.vault-menu').forEach(m => m.remove());
@@ -56527,6 +62745,11 @@ function _vaultMenu(event, id) {
 function _vaultMask(id) {
   clearTimeout(_vault.timers[id]); delete _vault.timers[id];
   delete _vault.revealed[id];
+}
+function _vaultCopy(id) {
+  if (!Object.prototype.hasOwnProperty.call(_vault.revealed, id)) { showToast('Reveal it first'); return; }
+  const item = (_vault.items || []).find(x => x.id === id);
+  _copyTextWithToast(_vault.revealed[id], 'Copied ' + ((item && item.key) || 'the value'));
 }
 function _vaultMaskAll() { for (const id of Object.keys(_vault.revealed)) _vaultMask(id); }
 async function _vaultReveal(id) {
@@ -56567,11 +62790,11 @@ function _vaultSubClose(id) {
 }
 // Add, Edit and Rotate share one dialog. Edit never shows the stored value:
 // leaving Value blank keeps it, typing one rotates (version + 1).
-function _vaultEdit(id, mode, opts) {
+function _vaultEdit(id, mode) {
   const it = id ? _vault.items.find(x => x.id === id) : null;
   mode = it ? (mode || 'edit') : 'add';
-  const kind = it ? (it.kind || 'secret') : (opts?.kind === 'api_key' ? 'api_key' : 'secret');
-  const noun = kind === 'api_key' ? 'API Key' : 'Secret';
+  const kind = it ? (it.kind || 'secret') : 'secret';
+  const noun = 'Secret';
   const wg = _vaultWorkerGroups();
   const groups = [...new Set([..._vault.groups, ...Object.values(wg).flat()])].sort();
   const workers = Object.keys(wg).sort();
@@ -56809,12 +63032,163 @@ async function _vaultAudit(key) {
       + '<span class="vault-audit-what">' + line(x) + '</span><time class="ui-help" title="' + esc(new Date((x.ts || 0) * 1000).toLocaleString()) + '">' + esc(timeAgo(x.ts)) + '</time></li>').join('') + '</ol>'
       : '<p class="ui-help">Nothing recorded yet.</p>');
 }
+// ── Settings > This Mac: the Mac app's own settings, in the one Settings ──
+// The app answers through amuxSettings (desktop/amux-settings.swift
+// settingsAction) and calls _macSettingsState with what to draw; ⌘, and every
+// "Settings…" menu item open this tab (owner, 2026-11-25: "consolidate all our
+// settings"). A browser has no such bridge, so the tab stays hidden there.
+let _macSettings = null;
+function _macSettingsBridge() { return window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.amuxSettings; }
+function _macSettingsSend(action, name, value) {
+  const b = _macSettingsBridge();
+  if (b) b.postMessage({ action, name: name || '', value });
+}
+function _macSettingsTabSync() {
+  const t = document.getElementById('settings-tab-mac');
+  if (t) t.hidden = !_macSettingsBridge();
+}
+// The Mac app's Settings window (desktop/amux-settings.swift
+// SettingsWindowController) loads /?settings_window=1: Settings fills that
+// window and is all it shows, apart from every amux window (owner, 2026-11-27).
+// The app asks this before trusting the page; an older dashboard answers no.
+function _settingsWindowMode() { return /[?&]settings_window=/.test(location.search); }
+(function _settingsWindowBoot() {
+  if (!_settingsWindowMode()) return;
+  document.documentElement.classList.add('settings-window');
+  const boot = () => {
+    // This Mac first when the app is listening, else the last tab.
+    const mac = _macSettingsOpen();
+    if (!mac) { const m = document.getElementById('settings-menu'); if (m && !m.classList.contains('open')) toggleSettings(); }
+    console.info('[settings] verdict=settings_window_open mac_tab=' + mac);
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else setTimeout(boot, 0);
+})();
+// Called by the app (showSettings). True means the tab is open.
+function _macSettingsOpen() {
+  if (!_macSettingsBridge()) return false;
+  _macSettingsTabSync();
+  const menu = document.getElementById('settings-menu');
+  if (!menu) return false;
+  if (!menu.classList.contains('open')) toggleSettings();
+  _settingsTab('mac');
+  return true;
+}
+function _macSettingsState(s) {
+  _macSettings = s || null;
+  _macSettingsRender();
+}
+function _macToggleRow(key, label, hint) {
+  const on = !!(_macSettings.toggles || {})[key];
+  return '<div class="settings-row mac-set-row"><label class="mac-set-label" for="mac-set-' + key + '"><b>' + esc(label) + '</b>'
+    + (hint ? '<span class="ui-help">' + esc(hint) + '</span>' : '') + '</label>'
+    + '<label class="theme-toggle"><input type="checkbox" id="mac-set-' + key + '"' + (on ? ' checked' : '')
+    + ' onchange="_macSettingsSend(\'toggle\',\'' + key + '\',this.checked)"><span class="theme-track"><span class="theme-thumb"></span></span></label></div>';
+}
+let _macSettingsDraws = 0;
+function _macSettingsRender() {
+  const host = document.getElementById('mac-settings');
+  if (!host) return;
+  host.dataset.draws = String(++_macSettingsDraws);
+  const s = _macSettings;
+  if (!s) { host.innerHTML = '<p class="ui-help">Loading this Mac\'s settings…</p>'; return; }
+  const sec = (label, body) => '<div class="settings-section-label">' + esc(label) + '</div>' + body + '<div class="settings-sep"></div>';
+  const ws = s.workspaces || [];
+  const wsRows = ws.length ? ws.map(w => {
+    // A name can carry any character (a workspace saved on another Mac syncs here): escJs.
+    const n = "'" + escJs(w.name) + "'";
+    return '<div class="settings-row mac-set-row mac-set-stack"><div class="mac-set-label"><b>' + esc(w.name) + '</b><span class="ui-help">'
+      + esc(w.summary) + (w.open ? ' · open now' : '') + ' · saved ' + esc(w.saved) + '</span></div>'
+      + '<span class="mac-set-actions"><button class="btn primary" onclick="_macSettingsSend(\'open\',' + n + ')">Open</button>'
+      + '<button class="btn" title="Replace with the windows open now" onclick="_macSettingsSend(\'update\',' + n + ')">Update</button>'
+      + '<button class="btn" onclick="_macSettingsSend(\'rename\',' + n + ')">Rename</button>'
+      + '<button class="btn danger" onclick="_macSettingsSend(\'delete\',' + n + ')">Delete</button></span></div>';
+  }).join('') : '<p class="ui-help">No saved workspaces yet. Arrange your windows across your Desktops, then save them here.</p>';
+  const opt = (v, t, cur) => '<option value="' + esc(v) + '"' + (v === cur ? ' selected' : '') + '>' + esc(t) + '</option>';
+  const launch = [['last', 'Reopen the windows from last time'], ['new', 'Open one new window']]
+    .concat(ws.map(w => ['layout:' + w.name, 'Open workspace: ' + w.name])).map(o => opt(o[0], o[1], s.launch)).join('');
+  const split = [['right', 'To the right'], ['below', 'Below'], ['longer', "Along the pane's longer side"]].map(o => opt(o[0], o[1], s.split)).join('');
+  const perms = (s.permissions || []).map(p => {
+    const on = p.state === 'on';
+    return '<div class="settings-row mac-set-row" data-permission="' + esc(p.id || '') + '"><div class="mac-set-label"><b>' + esc(p.name || '') + '</b><span class="ui-help">' + esc(p.for || '') + '</span></div>'
+      + '<span class="mac-perm-state" data-state="' + esc(p.state || '') + '">' + (on ? 'On' : p.state === 'off' ? 'Off' : 'Not set up') + '</span>'
+      + (on ? '' : '<button class="btn" onclick="_macSettingsSend(\'permission\',\'' + escJs(p.id || '') + '\')">Turn On</button>') + '</div>';
+  }).join('');
+  const u = s.update || {};
+  // The app redraws this on every change from any window; a name being typed survives it.
+  const typing = document.getElementById('mac-ws-name');
+  const typed = typing ? typing.value : '', hadFocus = typing && document.activeElement === typing;
+  host.innerHTML =
+    sec('Workspaces', wsRows + '<div class="settings-row mac-set-row"><input class="input" id="mac-ws-name" placeholder="Name this workspace, e.g. Morning triage"'
+      + ' onkeydown="if(event.key===\'Enter\')_macSettingsSaveWs()"><button class="btn primary" id="mac-ws-save" onclick="_macSettingsSaveWs()">Save current windows</button></div>')
+    + sec('Computer use', _macToggleRow('computerUse', "Let workers use this Mac's apps",
+      "In the background, with their own cursor: your pointer and keyboard stay yours. Each worker may use only the apps you approve for it (AMUX_MAC_APPS in its Scope tab); terminals, password managers and System Settings stay off limits. ⌘⇧Esc stops it from any app. Now: " + (s.computerUseNow || '') + '.'))
+    + sec('Permissions', perms || '<p class="ui-help">No permissions to show.</p>')
+    + sec('Quick Ask', _macToggleRow('quickAsk', '⌥Space asks a worker from any app', 'A small panel to send a worker a message, with the window you were in or the text you selected attached if you want.'))
+    + sec('When amux opens', '<div class="settings-row mac-set-row"><select class="input" id="mac-set-launch" onchange="_macSettingsSend(\'launch\',\'\',this.value)">' + launch + '</select></div>'
+      + _macToggleRow('openAtLogin', 'Open amux at login', 'So a restart comes back to your windows on their Desktops. Now: ' + (s.openAtLoginNow || '') + '.')
+      + '<p class="ui-help">Each window goes back to its display and Desktop (' + (s.spacesCanMove ? 'available on this Mac' : 'not available on this macOS, so windows open on the current Desktop') + ').</p>')
+    + sec('Windows', _macToggleRow('menuBar', 'Show in menu bar', 'The amux icon, with who needs you, new windows, recording, computer use, pins and workspaces.')
+      + _macToggleRow('notifications', 'Notifications', 'Each new item waiting on you, and Messages addressed to you.')
+      + _macToggleRow('dockBadge', 'Show count on Dock icon', 'The number of items waiting on you.')
+      + _macToggleRow('zoomAllWindows', 'Zoom all windows together', 'Zooming one window zooms every amux window.')
+      + _macToggleRow('snapToGrid', 'Snap windows to a grid', 'While you drag, an outline shows where the window lands. Hold Option to place it freely.')
+      + '<div class="settings-row mac-set-row"><label class="mac-set-label" for="mac-set-split"><b>Split opens the new pane</b></label><select class="input" id="mac-set-split" onchange="_macSettingsSend(\'splitDirection\',\'\',this.value)">' + split + '</select></div>')
+    + _macStorageSection(s.storage, sec)
+    + _macLimitsSection(s.limits, sec)
+    + sec('Updates', '<div class="settings-row mac-set-row mac-set-stack"><div class="mac-set-label"><b>This app: ' + esc(u.built || '') + '</b><span class="ui-help" id="mac-upd-status" data-state="' + esc(u.state || '') + '">'
+      + esc(u.detail || 'Check whether a newer build is out.') + '</span></div><span class="mac-set-actions">'
+      + (u.canInstall ? '<button class="btn primary" id="mac-upd-install" onclick="_macSettingsSend(\'update-install\')"' + (u.busy ? ' disabled' : '') + '>Update and Relaunch</button>' : '')
+      + '<button class="btn" id="mac-upd-check" onclick="_macSettingsSend(\'update-check\')"' + (u.busy ? ' disabled' : '') + '>Check for Updates</button></span></div>')
+    + '<div class="settings-section-label">Server</div><div class="settings-row mac-set-row"><div class="mac-set-label"><b>' + esc(s.server || 'not connected') + '</b><span class="ui-help">Every window connects here.</span></div>'
+      + '<button class="btn" onclick="_macSettingsSend(\'server\')">Change…</button></div>';
+  const again = document.getElementById('mac-ws-name');
+  if (again && typed) again.value = typed;
+  if (again && hadFocus) again.focus();
+}
+// Saved page data (desktop/amux-storage.swift). WebKit's localStorage log for
+// the server reached 23 GB in the owner's app (2026-11-26) and every outbox read
+// stalled on it. Compact keeps every saved item and drops the log; the app also
+// does it by itself past 1 GB, at launch or while in the background.
+// The app's limits (desktop/amux-settings.swift appLimits), each an
+// AMUX_DESKTOP_* variable until 2026-11-26 (owner: "all should be configurable
+// in the ui"). An emptied field goes back to the default; a variable set in the
+// app's environment still wins and is shown as such.
+function _macLimitsSection(limits, sec) {
+  if (!limits || !limits.length) return '';
+  const rows = limits.map(l => {
+    const id = 'mac-limit-' + esc(l.key);
+    const note = l.fromEnv ? ' Set by ' + l.key + ' in the environment, which wins.' : (l.set ? '' : ' Default.');
+    return '<div class="settings-row mac-set-row"><label class="mac-set-label" for="' + id + '"><b>' + esc(l.label) + '</b><span class="ui-help">'
+      + esc((l.help || '') + note) + '</span></label><span class="mac-set-actions"><input class="input mac-limit-input" type="number" min="0" step="1" inputmode="numeric" id="' + id + '"'
+      + ' data-key="' + esc(l.key) + '" value="' + esc(String(Math.round(l.value))) + '" placeholder="' + esc(String(Math.round(l.default))) + '"' + (l.fromEnv ? ' disabled' : '')
+      + ' onchange="_macSettingsSend(\'limit\',this.dataset.key,this.value)"><span class="ui-help">' + esc(l.unit) + '</span></span></div>';
+  }).join('');
+  return sec('Memory and storage', rows);
+}
+function _macStorageSection(st, sec) {
+  if (!st) return '';
+  const size = st.measured ? st.size : 'not measured';
+  const help = st.large ? 'This is more than it should be and can slow amux down. Compacting keeps your queued messages, drafts and preferences, and every amux page reloads.'
+    : 'Queued messages, drafts and preferences this app keeps for the server. Compacting keeps all of them and every amux page reloads.';
+  return sec('Storage', '<div class="settings-row mac-set-row mac-set-stack"><div class="mac-set-label"><b id="mac-storage-size" data-bytes="' + esc(String(st.bytes || 0))
+    + '" data-large="' + (st.large ? '1' : '0') + '">Saved page data: ' + esc(size) + '</b><span class="ui-help" id="mac-storage-status">'
+    + esc(st.busy ? 'Compacting…' : (st.last || help)) + '</span></div><span class="mac-set-actions"><button class="btn' + (st.large ? ' primary' : '')
+    + '" id="mac-storage-compact" onclick="_macSettingsSend(\'compactStorage\')"' + (st.busy ? ' disabled' : '') + '>Compact</button></span></div>');
+}
+function _macSettingsSaveWs() {
+  const i = document.getElementById('mac-ws-name');
+  const v = i && i.value.trim();
+  if (v) { i.value = ''; _macSettingsSend('save', v); }
+}
 function _settingsTab(name) {
   if (name === 'integrations') setTimeout(() => { _chatgptAppLoad(); }, 0);
+  if (name === 'mac') { _macSettingsTabSync(); _macSettingsRender(); _macSettingsSend('state'); }
   const menu = document.getElementById('settings-menu');
   if (!menu) return;
   menu.querySelectorAll('.settings-tab-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.stab === name));
+  // On a phone the tab strip scrolls sideways: bring the chosen tab into it.
+  menu.querySelector('.settings-tab-btn.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   const panels = menu.querySelectorAll('.settings-tab-panel');
   let matched = false;
   panels.forEach(p => {
@@ -56883,9 +63257,11 @@ function toggleSettings() {
   const open = menu.classList.toggle('open');
   if(!open) closeSettings();
   if (open) {
+    _macSettingsTabSync();
     // Restore the last-used settings tab (default: account) before painting.
     let savedTab = 'account';
     try { savedTab = localStorage.getItem('amux_settings_tab') || 'account'; } catch (e) {}
+    if (savedTab === 'mac' && !_macSettingsBridge()) savedTab = 'account';
     _settingsTab(savedTab);
     // Load the server-saved caps before painting, so the selects show the real
     // values rather than defaults that then silently change under the user.
@@ -57273,7 +63649,7 @@ async function _standingApprovalsLoad() {
   } catch (e) { usesEl.textContent = 'Could not load the FYI feed'; }
 }
 async function _standingApprovalRevoke(id, btn) {
-  if (!confirm('Revoke ' + id + '? Workers will escalate these asks to you again.')) return;
+  if (!(await showConfirm('Revoke ' + id + '? Workers will escalate these asks to you again.', 'Revoke', true))) return;
   if (btn) { btn.disabled = true; btn.textContent = 'Revoking…'; }
   try {
     const r = await fetch(API + '/api/approvals/standing/' + encodeURIComponent(id), { method: 'DELETE' });
@@ -57319,7 +63695,57 @@ async function sendTestAlert(btn) {
   if (btn) btn.disabled = false;
 }
 
+// Settings opens INSIDE the window, wherever the gear is. On a wide screen the
+// menu hung under the gear, so when the Needs-you approvals above the header
+// pushed the gear down (777px in an 832px Mac app window, 2026-11-25) the menu
+// started 55px from the bottom and the owner could not open Settings at all.
+// Under the gear when there is room for most of it, else beside the gear from
+// the top, so the gear stays clickable. A phone keeps its own CSS placement.
+function _settingsPlace() {
+  const menu = document.getElementById('settings-menu');
+  // The Settings window places it with CSS (html.settings-window).
+  if (!menu || _settingsWindowMode()) return;
+  const st = menu.style;
+  // The menu lives in the sticky header, whose stacking level (40) is under
+  // the held-email strip's (90): wherever they overlap the strip painted over
+  // the menu. While Settings is open the header sits above the strip, still
+  // under the overlays (100+, AF-390).
+  const header = menu.closest('.header-row');
+  if (!menu.classList.contains('open') || window.matchMedia('(max-width: 600px)').matches) {
+    st.position = st.top = st.right = st.maxHeight = st.maxWidth = '';
+    if (header) header.style.zIndex = '';
+    return;
+  }
+  if (header) header.style.zIndex = '95';
+  const vh = window.innerHeight, vw = document.documentElement.clientWidth;
+  const btn = document.getElementById('settings-btn');
+  const r = btn ? btn.getBoundingClientRect() : null;
+  const seen = r && r.width > 0 && r.bottom > 0 && r.top < vh;
+  // Below the in-page tab bar when there is one.
+  const floor = 8 + (parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--chrome-tab-h')) || 0);
+  let top = floor, right = 12;
+  if (seen && vh - r.bottom - 18 >= Math.min(480, vh * 0.6)) { top = r.bottom + 6; right = vw - r.right; }
+  else if (seen) { right = Math.max(8, vw - r.left + 8); }
+  st.position = 'fixed';
+  st.top = Math.round(top) + 'px';
+  st.right = Math.round(right) + 'px';
+  st.maxHeight = Math.max(200, Math.round(vh - top - 12)) + 'px';
+  st.maxWidth = Math.max(260, Math.min(440, Math.round(vw - right - 8))) + 'px';
+}
+(function _settingsPlaceWatch() {
+  const go = () => {
+    const menu = document.getElementById('settings-menu');
+    if (!menu) return;
+    new MutationObserver(_settingsPlace).observe(menu, { attributes: true, attributeFilter: ['class'] });
+    window.addEventListener('resize', _settingsPlace);
+    document.addEventListener('scroll', _settingsPlace, { capture: true, passive: true });
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go); else go();
+})();
+
 function closeSettings() {
+  // The Settings window is Settings: nothing in it closes it but the window's own close.
+  if (_settingsWindowMode()) return;
   document.getElementById('settings-menu').classList.remove('open');
   const banner=document.getElementById('amux-auth-withheld'); if(banner) banner.hidden=false;
 }
@@ -57410,7 +63836,7 @@ function saveSettingsNewServer() {
 // not outside: answering it used to close Settings under the user.
 document.addEventListener('click', function(e) {
   const wrap = document.querySelector('.settings-wrap');
-  if (wrap && !wrap.contains(e.target) && !e.target.closest?.('#modal-backdrop')) closeSettings();
+  if (wrap && !_settingsWindowMode() && !wrap.contains(e.target) && !e.target.closest?.('#modal-backdrop')) closeSettings();
 });
 
 // ── Default Model ────────────────────────────────────────────────────────────
@@ -57509,71 +63935,6 @@ async function saveHelperModel(val) {
     if (r.ok) showToast(val ? ('Meta-task model: ' + val) : 'Meta-task model: default (haiku)');
     else showToast('Could not save meta-task model');
   } catch(e) { showToast('Error: ' + e.message); }
-}
-
-// ── API Keys ───────────────────────────────────────────────────────────────────
-// Same 3 keys provider::live_catalog (server) can probe for a real model
-// list; the placeholder/status ids match what api/settings.rs's PROVIDER_ENV_KEYS
-// allows it to read/write. ANTHROPIC_API_KEY keeps its ORIGINAL element ids
-// (settings-anthropic-key / settings-apikey-status, no suffix) — e2e/settings.spec.ts
-// locates them unsuffixed and saveApiKey() with no argument is a real call site
-// (index.html's own onclick used to omit it), so both stay working unchanged.
-const API_KEY_FIELDS = [
-  { key: 'ANTHROPIC_API_KEY', input: 'settings-anthropic-key', status: 'settings-apikey-status', placeholder: 'sk-ant-...' },
-  { key: 'OPENAI_API_KEY', input: 'settings-openai-key', status: 'settings-apikey-status-openai', placeholder: 'sk-...' },
-  { key: 'GEMINI_API_KEY', input: 'settings-gemini-key', status: 'settings-apikey-status-gemini', placeholder: 'AIza...' },
-];
-
-async function loadApiKeys() {
-  try {
-    const r = await fetch('/api/settings/env');
-    const data = await r.json();
-    for (const f of API_KEY_FIELDS) {
-      const inp = document.getElementById(f.input);
-      const st = document.getElementById(f.status);
-      if (!inp) continue;
-      inp.placeholder = data[f.key] ? data[f.key] : f.placeholder;
-      // Never clear a NON-EMPTY input: this callback is async and can land
-      // AFTER someone started typing into the field — the unconditional
-      // `inp.value = ''` here wiped the entry mid-flight, and Save then hit
-      // its empty-value early return as a silent no-op. That was the
-      // settings_api_key_anthropic CI flake (6/8 runs: fill won the race on a
-      // loaded runner, the refresh wiped it, waitForResponse hung 60s) and is
-      // the same bug a fast human hits as "my key vanished while I typed".
-      // The one writer that needs the field cleared — saveApiKey after a
-      // successful PATCH — clears it itself before calling us.
-      if (st) st.textContent = data[f.key] ? 'Key saved ✓' : 'No key set';
-    }
-  } catch(e) {}
-}
-
-async function saveApiKey(providerKey) {
-  const f = API_KEY_FIELDS.find(x => x.key === (providerKey || 'ANTHROPIC_API_KEY'));
-  if (!f) return;
-  const inp = document.getElementById(f.input);
-  const st = document.getElementById(f.status);
-  const val = inp ? inp.value.trim() : '';
-  if (!val) {
-    // Say so instead of silently no-oping: when the refresh race above wiped
-    // the field, Save "doing nothing" was indistinguishable from Save being
-    // broken — the e2e's only symptom was a 60s network wait on a request
-    // that was never sent.
-    if (st) st.textContent = 'Enter a key first';
-    return;
-  }
-  st && (st.textContent = 'Saving…');
-  try {
-    const body = {}; body[f.key] = val;
-    const r = await fetch('/api/settings/env', {method:'PATCH', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(body)});
-    if (r.ok) {
-      if (inp) inp.value = '';
-      if (st) st.textContent = 'Saved ✓';
-      await loadApiKeys();
-    } else {
-      if (st) st.textContent = 'Save failed';
-    }
-  } catch(e) { if (st) st.textContent = 'Error: ' + e.message; }
 }
 
 // ── Commit guard ─────────────────────────────────────────────────────────────
@@ -58142,8 +64503,8 @@ async function startCheckout(billing) {
     });
     const d = await r.json();
     if (d.url) location.href = d.url;
-    else alert(d.error || 'Failed to start checkout');
-  } catch(e) { alert('Connection error'); }
+    else await showAlert(d.error || 'Failed to start checkout');
+  } catch(e) { await showAlert('Connection error'); }
 }
 
 async function openBillingPortal() {
@@ -58151,18 +64512,17 @@ async function openBillingPortal() {
     const r = await fetch('/api/stripe/portal', { method: 'POST' });
     const d = await r.json();
     if (d.url) location.href = d.url;
-    else alert(d.error || 'No billing account');
-  } catch(e) { alert('Connection error'); }
+    else await showAlert(d.error || 'No billing account');
+  } catch(e) { await showAlert('Connection error'); }
 }
 
-// Load team + API keys + billing whenever settings opens
+// Load team + billing whenever settings opens
 const _origToggleSettings = toggleSettings;
 toggleSettings = function() {
   _origToggleSettings();
   const menu = document.getElementById('settings-menu');
   if (menu && menu.style.display !== 'none') {
     loadTeamSection();
-    loadApiKeys();
     loadBillingSection();
   }
 };
@@ -58487,6 +64847,7 @@ async function _handleDeeplink(hash) {
         return;
       }
       if (attempt < 20) setTimeout(() => tryOpen(attempt + 1), 400);
+      else _peekBootReveal('worker_not_found', target);
     };
     tryOpen(0);
     return;
@@ -58695,6 +65056,7 @@ async function _handleDeeplink(hash) {
       _filesPath = parent;
       switchView('files');
       await openFilePreview(dpath);
+      _fileBootLinkPath = (_fileData && _fileData.path) || null;
       if (edit) {
         const ok = !!(_fileData && _fileData.path && _fileEditable(_fileData));
         if (ok) setFileViewMode('edit');
@@ -58714,11 +65076,11 @@ async function _handleDeeplink(hash) {
 // any open session peek. Bounded to 24h so a days-later open still lands on a
 // sane default rather than a stale heavy tab.
 const _UI_RESTORE_MAX_AGE = 24 * 3600 * 1000;
-// The hashes that name where to land. Restoring the last screen must not run
-// over any of them (both checks below read this one list). reconnect joined it
-// on 2026-11-08: a connector alert's link opened Connectors and its prompt,
-// then the restore reopened the last worker over them.
-const _DEEPLINK_HASH_RE = /^#(?:peek|issue|menu|view|path|edit|browser|bq|task|reconnect)=/;
+// _DEEPLINK_HASH_RE (the hashes that name where to land) is defined above the
+// in-page tab bar, which reads it at load.
+// Set in sessionStorage by a tab's first boot: a later boot of the same tab
+// (a reload, a discarded tab coming back) restores from its own state.
+const _UI_TAB_SEEN_KEY = 'amux_tab_seen';
 function _restoreScreen(bootHash) {
   // Must run AFTER the DOM is parsed: switchView touches #grid-view, which is
   // defined later in the HTML than this inline script — calling it during boot
@@ -58737,10 +65099,43 @@ function _restoreScreen(bootHash) {
   const _bootHash = typeof bootHash === 'string' ? bootHash : location.hash;
   const _hasDeeplink = _DEEPLINK_HASH_RE.test(_bootHash)
                      || /[?&]view=/.test(location.search);
+  // A link names the screen: Home is not being decided.
+  if (_hasDeeplink) window._homeChoiceSettled = true;
+  // Simple mode is who she is, not which screen opens: applied on every load,
+  // from the last answer at once and the server's when it comes. Only the
+  // no-saved-view branch below asks it to pick the screen too. Applied there
+  // alone, a reload into Chat showed every tab (uc1, second load).
+  try { _homeSimple(localStorage.getItem('amux_home_choice') === 'intent'); } catch (e) { console.warn('[home] storage unreadable', e); }
+  // THIS TAB'S OWN STATE WINS OVER THE SHARED COPY. localStorage is shared by
+  // every tab of the origin (and every Mac app window), so amux_ui_view and
+  // amux_peek_state hold whatever tab was used LAST. A tab on the Workers list
+  // or the Files root (no #view=/#peek= in its address) that reloaded (Chrome
+  // discarding a background tab, a deploy's reload-when-shown, a crash) came
+  // back on the other tab's worker and its peek tab (owner, 2026-11-13: "each
+  // tab is not keeping its workers"). sessionStorage is per tab and survives a
+  // reload and a discard; only a tab that has none (a new tab, or a PWA iOS
+  // evicted, which wipes it) falls back to the shared copy.
+  //
+  // A tab of the in-page tab bar (?_tab=, an iframe) shares sessionStorage with
+  // the page around it, so neither copy is its own: it opens on its address
+  // (the bar keeps each tab's) and nothing else. Restoring here gave every
+  // rebuilt tab the worker another tab opened last (owner, 2026-11-13).
+  if (_isInTab) {
+    if (!_hasDeeplink) {
+      document.documentElement.classList.remove('boot-home-pending');
+      window._homeChoiceSettled = true;
+    }
+    _homeBootChoice();
+    return;
+  }
+  let _ownTab = false;
+  try { _ownTab = sessionStorage.getItem(_UI_TAB_SEEN_KEY) === '1'; sessionStorage.setItem(_UI_TAB_SEEN_KEY, '1'); } catch(e) {}
+  const _restoreStore = _ownTab ? sessionStorage : localStorage;
+  let _homeChoiceAsked = false;
   // 1. Restore the tab.
   if (!_hasDeeplink) {
     try {
-      const _v = JSON.parse(localStorage.getItem('amux_ui_view') || 'null');
+      const _v = JSON.parse(_restoreStore.getItem('amux_ui_view') || 'null');
       // Only restore a view whose nav tab still EXISTS. localStorage outlives
       // the feature it names: when the notes view was deleted, browsers that had
       // last been on it kept restoring 'notes' into a dispatcher that no longer
@@ -58751,9 +65146,23 @@ function _restoreScreen(bootHash) {
       if (_v && _v.v && _v.v !== 'workers' && (Date.now() - (_v.ts || 0) < _UI_RESTORE_MAX_AGE)
           && document.getElementById('tab-' + _v.v)) {
         try { switchView(_v.v); } catch(e) {}
+        document.documentElement.classList.remove('boot-home-pending');
+        window._homeChoiceSettled = true;
+      } else if (_ownTab) {
+        // This tab never left the screen it opened on: it stays there. The
+        // Home choice is for a tab's first screen, not for its reload.
+        document.documentElement.classList.remove('boot-home-pending');
+        window._homeChoiceSettled = true;
+      } else {
+        // Nothing saved: the home pref (or, for someone new, the intent
+        // Home) picks the first screen. Hidden until it answers, so a new
+        // person never sees the fleet flash first.
+        _homeChoiceAsked = true;
+        _homeBootChoice().then(c => { if (c === 'intent' && activeView === 'sessions' && !peekSession) { try { switchView('home'); } catch(e) { console.warn('[home] could not open Home', e); } } });
       }
     } catch(e) {}
   }
+  if (!_homeChoiceAsked) _homeBootChoice();
   // 2. Restore an open session peek. Prefer sessionStorage (same tab session);
   //    fall back to localStorage when we came back after an eviction.
   //    A #peek= deeplink names its own target — restoring the LAST peek over
@@ -58772,7 +65181,12 @@ function _restoreScreen(bootHash) {
   if (!_ps || !_ps.session) {
     try {
       const _lp = JSON.parse(localStorage.getItem('amux_peek_state') || 'null');
-      if (_lp && _lp.session && (Date.now() - (_lp.ts || 0) < _UI_RESTORE_MAX_AGE)) _ps = _lp;
+      if (_lp && _lp.session && (Date.now() - (_lp.ts || 0) < _UI_RESTORE_MAX_AGE)) {
+        // A tab with its own state had no worker open: the shared copy is
+        // another tab's worker. Say so, so the next leak announces itself.
+        if (_ownTab) amuxTrack('peek_restore_shared_ignored', {verdict: 'other_tab_peek_not_restored', measured: true, n_considered: 1});
+        else _ps = _lp;
+      }
     } catch(e) {}
   }
   if (_ps && _ps.session) {
@@ -59491,6 +65905,14 @@ async function pullFromRemote(btn) {
       return void setTimeout(_wtMaybeStart, 250);
     }
     if (typeof sessions !== 'undefined' && sessions && sessions.length > 0) return;
+    // The intent Home is a new person's first run (docs/design/intent-first.md):
+    // a tour of workers over it would put the machinery in front of someone who
+    // came to say what they want. Wait for Home to decide; skip when it shows.
+    if (!window._homeChoiceSettled) {
+      if (++_wtTries > 26 + 120) return;
+      return void setTimeout(_wtMaybeStart, 250);
+    }
+    if (typeof activeView !== 'undefined' && activeView === 'home') return;
     // One first-run thing at a time. A new amux Cloud server opens "Get started" (connect a
     // model) and this walkthrough together, and the window covered the walkthrough's Skip
     // (fresh server e2e, 2026-10-21). Connecting a model comes first; the tour waits.
@@ -59965,131 +66387,6 @@ function _costLoad() {
     })
     .catch(() => { body.innerHTML = '<div style="color:var(--dim);padding:var(--space-5);">Failed to load cost data.</div>'; });
 }
-// ── Scoreboard (Z14) ──
-// One read of GET /api/debug/scoreboard, drawn with the Metrics classes. It
-// refreshes from render(), which the SSE stream and the polling fallback both
-// call, so it needs no source of its own there; the 15 s timer covers a quiet
-// fleet, where neither repaints but CI, spend and the host still move. A field
-// the server could not read draws as the word "unmeasured" with its reason in
-// the list below the table, so no blank or zero stands in for a missing number.
-const _SB_MIN_GAP_MS = 5000;
-const _SB_POLL_MS = 15000;
-let _sbTimer = null, _sbInFlight = false, _sbLastAt = 0;
-
-function _sbStop() {
-  if (_sbTimer) { clearTimeout(_sbTimer); _sbTimer = null; }
-}
-function _sbLiveTick() {
-  if (activeView !== 'scoreboard' || document.hidden) return;
-  if (Date.now() - _sbLastAt >= _SB_MIN_GAP_MS) _sbLoad();
-}
-async function _sbLoad() {
-  _sbStop();
-  if (activeView !== 'scoreboard' || _sbInFlight) return;
-  _sbInFlight = true;
-  _sbLastAt = Date.now();
-  const up = document.getElementById('sb-updated');
-  try {
-    const r = await fetch(API + '/api/debug/scoreboard');
-    if (!r.ok) throw new Error('error ' + r.status);
-    const d = await r.json();
-    if (activeView === 'scoreboard') {
-      // A refresh replaces the tables, so keep the owner's sideways scroll.
-      const wrap = () => document.getElementById('sb-workers')?.parentElement;
-      const left = wrap()?.scrollLeft || 0;
-      document.getElementById('sb-body').innerHTML = _sbRender(d);
-      if (wrap()) wrap().scrollLeft = left;
-      if (up) up.textContent = 'Updated ' + new Date().toLocaleTimeString();
-    }
-  } catch (e) {
-    // The last good numbers stay on screen; the line says they are old.
-    if (up) up.textContent = 'Refresh failed: ' + (e.message || 'no answer');
-  } finally {
-    _sbInFlight = false;
-    if (activeView === 'scoreboard') _sbTimer = setTimeout(_sbLoad, _SB_POLL_MS);
-  }
-}
-function _sbMissing(why) {
-  return '<span class="sb-unmeasured" title="' + esc(why || 'not read') + '">unmeasured</span>';
-}
-function _sbGoalCell(p) {
-  if (!p || !p.measured) return _sbMissing(p && p.why_unmeasured);
-  const when = p.at ? new Date(p.at * 1000).toLocaleString() : '';
-  return '<span title="' + esc(when) + '">' + esc(String(p.done)) + (p.total != null ? '<span class="sb-of">/' + esc(String(p.total)) + '</span>' : '') + '</span>';
-}
-function _sbRateCell(r) {
-  if (!r || !r.measured) return _sbMissing(r && r.why_unmeasured);
-  return (r.per_h > 0 ? '+' : '') + esc(String(r.per_h)) + '<span class="sb-of">/h</span>';
-}
-function _sbCard(title, value, sub, section) {
-  const off = section && !section.measured;
-  const v = off ? _sbMissing(section.why_unmeasured) : (value == null ? _sbMissing('the source returned no value') : esc(String(value)));
-  return '<div class="metrics-card"><div class="metrics-card-title">' + esc(title) + '</div><div class="metrics-card-value">' + v + '</div><div class="metrics-card-sub">' + esc(off ? '' : (sub || '')) + '</div></div>';
-}
-function _sbMoney(v) { return v == null ? null : '$' + Number(v).toFixed(2); }
-function _sbStateBadge(w) {
-  const cls = { active: 'active', waiting: 'waiting', idle: 'idle' }[w.status] || 'idle';
-  return '<span class="status-badge ' + cls + '">' + esc(w.running ? (w.status || 'unknown') : 'stopped') + '</span>';
-}
-function _sbRow(w) {
-  const g = w.goal || {};
-  const cells = g.configured
-    ? [_sbGoalCell(g.now), _sbGoalCell(g.hour_ago), _sbGoalCell(g.today_start), _sbGoalCell(g.peak), _sbRateCell(g.rate_1h)]
-    : ['<td colspan="5" class="sb-nogoal">' + _sbMissing(g.why_unmeasured) + '</td>'];
-  const tds = g.configured ? cells.map(c => '<td>' + c + '</td>').join('') : cells[0];
-  const wait = w.waiting_on || {};
-  const spend = w.spend_today_usd == null ? _sbMissing('the spend section is unmeasured') : esc(_sbMoney(w.spend_today_usd));
-  return '<tr data-worker="' + esc(w.name) + '"><th scope="row" class="sb-name">' + esc(w.name) + (w.isolated ? ' <span class="sb-of">isolated</span>' : '') + '</th>'
-    + tds + '<td>' + _sbStateBadge(w) + '</td>'
-    + '<td class="sb-wait">' + (wait.measured ? esc(wait.detail) : _sbMissing(wait.why_unmeasured)) + '</td>'
-    + '<td>' + spend + '</td></tr>';
-}
-function _sbRender(d) {
-  const ra = d.rates || {}, ci = d.ci || {}, sp = d.spend || {}, ho = d.host || {}, ny = d.needsyou || {};
-  const workers = d.workers || [];
-  let h = '';
-  h += '<div class="metrics-section-title">Now</div><div class="metrics-cards" id="sb-cards">';
-  h += _sbCard('Needs you', ny.total, ny.overdue ? ny.overdue + ' overdue' : 'open cards', ny);
-  h += _sbCard('Cards done', ra.cards_done_1h, (ra.cards_done_24h ?? '?') + ' in 24 h, last hour shown', ra);
-  h += _sbCard('Spend today', _sbMoney(sp.today_usd), _sbMoney(sp.last_hour_usd) + ' in the last hour', sp);
-  h += _sbCard('Main CI', ci.tip_state, ci.summary || '', ci);
-  h += _sbCard('Commits behind', ci.behind, 'server behind main', ci);
-  h += _sbCard('CI pass rate', null, '', ci.pass_rate || { measured: false });
-  h += _sbCard('Host', ho.level, ho.reasons && ho.reasons.length ? ho.reasons.join('; ') : 'load ' + (ho.load1 ?? '?') + ' on ' + (ho.ncpu ?? '?') + ' cores', ho);
-  h += _sbCard('Memory', ho.mem_percent == null ? null : ho.mem_percent + '%', ho.mem_pressure ? ho.mem_pressure + ' pressure' : '', ho);
-  h += _sbCard('Disk free', ho.disk_free_gb == null ? null : Math.round(ho.disk_free_gb) + ' GB', '', ho);
-  h += '</div>';
-  (ci.workflows || []).forEach(w => {
-    h += '<div class="metrics-card-sub">' + esc(w.name) + ': ' + (w.commits_since_green == null ? _sbMissing('git could not count from the last green commit') : esc(String(w.commits_since_green)) + ' commit(s) since last green') + '</div>';
-  });
-  h += '<div class="metrics-section-title">Workers (' + workers.length + ')</div>';
-  if (d.measured === false) {
-    h += '<div class="reclaim-warn">Workers ' + _sbMissing(d.why_unmeasured) + ': ' + esc(d.why_unmeasured || '') + '</div>';
-  } else {
-    h += '<div class="metrics-table-wrap"><table class="metrics-table sb-table" id="sb-workers"><thead><tr><th scope="col">Worker</th><th scope="col">Goal</th><th scope="col">1 h ago</th><th scope="col">Today start</th><th scope="col">Peak</th><th scope="col">Rate</th><th scope="col">State</th><th scope="col">Waiting on</th><th scope="col">Spend</th></tr></thead><tbody>'
-      + workers.map(_sbRow).join('') + '</tbody></table></div>';
-  }
-  h += '<div class="metrics-section-title">Needs you (' + (ny.measured ? esc(String(ny.total)) : 'unmeasured') + ')</div>';
-  if (!ny.measured) {
-    h += '<div class="metrics-card-sub">' + esc(ny.why_unmeasured || '') + '</div>';
-  } else if (!(ny.queue || []).length) {
-    h += '<div class="metrics-card-sub">Nothing is waiting on you.</div>';
-  } else {
-    h += '<div class="metrics-table-wrap"><table class="metrics-table" id="sb-needsyou"><thead><tr><th scope="col">Card</th><th scope="col">Worker</th><th scope="col">Age</th></tr></thead><tbody>'
-      + ny.queue.map(c => '<tr><td>' + esc(c.id) + ' ' + esc(c.title || '') + '</td><td>' + esc(c.session || '') + '</td><td>' + esc(String(c.age_days ?? '')) + ' d</td></tr>').join('')
-      + '</tbody></table></div>';
-    if (ny.hidden) h += '<div class="metrics-card-sub">' + esc(String(ny.hidden)) + ' more on the Board.</div>';
-  }
-  const un = d.unmeasured || [];
-  if (un.length) {
-    h += '<div class="metrics-section-title" id="sb-why">Unmeasured, and why</div><ul class="sb-why-list">'
-      + un.map(u => '<li><b>' + esc(u.field) + '</b>: ' + esc(u.why || 'no reason recorded')
-        + (u.workers && u.workers.length ? ' <span class="sb-of">(' + esc(u.workers.join(', ')) + ')</span>' : '') + '</li>').join('')
-      + '</ul>';
-  }
-  return h;
-}
-
 function _costOpenSession(name) {
   if (!name) return;
   switchView('sessions');
@@ -60680,6 +66977,29 @@ function _metricsSetMode(mode) {
 // its open cards land (docs/design/worker-velocity.md, /api/velocity). The
 // fleet list first; a row opens that worker's breakdown and projection.
 let _velocityWorker = null;
+// The fleet answer's `goals`: each worker with a goal checker and its number
+// now, an hour ago, at the start of today and its peak (from goal_samples).
+let _velocityGoals = [];
+
+// One goal reading: "44/56", or "unmeasured" with the reason on hover.
+function _velocityGoalPoint(p) {
+  if (!p || !p.measured) return `<span class="velocity-unmeasured" title="${esc((p && p.why_unmeasured) || 'not read')}">unmeasured</span>`;
+  const when = p.at ? new Date(p.at * 1000).toLocaleString() : '';
+  return `<span title="${esc(when)}">${esc(String(p.done))}${p.total != null ? '/' + esc(String(p.total)) : ''}</span>`;
+}
+function _velocityGoalText(g) {
+  const r = g.rate_1h || {};
+  const rate = r.measured ? ` · ${r.per_h > 0 ? '+' : ''}${esc(String(r.per_h))}/h` : '';
+  return `${_velocityGoalPoint(g.now)} now · ${_velocityGoalPoint(g.hour_ago)} 1 h ago · ${_velocityGoalPoint(g.today_start)} today start · peak ${_velocityGoalPoint(g.peak)}${rate}${g.met ? ' · met' : ''}${g.stalled ? ' · <span class="velocity-stalled">stalled</span>' : ''}`;
+}
+function _velocityGoalsHtml(goals) {
+  if (!goals || goals.measured === false) return `<div class="metrics-section-title">Goals</div><div class="metrics-card reclaim-safe-text">${esc((goals && goals.why_unmeasured) || 'Goal history did not load.')}</div>`;
+  const rows = (goals.workers || []).map(g => `<div class="metrics-card velocity-goal" data-velocity-worker="${esc(g.worker)}" onclick="_velocityShowWorker(this.dataset.velocityWorker)">
+      <div class="reclaim-safe-head">${esc(g.worker)}</div>
+      <div class="reclaim-safe-text velocity-goal-text">${_velocityGoalText(g)}</div>
+    </div>`).join('');
+  return rows ? `<div class="metrics-section-title">Goals (${goals.workers.length}) · now, 1 h ago, start of today, peak</div>${rows}` : '';
+}
 
 // The Usage tab (docs/design/usage-optimization.md): Metrics in its Usage mode.
 function openUsage() {
@@ -60719,11 +67039,12 @@ function _velocityLoad() {
     const o = null;
     opt.then(x => { const s = document.getElementById('usage-summary'); if (s && x && !_velocityWorker) s.innerHTML = _usageSummaryHtml(x); });
     if (!d || !Array.isArray(d.workers)) { el.innerHTML = '<div style="color:var(--red);padding:var(--space-5);">Velocity did not load.</div>'; return; }
+    _velocityGoals = (d.goals && d.goals.workers) || [];
     const rows = d.workers.map(w => `<div class="metrics-card velocity-row" data-velocity-worker="${esc(w.worker)}" onclick="_velocityShowWorker(this.dataset.velocityWorker)" style="cursor:pointer;">
         <div class="reclaim-safe-head">${esc(w.worker)}</div>
         <div class="reclaim-safe-text">${w.finished_cards} finished (${w.finished_per_day}/day) · ${w.finished_share_of_time}% of time on finished work · ${w.wasted_hours} h wasted · top: ${esc(w.top_bottleneck || '–')}</div>
       </div>`).join('');
-    el.innerHTML = `<div id="usage-summary">${_usageSummaryHtml(o) || '<div class="metrics-section-title">Usage & optimization: loading…</div>'}</div><div class="metrics-section-title">Workers, last ${d.window_days} days · most wasted hours first</div>${rows || '<div class="metrics-card reclaim-safe-text">No worker has enough history yet.</div>'}`;
+    el.innerHTML = `<div id="usage-summary">${_usageSummaryHtml(o) || '<div class="metrics-section-title">Usage & optimization: loading…</div>'}</div>${_velocityGoalsHtml(d.goals)}<div class="metrics-section-title">Workers, last ${d.window_days} days · most wasted hours first</div>${rows || '<div class="metrics-card reclaim-safe-text">No worker has enough history yet.</div>'}`;
   }).catch(() => { el.innerHTML = '<div style="color:var(--red);padding:var(--space-5);">Velocity did not load.</div>'; });
 }
 
@@ -60753,8 +67074,10 @@ function _velocityShowWorker(name) {
     } else if (p) {
       proj = `<div class="metrics-card reclaim-safe-text">${esc(p.why_unmeasured || 'No projection.')}</div>`;
     }
+    const goal = _velocityGoals.find(g => g.worker === name);
+    const goalCard = goal ? `<div class="metrics-section-title">Goal</div><div class="metrics-card"><div class="reclaim-safe-text velocity-goal-text" id="velocity-goal">${_velocityGoalText(goal)}</div></div>` : '';
     el.innerHTML = `<div class="metrics-section-title" style="display:flex;align-items:center;gap:var(--space-2);">${back}<span>${esc(name)}, last ${s.window_days} days</span></div>
-      <div class="metrics-card"><div class="reclaim-safe-text" id="velocity-summary">Finished ${s.finished_cards} of ${s.cards} cards (${s.finished_per_day}/day), ${s.attempts_per_card} attempts per card. ${s.finished_share_of_time}% of ${s.hours.total} h went to attempts that finished. A finished card: ${fmt(m.p50)} min median (${fmt(m.p25)} to ${fmt(m.p75)}), ${fmt(t.p50)} tokens.</div></div>
+      ${goalCard}<div class="metrics-card"><div class="reclaim-safe-text" id="velocity-summary">Finished ${s.finished_cards} of ${s.cards} cards (${s.finished_per_day}/day), ${s.attempts_per_card} attempts per card. ${s.finished_share_of_time}% of ${s.hours.total} h went to attempts that finished. A finished card: ${fmt(m.p50)} min median (${fmt(m.p25)} to ${fmt(m.p75)}), ${fmt(t.p50)} tokens.</div></div>
       <div class="metrics-section-title">Waste, by who can fix it</div><div class="metrics-card">${waste || '<div class="reclaim-safe-text">None.</div>'}</div>
       ${waits ? `<div class="metrics-section-title">What parked work waited on</div><div class="metrics-card">${waits}</div>` : ''}
       ${proj}`;
@@ -61144,7 +67467,7 @@ async function _reclaimQuarantineSelected() {
     + 'Nothing is deleted. Files move to ~/.amux/quarantine and can be restored '
     + 'with one click. Space is NOT returned until you purge the batch.\n\n'
     + paths.slice(0, 12).join('\n') + (paths.length > 12 ? '\n…and ' + (paths.length - 12) + ' more' : '');
-  if (!confirm(msg)) return;
+  if (!(await showConfirm(msg))) return;
   const r = await fetch(API + '/api/reclaim/quarantine', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -61152,7 +67475,7 @@ async function _reclaimQuarantineSelected() {
   });
   const d = await r.json().catch(() => ({}));
   if (d.refused && d.refused.length) {
-    alert('Staged ' + (d.moved || 0) + ' item(s).\n\nRefused ' + d.refused.length + ':\n'
+    await showAlert('Staged ' + (d.moved || 0) + ' item(s).\n\nRefused ' + d.refused.length + ':\n'
       + d.refused.map(x => x.path + ': ' + x.reason).join('\n'));
   } else {
     showToast('Staged ' + (d.moved || 0) + ' item(s) · ' + _fmtBytes(d.bytes || 0));
@@ -61162,11 +67485,11 @@ async function _reclaimQuarantineSelected() {
 }
 
 async function _reclaimRestore(batchId) {
-  if (!confirm('Restore every file in this batch to its original location?')) return;
+  if (!(await showConfirm('Restore every file in this batch to its original location?', 'Restore', false))) return;
   const r = await fetch(API + '/api/reclaim/quarantine/' + encodeURIComponent(batchId) + '/restore', { method: 'POST' });
   const d = await r.json().catch(() => ({}));
   showToast('Restored ' + (d.restored || 0) + ' item(s)');
-  if (d.failed && d.failed.length) alert('Failed:\n' + d.failed.map(x => x.path + ' — ' + x.reason).join('\n'));
+  if (d.failed && d.failed.length) await showAlert('Failed:\n' + d.failed.map(x => x.path + ' — ' + x.reason).join('\n'));
   _reclaimLoad();
 }
 
@@ -61185,14 +67508,14 @@ async function _reclaimPurge(batchId, bytes) {
   const msg = 'PERMANENTLY DELETE this quarantine batch?\n\n'
     + 'Size: ' + _fmtBytes(bytes) + '\n\n'
     + 'This cannot be undone. Restore will no longer be possible.';
-  if (!confirm(msg)) return;
-  if (prompt('Type PURGE to confirm permanent deletion:') !== 'PURGE') { showToast('Cancelled'); return; }
+  if (!(await showConfirm(msg, 'Delete', true))) return;
+  if ((await showPrompt('Type PURGE to confirm permanent deletion:', '', '', { trim: false })) !== 'PURGE') { showToast('Cancelled'); return; }
   const r = await fetch(API + '/api/reclaim/quarantine/' + encodeURIComponent(batchId)
     + '?confirm=' + encodeURIComponent(batchId), { method: 'DELETE' });
   const d = await r.json().catch(() => ({}));
   // Report the REAL delta, and say so when it disappoints.
   showToast('Purged · free space +' + _fmtBytes(d.actually_freed || 0));
-  if (d.note) alert(d.note);
+  if (d.note) await showAlert(d.note);
   _reclaimLoad();
 }
 
@@ -61213,8 +67536,8 @@ async function _reclaimPurgeOld() {
     + ' staged more than ' + _RECLAIM_PURGE_AGE_DAYS + ' days ago?\n\n'
     + 'Staged size: ' + _fmtBytes(est) + '\n\n'
     + 'This cannot be undone. Restore will no longer be possible for these batches.';
-  if (!confirm(msg)) return;
-  if (prompt('Type PURGE to confirm permanent deletion:') !== 'PURGE') { showToast('Cancelled'); return; }
+  if (!(await showConfirm(msg, 'Delete', true))) return;
+  if ((await showPrompt('Type PURGE to confirm permanent deletion:', '', '', { trim: false })) !== 'PURGE') { showToast('Cancelled'); return; }
   let freed = 0, ok = 0;
   const failed = [], notes = new Set();
   for (const b of old) {
@@ -61230,7 +67553,7 @@ async function _reclaimPurgeOld() {
   }
   showToast('Purged ' + ok + ' of ' + old.length + ' batches · free space +' + _fmtBytes(freed));
   if (failed.length || notes.size) {
-    alert((failed.length ? 'Not purged (' + failed.length + '):\n' + failed.join('\n') + '\n\n' : '')
+    await showAlert((failed.length ? 'Not purged (' + failed.length + '):\n' + failed.join('\n') + '\n\n' : '')
       + [...notes].join('\n'));
   }
   _reclaimLoad();
@@ -61716,9 +68039,9 @@ async function _reclaimPurgeAllStaged() {
   const batches = (_reclaimQuarantine?.batches || []).filter(b => b.status === 'staged' && b.item_count > 0);
   const total = batches.reduce((a, b) => a + (b.bytes || 0), 0);
   if (!batches.length) { showToast('Nothing is staged'); return; }
-  if (!confirm('PERMANENTLY DELETE every quarantined file?\n\n' + batches.length + ' batch(es), ' + _fmtBytes(total)
-    + '\n\nThis cannot be undone. Use "Review or restore" first if anything in there is still needed.')) return;
-  if (prompt('Type PURGE to confirm permanent deletion:') !== 'PURGE') { showToast('Cancelled'); return; }
+  if (!(await showConfirm('PERMANENTLY DELETE every quarantined file?\n\n' + batches.length + ' batch(es), ' + _fmtBytes(total)
+    + '\n\nThis cannot be undone. Use "Review or restore" first if anything in there is still needed.', 'Delete', true))) return;
+  if ((await showPrompt('Type PURGE to confirm permanent deletion:', '', '', { trim: false })) !== 'PURGE') { showToast('Cancelled'); return; }
   let freed = 0, failed = 0;
   for (const b of batches) {
     const r = await fetch(API + '/api/reclaim/quarantine/' + encodeURIComponent(b.id)
@@ -61739,9 +68062,9 @@ async function _reclaimCleanSafe() {
   const paths = [...new Set(safe.flatMap(r => r.paths))].filter(p => !_reclaimIsProtectedPath(p));
   if (!paths.length) { showToast('Nothing rebuildable to clean'); return; }
   const est = safe.reduce((a, r) => a + (r.bytes || 0), 0);
-  if (!confirm('Delete ' + paths.length + ' rebuildable item(s), about ' + _fmtBytes(est) + '?\n\n'
+  if (!(await showConfirm('Delete ' + paths.length + ' rebuildable item(s), about ' + _fmtBytes(est) + '?\n\n'
     + 'Build output and caches only; they come back on the next build or download.\n\n'
-    + safe.slice(0, 10).map(r => '· ' + r.label + ' (' + _fmtBytes(r.bytes) + ')').join('\n'))) return;
+    + safe.slice(0, 10).map(r => '· ' + r.label + ' (' + _fmtBytes(r.bytes) + ')').join('\n'), 'Delete', true))) return;
   const btn = document.getElementById('reclaim-clean-safe');
   if (btn) { btn.disabled = true; btn.textContent = 'Cleaning…'; }
   const r = await fetch(API + '/api/reclaim/quarantine', {
@@ -64020,6 +70343,15 @@ function _pubSize(n) {
 }
 // An app (inside amux or public) is a card with a live preview; a pending one
 // keeps Approve / Decline, since it opens nothing until you approve it.
+// What amux the app itself may call (app_identity.rs): a published app has
+// none unless a person allows it, and approving a link allows what it asked.
+function _pubApiText(l) {
+  if (l.file || !l.port) return '';
+  const allow = l.api_allow || [], asked = l.api_requested || [];
+  if (allow.length) return 'amux access: ' + allow.join('; ');
+  if (asked.length) return 'asks for amux access: ' + asked.join('; ');
+  return 'no amux access';
+}
 function _pubCard(l) {
   const id = escJs(l.id), name = esc(_pubName(l)), worker = _pubWorker(l);
   const chip = worker ? '<span class="pub-chip">' + esc(worker) + '</span>' : '';
@@ -64034,13 +70366,15 @@ function _pubCard(l) {
     return `<div class="pub-card pub-pending" data-pub="${esc(l.id)}" data-search="${esc(_pubSearchText(l))}">
       <div class="pub-card-head"><div class="pub-card-text"><b>${name}${chip}</b>
         <span class="ui-help pub-pending-note">Waiting for your approval: ${internal ? 'it does not open yet.' : 'nobody can open it yet.'}</span>
-        <span class="ui-help pub-card-meta">${where}${by}</span></div></div>
+        <span class="ui-help pub-card-meta">${where}${by}</span>
+        <span class="ui-help pub-api" data-pub-api="${esc(l.id)}">${esc(_pubApiText(l))}</span></div></div>
       <div class="pages-head-actions"><button class="btn primary" onclick="_pubApprove('${id}')">Approve</button>
         <button class="btn danger" onclick="_pubRevoke('${id}')">Decline</button></div></div>`;
   }
   const open = internal ? ` role="button" tabindex="0" onclick="_pubOpenInternal('${id}')" onkeydown="if(event.key==='Enter'&&event.target===this){event.preventDefault();_pubOpenInternal('${id}')}"` : '';
   return `<div class="pub-card" data-pub="${esc(l.id)}" data-search="${esc(_pubSearchText(l))}"${open}>
-    <div class="pub-card-head"><div class="pub-card-text"><b>${name}${chip}</b><span class="ui-help pub-card-meta">${meta}</span></div>
+    <div class="pub-card-head"><div class="pub-card-text"><b>${name}${chip}</b><span class="ui-help pub-card-meta">${meta}</span>
+      <span class="ui-help pub-api" data-pub-api="${esc(l.id)}">${esc(_pubApiText(l))}</span></div>
       <button class="btn pub-more" aria-label="More actions for ${name}" onclick="event.stopPropagation();_pubMenu(event,'${id}')">&#x22EE;</button>
       <button class="btn danger pub-remove" onclick="event.stopPropagation();_pubRevoke('${id}')">${internal ? 'Remove' : 'Turn off'}</button></div>
     <div class="pub-preview" data-preview="${esc(l.id)}" aria-hidden="true">${l.running === false
@@ -64085,7 +70419,11 @@ function _pubMenu(e, id) {
     const it = ev.target.closest('[data-act]');
     if (!it) return;
     ev.stopPropagation(); _pubMenuClose();
-    if (it.dataset.act === 'open') { if (internal) _pubOpenInternal(id); else window.open(l.url || l.path, '_blank', 'noopener'); }
+    if (it.dataset.act === 'open') {
+      if (internal) _pubOpenInternal(id);
+      else if (_ownPageLink(l.url || l.path)) _openOwnPage(l.url || l.path, 'apps-menu');
+      else window.open(l.url || l.path, '_blank', 'noopener');
+    }
     else if (it.dataset.act === 'copy') _copyTextWithToast(l.url || l.path, 'Link copied');
     else if (it.dataset.act === 'rename') _pubRename(id);
     else if (it.dataset.act === 'remove') _pubRevoke(id);
@@ -64169,7 +70507,9 @@ async function _pubApprove(id) {
     ? (l.file ? 'Show ' + what + ' inside amux? Only you, signed in, can open it.'
       : 'Open ' + what + ' inside amux? It runs with your amux access, so approve only an app you trust.')
     : 'Make ' + what + ' public? Anyone with the link can open it, without signing in, until you turn it off.';
-  if (!(await showConfirm(ask, 'Approve', true))) return;
+  const asked = (l && l.api_requested) || [];
+  const api = asked.length ? ' It also asks to call amux: ' + asked.join('; ') + '. Approving allows exactly these.' : '';
+  if (!(await showConfirm(ask + api, 'Approve', true))) return;
   try { await _pubAsPerson('approve', () => _pubFetch('/' + encodeURIComponent(id) + '/approve', { method: 'POST' })); showToast('Public link approved'); }
   catch (e) { showToast('Not approved: ' + e.message); }
   _pubList();
@@ -65445,17 +71785,8 @@ const _TRASH_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="1
 
 // ── Pinned notes on home screen ──────────────────────────────────────────────
 
-// The CRM / People view was removed (AMUX-2590, Ethan 2026-08-09): its tab,
-// markup, styles and every _crm* function are gone from this client. The
-// serve-time AMUX-FEATURE-FLAGS CSS in static_files.rs stays as the one
-// greppable line to reverse.
-//
-// This comment used to add "the /api/crm endpoints still exist for agents".
-// That was FALSE when written: the routes went with the python server at
-// 792ce1f, so POST /api/crm/contacts answered 405 and GET /api/crm answered
-// 404, while 308 contacts sat in the tables migrations kept maintaining. It is
-// true now only because AMUX-2929 ported them back — the comment was a claim
-// about another file, and nothing checks those (ethos rule 6).
+// The CRM / People view was removed on 2026-08-09 (AMUX-2590) and came back on
+// 2026-11-23 as the CRM tab (docs/design/crm.md; search "── CRM tab").
 
 // ── Gmail Inbox tab ────────────────────────────────────────────────────────────
 let _gmailAccounts = [];
@@ -65790,7 +72121,7 @@ function _gmailToggleSidebar() {
 }
 
 async function _gmailConnectAccount() {
-  const account = prompt('Enter Gmail address to connect:');
+  const account = (await showPrompt('Enter Gmail address to connect:', '', '', { trim: false }));
   if (!account || !account.includes('@')) return;
   // Get auth URL
   const r = await fetch(API + '/api/gmail/auth?account=' + encodeURIComponent(account)).catch(()=>null);
@@ -67318,6 +73649,9 @@ async function _bwImportProfile() {
   html += '</div>';
   html += '<div style="margin-top:var(--space-1);"><label style="font-size:var(--fs-md);font-weight:500;">Destination profile name</label>';
   html += '<input id="bwi-dest" class="bw-in" style="width:100%;box-sizing:border-box;margin-top:var(--space-1);" placeholder="e.g. chrome-default" value="imported-chrome"></div>';
+  // Per site, as Athena imports: only the sign-ins a profile needs, not a whole browser's.
+  html += '<div class="bwi-sites-row"><label for="bwi-sites" class="bwi-sites-label">Only these sites <span class="bwi-sites-hint">(optional, comma-separated)</span></label>';
+  html += '<input id="bwi-sites" class="bw-in bwi-sites-input" placeholder="e.g. github.com, linear.app" value=""></div>';
 
   var ok = await showFormModal('Import browser profile', html, 'Import');
   if (!ok) return;
@@ -67329,6 +73663,7 @@ async function _bwImportProfile() {
   var profileName = parts[1];
   var dest = (document.getElementById('bwi-dest') || {}).value || '';
   dest = dest.trim();
+  var sites = ((document.getElementById('bwi-sites') || {}).value || '').split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
   if (!dest) { showToast('Destination name is required'); return; }
 
   _bwStatus('Importing cookies...');
@@ -67336,7 +73671,7 @@ async function _bwImportProfile() {
     var r = await fetch('/api/browser/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ browser_id: browserId, profile_name: profileName, destination: dest })
+      body: JSON.stringify({ browser_id: browserId, profile_name: profileName, destination: dest, sites: sites })
     });
     var d = await r.json();
     if (d.error) {
@@ -67344,8 +73679,8 @@ async function _bwImportProfile() {
       _bwStatus('Import failed');
       return;
     }
-    var msg = 'Imported ' + d.imported_cookies + ' cookies into profile "' + esc(d.profile) + '"';
-    if (d.skipped_cookies) msg += ' (' + d.skipped_cookies + ' skipped)';
+    var msg = 'Imported ' + d.imported_cookies + ' cookies' + (sites.length ? ' for ' + sites.join(', ') : '') + ' into profile "' + esc(d.profile) + '"';
+    if (d.skipped_cookies) msg += ' (' + d.skipped_cookies + (sites.length ? ' for other sites left out)' : ' skipped)');
     showToast(msg);
     _bwStatus(msg);
     await _bwLoadProfiles();
@@ -67359,7 +73694,7 @@ async function _bwImportProfile() {
 
 async function _bwSaveProfile() {
   const suggested = _bwActiveProfile || '';
-  const name = prompt('Register the current site to which profile?\n(Logging in under this profile persists automatically.)', suggested);
+  const name = (await showPrompt('Register the current site to which profile?\n(Logging in under this profile persists automatically.)', '', suggested, { trim: false }));
   if (name === null) return;
   _bwStatus('Saving profile…');
   try {
@@ -67655,7 +73990,7 @@ async function _jrnlSave() {
 }
 
 async function _jrnlDelete(id) {
-  if (!confirm('Delete this journal entry?')) return;
+  if (!(await showConfirm('Delete this journal entry?', 'Delete', true))) return;
   await fetch('/api/journal/' + id, { method: 'DELETE' });
   showToast('Journal entry deleted');
   _jrnlActiveId = null;
@@ -67695,7 +74030,7 @@ function _jrnlViewMedia(url) {
 }
 
 function _jrnlGetLocation() {
-  if (!navigator.geolocation) { alert('Geolocation not supported'); return; }
+  if (!navigator.geolocation) { showAlert('Geolocation not supported'); return; }
   navigator.geolocation.getCurrentPosition(async (pos) => {
     document.getElementById('jrnl-ed-lat').value = pos.coords.latitude;
     document.getElementById('jrnl-ed-lng').value = pos.coords.longitude;
@@ -67706,7 +74041,7 @@ function _jrnlGetLocation() {
       const place = d.address ? [d.address.city || d.address.town || d.address.village || '', d.address.state || '', d.address.country || ''].filter(Boolean).join(', ') : '';
       if (place) document.getElementById('jrnl-ed-place').value = place;
     } catch(e) {}
-  }, (err) => { alert('Location error: ' + err.message); }, { enableHighAccuracy: true });
+  }, (err) => { showAlert('Location error: ' + err.message); }, { enableHighAccuracy: true });
 }
 
 // Calendar view
@@ -70111,6 +76446,8 @@ function _cvFindName(conv) {
   if (conv && conv.indexOf('w:') === 0) return conv.slice(2);
   // A worker's direct message with you (`d:<worker>|<you>`): the worker.
   if (conv && conv.indexOf('d:') === 0) return conv.slice(2).split('|')[0];
+  // Two workers' direct message (`ww:<a>|<b>`): both names.
+  if (conv && conv.indexOf('ww:') === 0) return conv.slice(3).split('|').join(' \u2194 ');
   // A direct message the list has not named (not loaded yet, or not in it):
   // the other person, never the raw id. "p:doron@z.com|ethan@x.com" was the
   // composer's placeholder on a phone and wrapped it to three rows.
@@ -70158,6 +76495,7 @@ function _cvNewCandidates() {
     ...(L.channels || []).map(c => ({ conv: c.conv, label: '#' + (c.title || c.name), kind: 'channel', ico: '<span class="cv-ico">#</span>' })),
     ...(L.people || []).filter(p => p.conv).map(p => ({ conv: p.conv, label: p.me ? p.name + ' (you)' : p.name, kind: 'person', ico: _cvAvatar(p.name, false, p.email) })),
     ...(L.direct || []).map(d => ({ conv: d.conv, label: d.worker, kind: 'direct message', ico: _cvAvatar(d.worker, true) })),
+    ...(L.pairs || []).map(d => ({ conv: d.conv, label: d.a + ' \u2194 ' + d.b, kind: 'workers\u2019 direct message', ico: _cvAvatar(d.a, true) })),
     ...(L.workers || []).map(w => ({ conv: w.conv, label: w.name, kind: 'worker', ico: _cvAvatar(w.name, true) })),
   ];
 }
@@ -70204,15 +76542,17 @@ function _cvRenderSide() {
     // Owners and admins manage channels from here (AA-52). The server refuses
     // everyone else, so this only hides a button nobody else could use.
     + (admin ? '<button type="button" class="cv-item" id="cv-manage-channels" onclick="_cvManageChannels()"><span class="cv-ico">+</span><span class="cv-lbl">Manage channels</span></button>' : '');
-  const ppl = (L.people || []), dms = (L.direct || []);
-  document.getElementById('cv-people-sec').style.display = ppl.length || dms.length ? '' : 'none';
+  const ppl = (L.people || []), dms = (L.direct || []), pairs = (L.pairs || []);
+  document.getElementById('cv-people-sec').style.display = ppl.length || dms.length || pairs.length ? '' : 'none';
   // Your own entry opens your notes to yourself, as in Slack (Ethan,
   // 2026-11-06: "i should also be able to open my own"). A worker that wrote
   // to you directly is listed here too, as its 1:1 with you.
   document.getElementById('cv-people').innerHTML = ppl.map(p => p.me && !p.conv
     ? '<div class="cv-item" style="cursor:default">' + _cvAvatar(p.name, false, p.email) + '<span class="cv-lbl">' + esc(p.name) + ' (you)</span><span class="cv-dot on"></span></div>'
     : _cvItem(p.conv, _cvAvatar(p.name, false, p.email), p.me ? p.name + ' (you)' : p.name, p.unread, p.mentions, '<span class="cv-dot' + (p.me || p.online ? ' on' : '') + '" title="' + (p.me || p.online ? 'online' : 'away') + '"></span>')).join('')
-    + dms.map(d => _cvItem(d.conv, _cvAvatar(d.worker, true), d.worker, d.unread, d.mentions, '<span class="cv-dm-tag" title="A direct message from this worker">DM</span>')).join('');
+    + dms.map(d => _cvItem(d.conv, _cvAvatar(d.worker, true), d.worker, d.unread, d.mentions, '<span class="cv-dm-tag" title="A direct message from this worker">DM</span>')).join('')
+    // Two workers' direct messages with each other (was the channel drawer).
+    + pairs.map(d => _cvItem(d.conv, _cvAvatar(d.a, true), d.a + ' \u2194 ' + d.b, d.unread, d.mentions, '<span class="cv-dm-tag" title="A direct message between two workers">DM</span>')).join('');
   const sess = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
   document.getElementById('cv-workers').innerHTML = (L.workers || []).map(w => {
     const s = sess.find(x => x.name === w.name); const act = s && /active|working|running/i.test(String(s.status || ''));
@@ -70776,6 +77116,9 @@ function _cvRenderHead(sel, d) {
   } else if (sel.indexOf('d:') === 0) {
     const w = sel.slice(2).split('|')[0];
     meta.textContent = 'Direct message with ' + w + '. Only you and ' + w + ' can read this; messages here go to it.';
+  } else if (sel.indexOf('ww:') === 0) {
+    const ab = sel.slice(3).split('|');
+    meta.textContent = 'Direct message between ' + ab[0] + ' and ' + ab[1] + '. Each one\u2019s posts go to the other; yours go to the worker you @mention, or both.';
   } else {
     const ends = sel.slice(2).split('|');
     meta.textContent = ends.length === 2 && ends[0] === ends[1] ? 'Your notes to yourself. Only you can read this.' : 'Direct message';
@@ -70935,6 +77278,9 @@ function _cvDelivHtml(p) {
   const chips = want.map(w => {
     const d = got.find(x => x.worker === w);
     if (!d) return '<span>sending to ' + esc(w) + '…</span>';
+    // A post carried over from the retired worker channel files: what it
+    // reached then was never recorded, so say where it came from instead.
+    if (d.state === 'imported') return '<span title="' + esc(d.detail || '') + '">from the old channel with ' + esc(w) + '</span>';
     // Where its answer will be: here, its own thread (from a direct message), or its
     // terminal (an isolated worker gets the owner's words with no reply route).
     const where = d.reply === 'pane' ? '; it answers in its terminal' : d.reply === 'thread' ? '; it answers in its thread' : '';
@@ -70945,7 +77291,13 @@ function _cvDelivHtml(p) {
   return '<div class="cv-deliv">' + chips.join('') + '</div>';
 }
 const _CV_QUICK = ['\u{1F44D}', '\u2705', '\u{1F440}', '\u2764\uFE0F', '\u{1F602}'];
-function _cvPostHtml(p, showConv, inThread) {
+// `opts` (optional) draws a post outside the Messages view (Chat, intent
+// Home): {plain: true, name, body, from}. Plain shows `name` in place of the
+// author, an initial in place of the worker avatar, `body` (HTML) in place of
+// the rendered body when given, and none of the actions, reactions, thread
+// line or delivery chips, which all act on the Messages view's own state.
+function _cvPostHtml(p, showConv, inThread, opts) {
+  const plain = !!(opts && opts.plain);
   const worker = p.author_key.indexOf('worker:') === 0;
   const t = new Date(p.ts);
   const mine = p.author_key === _cvMeKey();
@@ -70953,6 +77305,7 @@ function _cvPostHtml(p, showConv, inThread) {
   const real = typeof p.id === 'number';
   const pinned = real && _cvPinnedIds().has(p.id);
   const body = p.deleted ? '<div class="cv-deleted">This message was deleted.</div>'
+    : plain && opts.body !== undefined ? '<div class="cv-post-body cv-md">' + opts.body + '</div>'
     : _cv.editing && _cv.editing.id === p.id ? '<div class="cv-post-body" data-body-id="' + esc(String(p.id)) + '">' + _cvEditHtml(p.id) + '</div>'
     : '<div class="cv-post-body cv-md" data-body-id="' + esc(String(p.id)) + '">' + _cvBodyHtml(p) + '</div>' + _cvAttachHtml(p) + _cvPreviewHtml(p);
   const reacts = Object.entries(p.reactions || {}).map(([e, who]) => '<button type="button" class="cv-react' + ((who || []).includes(_cvMeKey()) ? ' mine' : '')
@@ -70970,6 +77323,14 @@ function _cvPostHtml(p, showConv, inThread) {
     + (mine ? '<button type="button" title="Edit" aria-label="Edit" onclick="_cvEdit(' + p.id + ')">&#x270F;&#xFE0F;</button>' : '')
     + (mine || owner ? '<button type="button" title="Delete" aria-label="Delete" onclick="_cvDelete(' + p.id + ')">&#x1F5D1;&#xFE0F;</button>' : '')
     + '</div><button type="button" class="cv-more" aria-label="More actions" onclick="_cvMore(this)">&#x22EF;</button>' : '';
+  if (plain) {
+    const name = opts.name || p.author_name || '';
+    return '<div class="cv-post' + (p.pending ? ' pending' : '') + '" data-id="' + esc(String(p.id)) + '"' + (opts.from ? ' data-from="' + esc(opts.from) + '"' : '') + '>'
+      + _cvAvatar(name, false, null)
+      + '<div class="cv-post-main"><div class="cv-post-head"><span class="cv-post-who">' + esc(name) + '</span>'
+      + '<span class="cv-post-ts" title="' + esc(t.toLocaleString()) + '">' + t.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + '</span></div>'
+      + body + '</div></div>';
+  }
   return '<div class="cv-post' + (p.pending ? ' pending' : '') + '" data-id="' + esc(String(p.id)) + '">' + _cvAvatar(p.author_name, worker, p.author_key) + '<div class="cv-post-main"><div class="cv-post-head">' +
     '<span class="cv-post-who">' + esc(p.author_name) + (mine ? ' <span style="color:var(--dim);font-weight:400">(you)</span>' : '') + '</span>' +
     '<span class="cv-post-ts" title="' + esc(t.toLocaleString()) + '">' + t.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + '</span>' +
@@ -71608,6 +77969,9 @@ async function _cvRefreshPost(id) {
 const _cvNotified = new Set();
 async function _cvMaybeNotify(ev) {
   if (_cvNotified.has(ev.id)) return;
+  // The device switch covers Messages too. An older Mac app has its own
+  // switch and no way to tell the page, so it decides there.
+  if (!_notifInOlderApp() && !amuxNotifyAllowed('native')) return;
   const looking = !document.hidden && _cvViewOn() && _cv.sel === ev.conv && (!ev.parent_id || (_cv.thread && _cv.thread.root === ev.parent_id));
   if (looking) return;
   let p = null;
@@ -75303,6 +81667,7 @@ const _CMDK_WEIGHT = { worker: 220, group: 200, view: 160, action: 140, card: 60
 function _cmdkActions() {
   return [
     { title: 'New worker', sub: 'Create or connect', run: () => openCreate() },
+    { title: 'New workflow (guided)', sub: 'Answer a few plain questions, then start a worker on it', run: () => openWorkflowWizard() },
     { title: 'New card', sub: 'Add a card to the board', run: () => { switchView('board'); openBoardAdd(); } },
     { title: 'New schedule', sub: 'Run a prompt or command on a timer', run: () => { switchView('scheduler'); openSchedModal(); } },
     { title: 'New scratchpad note', sub: 'Scratchpad', run: () => { switchView('scratchpad'); _scratchpadNewNote(); } },
@@ -75330,7 +81695,7 @@ async function _cmdkLoadLists() {
     group: get('/api/groups').then(d => (d.groups || []).map(g => { const about = [g.department, g.goal].filter(Boolean).join(' · '); return { kind: 'group', id: g.name, title: g.name, sub: about || 'Group', body: about }; })),
     pin: get('/api/pinned').then(d => (d || []).map(p => ({ kind: 'pin', id: p.id, title: p.title || String(p.file_path || '').split('/').pop(), sub: p.file_path || 'Pinned note', body: p.file_path || '' }))),
     // Names and scopes only; the vault never sends values here.
-    secret: get('/api/vault/secrets').then(d => (d.items || []).map(s => ({ kind: 'secret', id: s.key, title: s.key, sub: (s.kind === 'api_key' ? 'API key' : 'Secret') + (s.scope ? ' · ' + s.scope + (s.target ? ' ' + s.target : '') : '') }))),
+    secret: get('/api/vault/secrets').then(d => (d.items || []).map(s => ({ kind: 'secret', id: s.key, title: s.key, sub: 'Secret' + (s.scope ? ' · ' + s.scope + (s.target ? ' ' + s.target : '') : '') }))),
     payment: get('/api/vault').then(d => (d.items || []).filter(p => p.kind !== 'login').map(p => ({ kind: 'payment', id: p.id, title: p.label || p.brand || 'Card', sub: 'Payment method' + (p.brand ? ' · ' + p.brand : '') }))),
     connector: get('/api/connectors').then(d => (d.connectors || []).map(c => ({ kind: 'connector', id: c.id, title: c.name || c.id, sub: c.category || 'Connector' }))),
     skill: get('/api/skills').then(d => (d || []).map(s => ({ kind: 'skill', id: s.name, title: '/' + s.name, sub: s.description || 'Skill', body: s.description || '' }))),
@@ -75360,17 +81725,87 @@ function _cmdkLocal() {
     ...(l.pin || []), ...(l.connector || []), ...(l.skill || []), ...(l.secret || []), ...(l.payment || [])];
 }
 
-// What you opened from here, and how often: { "kind:id": [count, lastMs, title] }.
-function _cmdkUsage() {
+// ── Where you went (owner, 2026-11-23) ──
+// Every worker, tab, file, group and card you open, from anywhere (not only
+// from here), kept on the server so the phone and the Mac share it
+// (api/palette_history.rs), plus which result you chose for what you typed.
+// { "kind:id": [count, lastMs, title] } and { query: { "kind:id": [picks, lastMs] } }.
+const _NAV = { usage: null, picks: {}, loadedAt: 0, loading: null, bootAt: Date.now(), last: {} };
+const _NAV_BOOT_MS = 3000;   // the page restoring its last view and worker is not a visit
+function _navLocalUsage() {
   try { return JSON.parse(localStorage.getItem(_CMDK_USAGE_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function _navLoad(force) {
+  if (_NAV.loading) return _NAV.loading;
+  if (!force && _NAV.usage && Date.now() - _NAV.loadedAt < 60_000) return Promise.resolve();
+  _NAV.loading = fetch(API + '/api/palette/history', { headers: _authHeaders(), signal: AbortSignal.timeout(8000) })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('palette history ' + r.status)))
+    .then(d => {
+      const u = {}, p = {};
+      for (const v of d.visits || []) u[v.kind + ':' + v.id] = [v.visits, v.last_at, v.title];
+      for (const v of d.picks || []) (p[v.query] = p[v.query] || {})[v.kind + ':' + v.id] = [v.picks, v.last_at];
+      // A browser's history from before the server kept it goes up once.
+      const old = _navLocalUsage();
+      if (!Object.keys(u).length && Object.keys(old).length) {
+        const visits = Object.entries(old).map(([k, e]) => { const kind = k.split(':')[0]; return { kind, id: k.slice(kind.length + 1), title: e[2] || '', visits: e[0], last_at: e[1] }; });
+        fetch(API + '/api/palette/history/import', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ visits }) })
+          .catch(e => console.warn('[amux] palette history import failed', e));
+        Object.assign(u, old);
+      }
+      // A visit or a pick made while this read was in flight is kept.
+      for (const [k, e] of Object.entries(_NAV.usage || {})) if (!u[k] || u[k][1] < e[1]) u[k] = e;
+      for (const [q, hits] of Object.entries(_NAV.picks || {})) for (const [k, e] of Object.entries(hits)) {
+        const pq = (p[q] = p[q] || {});
+        if (!pq[k] || pq[k][1] < e[1]) pq[k] = e;
+      }
+      _NAV.usage = u; _NAV.picks = p; _NAV.loadedAt = Date.now();
+    })
+    .catch(e => { console.warn('[amux] palette history unavailable; using this browser\'s', e); if (!_NAV.usage) _NAV.usage = _navLocalUsage(); })
+    .finally(() => { _NAV.loading = null; });
+  return _NAV.loading;
+}
+// Read once the page has settled, so Cmd-K's first frame already has Recent.
+setTimeout(() => { _navLoad(); }, _NAV_BOOT_MS);
+// One open of kind:id, from anywhere. `query` is what was typed in Cmd-K, when
+// it was chosen there. The same thing again within 30 s is the same visit.
+function _navVisit(kind, id, title, query) {
+  if (!kind || !id) return;
+  const now = Date.now(), k = kind + ':' + id;
+  if (!query && now - _NAV.bootAt < _NAV_BOOT_MS) return;
+  if (!query && now - (_NAV.last[k] || 0) < 30_000) return;
+  _NAV.last[k] = now;
+  const u = _NAV.usage || (_NAV.usage = _navLocalUsage()), prev = u[k] || [0, 0, ''];
+  u[k] = [prev[0] + 1, now, title || prev[2]];
+  const q = String(query || '').trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 40);
+  if (q) { const pq = (_NAV.picks[q] = _NAV.picks[q] || {}), pp = pq[k] || [0, 0]; pq[k] = [pp[0] + 1, now]; }
+  fetch(API + '/api/palette/visit', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ kind, id: String(id), title: String(title || ''), query: q }), keepalive: true })
+    .then(r => { if (!r.ok) console.warn('[amux] palette visit not recorded', r.status); })
+    .catch(e => console.warn('[amux] palette visit not recorded', e));
+}
+// What you opened, and how often: { "kind:id": [count, lastMs, title] }.
+function _cmdkUsage() {
+  return _NAV.usage || _navLocalUsage();
+}
+// What you chose before for this query, or for a longer one it starts (typing
+// "de" on the way to "dec"): up to +900 over every match tier, a month halving it.
+function _cmdkPickBoost(q, it) {
+  if (!q || q.length < 2) return 0;
+  const k = it.kind + ':' + it.id;
+  let best = 0;
+  for (const [pq, hits] of Object.entries(_NAV.picks || {})) {
+    if (pq !== q && !pq.startsWith(q)) continue;
+    const e = hits[k];
+    if (!e) continue;
+    const days = Math.max(0, Date.now() - e[1]) / 86_400_000;
+    best = Math.max(best, Math.round(Math.min(900, 300 * Math.log2(1 + e[0])) * Math.pow(0.5, days / 30)) * (pq === q ? 1 : 0.8));
+  }
+  return best;
 }
 
 function _cmdkRecord(r) {
   if (!r.id || r.kind === 'more' || r.kind === 'hidden') return;
-  const u = _cmdkUsage(), k = r.kind + ':' + r.id, prev = u[k] || [0, 0, ''];
-  u[k] = [prev[0] + 1, Date.now(), r.title];
-  const keep = Object.entries(u).sort((a, b) => b[1][1] - a[1][1]).slice(0, 60);
-  try { localStorage.setItem(_CMDK_USAGE_KEY, JSON.stringify(Object.fromEntries(keep))); } catch (e) {}
+  _navVisit(r.kind, r.id, r.title, _cmdk.q);
 }
 
 // Up to +200 for something opened often and lately; a week halves it.
@@ -75503,8 +81938,9 @@ function _cmdkCompute() {
       const m = _cmdkMatch(it, q, toks);
       if (!m) continue;
       if (it.archived && !_cmdk.hidden) { _cmdk.hiddenLocal++; continue; }
-      scored.push([{ ...it, tier: m.tier, match: m.match,
-        snippet: m.match === 'body' ? _cmdkSnippet(String(it.body), toks) : '' }, m.tier * 10000 + _cmdkBoost(it, m, u)]);
+      const pick = _cmdkPickBoost(q, it);
+      scored.push([{ ...it, tier: m.tier, match: pick ? 'learned' : m.match,
+        snippet: m.match === 'body' ? _cmdkSnippet(String(it.body), toks) : '' }, (pick ? 60000 + pick : m.tier * 10000) + _cmdkBoost(it, m, u)]);
     }
     // A file you pinned shows once, as the pin.
     const pinned = new Set(scored.filter(([it]) => it.kind === 'pin' && it.body).map(([it]) => it.body));
@@ -75518,7 +81954,9 @@ function _cmdkCompute() {
       const it = { kind: h.kind, id: h.id, title: h.title, status: h.kind === 'file' ? '' : h.status, session: h.session, archived: h.archived,
         sub,
         tier, match: h.match || '', snippet: h.snippet || '' };
-      scored.push([it, tier * 10000 + (h.boost || 0) + _cmdkContext(it) + _cmdkFrecency(u, it)]);
+      const pick = _cmdkPickBoost(q, it);
+      if (pick) it.match = 'learned';
+      scored.push([it, (pick ? 60000 + pick : tier * 10000) + (h.boost || 0) + _cmdkContext(it) + _cmdkFrecency(u, it)]);
     }
     all = scored.sort((a, b) => b[1] - a[1]).slice(0, 40).map(([it]) => it);
   }
@@ -75681,6 +82119,7 @@ function openCmdk() {
   _cmdkRender();
   inp.focus();
   _cmdkLoadLists().then(() => { if (ov.classList.contains('active')) _cmdkRender(); });
+  _navLoad().then(() => { if (ov.classList.contains('active')) _cmdkRender(); });
 }
 
 function closeCmdk() {
@@ -75801,6 +82240,8 @@ const _HK_ACTIONS = {
   open_hotkeys: { label: 'Open Hotkeys', desc: 'Come back to this tab', ico: '⌘', tone: 'gray', run: () => switchView('hotkeys') },
   go_back: { label: 'Back', desc: 'Go back to the previous tab, worker, card or file', ico: '‹', tone: 'gray', run: () => navBack() },
   go_forward: { label: 'Forward', desc: 'Go forward again after going back', ico: '›', tone: 'gray', run: () => navForward() },
+  key_mode: { label: 'Key mode', desc: 'In a worker: arrows, Enter, Esc, Tab, Space, Backspace and y/n/1/2/3 go to the worker until you type something else',
+    ico: '⌨', tone: 'blue', run: () => _kmToggle() },
 };
 // Shortcuts bound elsewhere in amux. Shown so this tab is the whole map, and
 // so a new hotkey cannot silently shadow one of them.
@@ -75818,12 +82259,17 @@ const _HK_DEFAULTS = [
   { id: 'hk-dictate-text', action: 'dictate', type: 'text', trigger: '##', enabled: true, remove: true, indicator: false },
   { id: 'hk-dictate-keys', action: 'dictate', type: 'keys', trigger: 'Alt+Shift+M', enabled: true, remove: true, indicator: false },
   { id: 'hk-dictate-globe', action: 'dictate', type: 'keys', trigger: 'Globe Globe', enabled: true, remove: true, indicator: false },
+  // Held: dictates until you let go, like Wispr Flow's fn (owner, 2026-11-16).
+  { id: 'hk-dictate-globe-hold', action: 'dictate', type: 'keys', trigger: 'Globe Hold', enabled: true, remove: true, indicator: false },
   { id: 'hk-new-task', action: 'new_task', type: 'keys', trigger: 'Alt+Shift+N', enabled: true, remove: true, indicator: false },
   { id: 'hk-new-task-text', action: 'new_task', type: 'text', trigger: '!!', enabled: false, remove: true, indicator: true },
   { id: 'hk-draw', action: 'open_draw', type: 'keys', trigger: 'Alt+Shift+D', enabled: true, remove: true, indicator: false },
   { id: 'hk-back', action: 'go_back', type: 'keys', trigger: 'Mod+[', enabled: true, remove: true, indicator: false },
   { id: 'hk-forward', action: 'go_forward', type: 'keys', trigger: 'Mod+]', enabled: true, remove: true, indicator: false },
   { id: 'hk-record', action: 'record', type: 'keys', trigger: 'Alt+Shift+R', enabled: true, remove: true, indicator: false },
+  // ⌃; on a Mac (⌘; is taken by the system spelling menu), Ctrl+; elsewhere.
+  { id: 'hk-key-mode', action: 'key_mode', type: 'keys', trigger: /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '') ? 'Ctrl+;' : 'Mod+;',
+    enabled: true, remove: true, indicator: false },
 ];
 let _hkList = _HK_DEFAULTS.map(h => Object.assign({}, h));
 let _hkLoaded = false;
@@ -75884,7 +82330,7 @@ function _hkComboFromEvent(e) {
   return mods.concat([key]).join('+');
 }
 function _hkKeyChips(combo) {
-  const glyph = { Mod: _HK_IS_MAC ? '⌘' : 'Ctrl', Ctrl: _HK_IS_MAC ? '⌃' : 'Ctrl', Alt: _HK_IS_MAC ? '⌥' : 'Alt', Shift: '⇧', Enter: '↵', Space: 'Space', Globe: '🌐' };
+  const glyph = { Mod: _HK_IS_MAC ? '⌘' : 'Ctrl', Ctrl: _HK_IS_MAC ? '⌃' : 'Ctrl', Alt: _HK_IS_MAC ? '⌥' : 'Alt', Shift: '⇧', Enter: '↵', Space: 'Space', Globe: '🌐', Hold: 'hold' };
   return '<span class="hk-keys">' + String(combo || '').split(/[+ ]/).filter(Boolean)
     .map(k => '<kbd class="hk-kbd">' + esc(glyph[k] || k) + '</kbd>').join('') + '</span>';
 }
@@ -75901,7 +82347,7 @@ function _hkConflict(h, list) {
   } else {
     const parts = t.split('+');
     // 🌐 works alone or with a key (the Mac app hands it over: _hkNativeKey).
-    if (t !== 'Globe' && t !== 'Globe Globe' && (parts.length < 2 || !parts.some(p => p === 'Mod' || p === 'Ctrl' || p === 'Alt' || p === 'Globe')))
+    if (t !== 'Globe' && t !== 'Globe Globe' && t !== 'Globe Hold' && (parts.length < 2 || !parts.some(p => p === 'Mod' || p === 'Ctrl' || p === 'Alt' || p === 'Globe')))
       return 'A shortcut needs ⌘, ⌥, ⌃ or 🌐 (⇧ alone is how capitals are typed)';
     const b = _HK_BUILTIN.find(x => x.combo === t);
     if (b) return 'amux already uses this for ' + b.label;
@@ -75946,15 +82392,12 @@ function _hkDictate(el) {
   const pop = document.getElementById('dict-popup');
   if (!pop) throw new Error('dictation is unavailable');
   const composer = document.getElementById('peek-cmd-input');
-  _hkDictTarget = el && el !== composer ? { el, at: el.selectionStart ?? el.value.length } : null;
-  if (_hkDictTarget || !peekSession) {
+  // The text goes in at the caret of the box you were in, the composer too.
+  _hkDictTarget = el ? { el, at: el.selectionStart ?? el.value.length, end: el.selectionEnd ?? el.selectionStart ?? el.value.length } : null;
+  if ((el && el !== composer) || !peekSession) {
     if (!pop._hkHome) pop._hkHome = pop.parentNode;
     document.body.appendChild(pop);
-    pop.classList.add('dict-floating');
-    const r = (el || document.activeElement || document.body).getBoundingClientRect();
-    const w = Math.min(280, window.innerWidth - 16);
-    pop.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.left)) + 'px';
-    pop.style.top = Math.max(8, Math.min(window.innerHeight - 160, r.bottom + 8)) + 'px';
+    pop.classList.add('dict-floating');   // a pill at the bottom of the window
   }
   _dictOpenPopup();
 }
@@ -75962,7 +82405,6 @@ function _hkDictHome() {
   const pop = document.getElementById('dict-popup');
   if (pop && pop._hkHome && pop.parentNode !== pop._hkHome) {
     pop.classList.remove('dict-floating');
-    pop.style.left = pop.style.top = '';
     pop._hkHome.appendChild(pop);
   }
 }
@@ -75972,15 +82414,27 @@ function _hkDictDeliver(text) {
   const t = _hkDictTarget;
   _hkDictTarget = null;
   if (!t || !document.contains(t.el)) return false;
-  const v = t.el.value, at = Math.min(t.at, v.length);
-  const pre = v.slice(0, at), post = v.slice(at);
+  // A selection is replaced, as typing would.
+  const v = t.el.value, at = Math.min(t.at, v.length), end = Math.max(at, Math.min(t.end ?? at, v.length));
+  const pre = v.slice(0, at), post = v.slice(end);
   const gap = pre && !/\s$/.test(pre) ? ' ' : '';
-  t.el.value = pre + gap + text + post;
+  const tail = post && !/^[\s.,;:!?)]/.test(post) ? ' ' : '';
+  t.el.value = pre + gap + text + tail + post;
+  _dictWatchField(t.el, text, v);
   const caret = (pre + gap + text).length;
   try { t.el.focus(); t.el.setSelectionRange(caret, caret); } catch (e) {}
   t.el.dispatchEvent(new Event('input', { bubbles: true }));
   return true;
 }
+
+// Esc while the pill is up throws the take away, as its ✕ does.
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || !_dictPopupOpen || (!_dictRecording && !_dictNative)) return;
+  e.preventDefault();
+  e.stopPropagation();
+  _dictClosePopup(true);
+  _dictBeacon('dict_cancelled', { how: 'esc' });
+}, true);
 
 document.addEventListener('keydown', e => {
   if (_hkRecording || e.repeat || e.isComposing) return;
@@ -76000,13 +82454,39 @@ document.addEventListener('keydown', e => {
 // key). A recording takes it like any combination; otherwise the hotkey bound
 // to it runs. `info.mac_dictation` is true when macOS also starts its own
 // dictation on 🌐🌐, which the owner is told once.
-let _hkMacDictWarned = false;
+let _hkMacDictWarned = false, _hkWisprWarned = false, _hkGlobeStoppedAt = 0;
 window._hkNativeKey = function (combo, info) {
   combo = String(combo || '');
-  if (!/^Globe( Globe|\+[A-Z0-9]|\+Space)?$/.test(combo)) return 'not_globe';
+  // Letting go of a held 🌐 ends the take holding it started.
+  if (combo === 'Globe Release') {
+    if (_dictPtt && _dictRecording) { _dictStopRec(); return 'released'; }
+    return 'release_ignored';
+  }
+  if (!/^Globe( Globe| Hold|\+[A-Z0-9]|\+Space)?$/.test(combo)) return 'not_globe';
+  // 🌐 while a take records finishes it (owner, 2026-11-17: "when I press the
+  // button that was used to invoke the dictation, that should close the
+  // dictation"), a single tap included: only 🌐🌐 was bound, and a lone tap
+  // went nowhere. The app sends a double tap as "Globe" then "Globe Globe",
+  // so a "Globe Globe" right after a stop is the rest of that tap.
+  if ((combo === 'Globe' || combo === 'Globe Globe') && _dictRecording && !_dictPtt) {
+    _dictStopRec(); _hkGlobeStoppedAt = Date.now();
+    _hkBeacon('hotkey_globe_stopped_take', { trigger: combo });
+    return 'stopped';
+  }
+  if (combo === 'Globe Globe' && Date.now() - _hkGlobeStoppedAt < 600) return 'stop_tap_tail';
   if (_hkRecording && _hkRecordTake) { _hkRecordTake(combo); return 'recorded'; }
   const h = _hkList.find(x => !x.deleted && x.enabled && x.type === 'keys' && x.trigger === combo);
   if (!h) { _hkBeacon('hotkey_globe_unbound', { trigger: combo }); return 'unbound'; }
+  if (combo === 'Globe Hold' && info && info.wispr) {
+    // Wispr Flow takes a held fn from every app; both would type the same words.
+    if (!_hkWisprWarned) {
+      _hkWisprWarned = true;
+      showToast('Wispr Flow is running and dictates while 🌐 is held, so amux leaves holding 🌐 to it. 🌐🌐 still dictates with amux.');
+    }
+    _hkBeacon('hotkey_globe_hold_left_to_wispr', { trigger: combo });
+    return 'left_to_wispr';
+  }
+  if (combo === 'Globe Hold') _dictPtt = !_dictRecording;
   if (combo === 'Globe Globe' && info && info.mac_dictation && !_hkMacDictWarned) {
     _hkMacDictWarned = true;
     showToast('macOS also starts its own dictation on 🌐🌐. To leave it to amux: System Settings → Keyboard → "Press 🌐 key to" → Do Nothing.');
@@ -76124,6 +82604,7 @@ function _hkOpenDialog(id) {
     + '<button type="button" class="btn" id="hk-record" onclick="_hkRecord()">Record shortcut</button></div>'
     + '<span class="ui-help" id="hk-trigger-help"></span></div>'
     + '<label class="sx-check" id="hk-remove-row"><input type="checkbox" id="hk-remove"><span><b>Remove the trigger text</b><span class="ui-help">Delete the typed trigger (like ##) when it fires</span></span></label>'
+    + '<label class="sx-check" id="hk-km-idle-row"><input type="checkbox" id="hk-km-idle"><span><b>Turn off after ' + (_KM_IDLE_MS / 1000) + ' seconds without a key</b><span class="ui-help">Off: key mode stays on until you press the shortcut again, type, or close the worker</span></span></label>'
     + '<label class="sx-check"><input type="checkbox" id="hk-indicator"><span><b>Show a small indicator</b><span class="ui-help">A short toast when it fires</span></span></label>'
     + '<div class="hk-modal-foot">'
     + (src ? '<button class="btn danger" onclick="_hkDelete()">' + (_HK_DEFAULTS.some(d => d.id === src.id) ? 'Remove' : 'Delete') + '</button>' : '')
@@ -76135,7 +82616,9 @@ function _hkOpenDialog(id) {
   ov.querySelector('#hk-trigger').value = e.trigger;
   ov.querySelector('#hk-remove').checked = !!e.remove;
   ov.querySelector('#hk-indicator').checked = !!e.indicator;
+  ov.querySelector('#hk-km-idle').checked = e.idle_off !== false;
   ov.querySelectorAll('input[name="hk-type"]').forEach(r => r.addEventListener('change', _hkTypeUI));
+  ov.querySelector('#hk-action').addEventListener('change', _hkTypeUI);
   _hkTypeUI();
   ov.classList.add('active');
   setTimeout(() => ov.querySelector('#hk-action').focus(), 0);
@@ -76145,6 +82628,7 @@ function _hkTypeUI() {
   document.getElementById('hk-trigger-label').textContent = text ? 'Text trigger' : 'Shortcut';
   document.getElementById('hk-record').hidden = text;
   document.getElementById('hk-remove-row').style.display = text ? '' : 'none';
+  document.getElementById('hk-km-idle-row').style.display = document.getElementById('hk-action').value === 'key_mode' ? '' : 'none';
   const act = _HK_ACTIONS[document.getElementById('hk-action').value];
   document.getElementById('hk-action').title = act ? act.desc : '';
   document.getElementById('hk-record').style.display = text ? 'none' : '';
@@ -76193,6 +82677,8 @@ async function _hkSaveDialog() {
     remove: document.getElementById('hk-remove').checked,
     indicator: document.getElementById('hk-indicator').checked,
   });
+  if (next.action === 'key_mode') next.idle_off = document.getElementById('hk-km-idle').checked;
+  else delete next.idle_off;
   delete next.isNew;
   const why = _hkConflict(next, _hkList);
   const t = document.getElementById('hk-trigger');
@@ -76221,3 +82707,470 @@ async function _hkDelete() {
   showToast('Removed ' + _HK_ACTIONS[e.action].label + ' ' + e.trigger);
 }
 _hkLoad();
+
+// ── Outbound tab (api/outbound_feed.rs) ──────────────────────────────────────
+// Every message a worker wants to send to someone outside, on every channel,
+// in one place: held email drafts, chat-bridge replies, social posts and
+// browser-typed messages (an X or LinkedIn DM). The feed is a projection of
+// each kind's own record; deciding goes through each kind's own path
+// (/api/approvals/decide, or the email approve route for an edit or a
+// schedule), so this tab and the Needs-you cards can never disagree.
+let _obData = null;          // the last feed
+let _obConnectors = {};      // connector id -> connector, for "how it goes out"
+let _obState = 'needs';      // the view: needs | scheduled | approved | sent | declined | failed | all
+let _obChannel = '';         // channel filter, '' = all
+let _obWorker = '';          // worker filter, '' = all
+let _obQuery = '';           // search text
+let _obOpen = '';            // ref of the open item
+const _obSelected = new Set();   // refs ticked for a bulk decision
+const _obBusy = new Set();       // refs with a decision in flight
+let _obEditing = '';         // ref whose text is in an edit box (the poll does not repaint under it)
+let _obTimer = null;
+
+const _OB_VIEWS = [
+  ['needs', 'Needs approval'], ['scheduled', 'Scheduled'], ['approved', 'Approved'],
+  ['sent', 'Sent'], ['declined', 'Declined'], ['failed', 'Failed'], ['all', 'All'],
+];
+const _OB_CHANNEL = {
+  email: ['✉', 'Email'], x: ['𝕏', 'X'], twitter: ['𝕏', 'X'], linkedin: ['in', 'LinkedIn'], slack: ['#', 'Slack'],
+  telegram: ['✈', 'Telegram'], discord: ['◎', 'Discord'], whatsapp: ['◔', 'WhatsApp'], whatsapp_app: ['◔', 'WhatsApp'],
+  imessage: ['◌', 'iMessage'], reddit: ['◉', 'Reddit'], hn: ['Y', 'Hacker News'], devto: ['D', 'DEV'], youtube: ['▶', 'YouTube'],
+};
+function _obChan(c) { return _OB_CHANNEL[c] || ['↗', c ? c.charAt(0).toUpperCase() + c.slice(1) : 'Other']; }
+const _OB_STATE_PILL = {
+  needs: ['cx-warn', 'needs approval'], scheduled: ['cx-idle', 'scheduled'], approved: ['cx-ok', 'approved'],
+  sent: ['cx-ok', 'sent'], declined: ['cx-idle', 'declined'], failed: ['cx-bad', 'failed'],
+};
+const _OB_EMAIL_ROUTE = '/api/email/' + 'approve/';
+
+function _obFit() {
+  const view = document.getElementById('outbound-view');
+  if (!view || view.style.display === 'none') return;
+  requestAnimationFrame(() => view.style.setProperty('--ob-top', Math.max(0, view.getBoundingClientRect().top) + 'px'));
+}
+window.addEventListener('resize', _obFit);
+
+function _obEnter() {
+  _obFit();
+  _obLoad();
+  if (!_obTimer) _obTimer = setInterval(() => { if (activeView === 'outbound' && !document.hidden) _obLoad(true); }, 30_000);
+}
+function _obLeave() { if (_obTimer) { clearInterval(_obTimer); _obTimer = null; } }
+
+async function _obLoad(quiet) {
+  try {
+    const [r, rc] = await Promise.all([
+      fetch(API + '/api/outbound/feed', { headers: _authHeaders() }),
+      quiet && Object.keys(_obConnectors).length ? null : fetch(API + '/api/connectors', { headers: _authHeaders() }),
+    ]);
+    const d = await r.json().catch(() => ({}));
+    _obData = r.ok ? d : { items: [], counts: {}, channels: {}, error: d.why_unmeasured || d.error || ('HTTP ' + r.status) };
+    if (rc && rc.ok) {
+      const c = await rc.json().catch(() => ({}));
+      _obConnectors = {};
+      (c.connectors || []).forEach(x => { _obConnectors[x.id] = x; });
+    }
+  } catch (e) {
+    _obData = { items: [], counts: {}, channels: {}, error: e.message };
+  }
+  _obBadge();
+  // Never repaint under an edit: the box holds what the owner is changing.
+  if (_obEditing) return;
+  _obRender();
+}
+
+// The count of waiting items on the tab's own label.
+function _obBadge() {
+  const lbl = document.querySelector('#tab-outbound .tab-lbl');
+  if (!lbl) return;
+  const n = (_obData && _obData.counts && _obData.counts.needs) || 0;
+  let b = lbl.querySelector('.ob-tab-count');
+  if (!n) { if (b) b.remove(); return; }
+  if (!b) { b = document.createElement('span'); b.className = 'ob-tab-count'; lbl.appendChild(b); }
+  b.textContent = n > 99 ? '99+' : String(n);
+}
+
+function _obSetView(v) { _obState = v; _obSelected.clear(); _obOpen = ''; _obRender(); }
+function _obSetChannel(c) { _obChannel = _obChannel === c ? '' : c; _obRender(); }
+function _obSetWorker(w) { _obWorker = w; _obRender(); }
+function _obSearch(q) { _obQuery = (q || '').trim().toLowerCase(); _obRender(); }
+
+function _obVisible() {
+  const all = (_obData && _obData.items) || [];
+  return all.filter(it => (_obState === 'all' || it.state === _obState)
+    && (!_obChannel || it.channel === _obChannel)
+    && (!_obWorker || it.worker === _obWorker)
+    && (!_obQuery || [it.worker, it.to, it.subject, it.text, it.account, it.channel, it.reason, it.target]
+      .some(f => (f || '').toLowerCase().includes(_obQuery))));
+}
+
+function _obWho(it) {
+  if (it.crm && it.crm.name) return it.crm.name;
+  return it.to || it.target || it.account || (it.channel === 'email' ? '' : _obChan(it.channel)[1]);
+}
+function _obTitle(it) {
+  const t = it.subject || (it.text || '').split('\n').find(l => l.trim()) || '';
+  return t.length > 140 ? t.slice(0, 140) + '…' : t;
+}
+function _obWhen(it) {
+  if (it.state === 'scheduled' && it.scheduled_at) return 'sends ' + _apprWhenText(it.scheduled_at);
+  return timeAgo(Math.floor(it.sent_at || it.decided_at || it.created || 0));
+}
+
+// How this item goes out, and whether that route can send right now.
+function _obRoute(it) {
+  if (it.via === 'browser') return { ok: true, text: 'Typed by ' + (it.worker || 'the worker') + ' in the amux browser after you approve (the site has no API)', kind: 'browser' };
+  if (it.via === 'mac_app') return { ok: true, text: 'Sent through ' + (it.connector_label || 'the app on this Mac'), kind: 'mac_app' };
+  if (!it.connector) return { ok: true, text: 'Sent by API', kind: 'api' };
+  const c = _obConnectors[it.connector];
+  if (!c) return { ok: null, text: 'Sent with the ' + (it.connector_label || it.connector) + ' connector', kind: 'api' };
+  const ok = c.status === 'connected' || c.usable === true;
+  return { ok, text: (ok ? 'Sent with the ' : 'Needs the ') + (c.label || it.connector_label || it.connector) + ' connector'
+    + (ok ? '' : ' (' + String(c.status || 'not connected').replace(/_/g, ' ') + ')'), kind: 'api', connector: it.connector };
+}
+
+function _obRender() {
+  const view = document.getElementById('outbound-view');
+  if (!view || view.style.display === 'none') return;
+  const d = _obData || { items: [], counts: {}, channels: {} };
+  const counts = d.counts || {};
+  // Every message on record; the list itself is capped per source.
+  const total = d.n_considered || (d.items || []).length;
+  // Row 1: the views. One row; it scrolls sideways on a phone. An empty
+  // view other than the one open is left out, so the row stays short.
+  document.getElementById('ob-views').innerHTML = _OB_VIEWS.map(([k, label]) => {
+    const n = k === 'all' ? total : (counts[k] || 0);
+    if (k !== 'needs' && k !== 'all' && k !== _obState && !n) return '';
+    return '<button class="ob-view' + (_obState === k ? ' on' : '') + '" role="tab" aria-selected="' + (_obState === k) + '" data-v="' + k
+      + '" onclick="_obSetView(this.dataset.v)">' + esc(label) + '<span class="ob-count' + (k === 'needs' && n ? ' hot' : '') + '">' + n + '</span></button>';
+  }).join('');
+  // Row 2: channels (with how each goes out) and workers.
+  const chans = Object.entries(d.channels || {}).sort((a, b) => (b[1].needs - a[1].needs) || (b[1].total - a[1].total));
+  const workers = [...new Set((d.items || []).map(i => i.worker).filter(Boolean))].sort();
+  const chip = (c, info) => {
+    const [ico, name] = _obChan(c);
+    const r = _obRoute({ via: info.via, connector: info.connector, connector_label: info.connector_label });
+    const dot = r.ok === false ? ' ob-dot-bad' : (info.via === 'browser' ? ' ob-dot-browser' : ' ob-dot-ok');
+    return '<button class="cx-filter ob-chip' + (_obChannel === c ? ' on' : '') + '" data-c="' + esc(c) + '" title="' + esc(r.text) + '"'
+      + ' onclick="_obSetChannel(this.dataset.c)"><span class="ob-chip-ico">' + esc(ico) + '</span>' + esc(name)
+      + (info.needs ? ' <span class="ob-chip-n">' + info.needs + '</span>' : '') + '<span class="ob-dot' + dot + '" aria-hidden="true"></span></button>';
+  };
+  document.getElementById('ob-channels').innerHTML =
+    '<button class="cx-filter ob-chip' + (!_obChannel ? ' on' : '') + '" onclick="_obSetChannel(\'\')">All channels</button>'
+    + chans.map(([c, info]) => chip(c, info)).join('');
+  const ws = document.getElementById('ob-worker');
+  ws.innerHTML = '<option value="">All workers</option>' + workers.map(w => '<option value="' + esc(w) + '"' + (w === _obWorker ? ' selected' : '') + '>' + esc(w) + '</option>').join('');
+  const note = document.getElementById('ob-note');
+  note.textContent = d.error ? 'Could not load outbound: ' + d.error : '';
+  note.hidden = !d.error;
+  _obRenderList();
+  _obRenderDetail();
+}
+
+function _obRenderList() {
+  const list = document.getElementById('ob-list');
+  const rows = _obVisible();
+  if (_obOpen && !rows.some(r => r.ref === _obOpen)) _obOpen = '';
+  // Desktop opens the first item; a phone shows the list until one is tapped.
+  if (!_obOpen && rows.length && !window.matchMedia('(max-width: 600px)').matches) _obOpen = rows[0].ref;
+  for (const ref of [..._obSelected]) if (!rows.some(r => r.ref === ref && r.decidable)) _obSelected.delete(ref);
+  const decidable = rows.filter(r => r.decidable);
+  const head = document.getElementById('ob-list-head');
+  const allOn = decidable.length && decidable.every(r => _obSelected.has(r.ref));
+  head.innerHTML = (decidable.length ? '<input type="checkbox" class="ob-check" aria-label="Select all" ' + (allOn ? 'checked' : '')
+      + ' onchange="_obSelectAll(this.checked)">' : '')
+    + '<span class="ob-list-n">' + rows.length + ' ' + (_obState === 'needs' ? 'to review' : (rows.length === 1 ? 'message' : 'messages'))
+      + (_obCapped(rows.length) ? ' <span class="ob-dim">(the latest of ' + _obCapped(rows.length) + ')</span>' : '') + '</span>'
+    + (_obSelected.size ? '<span class="ob-bulk"><button class="btn primary" onclick="_obBulk(\'approve\')">Approve ' + _obSelected.size + '</button>'
+      + '<button class="btn" onclick="_obBulk(\'reject\')">Discard ' + _obSelected.size + '</button></span>' : '');
+  if (!rows.length) {
+    const empty = { needs: 'Nothing is waiting for you. When a worker wants to message someone outside, it shows up here first.',
+      scheduled: 'Nothing is scheduled.', approved: 'Nothing approved is still on its way.', sent: 'Nothing sent yet.' }[_obState] || 'Nothing here.';
+    list.innerHTML = '<div class="ob-empty">' + esc(_obQuery || _obChannel || _obWorker ? 'No messages match these filters.' : empty) + '</div>';
+    return;
+  }
+  list.innerHTML = rows.map(it => {
+    const [ico] = _obChan(it.channel);
+    const route = _obRoute(it);
+    const pill = _OB_STATE_PILL[it.state] || ['cx-idle', it.state];
+    return '<div class="ob-row' + (it.ref === _obOpen ? ' open' : '') + (it.state === 'needs' ? ' waiting' : '') + '" role="button" tabindex="0"'
+      + ' data-ref="' + esc(it.ref) + '" onclick="_obOpenItem(this.dataset.ref)" onkeydown="if(event.key===\'Enter\')_obOpenItem(this.dataset.ref)">'
+      + (it.decidable ? '<input type="checkbox" class="ob-check" aria-label="Select" ' + (_obSelected.has(it.ref) ? 'checked' : '')
+        + ' data-ref="' + esc(it.ref) + '" onclick="event.stopPropagation()" onchange="_obSelect(this.dataset.ref,this.checked)">' : '<span class="ob-check-gap"></span>')
+      + '<span class="ob-ico ob-ch-' + esc(it.channel) + '" aria-label="' + esc(_obChan(it.channel)[1]) + '">' + esc(ico) + '</span>'
+      + '<div class="ob-row-main">'
+      + '<div class="ob-row-top"><span class="ob-row-worker">' + esc(it.worker || 'unknown worker') + '</span>'
+      + '<span class="ob-row-when">' + esc(_obWhen(it)) + '</span></div>'
+      + '<div class="ob-row-title">' + esc((it.action ? it.action.charAt(0).toUpperCase() + it.action.slice(1) + ': ' : '') + _obTitle(it)) + '</div>'
+      + '<div class="ob-row-to">' + esc((it.account ? it.account + ' → ' : '') + _obWho(it))
+      + (route.ok === false ? ' <span class="ob-warn" title="' + esc(route.text) + '">connector missing</span>' : '')
+      + (it.state !== 'needs' && _obState === 'all' ? ' <span class="cx-pill ' + pill[0] + '">' + esc(pill[1]) + '</span>' : '')
+      + '</div></div></div>';
+  }).join('');
+}
+
+// The view's total when the list holds fewer (history is capped per source);
+// 0 when the list is the whole view or a filter narrows it.
+function _obCapped(shown) {
+  const d = _obData || {};
+  if (_obChannel || _obWorker || _obQuery) return 0;
+  const total = _obState === 'all' ? (d.n_considered || 0) : ((d.counts || {})[_obState] || 0);
+  return total > shown ? total : 0;
+}
+
+function _obSelect(ref, on) { if (on) _obSelected.add(ref); else _obSelected.delete(ref); _obRenderList(); }
+function _obSelectAll(on) { _obVisible().filter(r => r.decidable).forEach(r => on ? _obSelected.add(r.ref) : _obSelected.delete(r.ref)); _obRenderList(); }
+function _obOpenItem(ref) {
+  if (_obEditing && _obEditing !== ref) _obEditing = '';
+  _obOpen = ref;
+  document.getElementById('outbound-view').classList.add('ob-detail-open');
+  _obRenderList(); _obRenderDetail();
+  const d = document.getElementById('ob-detail'); if (d) d.scrollTop = 0;
+}
+function _obBack() { _obOpen = ''; _obEditing = ''; document.getElementById('outbound-view').classList.remove('ob-detail-open'); _obRender(); }
+function _obItem(ref) { return ((_obData && _obData.items) || []).find(i => i.ref === ref); }
+
+function _obField(label, value) {
+  return label && value ? '<div class="ob-field"><span class="ob-field-k">' + esc(label) + '</span><span class="ob-field-v">' + esc(value) + '</span></div>' : '';
+}
+
+function _obRenderDetail() {
+  const pane = document.getElementById('ob-detail');
+  const side = document.getElementById('ob-side');
+  const it = _obItem(_obOpen);
+  if (!it) {
+    pane.innerHTML = '<div class="ob-empty">Pick a message to see everything about it before it goes out.</div>';
+    side.innerHTML = '';
+    document.getElementById('outbound-view').classList.remove('ob-detail-open');
+    return;
+  }
+  const [ico, chName] = _obChan(it.channel);
+  const st = _OB_STATE_PILL[it.state] || ['cx-idle', it.state];
+  // Disabled while a decision is in flight, and for a moment after the last
+  // one opened this message (see _obSettleUntil).
+  const busy = _obBusy.has(it.ref) || Date.now() < _obSettleUntil;
+  const editing = _obEditing === it.ref;
+  const waited = it.state === 'needs' ? 'waiting ' + timeAgo(Math.floor(it.created)).replace(' ago', '') : '';
+  const q = esc(it.ref);
+  let actions = '';
+  if (it.decidable) {
+    actions = '<button class="btn primary ob-approve" ' + (busy ? 'disabled' : '') + ' data-ref="' + q + '" onclick="_obDecide(this.dataset.ref,\'approve\')">'
+        + (_obBusy.has(it.ref) ? 'Working…' : (editing ? 'Approve edited' : 'Approve')) + '</button>'
+      + (it.kind === 'email' ? '<button class="btn ob-schedule" ' + (busy ? 'disabled' : '') + ' data-ref="' + q + '" onclick="_obSchedule(this.dataset.ref)">Schedule</button>'
+        + '<button class="btn ob-edit-btn" ' + (busy ? 'disabled' : '') + ' data-ref="' + q + '" onclick="_obEdit(this.dataset.ref)">' + (editing ? 'Cancel edit' : 'Edit') + '</button>' : '')
+      + '<button class="btn ob-discard" ' + (busy ? 'disabled' : '') + ' data-ref="' + q + '" onclick="_obDecide(this.dataset.ref,\'reject\')">Discard</button>';
+  }
+  const parent = it.parent && (it.parent.text || it.parent.author) ? it.parent : null;
+  const thread = Array.isArray(it.thread) ? it.thread : [];
+  const atts = Array.isArray(it.attachments) ? it.attachments : [];
+  const pendingEmail = it.kind === 'email' && (it.state === 'needs' || it.state === 'scheduled');
+  const body = editing
+    ? '<textarea id="ob-edit-box" class="input ob-edit" aria-label="Message text">' + esc(it.text || '') + '</textarea>'
+      + '<div class="ob-hint">Approve sends what is in this box. The edit is recorded in the send ledger.</div>'
+    : '<div class="ob-body">' + esc(it.text || '(no text)') + '</div>';
+  const replying = it.kind === 'email' && it.action === 'reply all' ? 'to everyone on the thread'
+    : (it.kind === 'email' && it.action === 'reply' ? 'to the sender' : '');
+  pane.innerHTML = '<div class="ob-detail-head">'
+      + '<button class="btn ob-back" onclick="_obBack()" aria-label="Back to the list">‹</button>'
+      + '<span class="ob-ico ob-ch-' + esc(it.channel) + '">' + esc(ico) + '</span>'
+      + '<span class="ob-detail-title">' + esc(it.worker || 'unknown worker') + ' <span class="ob-dim">· ' + esc(it.action || 'message') + '</span></span>'
+      + (waited ? '<span class="ob-dim ob-waited">' + esc(waited) + '</span>' : '<span class="cx-pill ' + st[0] + '">' + esc(st[1]) + '</span>')
+      + '</div>'
+    + (actions ? '<div class="ob-actions">' + actions + '</div>' : '')
+    + '<div id="ob-sched-row" class="ob-sched" hidden></div>'
+    + '<div class="ob-fields">'
+      + _obField('From', it.account) + _obField('To', it.to || it.target) + _obField('Cc', it.cc)
+      + _obField('Subject', it.subject) + _obField('Where', it.target && it.to ? it.target : '')
+      + _obField('Replying', replying)
+      + _obField('Sends', it.state === 'scheduled' && it.scheduled_at ? _apprWhenText(it.scheduled_at) : '')
+    + '</div>'
+    + body
+    + '<div class="ob-tags"><span class="ob-tag">' + esc(ico + ' ' + chName) + '</span>'
+      + (it.worker ? '<button class="ob-tag ob-tag-link" data-w="' + esc(it.worker) + '" onclick="openPeek(this.dataset.w)">Worker: ' + esc(it.worker) + '</button>' : '')
+      + (it.card ? '<span class="ob-tag">Card ' + esc(it.card) + '</span>' : '') + '</div>'
+    + (it.reason ? '<div class="ob-section"><div class="ob-section-h">Why ' + esc(it.worker || 'the worker') + ' is sending it</div><div class="ob-section-b">' + esc(it.reason) + '</div></div>' : '')
+    + (parent ? '<div class="ob-section"><div class="ob-section-h">What it answers</div><div class="ob-quote">'
+        + (parent.author ? '<div class="ob-quote-who">' + esc(parent.author) + (parent.subject ? ' · ' + esc(parent.subject) : '') + '</div>' : '')
+        + esc(String(parent.text || '').slice(0, 4000)) + '</div></div>' : '')
+    + (thread.length ? '<details class="ob-section"><summary class="ob-section-h">Recent thread (' + thread.length + ')</summary>'
+        + thread.map(m => '<div class="ob-quote"><div class="ob-quote-who">' + esc(m.author || m.who || '') + '</div>' + esc(String(m.text || m.body || '').slice(0, 2000)) + '</div>').join('') + '</details>' : '')
+    + (atts.length ? '<div class="ob-section"><div class="ob-section-h">Attachments (' + atts.length + ')</div>'
+        + atts.map(a => '<div class="ob-att"><span class="ob-att-name">' + esc(a.filename || 'attachment') + '</span>'
+            + (a.size ? '<span class="ob-dim">' + esc(_apprSize(a.size)) + '</span>' : '')
+            + (pendingEmail ? '<button class="btn" data-id="' + esc(it.id) + '" data-i="' + Number(a.index) + '" onclick="_obAttachment(this.dataset.id,this.dataset.i)">Open</button>' : '')
+            + '</div>').join('') + '</div>' : '')
+    + (it.result_url ? '<div class="ob-section"><div class="ob-section-h">Posted</div><a href="' + esc(it.result_url) + '" target="_blank" rel="noopener">' + esc(it.result_url) + '</a></div>' : '')
+    + (it.error ? '<div class="ob-section ob-error"><div class="ob-section-h">Error</div>' + esc(it.error) + '</div>' : '')
+    + (it.decision_reason ? '<div class="ob-section"><div class="ob-section-h">Decision note</div>' + esc(it.decision_reason) + '</div>' : '');
+  _obRenderSide(it);
+  if (editing) { const ta = document.getElementById('ob-edit-box'); if (ta && document.activeElement !== ta) ta.focus(); }
+}
+
+function _obRenderSide(it) {
+  const side = document.getElementById('ob-side');
+  const c = it.crm;
+  const route = _obRoute(it);
+  let html = '<div class="ob-card"><div class="ob-card-h">Recipient</div>';
+  if (c) {
+    html += '<div class="ob-person"><div class="ob-person-name">' + esc(c.name || '') + '</div>'
+      + (c.role ? '<div class="ob-dim">' + esc(c.role) + '</div>' : '')
+      + (c.email ? '<div class="ob-dim">' + esc(c.email) + '</div>' : '') + '</div>';
+  } else {
+    // A post or a thread has a URL, not a person: name the site, link the URL.
+    const url = /^https?:\/\//.test(it.target || '') ? it.target : '';
+    const name = it.to || (url ? _obChan(it.channel)[1] + ' ' + (it.action === 'comment' ? 'post' : 'page') : '') || 'unknown';
+    html += '<div class="ob-person"><div class="ob-person-name">' + esc(name) + '</div>'
+      + (url ? '<a class="ob-person-link" href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(url) + '</a>' : '')
+      + '<div class="ob-dim">Not in the CRM</div></div>';
+  }
+  html += '</div>';
+  if (c) {
+    const a = c.account || {};
+    html += '<div class="ob-card"><div class="ob-card-h">CRM</div>'
+      + '<div class="ob-kv"><span>Company</span><span>' + esc(a.name || c.company || '-') + '</span></div>'
+      + (a.status || c.status ? '<div class="ob-kv"><span>Status</span><span>' + esc(a.status || c.status) + '</span></div>' : '')
+      + (a.industry ? '<div class="ob-kv"><span>Industry</span><span>' + esc(a.industry) + '</span></div>' : '')
+      + (c.last_touch ? '<div class="ob-kv"><span>Last touch</span><span>' + esc(String(c.last_touch).slice(0, 10)) + '</span></div>' : '')
+      + '<button class="btn ob-card-btn" onclick="switchView(\'crm\')">Open CRM</button></div>';
+  }
+  html += '<div class="ob-card"><div class="ob-card-h">How it goes out</div>'
+    + '<div class="ob-route' + (route.ok === false ? ' bad' : '') + '">' + esc(route.text) + '</div>'
+    + (route.ok === false ? '<button class="btn ob-card-btn" onclick="switchView(\'connectors\')">Connect it</button>' : '')
+    + (it.via === 'browser' && it.state === 'approved' && it.window_until ? '<div class="ob-dim">The worker may post until ' + esc(new Date(it.window_until * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })) + '</div>' : '')
+    + '</div>';
+  html += '<div class="ob-card"><div class="ob-card-h">Worker</div>'
+    + '<div class="ob-kv"><span>Worker</span><span>' + esc(it.worker || '-') + '</span></div>'
+    + '<div class="ob-kv"><span>Asked</span><span>' + esc(new Date(it.created * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })) + '</span></div>'
+    + (it.card ? '<div class="ob-kv"><span>Card</span><span>' + esc(it.card) + '</span></div>' : '')
+    + (it.worker ? '<button class="btn ob-card-btn" data-w="' + esc(it.worker) + '" onclick="openPeek(this.dataset.w)">Open worker</button>' : '') + '</div>';
+  html += '<div class="ob-card"><div class="ob-card-h">Scheduling</div><div class="ob-dim">'
+    + esc(it.scheduled_at ? (it.state === 'sent' ? 'Was due ' : 'Sends ') + _apprWhenText(it.scheduled_at)
+      : (it.sent_at ? 'Sent ' + new Date(it.sent_at * 1000).toLocaleString() : 'Not scheduled')) + '</div></div>';
+  side.innerHTML = html;
+}
+
+function _obEdit(ref) {
+  _obEditing = _obEditing === ref ? '' : ref;
+  _obRenderDetail();
+}
+
+async function _obAttachment(id, index) {
+  try {
+    const r = await fetch(API + '/api/email/approvals/' + encodeURIComponent(id) + '/attachments/' + encodeURIComponent(index), { headers: _authHeaders() });
+    if (!r.ok) { showToast('Could not open the attachment: HTTP ' + r.status); return; }
+    const url = URL.createObjectURL(await r.blob());
+    window.open(url, '_blank', 'noopener');
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  } catch (e) { showToast('Could not open the attachment: ' + e.message); }
+}
+
+function _obSchedule(ref) {
+  const row = document.getElementById('ob-sched-row');
+  if (!row) return;
+  if (!row.hidden) { row.hidden = true; row.innerHTML = ''; return; }
+  const when = new Date(); when.setDate(when.getDate() + 1); when.setHours(9, 0, 0, 0);
+  row.innerHTML = '<label class="ob-sched-form"><span>Send at</span>'
+    + '<input type="datetime-local" class="input" id="ob-sched-at" value="' + _apprLocalInput(when) + '" min="' + _apprLocalInput(new Date()) + '">'
+    + '<button class="btn primary" data-ref="' + esc(ref) + '" onclick="_obScheduleConfirm(this.dataset.ref,this)">Schedule send</button></label>';
+  row.hidden = false;
+}
+
+async function _obScheduleConfirm(ref, btn) {
+  const it = _obItem(ref);
+  const inp = document.getElementById('ob-sched-at');
+  const when = inp && inp.value ? new Date(inp.value) : null;
+  if (!it || !when || isNaN(when) || when.getTime() <= Date.now()) { showToast('Pick a time in the future'); return; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Scheduling…'; }
+  const body = { send_at: when.getTime() / 1000 };
+  const ta = document.getElementById('ob-edit-box');
+  if (ta) body.body = ta.value;
+  const r = await _obEmailRelease(it.id, body);
+  if (r.ok && r.d.scheduled) { _obEditing = ''; showToast('Scheduled: sends ' + _apprWhenText(r.d.send_at)); }
+  else showToast('Not scheduled: ' + (r.d.error || ('HTTP ' + r.status)));
+  await _obLoad();
+}
+
+// The owner's release of a held email, the same request the approvals strip
+// makes: the X-Amux-Approver marker names the dashboard as the approver.
+async function _obEmailRelease(id, body) {
+  const headers = { ..._authHeaders(), 'X-Amux-Approver': 'dashboard' };
+  if (body) headers['Content-Type'] = 'application/json';
+  const r = await fetch(API + _OB_EMAIL_ROUTE + encodeURIComponent(id), { method: 'POST', headers, body: body ? JSON.stringify(body) : undefined });
+  return { ok: r.ok, status: r.status, d: await r.json().catch(() => ({})) };
+}
+
+// One decision through the item's own path. Returns '' on success, else why not.
+async function _obDecideOne(it, verb, reason) {
+  if (it.kind === 'email') {
+    if (verb === 'approve') {
+      const ta = _obEditing === it.ref ? document.getElementById('ob-edit-box') : null;
+      const r = await _obEmailRelease(it.id, ta ? { body: ta.value } : null);
+      return r.ok ? '' : (r.d.error || ('HTTP ' + r.status));
+    }
+    const r = await fetch(API + '/api/email/reject/' + encodeURIComponent(it.id), {
+      method: 'POST', headers: { ..._authHeaders(), 'X-Amux-Approver': 'dashboard', 'Content-Type': 'application/json' },
+      body: JSON.stringify(reason ? { reason } : {}),
+    });
+    const d = await r.json().catch(() => ({}));
+    return r.ok ? '' : (d.error || ('HTTP ' + r.status));
+  }
+  const r = await fetch(API + '/api/approvals/decide', {
+    method: 'POST', headers: { ..._authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ approval_ref: it.ref, decision: verb, reason: reason || undefined }),
+  });
+  const d = await r.json().catch(() => ({}));
+  return r.ok && d.ok !== false ? '' : (d.error || d.code || ('HTTP ' + r.status));
+}
+
+// After a decision the next message opens with its Approve button where the
+// last one was. A double tap must not decide that one too, so decisions are
+// ignored for a moment after an advance.
+let _obSettleUntil = 0;
+const _OB_SETTLE_MS = 700;
+
+async function _obDecide(ref, verb) {
+  const it = _obItem(ref);
+  if (!it || _obBusy.has(ref)) return;
+  if (Date.now() < _obSettleUntil) { _interactionDiagnostic({ verdict: 'outbound_decide_ignored_after_advance', action: verb, measured: true, n_considered: 1 }); return; }
+  let reason = '';
+  if (verb === 'reject') {
+    const r = await showPrompt('Discard this ' + _obChan(it.channel)[1] + ' message? Nothing is sent. A note for ' + (it.worker || 'the worker') + ' (optional):', 'Why not');
+    if (r === null) return;
+    reason = String(r).trim();
+  }
+  _obBusy.add(ref); _obRenderDetail();
+  const err = await _obDecideOne(it, verb, reason);
+  _obBusy.delete(ref);
+  if (err) showToast((verb === 'approve' ? 'Not approved: ' : 'Not discarded: ') + err);
+  else {
+    showToast(verb === 'approve' ? (it.via === 'browser' ? 'Approved. ' + (it.worker || 'The worker') + ' may post it now.' : 'Approved') : 'Discarded. Nothing was sent.');
+    if (_obEditing === ref) _obEditing = '';
+    // Move to the next item, so a run of approvals is one click each.
+    const rows = _obVisible(); const i = rows.findIndex(r => r.ref === ref);
+    const next = rows[i + 1] || rows[i - 1];
+    _obOpen = next ? next.ref : '';
+    _obSettleUntil = Date.now() + _OB_SETTLE_MS;
+    setTimeout(() => { if (activeView === 'outbound' && !_obEditing) _obRenderDetail(); }, _OB_SETTLE_MS + 30);
+  }
+  await _obLoad();
+}
+
+async function _obBulk(verb) {
+  const refs = [..._obSelected];
+  if (!refs.length) return;
+  const ok = await showConfirm((verb === 'approve' ? 'Approve and send ' : 'Discard ') + refs.length + ' message' + (refs.length === 1 ? '' : 's') + '?',
+    verb === 'approve' ? 'Approve ' + refs.length : 'Discard ' + refs.length, verb !== 'approve');
+  if (!ok) return;
+  let failed = 0;
+  for (const ref of refs) {
+    const it = _obItem(ref);
+    if (!it) continue;
+    _obBusy.add(ref);
+    const err = await _obDecideOne(it, verb, '');
+    _obBusy.delete(ref);
+    if (err) failed++;
+    else _obSelected.delete(ref);
+  }
+  showToast((refs.length - failed) + ' ' + (verb === 'approve' ? 'approved' : 'discarded') + (failed ? ', ' + failed + ' failed (still selected)' : ''));
+  await _obLoad();
+}

@@ -852,6 +852,9 @@ async fn run_turn(state: &AppState, name: &str, lane: &Lane, q: Queued) {
             // and is the source of the owner-relay origin stamp.
             ("chat_inflight_text", json!(super::session_verbs::redact_secrets(&q.text.chars().take(300).collect::<String>()))),
             ("chat_inflight_started", json!(crate::config::now_f64())),
+            // Where a Messages post asked to be answered (`amux post '<conv>'`),
+            // kept whole: the text above is cut to 300 characters.
+            ("chat_inflight_post", json!(reply_target(&q.text))),
         ],
     );
     report_state(state, name, "active", "UserPromptSubmit", &turn_id).await;
@@ -892,11 +895,23 @@ async fn run_turn(state: &AppState, name: &str, lane: &Lane, q: Queued) {
         out = execute(state, name, &provider, &q.text, lane, &turn_id, true).await;
     }
     let duration_ms = started.elapsed().as_millis() as u64;
-    finish_turn(state, name, lane, &turn_id, &provider, out, duration_ms).await;
+    // The reply target comes from the message in hand: the meta copy can be
+    // rewritten by a start racing the first turn of a just-created worker.
+    finish_turn(state, name, lane, &turn_id, &provider, out, duration_ms, Some(reply_target(&q.text))).await;
 }
 
 /// Persist and report a finished turn: the one path a live turn and a turn
 /// re-attached after a restart share, so both record the reply the same way.
+/// Where a Messages post asked to be answered: its `amux post '<conv>'` line,
+/// or "" for a turn no post started.
+fn reply_target(text: &str) -> String {
+    if !text.contains("amux Messages") {
+        return String::new();
+    }
+    text.rfind("amux post ").map(|i| text[i..].chars().take(200).collect()).unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn finish_turn(
     state: &AppState,
     name: &str,
@@ -905,6 +920,7 @@ async fn finish_turn(
     provider: &str,
     out: TurnOutcome,
     duration_ms: u64,
+    reply_to: Option<String>,
 ) {
     let turn_id = turn_id.to_string();
     let interrupted = lane.interrupt.swap(false, Ordering::SeqCst);
@@ -958,12 +974,21 @@ async fn finish_turn(
     )
     .await;
     let stem = meta_str(&load_meta(name), "chat_inflight_files");
+    // A turn that began with a Messages post (an outcome thread included)
+    // posts its answer there from here, with the text in hand. The turn-end
+    // hook's transcript read would do the same later and skips a thread that
+    // already has the answer (`relay_turn` checks).
+    let reply_to = reply_to.unwrap_or_else(|| meta_str(&load_meta(name), "chat_inflight_post"));
+    if error.is_none() && !interrupted && !reply_to.is_empty() && !a.text.trim().is_empty() {
+        super::conversations::relay_turn(state, name, &format!("amux Messages\n{reply_to}"), &a.text).await;
+    }
     update_meta(
         name,
         &[
             ("chat_inflight_turn", json!("")),
             ("chat_inflight_origin", json!("")),
             ("chat_inflight_text", json!("")),
+            ("chat_inflight_post", json!("")),
             ("chat_inflight_files", json!("")),
             ("chat_inflight_pgid", json!(0)),
             ("chat_inflight_provider", json!("")),
@@ -2016,7 +2041,7 @@ async fn reattach_turn(state: &AppState, name: &str, turn_id: &str, files: TurnF
         0
     };
     let ok = out.asm.error.is_none();
-    finish_turn(state, name, &lane, turn_id, &provider, out, duration_ms).await;
+    finish_turn(state, name, &lane, turn_id, &provider, out, duration_ms, None).await;
     tracing::info!(session = %name, turn = %turn_id, duration_ms, ok, measured = true, n_considered = 1,
         verdict = "chat_turn_resumed", "a chat turn that outlived a server restart finished and was recorded");
 }
@@ -2511,6 +2536,13 @@ fn interrupt_turn(name: &str) -> (bool, String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_messages_post_names_where_its_answer_goes() {
+        let asked = "Dana asked for this in amux (amux Messages, an outcome).\n\nPlan dinners\n\nPost it with:\namux post 'o:o1' <<'EOF'\n<your answer>\nEOF";
+        assert!(reply_target(asked).starts_with("amux post 'o:o1'"));
+        assert_eq!(reply_target("plan dinners; amux post 'o:o1' is just words"), "", "only a Messages delivery has a target");
+    }
+
     use super::*;
 
     #[test]

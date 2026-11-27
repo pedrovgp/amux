@@ -163,7 +163,7 @@ fn latency_min_samples() -> i64 {
     env_i64("AMUX_AUTOFIX_LATENCY_MIN_SAMPLES", 30).max(5)
 }
 /// Endpoints whose DESIGN includes a long blocking call, with their design
-/// budget (AMUX-3485). POST /api/files/mdai/run is a model synthesis whose
+/// budget (AMUX-3485). POST /api/mdai/run is a model synthesis whose
 /// accepted duration is ~100s for a large node (AF-142 — measured, judged,
 /// and recommended for acceptance); its per-node budget is MODEL_TIMEOUT_S
 /// (150s). A 10s outlier threshold under a 150s design budget files a card
@@ -173,6 +173,9 @@ fn latency_min_samples() -> i64 {
 /// endpoint's own timeout failed to bound the call — the one latency story
 /// on these routes that IS wrong.
 const LONG_BY_DESIGN: &[(&str, f64)] = &[
+    ("/api/mdai/run", 150_000.0),
+    // The legacy spelling (aliases.rs) reaches the same handler, and the
+    // request log records the RAW path, so it keeps the same budget.
     ("/api/files/mdai/run", 150_000.0),
     // GET /api/sessions/{name}/peek (AF-1167). The full peek (history) reads
     // the pane with a 10s capture-pane bound, then geometry and the transcript,
@@ -186,6 +189,10 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // on a loaded host. The control-mode client that removes the spawn
     // (backend/tmux_ctl.rs) has been off since it crashed the fleet (AF-1056).
     ("/api/sessions/{name}/peek", 15_000.0),
+    // GET /api/computer/mac/broker/next (2026-11-23): the Mac app's long poll
+    // for computer-use calls. It waits up to POLL_WAIT (25s) for a call by
+    // design and answers "none" at the end, so 30s is past its own bound.
+    ("/api/computer/mac/broker/next", 30_000.0),
     // POST /api/browser/navigate (AMUX-3835). The duration is a REMOTE PAGE
     // LOAD plus a settle, so the wait belongs to the site, not to amux. The
     // budget is this endpoint's OWN bound, added up rather than guessed:
@@ -6988,6 +6995,16 @@ pub struct CiRun {
     /// commits first. The finding routes to the first one: a flaky spec is
     /// fixed fastest by whoever wrote it (velocity audit 2026-10-22).
     pub test_owners: Vec<String>,
+    /// The commit the run tested.
+    pub head_sha: String,
+    /// For a failing run: the `Amux-Session` trailer on that commit, and
+    /// whether that lane is isolated. Read from the local checkout at fetch
+    /// time (no API call) so the card can say who turned the workflow red and
+    /// whether `amux send` can reach them. Main's `checks` was red 10 h on
+    /// 2026-11-10 with nobody told: its author and the card's route were both
+    /// lanes nobody could message.
+    pub head_lane: Option<String>,
+    pub head_lane_isolated: bool,
 }
 
 /// A workflow whose redness means MERGED AND DEPLOYED HAVE DIVERGED.
@@ -7416,6 +7433,7 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
                 format!("{} (run {})", ci_when(first_seen), oldest.run_id),
             ),
             ("first_failure_url".into(), oldest.url.clone()),
+            ("first_red_commit".into(), ci_first_red_commit(oldest)),
             (
                 "failing_for".into(),
                 format!("{:.1}h", ((now - first_seen) / 3600.0).max(0.0)),
@@ -7638,7 +7656,7 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 "--limit".into(),
                 ci_run_limit().to_string(),
                 "--json".into(),
-                "databaseId,conclusion,createdAt,event,headBranch,url,workflowName,status".into(),
+                "databaseId,conclusion,createdAt,event,headBranch,headSha,url,workflowName,status".into(),
             ],
             timeout_s,
         )
@@ -7687,6 +7705,9 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 failing_step: None,
                 failing_tests: Vec::new(),
                 test_owners: Vec::new(),
+                head_sha: s("headSha"),
+                head_lane: None,
+                head_lane_isolated: false,
             });
         }
     }
@@ -7725,7 +7746,7 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 "--limit".into(),
                 ci_run_limit().to_string(),
                 "--json".into(),
-                "databaseId,conclusion,createdAt,event,headBranch,url,workflowName,status".into(),
+                "databaseId,conclusion,createdAt,event,headBranch,headSha,url,workflowName,status".into(),
             ],
             timeout_s,
         )
@@ -7768,6 +7789,9 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 failing_step: None,
                 failing_tests: Vec::new(),
                 test_owners: Vec::new(),
+                head_sha: s("headSha"),
+                head_lane: None,
+                head_lane_isolated: false,
             });
             added += 1;
         }
@@ -7836,10 +7860,54 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
         }
     }
 
+    ci_head_lanes(&mut runs).await;
+
     if let Ok(mut g) = ci_cache().write() {
         *g = Some((now, runs.clone(), suppressed.clone()));
     }
     (runs, suppressed)
+}
+
+/// Fill `head_lane` and `head_lane_isolated` for failing default-branch runs,
+/// from the `Amux-Session` trailer of each run's commit in the checkout this
+/// server was built from (the same history `ci_test_owners` reads). One
+/// `git log -1` per distinct sha; a sha the checkout does not have stays None.
+async fn ci_head_lanes(runs: &mut [CiRun]) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut seen: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for r in runs.iter_mut() {
+        if !r.on_default_branch || !ci_is_failure(&r.conclusion) || r.head_sha.is_empty() {
+            continue;
+        }
+        if !seen.contains_key(&r.head_sha) {
+            let lane = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["log", "-1", "--format=%(trailers:key=Amux-Session,valueonly,separator=,)", &r.head_sha])
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| ci_rank_owners(&String::from_utf8_lossy(&o.stdout)).into_iter().next());
+            seen.insert(r.head_sha.clone(), lane);
+        }
+        r.head_lane = seen.get(&r.head_sha).cloned().flatten();
+        r.head_lane_isolated = r.head_lane.as_deref().is_some_and(crate::api::session_verbs::session_is_isolated);
+    }
+}
+
+/// The card's `first_red_commit` line: the commit the streak's oldest failing
+/// run tested, the lane its trailer names, and whether that lane can be told.
+pub fn ci_first_red_commit(r: &CiRun) -> String {
+    if r.head_sha.is_empty() {
+        return "<not recorded>".into();
+    }
+    let sha = &r.head_sha[..r.head_sha.len().min(9)];
+    match (&r.head_lane, r.head_lane_isolated) {
+        (Some(l), true) => format!("{sha} by {l}, which is ISOLATED: `amux send` cannot reach it, so fix it here or ask the owner"),
+        (Some(l), false) => format!("{sha} by {l}"),
+        (None, _) => format!("{sha} (no Amux-Session trailer: a hand commit or a pull request merge)"),
+    }
 }
 
 /// The test FILES a failed-job log names as failing, in first-seen order.
@@ -15617,8 +15685,8 @@ mod tests {
             Row {
                 ts: now - 500.0,
                 method: "POST",
-                path: "/api/files/mdai/run",
-                family: "/api/files",
+                path: "/api/mdai/run",
+                family: "/api/mdai",
                 status: 200,
                 body: "",
                 worker: "",
@@ -15629,7 +15697,7 @@ mod tests {
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
             !f.iter()
-                .any(|x| x.signature.contains("/api/files/mdai/run")),
+                .any(|x| x.signature.contains("/api/mdai/run")),
             "a synthesis inside its 150s design budget is designed behavior: {f:?}"
         );
         log_row(
@@ -15637,8 +15705,8 @@ mod tests {
             Row {
                 ts: now - 100.0,
                 method: "POST",
-                path: "/api/files/mdai/run",
-                family: "/api/files",
+                path: "/api/mdai/run",
+                family: "/api/mdai",
                 status: 200,
                 body: "",
                 worker: "",
@@ -15649,7 +15717,7 @@ mod tests {
         let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
         assert!(
             f2.iter()
-                .any(|x| x.signature.contains("/api/files/mdai/run")),
+                .any(|x| x.signature.contains("/api/mdai/run")),
             "past the design budget the endpoint's own timeout failed — that must file: {f2:?}"
         );
     }
@@ -17460,7 +17528,31 @@ mod tests {
             failing_step: None,
             failing_tests: Vec::new(),
             test_owners: Vec::new(),
+            head_sha: String::new(),
+            head_lane: None,
+            head_lane_isolated: false,
         }
+    }
+
+    #[test]
+    fn the_card_names_the_first_red_commit_and_whether_its_lane_can_be_told() {
+        let mut runs = vec![ci_run("checks", 1, "success", 300.0)];
+        for i in 0..3 {
+            runs.push(ci_run("checks", 10 + i, "failure", 200.0 - i as f64 * 50.0));
+        }
+        runs[1].head_sha = "2fd93f843deadbeef".into();
+        runs[1].head_lane = Some("amux-helper".into());
+        runs[1].head_lane_isolated = true;
+        runs[3].head_sha = "f3d3c6989cafe".into();
+        let (f, _) = ci_findings(&runs, unix_now());
+        let line = f[0].evidence.iter().find(|(k, _)| k == "first_red_commit").map(|(_, v)| v.clone());
+        assert_eq!(line.as_deref(), Some("2fd93f843 by amux-helper, which is ISOLATED: `amux send` cannot reach it, so fix it here or ask the owner"));
+        runs[1].head_lane_isolated = false;
+        let (g, _) = ci_findings(&runs, unix_now());
+        assert!(g[0].evidence.iter().any(|(k, v)| k == "first_red_commit" && v == "2fd93f843 by amux-helper"));
+        runs[1].head_lane = None;
+        let (h, _) = ci_findings(&runs, unix_now());
+        assert!(h[0].evidence.iter().any(|(k, v)| k == "first_red_commit" && v.starts_with("2fd93f843 (no Amux-Session")));
     }
 
     fn card_row(st: &AppState, id: &str) -> (String, String, String) {

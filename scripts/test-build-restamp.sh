@@ -10,6 +10,11 @@
 # changes only the dashboard re-stamps with a snapshot of it; with server code
 # too, or for a server that cannot serve a snapshot, it compiles.
 set -euo pipefail
+# The deploy target directory comes from the environment (server.env reaches
+# every process the server starts); a test's fake cargo must never write there.
+unset AMUX_DEPLOY_TARGET_DIR
+# Their fake cargo writes a few-byte stand-in; the builder refuses those by default.
+export AMUX_DEPLOY_MIN_BIN_BYTES=0
 export AMUX_RS_RUNS_URL=http://127.0.0.1:9/none
 export AMUX_ACTIVATION_ROLLBACK=0
 

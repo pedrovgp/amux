@@ -100,3 +100,29 @@ O peer não tinha terminado — e já não está ativo: os workers `amux-tg-fix-
 **Deploy (achado separado, não alterado aqui):** `/health` ainda reporta `commit=abfba334d`. O workflow `gate` passou para `3b5918368`, mas o job `e2e` falhou; `/api/pull` responde `measured=false, repo=null, state=unmeasured` e o timer/serviço do builder está inativo nesta máquina, então não há como explicar ou disparar a ativação daqui. Não mexi nisso sem sua autorização.
 
 **Correção de fluxo (pedido do dono):** não foi `upstream/main` (mixpeek/amux). O merge usou `origin/main` = `3b5918368`; a `main` local já estava nesse mesmo commit, então nenhum dado passou por ela. O merge foi feito diretamente num worktree em `origin/feat/telegram-gateway` (`b404df409`) e publicado de volta em `origin/feat/telegram-gateway`. O amend autorizado acrescenta `Vision: A4, A6, A10` ao corpo do commit: A10 porque a cópia obsoleta e duplicada do provider no feat foi removida em favor da versão do main; A4 porque a evidência do peer e as verificações ficaram registradas; A6 porque `origin/main` é a fonte de verdade.
+
+## 4. `upstream/main` como target, merge final
+
+**Prompt**
+
+> Põe esse seu commit extra na feat/telegrma-gateway, deixando os mains alinhados. Daí da pull na main para o feat/telegram e resolve os conflitos uma vez só
+
+**Prompt (resposta à pergunta sobre como alinhar os mains)**
+
+> 1 é ao contrátio né? upstream/main é a fonte da verdade, quero que origin/main seja uma cópia dele. Aliás, eu nem quero mais ter origin main, quero manter só o upstream/main. Mas tem um commit no origin/main que me interessa. Se ele já está no feat/telegram-gateway, então pode só se livrar do origin/main (e do main) e usar sempre o upstream/main como target quando quisermos mergear algo. Caso esse commit não esteja no feat/..., da um cherry pick nele antes de se livrar do origin/main.
+
+**Prompt (resposta à pergunta sobre o escopo da remoção)**
+
+> Só trocar o target
+
+**Final answer**
+
+—— answer ——
+
+O commit extra (`3b5918368`) já estava integralmente no feat: veio como parent do merge `efc9724e2` e os dois arquivos que ele toca (`session_verbs.rs`, `pane_prompts.rs`) têm os mesmos marcadores do fix. Não houve cherry-pick.
+
+Não apaguei nada: você escolheu "só trocar o target". `origin/main` e a branch local `main` continuam existindo, mas `upstream/main` passa a ser o target de merges.
+
+Trouxe `upstream/main` (`3de92c3f8`, 571 commits à frente da base antiga) para `feat/telegram-gateway` em worktree isolado. O `git merge-tree` previu **zero conflitos** e a árvore do merge bateu exatamente com a previsão (`cb6a76c1…`) — os 40 trechos conflitantes do merge anterior não reapareceram porque o feat já tinha a versão do provider que o upstream também tem. Sem marcadores, sem unmerged, `git diff --check` limpo; os 59 arquivos do gateway e os seis marcadores do fix sobreviveram com as mesmas contagens.
+
+Verificação: `cargo check --workspace`, `clippy --workspace --all-targets -D warnings`, gateway `pytest -q` (422 passed) e suíte completa `amux-server --lib` via `scripts/test-contended.sh` → `test result: ok. 5044 passed; 0 failed; 21 ignored`. Merge comitado com `Vision: A4, A6, A10` e publicado em `origin/feat/telegram-gateway`; checkout compartilhado sincronizado.

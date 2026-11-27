@@ -52,7 +52,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
 _scrubbed=""
 for _k in ${!AMUX_@}; do
   case "$_k" in
-    AMUX_HOME|AMUX_RS_PORT|AMUX_RS_NO_LOOPBACK_BYPASS|AMUX_NO_SELF_ADOPT|AMUX_VAULT_KEYSTORE|AMUX_DASHBOARD_DIR|AMUX_GEMINI_BASE|AMUX_APP_PORTS|AMUX_E2E_*) ;;
+    AMUX_HOME|AMUX_RS_PORT|AMUX_RS_NO_LOOPBACK_BYPASS|AMUX_NO_SELF_ADOPT|AMUX_VAULT_KEYSTORE|AMUX_DASHBOARD_DIR|AMUX_GEMINI_BASE|AMUX_APP_PORTS|AMUX_HOME_DEFAULT|AMUX_CRM_MX_CHECK|AMUX_E2E_*) ;;
     *) unset "$_k"; _scrubbed="$_scrubbed $_k" ;;
   esac
 done
@@ -70,6 +70,12 @@ for _k in $(compgen -e); do
   fi
 done
 [ -n "$_scrubbed" ] && echo "[e2e] ENV: scrubbed fleet vars:$_scrubbed (a throwaway home must not inherit fleet toggles)"
+
+# A test server answers this machine only. The server binds every interface by
+# default (AMUX_RS_BIND, docs/self-hosting.md), and on the owner's Mac each e2e
+# run left one listening on the Wi-Fi and tailnet addresses, where the network
+# watch reported it. Specs reach it as localhost, which already lands on IPv4.
+export AMUX_RS_BIND=127.0.0.1
 
 # WHICH DASHBOARD BYTES THIS SERVER SERVES. CI may boot a server binary main
 # compiled (rust.yml server-bin cache) for a PR that changed only the

@@ -42,7 +42,9 @@ lands in an agent's turn, so only addresses, counts, ports and process names are
 sent, each cleaned to a short safe charset.
 
 --dry-run prints what it would send and records nothing. --rebaseline accepts the
-current snapshot as normal.
+current snapshot as normal, adding its listeners and egress names to those
+already accepted (a backup or kubectl that is not running at that moment stays
+accepted). To forget an accepted name, delete baseline.json and rebaseline.
 """
 
 from __future__ import annotations
@@ -82,6 +84,10 @@ DYNAMIC_PORT_COMMANDS = ("amux-serv", "rapportd", "Spotify", "ControlCe", "ident
 # A process a test binary starts (the shard tests run target/debug/mvs-shard as a
 # child, 2026-11-09) is judged by that parent: a plain target/ binary with no test
 # parent may be a dev server and keeps its port key.
+# Each rebuild gets a new hash, so the key drops it: one line per test crate per
+# SEEN_TTL (three mvs_shard builds alerted on 11-27). A crate not seen that day
+# still alerts.
+TEST_HASH = re.compile(r"-[0-9a-f]{16}$")
 TEST_BINARY = re.compile(r"/target/[^/ ]+/deps/[^/ ]+-[0-9a-f]{16}(\s|$)")
 FILE_SERVER = re.compile(
     r"(-m\s+(http\.server|SimpleHTTPServer)\b|\bhttp-server\b|\bnpx\s+serve\b|\bserve\s+-[ls]\b)"
@@ -128,6 +134,28 @@ SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "nc", "ncat", "netcat", "socat",
           "telnet", "perl", "ruby", "php",
           # Launchers: `env X=1 git ...` and friends hold the socket the same way.
           "env", "xargs", "nohup", "timeout", "sudo"}
+
+# git, and the utilities a git or gh script runs while its socket is open (a
+# child of `git fetch` that execs `date` or `grep` inherits the connection and
+# lsof names the child). Accepting these by name would hide them reaching any
+# host, and alerting on GitHub alone was every alert they raised (11-22 to
+# 11-24: grep, date and git, each to 140.82.112.0/20). So they are judged per
+# destination like a shell: GitHub is quiet, anything else alerts.
+# lsof and the kernel cut a name short (git-remot, git-remote-http), so any
+# git-remote-* helper counts by prefix. The set holds the coreutils a hook or
+# script commonly runs, so a new child (mkdir on 11-27) does not need its own
+# alert and fix; none of them opens a socket of its own.
+GIT_AND_INHERITORS = {"git", "date", "grep", "sed", "awk", "cat", "head", "tail",
+                      "sort", "cut", "tr", "wc", "sleep", "mkdir", "rm", "mv", "cp",
+                      "ls", "touch", "ln", "chmod", "basename", "dirname", "readlink",
+                      "realpath", "mktemp", "tee", "printf", "echo", "expr", "test",
+                      "uname", "stat", "find", "uniq", "diff", "true", "false", "id",
+                      "whoami", "hostname", "pwd"}
+PER_DESTINATION = SHELLS | GIT_AND_INHERITORS
+
+
+def per_destination(cmd: str) -> bool:
+    return cmd in PER_DESTINATION or cmd.startswith("git-remot")
 
 
 def is_github(addr: str) -> bool:
@@ -285,7 +313,8 @@ def evaluate(snap: dict, base: dict, reqs: dict) -> list[dict]:
         elif not known:
             test = bool(TEST_BINARY.search(w.get("cmdline", ""))
                         or TEST_BINARY.search(w.get("parent", "")))
-            key = f"listener:{w['command']}:{'cargo-test' if test else port}"
+            name = TEST_HASH.sub("", w["command"]) if test else w["command"]
+            key = f"listener:{name}:{'cargo-test' if test else port}"
             if not any(r["key"] == key for r in out):  # one line per test binary
                 out.append({"key": key, "kind": "LISTENER", "w": w, "test": test})
     known_peers = set(base.get("peers", []))
@@ -302,7 +331,7 @@ def evaluate(snap: dict, base: dict, reqs: dict) -> list[dict]:
         out.append({"key": f"firewall:{snap['firewall']}", "kind": "FIREWALL", "state": snap["firewall"]})
     known_egress = set(base.get("egress", []))
     for cmd in sorted(snap["egress"]):
-        if cmd in SHELLS:
+        if per_destination(cmd):
             for addr in sorted(snap["egress"][cmd]):
                 if not is_github(addr):
                     out.append({"key": f"egress:{cmd}:{addr}", "kind": "NEW-EGRESS",
@@ -376,6 +405,18 @@ def baseline_of(snap: dict) -> dict:
     }
 
 
+def rebaselined(old: dict | None, snap: dict) -> dict:
+    # Adds to what was accepted. Replacing it forgot every name not running
+    # at that moment: restic, accepted at its 03:00 run on 11-24, alerted
+    # again on 11-25 after later rebaselines taken while it was idle.
+    new = baseline_of(snap)
+    if old:
+        new["listeners"] = sorted({tuple(x) for x in old.get("listeners", [])}
+                                  | set(new["listeners"]))
+        new["egress"] = sorted(set(old.get("egress", [])) | set(new["egress"]))
+    return new
+
+
 # An alerted key stays quiet this long after it was last present, so a dev
 # server restarted every few minutes on the same wide port alerts once a day
 # instead of on every return. Keys that carry a pid (file servers) still alert
@@ -409,7 +450,7 @@ def main() -> int:
         return 2
     first = base is None or "--rebaseline" in sys.argv
     if first:
-        base = baseline_of(snap)
+        base = rebaselined(base, snap)
     rows = evaluate(snap, base, reqs)
     fresh = [r for r in rows if r["key"] not in seen]
     if do_fix and not dry:

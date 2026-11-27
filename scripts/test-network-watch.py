@@ -82,6 +82,14 @@ check("a cargo test binary is reported on one line per run",
       sum(r["kind"] == "LISTENER" for r in run_a) == 1, str([nw.line(r) for r in run_a]))
 check("a cargo test binary is still reported and says so",
       any("cargo test binary" in nw.line(r) for r in run_a), str([nw.line(r) for r in run_a]))
+rebuilt = "/y/target/debug/deps/mvs_shard-669424ee673c15c1"
+run_c = nw.evaluate({**snap, "wide": [{**tbrow(12, "53602", rebuilt), "command": "mvs_shard-669424ee673c15c1"}]}, base, reqs)
+check("a rebuilt test binary (new hash) shares its crate's key",
+      {r["key"] for r in run_c if r["kind"] == "LISTENER"} == keys_a, str([r["key"] for r in run_c]))
+other = nw.evaluate({**snap, "wide": [{**tbrow(13, "53603", "/y/target/debug/deps/other_crate-669424ee673c15c1"),
+                                       "command": "other_crate-669424ee673c15c1"}]}, base, reqs)
+check("a different test crate gets its own key",
+      {r["key"] for r in other if r["kind"] == "LISTENER"} == {"listener:other_crate:cargo-test"})
 for label, exe in [("a release binary", "/x/target/debug/mvs_shard"),
                    ("a hashed name outside deps/", "/x/target/debug/mvs_shard-b41e156173769d4b"),
                    ("a short hash in deps/", "/x/target/debug/deps/mvs_shard-b41e")]:
@@ -130,6 +138,26 @@ check("a shell alerts once per non-GitHub destination even when accepted by name
 check("a launcher is judged per destination like a shell",
       not any(r["kind"] == "NEW-EGRESS" for r in nw.evaluate(
           {**snap, "egress": {"env": {"140.82.114.4"}}}, base, reqs)))
+git_rows = [r["key"] for r in nw.evaluate(
+    {**snap, "egress": {"git": {"140.82.114.3", "203.0.113.7"}, "date": {"140.82.112.4"}}},
+    {**base, "egress": ["claude", "git", "date"]}, reqs) if r["kind"] == "NEW-EGRESS"]
+check("git and a child that inherits its socket are quiet to GitHub and alert elsewhere, even accepted by name",
+      git_rows == ["egress:git:203.0.113.7"], str(git_rows))
+check("a coreutil a git hook runs (mkdir, rm, mktemp) is quiet to GitHub and alerts elsewhere",
+      [r["key"] for r in nw.evaluate(
+          {**snap, "egress": {"mkdir": {"140.82.112.4", "203.0.113.9"}, "mktemp": {"140.82.113.1"}}},
+          base, reqs) if r["kind"] == "NEW-EGRESS"] == ["egress:mkdir:203.0.113.9"])
+check("a git-remote helper is judged per destination under any truncated name",
+      all(nw.per_destination(n) for n in ["git-remot", "git-remote-http", "git-remote-https"])
+      and not any(r["kind"] == "NEW-EGRESS" for r in nw.evaluate(
+          {**snap, "egress": {"git-remote-http": {"140.82.114.4"}}}, base, reqs)))
+re_base = nw.rebaselined({"listeners": [["old", "9"]], "egress": ["restic"], "peers": ["gone"],
+                          "firewall": "off"}, snap)
+check("a rebaseline keeps names accepted earlier and adds the current ones",
+      "restic" in re_base["egress"] and "claude" in re_base["egress"]
+      and ("old", "9") in re_base["listeners"] and ("amux-serv", "8824") in re_base["listeners"]
+      and re_base["peers"] == nw.baseline_of(snap)["peers"], str(re_base))
+check("a first baseline is the snapshot", nw.rebaselined(None, snap) == nw.baseline_of(snap))
 now = 1_000_000.0
 kept = nw.remember({"listener:node:3931": now - 3600, "old": now - 25 * 3600}, ["new"], now)
 check("a key gone for an hour stays quiet, one gone a day alerts again",
@@ -198,6 +226,13 @@ try:
     repeated = [x for x in body.splitlines()[1:-1] if x and x in again]
     check("second run repeats nothing from the first", p.returncode == 0 and not repeated,
           str(repeated) or p.stderr)
+    b = json.loads((state / "baseline.json").read_text())
+    b["egress"] = sorted(set(b.get("egress", [])) | {"accepted-while-idle"})
+    (state / "baseline.json").write_text(json.dumps(b))
+    p = watch("--rebaseline")
+    kept_names = json.loads((state / "baseline.json").read_text()).get("egress", [])
+    check("e2e: --rebaseline keeps an accepted name that is not running now",
+          p.returncode == 0 and "accepted-while-idle" in kept_names, p.stderr + str(kept_names))
 finally:
     if srv.poll() is None:
         srv.kill()

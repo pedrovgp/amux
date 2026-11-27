@@ -21,7 +21,7 @@ if [ "$DEV" = 1 ]; then BUNDLE_ID=com.amux.desktop.dev; fi
 # One binary: the app, the pinned-note overlay and the menu bar readout. The
 # last two keep their own standalone builds; -D AMUX_APP drops their entry
 # points here.
-SRC="desktop/amux-desktop.swift desktop/amux-settings.swift desktop/amux-update.swift desktop/amux-workspace.swift desktop/amux-rehome.swift desktop/amux-snapzones.swift desktop/amux-panegrid.swift desktop/amux-panes.swift desktop/amux-tabcolors.swift desktop/amux-recorder-core.swift desktop/amux-recorder.swift scripts/pinned-overlay.swift scripts/amux-menubar.swift"
+SRC="desktop/amux-desktop.swift desktop/amux-settings.swift desktop/amux-storage.swift desktop/amux-update.swift desktop/amux-workspace.swift desktop/amux-find.swift desktop/amux-dictation-core.swift desktop/amux-dictation.swift desktop/amux-rehome.swift desktop/amux-snapzones.swift desktop/amux-panegrid.swift desktop/amux-panes.swift desktop/amux-tabcolors.swift desktop/amux-recorder-core.swift desktop/amux-recorder.swift desktop/amux-statusmenu.swift desktop/amux-computer.swift desktop/amux-agentview.swift scripts/pinned-overlay.swift scripts/amux-menubar.swift"
 BIN="$APP/Contents/MacOS/amux"
 ICON_SRC="assets/icon-512.png"
 ICNS="$APP/Contents/Resources/AppIcon.icns"
@@ -41,7 +41,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 MIN_MACOS=12.0
 # ScreenCaptureKit (system audio for the recorder) exists from macOS 13, so it
 # is weak-linked: on 12 the app runs and records the microphone only.
-FRAMEWORKS="-framework Cocoa -framework WebKit -framework Carbon -framework UserNotifications -framework ServiceManagement -framework AVFoundation -framework CoreMedia -framework PDFKit -Xlinker -weak_framework -Xlinker ScreenCaptureKit"
+FRAMEWORKS="-framework Cocoa -framework WebKit -framework Carbon -framework UserNotifications -framework ServiceManagement -framework AVFoundation -framework CoreMedia -framework PDFKit -framework Speech -Xlinker -weak_framework -Xlinker ScreenCaptureKit"
 compile() {  # $1 = output, $2 = optional -target
     # shellcheck disable=SC2086  # SRC and FRAMEWORKS are word lists
     xcrun swiftc -O -parse-as-library -D AMUX_APP ${2:+-target "$2"} -o "$1" $SRC $FRAMEWORKS
@@ -150,6 +150,34 @@ fi
 /usr/libexec/PlistBuddy -c "Add :AmuxBuildCommit string ${COMMIT:-}" -c "Add :AmuxBuildDate string $(date -u '+%Y-%m-%d %H:%M UTC')" "$APP/Contents/Info.plist"
 echo "  Built from ${COMMIT:-an unknown commit}"
 
+# Computer use on this Mac (amux-computer.swift): trycua's cua-driver (MIT),
+# pinned to one release and checked against its published SHA-256 before it
+# goes in the bundle. The app runs it embedded, so it uses Amux's own
+# Accessibility and Screen Recording grants. A failed download builds an app
+# without it, and Settings > Computer use then says the driver is missing.
+CUA_VER=0.58.1
+CUA_SHA=99b06af80422ba77be91932ce6c58fed4934a9565cb74bb5cde1fa0396ed1eb2
+CUA_TGZ="cua-driver-rs-$CUA_VER-darwin-universal-binary.tar.gz"
+CUA_CACHE="${AMUX_CACHE_DIR:-$HOME/.amux/cache}/cua-driver-$CUA_VER"
+if [ ! -x "$CUA_CACHE/cua-driver" ]; then
+    CUA_TMP=$(mktemp -d)
+    if curl -fsSL -o "$CUA_TMP/$CUA_TGZ" "https://github.com/trycua/cua/releases/download/cua-driver-rs-v$CUA_VER/$CUA_TGZ" \
+        && echo "$CUA_SHA  $CUA_TMP/$CUA_TGZ" | shasum -a 256 -c - >/dev/null \
+        && mkdir -p "$CUA_TMP/x" && tar -xzf "$CUA_TMP/$CUA_TGZ" -C "$CUA_TMP/x" cua-driver; then
+        mkdir -p "$CUA_CACHE" && mv "$CUA_TMP/x/cua-driver" "$CUA_CACHE/cua-driver"
+    else
+        echo "  !! cua-driver $CUA_VER did not download or failed its checksum: this build has no computer use"
+    fi
+    rm -rf "$CUA_TMP"
+fi
+if [ -x "$CUA_CACHE/cua-driver" ]; then
+    mkdir -p "$APP/Contents/Helpers"
+    cp "$CUA_CACHE/cua-driver" "$APP/Contents/Helpers/cua-driver"
+    { printf 'cua-driver %s, from https://github.com/trycua/cua\n\n' "$CUA_VER"; cat desktop/third-party/cua-driver-LICENSE.txt; } \
+        > "$APP/Contents/Resources/cua-driver-LICENSE.txt"
+    echo "  Bundled cua-driver $CUA_VER (computer use on this Mac)"
+fi
+
 # Ad-hoc sign so macOS keeps the microphone and notification permissions
 # across rebuilds of the same bundle id.
 # Ad hoc, with the bundle id as the designated requirement. macOS keys the
@@ -157,8 +185,17 @@ echo "  Built from ${COMMIT:-an unknown commit}"
 # hoc signature's default one is the binary's hash: every rebuild silently
 # lost both grants and asked again (2026-10-28). The id stays the same build
 # to build, so a grant given once carries over.
-codesign --force --deep --sign - -r="designated => identifier \"$BUNDLE_ID\"" "$APP" >/dev/null 2>&1 \
+# Helpers are signed first, each under its own identifier. `--deep` on the
+# app gave the bundled cua-driver the APP's requirement (identifier
+# $BUNDLE_ID), which the driver's own identifier cannot meet, so
+# `codesign --verify --deep` failed with "nested code is modified or invalid"
+# (desktop CI red from 694a5708c, 2026-11-22).
+for h in "$APP"/Contents/Helpers/*; do
+    [ -f "$h" ] && { codesign --force --sign - "$h" >/dev/null 2>&1 || echo "  !! codesign failed on $h"; }
+done
+codesign --force --sign - -r="designated => identifier \"$BUNDLE_ID\"" "$APP" >/dev/null 2>&1 \
   && echo "  Signed (ad hoc, requirement: identifier $BUNDLE_ID)" || echo "  !! codesign failed; permissions may be asked again"
+codesign --verify --deep --strict "$APP" 2>/dev/null || echo "  !! codesign --verify --deep failed on $APP: $(codesign --verify --deep --strict "$APP" 2>&1 | tail -1)"
 
 # Install to /Applications if requested or by default on build
 # AMUX_DESKTOP_NO_INSTALL=1 leaves the bundle in the repo root (CI zips it).

@@ -232,7 +232,7 @@ extension AppDelegate {
     /// so tabs behind others load one at a time instead of all at launch. A
     /// fallback timer keeps the queue moving if a page never finishes.
     func loadNextDeferred(after c: DashboardWindowController?) {
-        guard let next = controllers.first(where: { $0.deferredURL != nil }) else { return }
+        guard let next = controllers.first(where: { $0.deferredURL != nil && !$0.discarded }) else { return }
         deferredTimer?.invalidate()
         deferredTimer = Timer.scheduledTimer(withTimeInterval: envSeconds("AMUX_DESKTOP_DEFER_STEP_S", 4), repeats: false) { [weak self] _ in
             self?.loadNextDeferred(after: nil)
@@ -333,7 +333,7 @@ extension AppDelegate {
         if let front = placed.reversed().first(where: { $0.0.window?.isOnActiveSpace == true && $0.1.minimized != true && $0.1.selected != false })?.0 {
             front.window?.makeKeyAndOrderFront(nil)
         }
-        if controllers.contains(where: { $0.deferredURL != nil }) {
+        if controllers.contains(where: { $0.deferredURL != nil && !$0.discarded }) {
             // The queue also starts on its own if no shown page ever finishes.
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                 if self?.deferredTimer == nil { self?.loadNextDeferred(after: nil) }
@@ -709,13 +709,7 @@ extension AppDelegate {
                     if self.globeDown { self.globeUsed = true }   // another modifier joined in
                     return e
                 }
-                if e.modifierFlags.contains(.function) {
-                    self.globeDown = true
-                    self.globeUsed = false
-                } else if self.globeDown {
-                    self.globeDown = false
-                    if !self.globeUsed { self.globeTapped() }
-                }
+                self.globeChanged(down: e.modifierFlags.contains(.function))
                 return e
             }
             guard self.globeDown else { return e }
@@ -724,15 +718,44 @@ extension AppDelegate {
             guard e.modifierFlags.contains(.function) else { self.globeDown = false; return e }
             // Any key with 🌐 means it was not a tap, Globe+arrow (Home, End) included.
             self.globeUsed = true
+            if self.globeHeld { return e }   // typing while dictating: the keys are the page's
             guard let k = globeKeyName(e) else { return e }
             if !e.isARepeat { self.sendGlobe("Globe+" + k) }
             return nil
         }
-        // Leaving amux with 🌐 held: its release goes to another app.
+        // Leaving amux with 🌐 held: its release goes to another app, so a
+        // take held open ends here.
         NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.globeDown = false
+            if self?.globeDown == true { self?.globeChanged(down: false) }
         }
     }
+
+    /// 🌐 pressed or let go. Let go alone it is a tap. Held alone past
+    /// globeHoldDelay it is "Globe Hold" (dictation, like Wispr Flow's fn),
+    /// and letting go is "Globe Release", which ends the take.
+    func globeChanged(down: Bool) {
+        if down {
+            globeDown = true
+            globeUsed = false
+            globeHoldTimer?.cancel()
+            let w = DispatchWorkItem { [weak self] in
+                guard let self = self, self.globeDown, !self.globeUsed else { return }
+                self.globeUsed = true
+                self.globeHeld = true
+                self.sendGlobe("Globe Hold")
+            }
+            globeHoldTimer = w
+            DispatchQueue.main.asyncAfter(deadline: .now() + globeHoldDelay, execute: w)
+        } else if globeDown {
+            globeDown = false
+            globeHoldTimer?.cancel()
+            if globeHeld { globeHeld = false; sendGlobe("Globe Release") }
+            else if !globeUsed { globeTapped() }
+        }
+    }
+
+    /// How long 🌐 is held before it dictates; a quicker press is a tap.
+    var globeHoldDelay: TimeInterval { 0.25 }
 
     /// A second tap within 0.45 s is "Globe Globe" (owner, 2026-11-03: "make
     /// hot key for starting dictation pressing globe twice"). The first tap
@@ -744,13 +767,18 @@ extension AppDelegate {
     }
 
     func sendGlobe(_ combo: String) {
-        guard let c = focusedPage() else { return }
+        // A quiet test copy has no key window: its shown page stands in.
+        // A running take owns 🌐, wherever focus has gone since.
+        guard let c = NativeDictation.shared.owner ?? focusedPage() ?? (desktopTestMode ? controllers.first(where: { isShown($0) }) : nil) else { return }
         let lit = String(data: (try? JSONSerialization.data(withJSONObject: [combo])) ?? Data(), encoding: .utf8)?.dropFirst().dropLast() ?? ""
         // macOS starts its own dictation on 🌐🌐 when Keyboard > "Press 🌐 key to"
         // is Start Dictation (AppleFnUsageType 3); the page says so once.
         let macDictation = UserDefaults(suiteName: "com.apple.HIToolbox")?.integer(forKey: "AppleFnUsageType") == 3
-        c.webView.evaluateJavaScript("typeof window._hkNativeKey === 'function' ? window._hkNativeKey(\(lit), {mac_dictation: \(macDictation)}) : 'no_hook'") { r, _ in
-            dlog("verdict=globe_key combo=\(combo) mac_dictation=\(macDictation) page=\(c.viewHash) result=\(r ?? "-")")
+        // Wispr Flow dictates on a held fn (🌐) from any app; with it running
+        // both would take the same words, so the page leaves the hold to it.
+        let wispr = !desktopTestMode && !NSRunningApplication.runningApplications(withBundleIdentifier: "com.electron.wispr-flow").isEmpty
+        c.webView.evaluateJavaScript("typeof window._hkNativeKey === 'function' ? window._hkNativeKey(\(lit), {mac_dictation: \(macDictation), wispr: \(wispr)}) : 'no_hook'") { r, _ in
+            dlog("verdict=globe_key combo=\(combo) mac_dictation=\(macDictation) wispr=\(wispr) page=\(c.viewHash) result=\(r ?? "-")")
         }
     }
 
@@ -1045,6 +1073,27 @@ extension AppDelegate {
         case "/pointer": Pointer.testOverride = (NSPoint(x: num("x"), y: num("y")), q.contains { $0.name == "down" && $0.value == "1" })
         case "/pointer-clear": Pointer.testOverride = nil
         case "/recorder": recorderTestHook(q)
+        // 🌐 pressed (?down=1) or let go (?down=0), as the keyboard does it;
+        // ?tap=N taps it N times at once (two hook calls are too far apart).
+        // Pretend microphones come and go: ?add=Name, ?remove=Name, ?default=Name.
+        case "/mics":
+            let w = MicWatch.shared
+            for it in q {
+                guard let v = it.value else { continue }
+                switch it.name {
+                case "add": if !w.testExtra.contains(v) { w.testExtra.append(v) }
+                case "remove": w.testExtra.removeAll { $0 == v }
+                case "default": w.testDefault = v
+                default: break
+                }
+            }
+            w.changed()
+        case "/globe":
+            if let n = Int(q.first { $0.name == "tap" }?.value ?? "") {
+                for _ in 0..<n { globeChanged(down: true); globeChanged(down: false) }
+            } else {
+                globeChanged(down: q.first { $0.name == "down" }?.value == "1")
+            }
         // A sideways scroll over the focused pane's tab strip (?dx= in points).
         case "/pane-strip-scroll":
             if let g = arrangeTarget.flatMap({ w in controllers.first { $0.window === w } })?.grid, let f = g.focused { g.views[f]?.scrollStrip(by: num("dx")) }
@@ -1167,14 +1216,25 @@ extension AppDelegate {
         // Through Window > Arrange > Snap to Grid While Dragging, as a person turns it off.
         case "/snap": if snapEnabled != (q.first { $0.name == "on" }?.value != "0") { toggleSnap(nil) }
         // Click a button in Settings by id, as a person does (desktop/test/update-e2e.py).
+        // One Settings action, as Settings > This Mac sends it (?action=toggle&name=menuBar&value=0).
+        case "/settings-action":
+            var m: [String: Any] = ["action": q.first { $0.name == "action" }?.value ?? "", "name": q.first { $0.name == "name" }?.value ?? ""]
+            if let v = q.first(where: { $0.name == "value" })?.value { m["value"] = v == "1" ? true : v == "0" ? false : v as Any }
+            settingsAction(m)
+        // in=page clicks it in the dashboard's Settings > This Mac instead.
         case "/settings-click":
-            showSettings(nil)
             let id = q.first { $0.name == "id" }?.value ?? ""
             // JSON-quoted for JavaScript (jsString also escapes for HTML attributes).
             let lit = String(data: (try? JSONSerialization.data(withJSONObject: [id])) ?? Data("[\"\"]".utf8), encoding: .utf8)?.dropFirst().dropLast() ?? "\"\""
+            let click = "(function(){const b=document.getElementById(\(lit));if(!b)return 'missing';if(b.disabled)return 'disabled';b.click();return 'clicked'})()"
+            // in=page: the server's Settings in the window; otherwise the app's own page.
+            let inPage = q.first(where: { $0.name == "in" })?.value == "page"
+            if settings == nil { settings = SettingsWindowController(app: self) }
+            settings?.builtIn = !inPage
+            showNativeSettings(nil)
             settings?.afterLoad.append { [weak self] in
-                self?.settings?.webView.evaluateJavaScript("(function(){const b=document.getElementById(\(lit));if(!b)return 'missing';if(b.disabled)return 'disabled';b.click();return 'clicked'})()") { r, e in
-                    dlog("verdict=test_settings_click id=\(id) result=\(r ?? "-") error=\(e.map { "\($0)" } ?? "-")")
+                self?.settings?.webView.evaluateJavaScript(click) { r, e in
+                    dlog("verdict=test_settings_click\(inPage ? " in=page" : "") id=\(id) result=\(r ?? "-") error=\(e.map { "\($0)" } ?? "-")")
                 }
             }
         // Name a tab, as Rename Tab does (empty clears it).
@@ -1203,15 +1263,86 @@ extension AppDelegate {
                let c = controllers.first(where: { isShown($0) }) ?? controllers.first {
                 c.webView.evaluateJavaScript(code) { _, err in if let err = err { dlog("verdict=test_js_failed error=\(err.localizedDescription)") } }
             }
+        // Choose a menu item by title (?title=Copy), as a click on it does.
+        // The amux menu bar item: ?title= chooses one of its items; ?needs=N
+        // stands in N waiting workers (test-w1…) for the needs-you section.
+        // Quick Ask: ?show=1 opens it; ?text=&worker= fill it; ?selection= stands
+        // in for selected text; ?window_self=1 attaches this copy's own window;
+        // ?attach_window=1 / ?attach_selection=1 tick the boxes; ?send=1 sends.
+        case "/quickask":
+            let qa = QuickAsk.shared
+            let val = { (k: String) in q.first { $0.name == k }?.value }
+            if val("show") == "1" { qa.show() }
+            if val("window_self") == "1" { qa.testWindowPID = getpid() }
+            if let t = val("text") { qa.field.stringValue = t }
+            if let s = val("selection") { qa.testSelection(s) }
+            if let w = val("worker") {
+                if qa.workers.itemTitles.contains(w) { qa.workers.selectItem(withTitle: w) } else { qa.workers.addItem(withTitle: w); qa.workers.selectItem(withTitle: w) }
+            }
+            if val("attach_window") == "1" { qa.attachWindow.state = .on }
+            if val("attach_selection") == "1" { qa.attachSelection.state = .on }
+            if val("send") == "1" { qa.send(nil) }
+        case "/status-menu":
+            if let n = Int(q.first { $0.name == "needs" }?.value ?? "") {
+                let items = (0..<n).map { ["worker": "test-w\($0 + 1)", "key": "k\($0)", "question": "Approve step \($0 + 1)?"] }
+                lastNeedsCount = n; lastNeedsItems = items
+                menuBar?.setNeeds(count: n, items: items)
+            }
+            if let t = q.first(where: { $0.name == "title" })?.value {
+                dlog("verdict=test_status_menu_chosen title=\(t) found=\(menuBar?.choose(t) == true ? 1 : 0)")
+            }
+        case "/menu":
+            let title = q.first { $0.name == "title" }?.value ?? ""
+            func pick(_ m: NSMenu) -> Bool {
+                for (i, it) in m.items.enumerated() {
+                    if it.title == title, it.action != nil { m.performActionForItem(at: i); return true }
+                    if let sub = it.submenu, pick(sub) { return true }
+                }
+                return false
+            }
+            let found = NSApp.mainMenu.map(pick) ?? false
+            dlog("verdict=test_menu_chosen title=\(title) found=\(found ? 1 : 0)")
+        // A real key press (?k=f&mods=cmd+shift) through NSApp, as the keyboard
+        // sends one, to the shown tab's window made key first.
+        case "/key":
+            let raw = q.first { $0.name == "k" }?.value ?? ""
+            let k = raw == "esc" ? "\u{1b}" : raw
+            let mods = q.first { $0.name == "mods" }?.value ?? ""
+            let codes: [String: UInt16] = ["a": 0, "s": 1, "f": 3, "g": 5, "c": 8, "v": 9, "e": 14, "x": 7, "\u{1b}": 53]
+            var f: NSEvent.ModifierFlags = []
+            if mods.contains("cmd") { f.insert(.command) }
+            if mods.contains("ctrl") { f.insert(.control) }
+            if mods.contains("alt") { f.insert(.option) }
+            if mods.contains("shift") { f.insert(.shift) }
+            if let c = controllers.first(where: { isShown($0) }) ?? controllers.first, let w = c.window, let u = k.unicodeScalars.first {
+                w.makeKey()
+                let chars = f.contains(.control) ? String(UnicodeScalar(UInt8(u.value & 0x1f))) : k
+                for t in [NSEvent.EventType.keyDown, .keyUp] {
+                    if let e = NSEvent.keyEvent(with: t, location: .zero, modifierFlags: f, timestamp: ProcessInfo.processInfo.systemUptime,
+                                                windowNumber: w.windowNumber, context: nil, characters: chars,
+                                                charactersIgnoringModifiers: k, isARepeat: false, keyCode: codes[k] ?? 0) {
+                        // A quiet copy is never active, so it has no key window and
+                        // NSApp drops key events. AppKit's own order instead: the
+                        // window's key equivalents, the menu, then the key itself.
+                        if NSApp.keyWindow === w { NSApp.sendEvent(e); continue }
+                        if t == .keyDown, !f.intersection([.command, .control]).isEmpty,
+                           w.performKeyEquivalent(with: e) || (NSApp.mainMenu?.performKeyEquivalent(with: e) ?? false) { continue }
+                        w.sendEvent(e)
+                    }
+                }
+                dlog("verdict=test_key_sent k=\(raw) mods=\(mods) key_window=\(NSApp.keyWindow === w ? 1 : 0) responder=\(w.firstResponder.map { String(describing: type(of: $0)) } ?? "none")")
+            }
         // Run JS in pane `i` of the key window's grid (or its only page) and
         // write what it returns, as a string, to <state file>.js.
         case "/js-pane":
             let i = Int(q.first { $0.name == "i" }?.value ?? "") ?? 0
             let host = controllers.first { $0.grid != nil && isShown($0) } ?? controllers.first { isShown($0) }
             let target = host?.grid.flatMap { g in i >= 0 && i < g.tree.leaves.count ? g.members[g.tree.leaves[i]] : nil } ?? host
-            if let code = q.first(where: { $0.name == "code" })?.value, let c = target,
+            // in=settings: the Settings window's page instead of a pane.
+            let web = q.first(where: { $0.name == "in" })?.value == "settings" ? settings?.webView : target?.webView
+            if let code = q.first(where: { $0.name == "code" })?.value, let w = web,
                let path = ProcessInfo.processInfo.environment["AMUX_DESKTOP_TEST_STATE"] {
-                c.webView.callAsyncJavaScript(code, arguments: [:], in: nil, in: .page) { r in
+                w.callAsyncJavaScript(code, arguments: [:], in: nil, in: .page) { r in
                     let out: String
                     switch r { case .success(let v): out = "\(v)"; case .failure(let e): out = "error: " + e.localizedDescription }
                     try? out.data(using: .utf8)?.write(to: URL(fileURLWithPath: path + ".js"), options: .atomic)
@@ -1261,10 +1392,15 @@ extension AppDelegate {
             let ws = controllers.compactMap { c -> [String: Any]? in
                 guard let w = c.window, w.isVisible else { return nil }
                 var d: [String: Any] = ["title": w.title, "frame": NSStringFromRect(w.frame), "tabs": (w.tabbedWindows ?? [w]).count, "key": w.isKeyWindow, "number": w.windowNumber,
+                                        "responder": w.firstResponder.map { String(describing: type(of: $0)) } ?? "none",
+                                        "find": c.findBar?.field.stringValue ?? NSNull(), "find_status": c.findBar?.status.stringValue ?? "",
+                                        "clipboard": copyPasteboard.string(forType: .string) ?? "",
                                         "view": c.viewHash, "selected": (w.tabGroup?.selectedWindow ?? w) === w, "tooltip": w.tab.toolTip ?? "",
                                         "connection": w.tab.accessoryView?.toolTip ?? "",
                                         "server": c.serverOrigin?.absoluteString ?? "", "saved": c.savedURL() ?? "",
-                                        "subtitle": w.subtitle]
+                                        "subtitle": w.subtitle,
+                                        // The same window as the window server reports it (AgentWatch's outline source).
+                                        "cg_frame": NSStringFromRect(AgentWatch.shared.windowFrame(pid: Int(getpid()), windowID: w.windowNumber) ?? .zero)]
                 if let g = c.grid {
                     d["grid"] = g.readingOrder
                     d["panes"] = g.tree.leaves.compactMap { g.members[$0]?.pageTitle }
@@ -1309,10 +1445,21 @@ extension AppDelegate {
                                      "visible_frame": NSStringFromRect(arrangeTarget?.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero),
                                      "screen_frame": NSStringFromRect(arrangeTarget?.screen?.frame ?? NSScreen.main?.frame ?? .zero),
                                      "windows": ws,
+                                     "status_menu": menuBar?.snapshot() ?? NSNull(),
+                                     "agent_view": AgentWatch.shared.state,
+                                     "quick_ask": QuickAsk.made ? QuickAsk.shared.state : ["visible": false, "workers": [String](), "last_sent": [String: Any]()],
+                                     "permissions": MacPermissions.all(),
+                                     "settings_permission_rows": settingsHTML(self).components(separatedBy: "data-permission=").count - 1,
+                                     "mac_settings": macSettingsState(),
+                                     "settings_window": settings.map { s -> [String: Any] in
+                                         ["visible": s.window?.isVisible ?? false, "key": s.window?.isKeyWindow ?? false, "number": s.window?.windowNumber ?? 0, "title": s.window?.title ?? "",
+                                          "url": s.webView.url?.absoluteString ?? "", "server": s.server?.absoluteString ?? ""]
+                                     } ?? NSNull(),
                                      // Every page, shown or not: its web process and what it costs.
                                      "pages": controllers.map { c -> [String: Any] in
                                          let pid = webPID(c)
                                          return ["view": c.viewHash, "shown": isShown(c), "pid": pid ?? 0,
+                                                 "url": c.webView.url?.absoluteString ?? "", "saved": c.savedURL() ?? "", "discarded": c.discarded,
                                                  "mb": pid.flatMap { footprintMB($0) } ?? -1, "cpu_s": pid.flatMap { cpuSeconds($0) } ?? -1]
                                      },
                                      "app_mb": footprintMB(getpid()) ?? -1, "app_cpu_s": cpuSeconds(getpid()) ?? -1,
@@ -1595,4 +1742,22 @@ final class AmuxWindow: NSWindow {
     }
     override func moveTabToNewWindow(_ sender: Any?) { if !refused(sender, "tab_moved") { super.moveTabToNewWindow(sender) } }
     override func mergeAllWindows(_ sender: Any?) { if !refused(sender, "tabs_merged") { super.mergeAllWindows(sender) } }
+    // A key nothing in the window answered: AppKit beeps here.
+    override func noResponder(for eventSelector: Selector) {
+        let e = NSApp.currentEvent
+        let page = firstResponder is WKWebView
+        dlog("verdict=key_unhandled selector=\(NSStringFromSelector(eventSelector)) key=\(e?.charactersIgnoringModifiers ?? "-") mods=\(e.map { keyModsName($0.modifierFlags) } ?? "-") responder=\(firstResponder.map { String(describing: type(of: $0)) } ?? "none") beep=\(page ? 0 : 1)")
+        // A key the page left alone is not an error, as in a browser: no beep.
+        if page && eventSelector == #selector(NSResponder.keyDown(with:)) { return }
+        super.noResponder(for: eventSelector)
+    }
+}
+
+func keyModsName(_ f: NSEvent.ModifierFlags) -> String {
+    var m: [String] = []
+    if f.contains(.command) { m.append("cmd") }
+    if f.contains(.control) { m.append("ctrl") }
+    if f.contains(.option) { m.append("alt") }
+    if f.contains(.shift) { m.append("shift") }
+    return m.isEmpty ? "none" : m.joined(separator: "+")
 }

@@ -103,13 +103,8 @@ fn is_off(v: &str) -> bool {
 /// (`~/.amux/server.env`, the operator switch) wins, then worker > group >
 /// global scope files.
 pub fn scoped(home: &Path, lane: &str, key: &str) -> Option<String> {
-    if let Some(v) = env_nonempty(key) {
-        return Some(v);
-    }
-    if lane.is_empty() {
-        return None;
-    }
-    crate::api::session_verbs::scoped_setting_in(home, lane, key)
+    crate::environment::resolve_in(home, crate::environment::Scope::Lane(lane), key, crate::environment::process(key).as_deref())
+        .map(|r| r.value.trim().to_string())
 }
 
 /// Fleet-wide knobs. Read on every call, so an edit to server.env or a scope
@@ -1247,6 +1242,7 @@ pub fn context_text(profiles: &[(String, Vec<String>)], lim: &Limits) -> String 
     let mut s = String::new();
     s.push_str("amux computer: a disposable Linux desktop (XFCE/Kasm, Chromium, Firefox, terminal) driven by pixels.\n");
     s.push_str("Access ladder: 1) amux browser (/api/browser, amux Chrome profiles)  2) CDP through the Chrome profile selected in Browser tab → fallback settings  3) this sandbox, only when 1 and 2 cannot reach it.\n");
+    s.push_str("A native app on the owner's Mac (not a web page): amux computer mac (list_apps, list_windows, get_window_state, click, type_text, set_value, run_steps), in the background through the amux Mac app, only for the apps the owner lists in AMUX_MAC_APPS for you.\n");
     s.push_str("Choose identity and purpose first with amux browser profiles / amux browser for URL. Use amux browser route for the shared ladder. Cookie evidence needs a live site check; observe again after any handoff.\n");
     s.push_str("Verbs: amux computer start | screenshot (then Read the path) | click X Y | double-click X Y | move X Y | type TEXT | key KEY (enter, ctrl+l) | scroll DX DY | open URL [--profile NAME] | stop\n");
     s.push_str("Loop: screenshot, read coordinates off the image, act, screenshot again to confirm. Stop when done.\n");

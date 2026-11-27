@@ -101,13 +101,27 @@
 <link rel="apple-touch-icon" href="/icon.png">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" crossorigin="anonymous">
 <link id="hljs-theme" rel="stylesheet" crossorigin="anonymous" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/app.css?v=__AMUX_ASSET_VER__">
 <link rel="stylesheet" href="/state/feedback.css">
 <!-- AMUX-BOOTSTRAP-BEGIN (see extraction note at top of file) -->
 <script>window._AMUX_S3_ICAL_URL="";window._AMUX_AUTH_TOKEN="";window._AMUX_HOME="";window._AMUX_POSTHOG_KEY="";window._AMUX_POSTHOG_HOST="https://us.i.posthog.com";window._AMUX_USER_EMAIL="";window._AMUX_USER_ID="";window._AMUX_UI_TOKEN="";window._AMUX_DEFAULT_MODEL="sonnet";window._AMUX_AUTH_WITHHELD=false;window._AMUX_DATA_DIR="";</script>
 <!-- AMUX-BOOTSTRAP-END -->
 </head>
 <body>
+<script>
+// The intent Home decides a new person's first screen; until it answers, the
+// fleet is hidden so it never flashes first (docs/design/intent-first.md).
+(function(){try{var v=JSON.parse(localStorage.getItem('amux_ui_view')||'null');
+var fresh=v&&v.v&&(Date.now()-(v.ts||0)<86400000);
+var dl=/^#(?:peek|issue|menu|view|path|edit|browser|bq|task|reconnect)=/.test(location.hash)||/[?&]view=/.test(location.search);
+if(!fresh&&!dl&&localStorage.getItem('amux_home_choice')!=='fleet'){document.documentElement.classList.add('boot-home-pending');
+setTimeout(function(){document.documentElement.classList.remove('boot-home-pending');},12000);}}catch(e){}})();
+// A #peek= address (a tab returned to from a link, a copied worker link) opens
+// on that worker: the fleet stays hidden until it opens, so the Workers list
+// never flashes first (owner, 2026-11-23). openPeek or _peekBootReveal clears it.
+(function(){try{if(/^#peek=/.test(location.hash)){document.documentElement.classList.add('boot-peek-pending');
+setTimeout(function(){document.documentElement.classList.remove('boot-peek-pending');},12000);}}catch(e){}})();
+</script>
 <div id="js-fallback" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:var(--space-4);z-index:99999;background:var(--bg);color:var(--dim);font-family:var(--font-ui);">
   <div style="font-size:var(--fs-3xl);">Loading amux...</div>
   <div id="js-fallback-retry" style="display:none;text-align:center;">
@@ -230,6 +244,7 @@
 <div id="email-approvals-banner" style="display:none;background:color-mix(in srgb, var(--red) 49%, var(--shade));border-bottom:1px solid var(--orange);color:color-mix(in srgb, var(--orange) 20%, var(--on-solid));padding:var(--space-2) var(--space-4);font-size:var(--fs-lg);z-index:90;position:relative;"></div>
 <div id="chrome-tabs-bar" class="chrome-tabs-bar"></div>
 <div id="chrome-tab-frames" class="chrome-tab-frames"></div>
+<button id="link-viewer-back" class="btn link-viewer-back" type="button" onclick="_linkViewerReturn()" title="Back to where this link was opened">&#x2039; Back</button>
 <div class="header-row">
   <div class="header-brand" style="display:flex;gap:var(--space-2);align-items:center;">
     <button id="nav-back-btn" class="nav-back-btn" type="button" aria-label="Back" title="Back" hidden>&#x2039;</button>
@@ -304,11 +319,16 @@
       <button class="settings-btn" id="settings-btn" onclick="event.stopPropagation();toggleSettings()" aria-label="Settings" title="Settings">&#x2699;&#xFE0F;</button>
       <div class="settings-menu" id="settings-menu">
         <div class="settings-tabs" id="settings-tabs">
-          <button class="settings-tab-btn active" data-stab="account" onclick="event.stopPropagation();_settingsTab('account')">Account</button>
-          <button class="settings-tab-btn" data-stab="integrations" onclick="event.stopPropagation();_settingsTab('integrations')">Connect</button>
-          <button class="settings-tab-btn" data-stab="device" onclick="event.stopPropagation();_settingsTab('device')">Device</button>
-          <button class="settings-tab-btn" data-stab="workers" onclick="event.stopPropagation();_settingsTab('workers')">Workers</button>
-          <button class="settings-tab-btn" data-stab="notifications" onclick="event.stopPropagation();_settingsTab('notifications')">Alerts</button>
+          <!-- Two groups (owner, 2026-11-26: "a seperate settings from mac/client vs server"):
+               what this phone, browser or Mac keeps for itself (This device, This Mac), then, after
+               the Server label, what the server keeps for everyone. -->
+          <button class="settings-tab-btn" data-stab="device" data-group="device" onclick="event.stopPropagation();_settingsTab('device')">This device</button>
+          <button class="settings-tab-btn" data-stab="mac" data-group="device" id="settings-tab-mac" hidden onclick="event.stopPropagation();_settingsTab('mac')">This Mac</button>
+          <span class="settings-tab-group settings-tab-group-server" aria-hidden="true">Server</span>
+          <button class="settings-tab-btn active" data-stab="account" data-group="server" onclick="event.stopPropagation();_settingsTab('account')">Account</button>
+          <button class="settings-tab-btn" data-stab="workers" data-group="server" onclick="event.stopPropagation();_settingsTab('workers')">Workers</button>
+          <button class="settings-tab-btn" data-stab="notifications" data-group="server" onclick="event.stopPropagation();_settingsTab('notifications')">Alerts</button>
+          <button class="settings-tab-btn" data-stab="integrations" data-group="server" onclick="event.stopPropagation();_settingsTab('integrations')">Connect</button>
         </div>
         <div class="settings-tab-panel active" id="stab-account" data-stab="account">
         <div class="settings-section" id="settings-usage-section">
@@ -482,6 +502,12 @@
           </label>
           <div id="settings-taskguard-status" style="font-size:var(--fs-xs);color:var(--dim);margin-top:var(--space-1);"></div>
         </div>
+        <div class="settings-sep"></div>
+        <div class="settings-section" id="settings-server-env-section">
+          <div class="settings-section-label">Every other server setting</div>
+          <div class="ui-help" style="margin-bottom:var(--space-2);">The server's own settings (its environment, such as limits, models and switches) for every worker. A group or one worker can override them in its Scope tab.</div>
+          <button class="btn" id="settings-server-env-btn" onclick="event.stopPropagation();_scopeEditOpen('global','','env')">Edit server settings</button>
+        </div>
         </div>
         <div class="settings-tab-panel" id="stab-notifications" data-stab="notifications">
         <div class="settings-section">
@@ -620,52 +646,28 @@
           <p class="connection-help ui-help">Connect ChatGPT to this amux so it can list workers, read their output, message them and manage board cards. Nothing can delete or stop a worker from ChatGPT. Every connection waits here for your approval.</p>
           <div id="chatgpt-app">Loading…</div>
         </section>
-        <div class="settings-sep"></div>
-        <div class="settings-section" id="settings-apikeys-section">
-          <div class="settings-section-label">API Keys</div>
-          <div style="font-size:var(--fs-xs);color:var(--dim);margin-bottom:var(--space-1-5);">Also used to fetch each vendor's own live model list instead of amux's static fallback.</div>
-          <div style="display:flex;flex-direction:column;gap:var(--space-2);">
-            <div id="settings-apikey-row-anthropic">
-              <div style="font-size:var(--fs-2xs);color:var(--dim);margin-bottom:var(--space-0-5);">Anthropic</div>
-              <div style="display:flex;gap:var(--space-1-5);align-items:center;">
-                <input id="settings-anthropic-key" type="password" autocomplete="off"
-                  class="search-input" placeholder="sk-ant-..."
-                  style="flex:1;font-size:var(--fs-base);padding:var(--space-1) var(--space-2);box-sizing:border-box;min-width:0;">
-                <button class="btn" style="font-size:var(--fs-xs);padding:var(--space-0-5) var(--space-2-5);white-space:nowrap;"
-                  onclick="saveApiKey('ANTHROPIC_API_KEY')">Save</button>
-              </div>
-              <div id="settings-apikey-status" style="font-size:var(--fs-xs);color:var(--dim);margin-top:var(--space-0-5);"></div>
-            </div>
-            <div id="settings-apikey-row-openai">
-              <div style="font-size:var(--fs-2xs);color:var(--dim);margin-bottom:var(--space-0-5);">OpenAI</div>
-              <div style="display:flex;gap:var(--space-1-5);align-items:center;">
-                <input id="settings-openai-key" type="password" autocomplete="off"
-                  class="search-input" placeholder="sk-..."
-                  style="flex:1;font-size:var(--fs-base);padding:var(--space-1) var(--space-2);box-sizing:border-box;min-width:0;">
-                <button class="btn" style="font-size:var(--fs-xs);padding:var(--space-0-5) var(--space-2-5);white-space:nowrap;"
-                  onclick="saveApiKey('OPENAI_API_KEY')">Save</button>
-              </div>
-              <div id="settings-apikey-status-openai" style="font-size:var(--fs-xs);color:var(--dim);margin-top:var(--space-0-5);"></div>
-            </div>
-            <div id="settings-apikey-row-gemini">
-              <div style="font-size:var(--fs-2xs);color:var(--dim);margin-bottom:var(--space-0-5);">Gemini</div>
-              <div style="display:flex;gap:var(--space-1-5);align-items:center;">
-                <input id="settings-gemini-key" type="password" autocomplete="off"
-                  class="search-input" placeholder="AIza..."
-                  style="flex:1;font-size:var(--fs-base);padding:var(--space-1) var(--space-2);box-sizing:border-box;min-width:0;">
-                <button class="btn" style="font-size:var(--fs-xs);padding:var(--space-0-5) var(--space-2-5);white-space:nowrap;"
-                  onclick="saveApiKey('GEMINI_API_KEY')">Save</button>
-              </div>
-              <div id="settings-apikey-status-gemini" style="font-size:var(--fs-xs);color:var(--dim);margin-top:var(--space-0-5);"></div>
-            </div>
-          </div>
         </div>
+        <div class="settings-tab-panel" id="stab-mac" data-stab="mac">
+          <div id="mac-settings" class="settings-section"><p class="ui-help">Loading this Mac's settings…</p></div>
         </div>
         <div class="settings-tab-panel" id="stab-device" data-stab="device">
         <div class="settings-section" style="padding:var(--space-2-5) var(--space-3-5);">
           <button onclick="_wtRestart();closeSettings();" style="width:100%;padding:var(--space-2) var(--space-3);border-radius:var(--radius-lg);border:1px solid var(--accent);background:var(--accent);color:var(--on-solid);font-size:var(--fs-md);font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:var(--space-1-5);">
             <span style="font-size:var(--fs-2xl);">?</span> Walkthrough
           </button>
+        </div>
+        <div class="settings-sep"></div>
+        <div class="settings-section" id="settings-device-notifs-section">
+          <div class="settings-section-label">Notifications</div>
+          <div class="ui-help" style="margin-bottom:var(--space-2);">Each phone, browser and Mac app keeps its own switches. Off here means nothing reaches this device: no lock-screen or background push, no Messages notifications, and in the Mac app no needs-you notifications either.</div>
+          <div class="settings-row" style="justify-content:space-between;align-items:center;">
+            <span style="font-size:var(--fs-lg);">Notifications on this device</span>
+            <label class="theme-toggle"><input type="checkbox" id="notif-device-native-cb" aria-label="Notifications on this device" onchange="_notifToggleNative()"><span class="theme-track"><span class="theme-thumb"></span></span></label>
+          </div>
+          <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:var(--space-1);">
+            <span style="font-size:var(--fs-lg);">In-app pop-ups</span>
+            <label class="theme-toggle"><input type="checkbox" id="notif-device-banner-cb" aria-label="In-app pop-ups" onchange="_notifToggleBanners()"><span class="theme-track"><span class="theme-thumb"></span></span></label>
+          </div>
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section">
@@ -770,8 +772,12 @@
 </div>
 <div class="tab-bar-outer">
 <div class="tab-bar">
+  <button id="tab-home" title="Intent: ask for anything, and see what is coming up" onclick="switchView('home')"><span class="tab-ico">&#x1F4AC;</span><span class="tab-lbl">Intent</span></button>
+  <button id="tab-everything" title="Everything else: the full workspace" onclick="_homeShowEverything()"><span class="tab-ico">&#x22EF;</span><span class="tab-lbl">Everything else</span></button>
   <button id="tab-sessions" class="active" onclick="switchView('sessions')"><span class="tab-ico">▦</span><span class="tab-lbl">Workers</span></button>
   <button id="tab-board" onclick="switchView('board')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span></button>
+  <button id="tab-crm" title="CRM: people, companies, deals and follow-ups, for Mixpeek, amux and personal" onclick="switchView('crm')"><span class="tab-ico">&#x1F465;</span><span class="tab-lbl">CRM</span></button>
+  <button id="tab-outbound" title="Outbound: every message a worker wants to send outside, on every channel, waiting for your approval" onclick="switchView('outbound')"><span class="tab-ico">&#x27A4;</span><span class="tab-lbl">Outbound</span></button>
   <button id="tab-usage" title="Usage & Optimization: where the spend goes, what it produces, what to change" onclick="openUsage()"><span class="tab-ico">$</span><span class="tab-lbl">Usage</span></button>
   <button id="tab-tasks" onclick="switchView('tasks')"><span class="tab-ico">&#x2611;</span><span class="tab-lbl">Tasks</span></button>
   <button id="tab-groups" onclick="switchView('groups')"><span class="tab-ico">&#x2756;</span><span class="tab-lbl">Groups</span></button>
@@ -780,10 +786,12 @@
   <button id="tab-files" onclick="switchView('files')"><span class="tab-ico">🗂</span><span class="tab-lbl">Files</span></button>
   <button id="tab-scratchpad" onclick="switchView('scratchpad')"><span class="tab-ico">📝</span><span class="tab-lbl">Scratchpad</span></button>
   <button id="tab-record" onclick="switchView('record')"><span class="tab-ico">🎙</span><span class="tab-lbl">Record</span></button>
+  <button id="tab-dictation" title="Dictation: the dictionary and settings every worker, the Mac app and the phone dictate with" onclick="switchView('dictation')"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span></button>
   <button id="tab-mdai" onclick="switchView('mdai')"><span class="tab-ico">&#x2726;</span><span class="tab-lbl">MDAI</span></button>
   <button id="tab-pages" title="Apps: apps with a backend, and files shared outside amux" onclick="switchView('pages')"><span class="tab-ico">&#x25A4;</span><span class="tab-lbl">Apps</span></button>
   <button id="tab-photos" onclick="switchView('photos')"><span class="tab-ico">&#x1F5BC;</span><span class="tab-lbl">Photos</span></button>
   <button id="tab-email" onclick="switchView('email')"><span class="tab-ico">📥</span><span class="tab-lbl">Email</span></button>
+  <button id="tab-calls" title="Calls: phone calls workers placed, held calls to approve, transcripts" onclick="switchView('calls')"><span class="tab-ico">&#x260E;</span><span class="tab-lbl">Calls</span></button>
   <button id="tab-connectors" onclick="switchView('connectors')"><span class="tab-ico">🔌</span><span class="tab-lbl">Connectors</span></button>
   <button id="tab-vault" onclick="switchView('vault')"><span class="tab-ico">&#x1F510;</span><span class="tab-lbl">Vault</span></button>
   <button id="tab-hotkeys" onclick="switchView('hotkeys')"><span class="tab-ico">&#x2318;</span><span class="tab-lbl">Hotkeys</span></button>
@@ -796,7 +804,6 @@
   <button id="tab-metrics" onclick="switchView('metrics')"><span class="tab-ico">↗</span><span class="tab-lbl">Metrics</span></button>
   <button id="tab-disk" onclick="switchView('disk')"><span class="tab-ico">🖴</span><span class="tab-lbl">Disk</span></button>
   <button id="tab-cost" onclick="switchView('cost')"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
-  <button id="tab-scoreboard" title="Scoreboard: goals, rates, CI, spend, host and what needs you" onclick="switchView('scoreboard')"><span class="tab-ico">&#x25C9;</span><span class="tab-lbl">Scoreboard</span></button>
   <button id="tab-torrents" onclick="switchView('torrents')"><span class="tab-ico">↓</span><span class="tab-lbl">Torrents</span></button>
   <button id="tab-terminal" onclick="switchView('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
   <button id="tab-browser" onclick="switchView('browser')"><span class="tab-ico">◳</span><span class="tab-lbl">Browser</span></button>
@@ -805,6 +812,24 @@
   <button class="tab-customize-btn" onclick="event.stopPropagation();toggleTabCustomizer()" title="Show/hide tabs">&#x229E;</button>
   <div class="tab-customizer-menu" id="tab-customizer-menu" style="display:none;"></div>
 </div>
+</div>
+<div id="home-view" class="home-view" style="display:none" aria-label="Intent">
+  <header id="home-hello" class="home-hello"><h1 id="home-greet" class="home-greet"></h1><div id="home-counts" class="home-counts"></div></header>
+  <div class="home-main">
+    <section id="home-ideas" class="home-pane home-extra" aria-label="Ideas for you"><div id="home-ideas-body" class="home-pane-body"></div></section>
+    <section id="home-goals" class="home-pane home-extra" aria-label="Goals"><div id="home-goals-body" class="home-pane-body"></div></section>
+    <section id="home-chat" class="home-pane"><div id="home-chat-body" class="home-pane-body"></div></section>
+    <section id="home-upcoming" class="home-pane home-extra" aria-label="Coming up"><div id="home-upcoming-body" class="home-pane-body"></div></section>
+  </div>
+  <form id="home-composer" class="home-composer" onsubmit="event.preventDefault();_homeSend()">
+    <div class="home-composer-box">
+      <span class="home-spark" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 15l.7 2.3L22 18l-2.3.7L19 21l-.7-2.3L16 18l2.3-.7z"/></svg></span>
+      <textarea id="home-input" class="home-input" rows="1" placeholder="What do you want to do?" aria-label="What do you want to do?"
+        oninput="_homeGrow(this)" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();_homeSend()}"></textarea>
+      <button id="home-send" type="submit" class="btn primary home-send" aria-label="Send" title="Send"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M3.4 20.4l17.5-7.5a1 1 0 000-1.8L3.4 3.6a1 1 0 00-1.4 1.1L4 11l9 1-9 1-2 6.3a1 1 0 001.4 1.1z"/></svg></button>
+    </div>
+    <div class="home-trust">Nothing is sent to anyone or paid for without your OK.</div>
+  </form>
 </div>
 <div id="session-view">
 <div style="padding:0 var(--space-3);margin-top:var(--space-1);display:flex;align-items:center;gap:var(--space-2);">
@@ -822,7 +847,6 @@
       <button class="tile-btn" id="tile-sort-btn" onclick="event.stopPropagation();toggleSortMenu()" title="Sort workers" style="font-size:var(--fs-xs);font-weight:700;">A&#x2193;</button>
       <div class="sort-menu" id="sort-menu" style="display:none;"></div>
     </div>
-    <button class="tile-btn" id="tile-freeze-btn" onclick="toggleFreeze()" title="Freeze worker order — click again to unfreeze and reset">&#x2744;</button>
     <button class="tile-btn" id="tile-expand-btn" onclick="toggleExpand()" title="Expand active workers — click again to collapse all">&#x26A1;</button>
   </div>
 </div>
@@ -913,13 +937,30 @@
   <div id="hk-status" class="ui-help" aria-live="polite"></div>
   <div id="hk-body" class="hk-body"></div>
 </div>
+<!-- Dictation: one dictionary and one set of settings serve every worker, the Mac app
+     and the phone, so they have their own tab here; each worker's Dictation tab keeps
+     only its own History (owner, 2026-11-18: "it should be its own tab on the global
+     workers page"). -->
+<div id="dictation-view" class="hk-all" style="display:none;">
+  <div class="hk-head">
+    <div><h2>Dictation</h2><p class="ui-help">The words and settings dictation uses for every worker, in the Mac app and on the phone.</p></div>
+  </div>
+  <section class="settings-section" id="settings-dictionary-section">
+    <div class="settings-section-label">Dictionary</div>
+    <div id="dict-dict-body"></div>
+  </section>
+  <section class="settings-section" id="settings-dictation-section">
+    <div class="settings-section-label">Settings</div>
+    <div id="dict-set-body"></div>
+  </section>
+</div>
 <div id="scheduler-view" class="sx-all" style="display:none;">
   <div class="sx-head">
     <div class="sx-head-title">
       <h2>Scheduler</h2>
       <span id="sched-stats" class="sx-summary"></span>
     </div>
-    <button class="btn primary sx-new" onclick="openSchedModal()" aria-label="New schedule">+<span class="sx-new-text"> New schedule</span></button>
+    <button class="btn primary sx-new" onclick="_sxNew()" aria-label="New schedule">+<span class="sx-new-text"> New schedule</span></button>
   </div>
   <!-- Segmented filter: one pill per group, with counts. Rendered by
        _sxRenderPills so the counts come from the same predicate the groups use. -->
@@ -935,6 +976,7 @@
       <option value="">All types</option>
       <option value="tmux">Trigger a worker</option>
       <option value="shell">Run a command</option>
+      <option value="event">When something happens</option>
     </select>
     <select id="sched-f-status" class="input sx-filter" aria-label="Filter by status" onchange="_sxFilters.status=this.value;renderScheduler()">
       <option value="">All statuses</option>
@@ -956,6 +998,7 @@
     <button class="btn" onclick="_sxClearSelection()">Clear</button>
   </div>
   <div id="scheduler-list" class="sx-list"></div>
+  <div id="scheduler-events" class="sx-list sx-events"></div>
   <!-- SYSTEM JOBS (AMUX-2703) — amux's own background loops, below the user's
        schedules and visually separated from them. They are NOT schedules:
        no run-now, no edit, no delete. See runtime_jobs/registry.rs. -->
@@ -994,7 +1037,7 @@
     <div class="fe-breadcrumb sp-dir" id="sp-dir" title="~/Vault/Scratchpad">~/Vault/Scratchpad</div>
     <button class="fe-tb-btn sp-more-btn" id="sp-more-btn" onclick="_spMoreToggle(event)" aria-label="Scratchpad actions" aria-haspopup="true" aria-expanded="false">&#x22EF;</button>
     <div class="sp-actions" id="sp-actions" onclick="if(event.target.closest('button'))_spMoreClose()">
-      <label class="sp-retain-wrap" title="Items older than this are deleted automatically">Keep
+      <label class="sp-retain-wrap" title="Items older than this move to scratchpad-expired in the amux home">Keep
         <select id="sp-retain" class="input sp-retain" onchange="_spSetRetain(this.value)" aria-label="Keep scratchpad items for">
           <option value="1">1 day</option><option value="3">3 days</option><option value="7">7 days</option>
           <option value="14">14 days</option><option value="30">30 days</option><option value="0">forever</option>
@@ -1484,6 +1527,52 @@
 </div>
 <!-- Photos: a media library on the owner's own Mixpeek (photos.js, loaded on first open). -->
 <div id="photos-view" class="ph-host" style="display:none;"></div>
+<!-- CRM (docs/design/crm.md): an agentic CRM run by workers. On a desktop a
+     rail of sections, a list and the open record beside it; on a phone one row
+     of controls (search, sections and filters scrolling sideways) over the list,
+     and the record opens over it. -->
+<div id="crm-view" class="crm-view">
+  <nav id="crm-nav" class="crm-nav" aria-label="CRM sections"></nav>
+  <div class="crm-col">
+    <div id="crm-head" class="crm-head"></div>
+    <div id="crm-bar" class="crm-bar" role="toolbar" aria-label="CRM views and filters">
+      <input id="crm-q" class="input crm-q" type="search" placeholder="Search" aria-label="Search the CRM" oninput="_crmSearch(this.value)">
+      <div id="crm-chips" class="crm-chips"></div>
+      <button class="btn primary crm-new" onclick="_crmNew()" aria-label="Add to the CRM">+ New</button>
+    </div>
+    <div id="crm-note" class="crm-note"></div>
+    <div class="crm-panes">
+      <div id="crm-list" class="crm-list"></div>
+      <div id="crm-detail" class="crm-detail"></div>
+    </div>
+  </div>
+</div>
+<div id="outbound-view" class="ob-view-root">
+  <div class="ob-bar" role="toolbar" aria-label="Outbound views and filters">
+    <div id="ob-views" class="ob-views" role="tablist" aria-label="Outbound by state"></div>
+    <input class="input ob-search" type="search" placeholder="Search outbound" aria-label="Search outbound" oninput="_obSearch(this.value)">
+    <div id="ob-channels" class="ob-channels"></div>
+    <select id="ob-worker" class="input ob-worker" aria-label="Worker" onchange="_obSetWorker(this.value)"></select>
+    <button class="btn ob-refresh" onclick="_obLoad()" aria-label="Refresh outbound">&#x21BB;</button>
+  </div>
+  <div id="ob-note" class="ob-note" hidden></div>
+  <div class="ob-panes">
+    <div class="ob-list-pane">
+      <div id="ob-list-head" class="ob-list-head"></div>
+      <div id="ob-list" class="ob-list"></div>
+    </div>
+    <div id="ob-detail" class="ob-detail"></div>
+    <div id="ob-side" class="ob-side"></div>
+  </div>
+</div>
+<div id="calls-view" class="calls-view">
+  <div id="calls-bar" class="calls-bar" role="toolbar" aria-label="Filter calls">
+    <div id="calls-filters" class="calls-filters"></div>
+    <button class="btn calls-refresh" onclick="_callsLoad()" aria-label="Refresh calls">&#x21BB;</button>
+  </div>
+  <div id="calls-note" class="calls-note"></div>
+  <div id="calls-list" class="calls-list"></div>
+</div>
 <div id="connectors-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow-y:auto;">
   <div class="cx-page">
     <div class="cx-top">
@@ -1833,15 +1922,6 @@
 </div>
 
 <!-- Cost / observability view -->
-<div id="scoreboard-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow-y:auto;padding:var(--space-3-5) var(--space-4) var(--space-16);">
-  <div id="sb-controls" class="sb-controls">
-    <span class="sb-title">Scoreboard</span>
-    <button id="sb-refresh" class="btn" onclick="_sbLoad()">Refresh</button>
-    <span id="sb-updated" class="sb-updated" aria-live="polite"></span>
-  </div>
-  <div id="sb-body"></div>
-</div>
-
 <div id="cost-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow-y:auto;padding:var(--space-3-5) var(--space-4) var(--space-16);">
   <div style="display:flex;align-items:center;gap:var(--space-2-5);flex-wrap:wrap;margin-bottom:var(--space-3);">
     <span style="font-size:var(--fs-3xl);font-weight:700;">Cost &amp; tokens</span>
@@ -3126,6 +3206,7 @@
 <div id="create-overlay" class="edit-overlay" onclick="if(event.target===this)closeCreate()">
   <div class="edit-box">
     <h3>New worker</h3>
+    <div class="field-optional" style="margin-bottom:var(--space-2);">Not sure what to write? <button type="button" class="btn" id="create-open-wizard" onclick="openWorkflowWizard()">Use the workflow wizard</button></div>
     <div class="field-group">
       <label class="field-label">Name</label>
       <input id="create-name" type="text" placeholder="my-project" autocomplete="off" autocorrect="off"
@@ -3239,6 +3320,11 @@
       <button class="btn" onclick="closeCreate()">Cancel</button>
       <button class="btn primary" onclick="submitCreate()">Create</button>
     </div>
+  </div>
+</div>
+<div id="wfw-overlay" class="edit-overlay" onclick="if(event.target===this)closeWorkflowWizard()">
+  <div class="edit-box" id="wfw-box" role="dialog" aria-labelledby="wfw-q">
+    <div id="wfw-body"></div>
   </div>
 </div>
 
@@ -3383,7 +3469,9 @@
     <button class="peek-tab" id="peek-tab-shell" onclick="setPeekTab('shell')" title="This worker's shell schedules: what runs on this machine for it, live and past output"><span class="tab-ico">$</span><span class="tab-lbl">Shell</span></button>
     <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="Edit this worker's configuration and see which layer supplies each value"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Configurations</span></button>
     <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this worker"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
+    <button class="peek-tab" id="peek-tab-intent" onclick="setPeekTab('intent')" title="Conversations from Intent routed to this worker" style="display:none;"><span class="tab-ico">&#x25CE;</span><span class="tab-lbl">Intent</span><span class="peek-tab-count" id="peek-tab-intent-count"></span></button>
     <button class="peek-tab" id="peek-tab-tasks" onclick="setPeekTab('tasks')" title="The task names this worker has worked on, newest first, as the model named them"><span class="tab-ico">&#x2611;</span><span class="tab-lbl">Tasks</span></button>
+    <button class="peek-tab" id="peek-tab-computer" onclick="setPeekTab('computer')" title="What this worker did in apps on this Mac, step by step, with what it saw"><span class="tab-ico">&#x1F5A5;</span><span class="tab-lbl">Computer</span><span class="peek-tab-count" id="peek-tab-computer-count"></span></button>
     <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
     <button class="peek-tab" id="peek-tab-readalouds" onclick="setPeekTab('readalouds')" title="Past read-alouds — replay any; auto-clears after 30 days"><span class="tab-ico">&#x1F50A;</span><span class="tab-lbl">Read alouds</span><span class="peek-tab-count" id="peek-tab-readalouds-count"></span></button>
     <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span><span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
@@ -3472,7 +3560,7 @@
                  "Attach file" at the top. -->
             <button type="button" class="peek-more-danger" onclick="_peekMoreClose();_peekClearInput()" title="Clear the composer: text, saved draft, and any staged attachments">&#x1F5D1; Clear input</button>
           </div>
-          <!-- Compact recording popup: live volume bars + timer, right above the
+          <!-- The listening pill: live volume bars + timer, right above the
                composer. Stop → transcribe → text lands in the input. -->
           <div class="dict-popup" id="dict-popup">
             <div class="dict-popup-wave" id="dict-wave">
@@ -3487,8 +3575,8 @@
               <span id="dict-popup-status" class="dict-popup-status">Listening…</span>
             </div>
             <div class="dict-popup-btns">
-              <button class="btn" onclick="_dictClosePopup(true)" title="Discard">Cancel</button>
-              <button class="btn primary" onclick="_dictStopRec()" title="Stop and transcribe">Done</button>
+              <button class="btn" onclick="_dictClosePopup(true)" title="Discard (Esc)" aria-label="Discard">&#x2715;</button>
+              <button class="btn primary" onclick="_dictStopRec()" title="Done: put the text in" aria-label="Done">&#x2713;</button>
             </div>
           </div>
         </div>
@@ -3637,6 +3725,15 @@
   
   <!-- This worker's tasks, newest first and numbered: the Tasks view's list
        fixed to peekSession (app.js _tasksScopes.peek). -->
+  <div id="peek-computer-panel" class="peek-tasks-panel peek-computer-panel">
+    <div class="pcu-bar">
+      <strong>Computer use on this Mac</strong>
+      <span id="peek-computer-count" class="tasks-count" role="status" aria-live="polite"></span>
+      <span class="pcu-hint">Live while this tab is open. &#x2318;&#x21E7;Esc or the menu bar's Stop Computer Use stops every worker.</span>
+    </div>
+    <section id="peek-computer-head" class="pcu-head" aria-label="This worker's computer use: status, apps and requests"></section>
+    <ol id="peek-computer-list" class="pcu-list" aria-label="This worker's computer-use steps, newest first"></ol>
+  </div>
   <div id="peek-tasks-panel" class="peek-tasks-panel tasks-scope row-note-host" style="padding:0;gap:0;flex-direction:column;">
     <div class="tasks-bar">
       <input id="peek-tasks-search" class="input tasks-search" type="search" placeholder="Search this worker's tasks, cards and messages" aria-label="Search this worker's tasks" oninput="_tasksSearchInput('peek')">
@@ -3712,11 +3809,9 @@
       <span class="dict-total"><span id="dict-total-words"></span><span id="dict-pending" class="dict-pending"></span></span>
     </div>
     <div class="dict-subtabs">
-      <button class="dict-subtab active" id="dict-subtab-history" onclick="_dictSetSub('history')">History</button>
-      <button class="dict-subtab" id="dict-subtab-dict" onclick="_dictSetSub('dict')">Dictionary</button>
-      <button class="dict-subtab" id="dict-subtab-settings" onclick="_dictSetSub('settings')">Settings</button>
-      <span style="flex:1;"></span>
+      <span class="dict-subtab active" id="dict-subtab-history">History</span>
       <input type="search" id="dict-search" class="dict-search" placeholder="Search&hellip;" oninput="_dictRenderHistory()">
+      <button type="button" class="btn" id="dict-open-settings" onclick="event.stopPropagation();_dictOpenSettings()" title="The dictionary and dictation settings, shared by every worker">Dictionary &amp; settings</button>
     </div>
     <div id="dict-outbox-strip"></div>
       <div id="dict-body" class="dict-body"></div>
@@ -3737,6 +3832,11 @@
        Rendered by _vxRender in app.js; stored by api/converse.rs. -->
   <div id="peek-converse-panel" class="peek-tasks-panel vx-panel"></div>
   <!-- Past read-alouds: replay any clip; auto-flushes after 30 days (Ethan 2026-08-13). -->
+  <!-- Intent: the conversations from Intent routed to this worker (owner,
+       2026-11-19: "These should be in a separate intent tab"). -->
+  <div id="peek-intent-panel" class="peek-tasks-panel" style="padding:0;gap:0;overflow-y:auto;-webkit-overflow-scrolling:touch;">
+    <div id="peek-msg-convs" class="peek-msg-convs"></div>
+  </div>
   <div id="peek-readalouds-panel" class="peek-tasks-panel" style="padding:0;gap:0;overflow-y:auto;-webkit-overflow-scrolling:touch;">
     <div id="peek-readalouds-list" class="ra-list"></div>
   </div>
@@ -3841,7 +3941,7 @@
         <button class="search-clear" onclick="document.getElementById('peek-sched-search').value='';_peekSchedSearch='';document.getElementById('peek-sched-search-wrap').classList.remove('has-value');_peekRenderSchedules()">&#x2715;</button>
       </div>
       <span id="peek-sched-stats" style="font-size:var(--fs-xs);color:var(--dim);white-space:nowrap;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;"></span>
-      <button class="btn" onclick="_peekNewSchedule()" style="font-size:var(--fs-base);padding:var(--space-1) var(--space-2-5);flex:none;min-height:36px;">+ New</button>
+      <button class="btn" onclick="_sxNew(peekSession)" style="font-size:var(--fs-base);padding:var(--space-1) var(--space-2-5);flex:none;min-height:36px;">+ New</button>
     </div>
     <div class="sx-bulk" id="peek-sched-bulk" hidden>
       <span id="peek-sched-bulk-n"></span>
@@ -4095,6 +4195,11 @@
         <div class="filter-section-title">Model type</div>
         <div id="filter-models" class="filter-chip-row"></div>
       </div>
+      <div class="filter-section">
+        <div class="filter-section-title">Default for new tabs</div>
+        <button class="btn" id="filter-default-btn" style="width:100%;" onclick="toggleListDefault()">Save as default</button>
+        <div class="filter-hint" id="filter-default-hint"></div>
+      </div>
     </div>
     <div class="filter-modal-actions">
       <button class="btn" onclick="clearAllFilters()">Clear all</button>
@@ -4125,28 +4230,6 @@
 </div>
 
 <!-- Channel drawer (session-to-session DM) -->
-<div id="channel-drawer" class="channel-drawer" onmousedown="this.dataset.bdMousedown=event.target===this?'1':''" onclick="if(event.target===this&&this.dataset.bdMousedown==='1'&&!this.dataset.justOpened)channelClose();this.dataset.bdMousedown=''">
-  <div class="channel-panel" role="dialog" aria-label="Worker channel">
-    <div class="channel-header">
-      <div class="channel-header-title">
-        <span class="channel-header-icon">#</span>
-        <span id="channel-header-pair">channel</span>
-      </div>
-      <div style="display:flex;gap:var(--space-1-5);">
-        <button class="btn" onclick="channelEnd()" aria-label="End channel" title="End channel and clear history" style="font-size:var(--fs-base);padding:var(--space-1) var(--space-2-5);color:var(--red);">End</button>
-        <button class="btn" onclick="channelClose()" aria-label="Close" style="font-size:var(--fs-2xl);padding:var(--space-1) var(--space-2-5);">&#x2715;</button>
-      </div>
-    </div>
-    <div id="channel-thread" class="channel-thread"></div>
-    <form class="channel-input-row" onsubmit="event.preventDefault(); channelSend();">
-      <textarea id="channel-input" class="channel-input" placeholder="Message..." rows="1"
-        oninput="try{localStorage.setItem('amux_draft_channel_'+(_channelMe||'')+'_'+(_channelOther||''),this.value)}catch(e){}"
-        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();channelSend();}"></textarea>
-      <button type="submit" class="btn primary" id="channel-send-btn">Send</button>
-    </form>
-  </div>
-</div>
-
 <!-- Confirm / alert modal -->
 <!-- Configuration editor: one editor UX at global, group, and worker level (AMUX-2436).
      Same shape as the peek Memory panel — full-height textarea, Preview, Save —
@@ -4230,6 +4313,7 @@
     <div class="file-actions" id="file-actions" role="menu">
       <button class="file-view-tab" id="file-tab-newwin" onclick="_fileOpenNewWindow()" title="Open this file in a new window">&#x29C9; Open in new window</button>
       <button class="file-view-tab" id="file-tab-reveal" onclick="_fileShowInFolder()" title="Show this file in its folder">&#x1F4C2; Show in folder</button>
+      <button class="file-view-tab" id="file-tab-askall" onclick="_mdAskAll()" title="Ask every @worker in this file one question; each reply shows under its line" hidden>Ask every @worker&#x2026;</button>
       <button class="file-view-tab" id="file-tab-worker" onclick="_fileOpenInWorker()" title="Hand this file to a worker with instructions">Open in worker&#x2026;</button>
       <div class="file-actions-sep" role="separator"></div>
       <button class="file-view-tab" id="file-tab-print" onclick="_filePrint()" title="Print this file">&#x2399; Print&#x2026;</button>
@@ -4251,7 +4335,7 @@
       <div class="file-actions-sep" role="separator"></div>
       <button class="file-view-tab file-action-danger" id="file-tab-delete" onclick="_fileDeleteOpen()" title="Delete this file">Delete&#x2026;</button>
     </div><!-- /file-actions -->
-    <button class="btn" onclick="closeFilePreview()" style="flex-shrink:0;">&#x2715;</button>
+    <button class="btn" onclick="dismissFilePreview()" title="Close" aria-label="Close" style="flex-shrink:0;">&#x2715;</button>
   </div>
   <div id="md-search-row">
     <input id="md-search-input" type="search" placeholder="Find in document…" autocomplete="off"
@@ -4278,19 +4362,8 @@
           <button type="button" role="tab" data-m="history" onclick="_mdxView('history')" title="Earlier versions from git">History</button>
           <button type="button" class="mdx-split" data-m="split" onclick="_mdxToggleSplit()" aria-pressed="false" title="Show the preview beside the source" aria-label="Side by side">&#x25EB;</button>
         </div>
-        <div class="mdx-tools" id="mdx-tools" role="toolbar" aria-label="Formatting">
-          <button type="button" data-t="heading" title="Heading (cycles # to ###)" aria-label="Heading"><b>H</b></button>
-          <button type="button" data-t="bold" title="Bold (⌘B)" aria-label="Bold"><b>B</b></button>
-          <button type="button" data-t="italic" title="Italic (⌘I)" aria-label="Italic"><i>I</i></button>
-          <button type="button" data-t="ul" title="Bulleted list" aria-label="Bulleted list">&#x2022;&#x2261;</button>
-          <button type="button" data-t="ol" title="Numbered list" aria-label="Numbered list">1&#x2261;</button>
-          <button type="button" data-t="task" title="Task" aria-label="Task">&#x2611;</button>
-          <button type="button" data-t="code" title="Code" aria-label="Code">&lt;/&gt;</button>
-          <button type="button" data-t="link" title="Link (⌘K)" aria-label="Link">&#x1F517;</button>
-          <button type="button" data-t="image" title="Image" aria-label="Image">&#x1F5BC;</button>
-          <button type="button" data-t="table" title="Table" aria-label="Table">&#x229E;</button>
-          <button type="button" data-t="worker" title="Tag a worker (@)" aria-label="Tag a worker">@</button>
-        </div>
+        <!-- Filled by _mdxToolbar (app.js) from _MDX_BAR, so the bar, the + menu and the / menu share one icon set. -->
+        <div class="mdx-tools" id="mdx-tools" role="toolbar" aria-label="Formatting"></div>
       </div>
       <div class="mdx-edit" id="mdx-edit-host"></div>
       <div class="mdx-status" id="mdx-status" aria-live="polite">

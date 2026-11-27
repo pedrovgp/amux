@@ -6,6 +6,11 @@
 # a build that never goes live is still rolled back at the limit. Runs the
 # shipped function lifted from rust-auto-build.sh, not a paraphrase.
 set -euo pipefail
+# The deploy target directory comes from the environment (server.env reaches
+# every process the server starts); a test's fake cargo must never write there.
+unset AMUX_DEPLOY_TARGET_DIR
+# Their fake cargo writes a few-byte stand-in; the builder refuses those by default.
+export AMUX_DEPLOY_MIN_BIN_BYTES=0
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
@@ -56,6 +61,16 @@ expect test "$(echo "$out" | grep -c 'verdict=activation_wait_post_hold')" = 1
 # The run ends and the server still never adopts: rolled back after the grace, not the full hold.
 out=$(run -1 "SCHED-706" 5 40 8 4)
 expect test "$(echo "$out" | tail -1)" = "rc=1 waited=24"
+
+# The default (no AMUX_ADOPT_SHELL_DEFER_MAX_S): the server no longer holds
+# adoption for shell runs, so a run in flight does not extend the wait.
+out=$(printf '%s' "SCHED-662" > "$TMP/runs"; env -u AMUX_ADOPT_SHELL_DEFER_MAX_S bash -c '
+  calls=0; sleep() { :; }
+  measure_live_identity() { calls=$((calls + 1)); live=old111; }
+  shell_runs_in_flight() { cat "'"$TMP/runs"'"; }
+  source "'"$TMP/fn.sh"'"
+  if wait_live_identity abc123def 5; then echo "rc=0 waited=$waited"; else echo "rc=1 waited=$waited"; fi')
+expect test "$(echo "$out" | tail -1)" = "rc=1 waited=5"
 
 echo "activation health wait: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

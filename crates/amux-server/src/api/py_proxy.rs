@@ -67,6 +67,7 @@ pub const PROXIED_FAMILIES: &[ProxiedFamily] = &[];
 pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/brex", "tokenized card issuance, webhook budget checks and credential health; disabled until configured (api/brex.rs)"),
     ("/api/_clear_sw", "service-worker cache reset landing page"),
+    ("/api/security", "encryption at rest for connector grants: status, key source, and the owner's decrypt back to plain files (api/at_rest.rs)"),
     ("/api/audit", "one worker's browser verbs, tool calls and API calls as a timeline (api/audit.rs)"),
     ("/api/board-groom", "stale board cards per lane, and the grooming turn a worker gets for its own (api/board_groom.rs)"),
     ("/api/social", "publish to social platforms and read each post's results at 24h, 72h and 7d (api/social.rs)"),
@@ -107,7 +108,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     // PROXIED_FAMILIES is empty and Python is deleted, so there is no other
     // value these could take. Found in one pass rather than one per test run —
     // the assert reports only the first offender.
-    ("/api/channels", "per-session channels + message history"),
+    ("/api/channels", "retired worker channels: 410 naming the Messages ww: conversation"),
     ("/api/client-debug", "SPA debug beacons (write-only, logged)"),
     ("/api/log-search", "grep across session log files"),
     ("/api/memory", "global memory document"),
@@ -125,9 +126,9 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/sessions-git", "bulk {session: {branch, repo}} map for the session cards — REUSES the session list's branch (one answer, not two) and adds repo, one rev-parse per DISTINCT dir, 30s TTL (api/sessions_git.rs, AMUX-2599)"),
     ("/api/offline-origin", "which origin can run a service worker — answers from the TLS dir we ACTUALLY serve, and gives no cert advice on a proxied origin (api/offline_origin.rs, AMUX-2599)"),
     ("/api/git", "POST /api/git/staged-guard — the shared-checkout staged-state guard the installed .git/hooks/amux-staged-guard calls on every commit. UNROUTED from the cutover until 2026-08-09 (405 x ~1,147/hr, swallowed by the hook's fail-open), so the guard was silently off fleet-wide (api/git_guard.rs, AMUX-1730)"),
-    ("/api/telegram", "Telegram bot connector — chat/session link+mappings, outbound send, poll+relay status (api/telegram.rs, db/telegram.rs, runtime_jobs/telegram_poll.rs + telegram_relay.rs). Net-new: python never had this route"),
+    ("/api/telegram", "Telegram bot connector — outbound send and poll status; chat links are bridge_links (api/telegram.rs, db/telegram.rs, runtime_jobs/telegram_poll.rs). Net-new: python never had this route"),
     ("/api/memories", "memories CRUD"),
-    ("/api/messages", "inter-worker messages"),
+    ("/api/messages", "human-message accountability rollup (/api/messages/accountability)"),
     ("/api/schedules", "scheduler CRUD + runs"),
     ("/api/search", "universal FTS5 search over cards (incl. their log lines), messages, memories, workers, journal, schedules + the index's own drift status/reindex (api/search.rs, migration 0013, RR-0110). Net-new: python never had this route"),
     ("/api/why", "provenance explainer — correlates the state-event journal, request log, card log, schedule runs/audit and turn ledger for one entity or a time window; every line cites its table (api/why.rs, RR-0109). Net-new"),
@@ -157,7 +158,8 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/gcal", "Google Calendar: accounts from the Google connector grant, live read and create of events, no local mirror (api/gcal.rs); distinct from /api/cal-events"),
     ("/api/browser", "full browser family: launch/profiles + CDP driver verbs (screenshot/state/action/inspect/navigate/search) against the server-machine Chrome, with durable redacted history in session_events; /agent answers 501 — the session's model drives the native verbs (api/browser.rs, AMUX-2598)"),
     ("/api/computer", "CUA computer-use sandboxes: start/stop/status/screenshot/action per lane, rung 3 of the access ladder (api/computer.rs, AMUX-5300)"),
-    ("/api/files", "modern files API (raw-body upload, rooted)"),
+    ("/api/files", "legacy Files spellings: rooted listing, download and raw-body upload, adapters onto /api/fs, /api/file/raw and the chunked upload (api/files.rs)"),
+    ("/api/mdai", "the .mdai computed-file engine; /api/files/mdai/* rewrites here (api/mdai.rs)"),
     ("/api/file", "file VIEWER: payload + raw range streaming + vtt + prepare/transcode with durable media jobs (api/file_viewer.rs)"),
     ("/api/library", "ebook library index — calibre metadata.db / opf scan (api/file_viewer.rs)"),
     ("/api/fs", "SPA Files surface — native port of the python contract (api/fs.rs)"),

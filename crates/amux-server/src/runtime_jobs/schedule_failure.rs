@@ -59,6 +59,10 @@ use crate::db::{PendingEvent, SharedStore, WriteOutcome};
 
 /// Same-signature failures after the last notice before telling again.
 pub const ESCALATE_AFTER: i64 = 3;
+/// Broken wake-condition checks in a row before the first notice. A check
+/// that breaks once (a flaky network call) recovers on its own; six in a row
+/// at a typical 5 to 15 minute interval is a check that has gone blind.
+pub const WHEN_BROKEN_AFTER: i64 = 6;
 /// Consecutive failures after which a schedule whose worker is gone is paused.
 pub const PAUSE_ORPHAN_AFTER: i64 = 3;
 
@@ -152,10 +156,21 @@ fn classify_raw(outcome: &RunOutcome) -> Verdict {
         RunOutcome::Refused { reason } if reason.starts_with(super::schedule_wake::GATE_PREFIX) => {
             Verdict::Neutral
         }
-        // A fire skipped because its wake condition (`when`) is not met yet.
-        RunOutcome::Refused { reason } if reason.starts_with(super::schedule_wake::WHEN_PREFIX) => {
-            Verdict::Neutral
+        // A wake condition (`when`) that crashed, timed out or exited other
+        // than 0 or 1: the check is blind. Counted, and told after
+        // WHEN_BROKEN_AFTER in a row (see `decide`).
+        RunOutcome::Refused { reason } if reason.starts_with(super::schedule_wake::WHEN_BROKEN_PREFIX) => {
+            Verdict::Fail(Failure {
+                kind: "when_check",
+                exit_code: None,
+                error_line: reason.clone(),
+                detail: format!("skipped: {reason}"),
+                tail: String::new(),
+            })
         }
+        // A wake condition that ran and answered "not yet" (exit 1): the
+        // check works, so it ends a broken-check streak.
+        RunOutcome::Refused { reason } if reason.starts_with(super::schedule_wake::WHEN_PREFIX) => Verdict::Pass,
         RunOutcome::Refused { reason } => Verdict::Fail(Failure {
             kind: "refused",
             exit_code: None,
@@ -271,6 +286,12 @@ pub fn decide(prev_streak: i64, prev: Option<&Notice>, v: &Verdict) -> (i64, Act
         Verdict::Neutral => (prev_streak, Action::Nothing),
         Verdict::Fail(f) => {
             let n = prev_streak + 1;
+            if f.kind == "when_check" && n < WHEN_BROKEN_AFTER {
+                return (n, Action::Nothing);
+            }
+            if f.kind == "when_check" && n == WHEN_BROKEN_AFTER {
+                return (n, Action::Notify("first"));
+            }
             let Some(p) = prev.filter(|_| prev_streak > 0) else {
                 return (n, Action::Notify("first"));
             };
@@ -384,10 +405,12 @@ pub fn notice_text(
         ),
         _ => format!("[amux] SCHEDULE FAILED: {id} \"{title}\", your schedule, failed ({streak} in a row)."),
     };
+    let when = f.kind == "when_check";
+    let (ran_label, ran) = if when { ("when check", sched.str_field("when_check")) } else { (skind, sched.str_field("command")) };
     let mut out = format!(
-        "{head}\n\nWhen: {} ({source})\nRan ({skind}): {}\nResult: {}\n",
+        "{head}\n\nWhen: {} ({source})\nRan ({ran_label}): {}\nResult: {}\n",
         fmt_ts(ran_at),
-        truncate(sched.str_field("command"), 200),
+        truncate(ran, 200),
         truncate(&f.detail, 300),
     );
     if !f.tail.trim().is_empty() {
@@ -398,6 +421,20 @@ pub fn notice_text(
     }
     if f.kind == "credential" {
         out.push_str(&format!("\n{}\n", super::schedule_lifecycle::CREDENTIAL_HINT));
+    }
+    if when {
+        // Run now delivers the prompt WITHOUT the check and reads as a pass, so
+        // the old Ask below reset the streak while the check stayed broken.
+        out.push_str(&format!(
+            "\nAsk: the wake condition itself is broken: it must exit 0 (deliver) or 1 (not yet), and it \
+             crashed, timed out or exited otherwise. Run it by hand as this schedule's owner \
+             (bash -o pipefail -c '<the check>'; echo $?), fix it, then read the next SCHEDULED run: \
+             GET /api/schedules/{id} shows failure_streak 0 once a scheduled check answers 0 or 1. Do \
+             not use Run now to confirm: it delivers the prompt without running the check.\n\
+             You will not be told again about this same error until it changes or fails \
+             {ESCALATE_AFTER} more times."
+        ));
+        return out;
     }
     out.push_str(&format!(
         "\nAsk: fix the cause (the script, its inputs, or the schedule itself), then rerun it with \
@@ -1142,9 +1179,27 @@ mod tests {
             classify(&RunOutcome::Refused {
                 reason: super::super::schedule_wake::when_reason("test -f /x", Some(1), false, "")
             }),
-            Verdict::Neutral,
-            "a wake condition that is not met yet is not a failure"
+            Verdict::Pass,
+            "a wake condition that is not met yet is not a failure; the check works"
         );
+        // mixpeek-meta-worker, 2026-11-25: a check that crashes, times out or
+        // exits other than 0 or 1 is blind. Counted, and told at the sixth.
+        for (code, timed_out) in [(Some(2), false), (Some(127), false), (None, false), (Some(1), true)] {
+            let v = classify(&RunOutcome::Refused {
+                reason: super::super::schedule_wake::when_reason("curl -f https://x/y", code, timed_out, "404"),
+            });
+            assert!(matches!(&v, Verdict::Fail(f) if f.kind == "when_check"), "{code:?} {timed_out}: {v:?}");
+        }
+        let broken = classify(&RunOutcome::Refused {
+            reason: super::super::schedule_wake::when_reason("curl -f https://x/y", Some(22), false, "404"),
+        });
+        let mut streak = 0;
+        for i in 1..WHEN_BROKEN_AFTER {
+            let (s, a) = decide(streak, None, &broken);
+            assert_eq!((s, a), (i, Action::Nothing), "silent before the sixth");
+            streak = s;
+        }
+        assert_eq!(decide(streak, None, &broken), (WHEN_BROKEN_AFTER, Action::Notify("first")), "told at the sixth");
         assert!(matches!(classify(&RunOutcome::Failed { reason: "timed out after 600s".into() }), Verdict::Fail(_)));
     }
 
@@ -1367,5 +1422,23 @@ mod tests {
         assert_eq!(take_queue(&store, "mixpeek-funnel").await.len(), 1, "the scheduler's notice is delivered");
         let peer = crate::api::session_verbs::steer_enqueue_store(&store, "mixpeek-funnel", "hi", "", "amux-app").await;
         assert_eq!(peer, Err("worker_group_boundary"), "a worker-origin send across groups is still refused");
+    }
+
+    /// p90, 2026-11-25: the notice for a broken wake condition told the lane
+    /// to confirm with Run now, which skips the check and reads as a pass.
+    #[test]
+    fn a_broken_when_checks_notice_names_the_check_and_not_run_now() {
+        let mut s = sched("SCHED-2896", "lane");
+        s.set("kind", Value::from("tmux"));
+        s.set("when_check", Value::from("gh api /x; exit 2"));
+        let reason = super::super::schedule_wake::when_reason("gh api /x; exit 2", Some(2), false, "");
+        let Verdict::Fail(f) = classify(&RunOutcome::Refused { reason }) else { panic!("a broken check is a failure") };
+        let t = notice_text(&s, &f, WHEN_BROKEN_AFTER, "first", "cron-rs", 0);
+        assert!(t.contains("Ran (when check): gh api /x; exit 2"), "{t}");
+        assert!(t.contains("exit 0 (deliver) or 1 (not yet)") && t.contains("Do not use Run now"), "{t}");
+        assert!(!t.contains("/run (curl"), "{t}");
+        let plain = sched("SCHED-1", "lane");
+        let Verdict::Fail(g) = classify(&RunOutcome::Failed { reason: "boom".into() }) else { panic!() };
+        assert!(notice_text(&plain, &g, 1, "first", "cron-rs", 0).contains("/run (curl"), "other failures keep their Ask");
     }
 }

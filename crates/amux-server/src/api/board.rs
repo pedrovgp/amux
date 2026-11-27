@@ -217,8 +217,8 @@ async fn needsyou_queue(
     (status, Json(body)).into_response()
 }
 
-/// The owner view's body, shared with the scoreboard so both rank one way.
-pub(crate) fn needsyou_payload(state: &AppState, want_all: bool, cap: usize) -> (StatusCode, Value) {
+/// The owner view's body.
+fn needsyou_payload(state: &AppState, want_all: bool, cap: usize) -> (StatusCode, Value) {
     let conn = match state.store.read() {
         Ok(c) => c,
         Err(e) => {
@@ -4012,11 +4012,11 @@ pub fn list_body_known(row: &IssueRow, slim: bool, stale: bool, isolated: Option
 /// for 30 minutes. `working` is the derived active-session set — the SAME
 /// derivation the session list serves, so the two views cannot disagree.
 pub fn is_stale(row: &IssueRow, now: i64, working: &std::collections::BTreeSet<String>) -> bool {
-    stale_candidate(row, now)
-        && row
-            .session
-            .as_deref()
-            .is_some_and(|sess| !working.contains(sess))
+    stale_candidate(row, now) && owner_not_working(row.session.as_deref(), working)
+}
+
+fn owner_not_working(session: Option<&str>, working: &std::collections::BTreeSet<String>) -> bool {
+    session.is_some_and(|sess| !working.contains(sess))
 }
 
 /// Everything `is_stale` asks before it reads the active-session set: in
@@ -4024,10 +4024,51 @@ pub fn is_stale(row: &IssueRow, now: i64, working: &std::collections::BTreeSet<S
 /// list uses it to decide whether the set is worth deriving at all (AMUX-5374),
 /// and a second spelling would let the two disagree about which rows can be stale.
 fn stale_candidate(row: &IssueRow, now: i64) -> bool {
-    matches!(row.status.as_str(), "doing" | "review")
-        && row.session.as_deref().is_some_and(|s| !s.is_empty())
-        && row.updated != 0
-        && now - row.updated >= 1800
+    stale_candidate_parts(&row.status, row.session.as_deref(), row.updated, now)
+}
+
+/// [`stale_candidate`] over the three columns it reads, so the board ETag can
+/// ask it without hydrating rows.
+fn stale_candidate_parts(status: &str, session: Option<&str>, updated: i64, now: i64) -> bool {
+    matches!(status, "doing" | "review")
+        && session.is_some_and(|s| !s.is_empty())
+        && updated != 0
+        && now - updated >= 1800
+}
+
+/// The board ETag's stale component. The ETag is the store rev, but `stale`
+/// moves without a write: a card crosses the 30-minute line on the clock, or
+/// its owner stops working. With the rev alone, a poller holding the ETag from
+/// before got 304s and never saw the flag. This hashes the ids of the cards
+/// that are stale right now, board-wide (a superset of any filtered page, so
+/// it can only cost a 304, never serve a wrong one). Empty when nothing is
+/// stale, which keeps the plain `board-{rev}` ETag and its 304s for the
+/// common case. Reads only in-progress rows (idx_issues_status) and the
+/// cached active-session set, and that only when some row could be stale.
+fn stale_etag_part(conn: &rusqlite::Connection, now: i64) -> anyhow::Result<String> {
+    use sha2::Digest as _;
+    let candidates: Vec<bs::StaleProbeRow> = bs::in_progress_touch_rows(conn)?
+        .into_iter()
+        .filter(|r| stale_candidate_parts(&r.status, r.session.as_deref(), r.updated, now))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(String::new());
+    }
+    let working = crate::api::sessions_legacy::active_python_sessions_recent(conn);
+    let mut h = sha2::Sha256::new();
+    let mut any = false;
+    for r in &candidates {
+        if owner_not_working(r.session.as_deref(), &working) {
+            h.update(r.id.as_bytes());
+            h.update([0u8]);
+            any = true;
+        }
+    }
+    Ok(if any {
+        format!("-s{}", &hex::encode(h.finalize())[..12])
+    } else {
+        String::new()
+    })
 }
 
 /// The nightly perf gate's budget for a default board read (scripts/perf-baseline.sh).
@@ -4624,8 +4665,21 @@ pub async fn list_board(
             format!("-{}", &hex::encode(digest)[..12])
         })
         .unwrap_or_default();
-    let etag_val = format!("\"board-{}{scope_etag}\"", rev);
-    if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+    // `stale` is time-based, so the rev alone cannot validate it. If the
+    // fingerprint cannot be read, skip the 304 and let the full read answer.
+    let stale_etag = state
+        .store
+        .read_async(|conn| stale_etag_part(conn, now_secs()))
+        .await;
+    let etag_val = format!(
+        "\"board-{}{scope_etag}{}\"",
+        rev,
+        stale_etag.as_deref().unwrap_or("")
+    );
+    if let (Ok(_), Some(inm)) = (
+        &stale_etag,
+        headers.get("if-none-match").and_then(|v| v.to_str().ok()),
+    ) {
         if inm == etag_val || inm == format!("W/{etag_val}") {
             let mut h = HeaderMap::new();
             if let Ok(v) = etag_val.parse() {
@@ -5882,6 +5936,33 @@ pub async fn create_item(
                 },
             );
         }
+    }
+    // A HEADERLESS CALLER IS NOT THE OWNER BY ABSENCE (amux-security, red-team
+    // run 7). The cross-board guard below keys on the caller's header, so a
+    // worker that dropped it could file a card on any lane's board, and the
+    // card is delivered into that lane's turn. A card for a lane with no
+    // worker identity needs the owner's proof (is_owner_request); an
+    // unassigned one reaches no lane and stays open to in-process writers.
+    // A verified local member is not headerless in this sense: the server
+    // installed its identity, and its scope is enforced on its own (a member
+    // scoped to one worker files on that worker's board and is refused
+    // elsewhere, e2e/local-multiplayer.spec.ts).
+    if request_to.is_none() && hdr_session.is_empty() && !session.is_empty()
+        && super::org::local_member_scope(&headers).is_none()
+        && !super::standing_approvals::is_owner_request(&headers)
+    {
+        tracing::warn!(requested_owner = %session, measured = true, n_considered = 1,
+            verdict = "board_create_unproven_refused",
+            "a card for a lane's board with no worker identity and no owner proof was refused");
+        return err(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "a card on a lane's board needs a worker identity or the owner's proof",
+                "code": "cross_board_create_unproven",
+                "requested_owner": session,
+                "how_to_fix": "a worker sends X-Amux-Session (amux board add does); the owner uses the dashboard or the amux CLI outside a worker, which send the owner bearer",
+            }),
+        );
     }
     if request_to.is_none() && !hdr_session.is_empty() && session != hdr_session
         && !super::session_verbs::speaks_for_owner(&hdr_session)
@@ -10936,6 +11017,19 @@ pub async fn patch_item(
             json!({ "error": "body must be a JSON object" }),
         );
     };
+    // Governance PR 12: an undecided approval card moves only through its
+    // item's own approve or reject path (done approves, discarded rejects),
+    // so the card and the item it surfaces cannot disagree.
+    if let Some(to) = map.get("status").and_then(Value::as_str) {
+        let reason = map
+            .get("reason")
+            .or_else(|| map.get("desc_append"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(resp) = super::approval_cards::board_move(&state, &headers, &id, to, reason).await {
+            return resp;
+        }
+    }
     if let Some(scope) = super::org::local_member_scope(&headers).filter(|scope| !scope.is_global())
     {
         if map.contains_key("session") {
@@ -16270,6 +16364,32 @@ mod af701_archive_guard_tests {
         assert_eq!(current(&store, &id).status, "doing");
         assert_eq!(route(&state, &id, me(), done("`pytest server/tests/unit/test_budget.py` -> 3 passed at 3054da0b8a1")).await, StatusCode::OK);
         assert_eq!(current(&store, &id).status, "done");
+    }
+
+    /// amux-security, red-team run 7: a worker that drops its header could
+    /// file a card on any lane's board. With an owner credential configured, a
+    /// headerless card for a lane needs the owner's proof; an unassigned card,
+    /// and every card on a host with no credential, are created as before.
+    #[tokio::test]
+    async fn a_headerless_card_on_a_lanes_board_needs_the_owners_proof() {
+        use crate::api::human_proof::{test_override, Mode, OWNER_PROOF_HEADER};
+        let (state, _store) = fixture();
+        let card = |t: &str, s: &str| Json(json!({"title": t, "session": s}));
+        let g = test_override::set(Mode::Report, true);
+        let r = create_item(State(state.clone()), HeaderMap::new(), card("headerless card for lane x", "lane-x")).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let b = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        assert!(String::from_utf8_lossy(&b).contains("cross_board_create_unproven"));
+        let mut owner = HeaderMap::new();
+        owner.insert(OWNER_PROOF_HEADER, axum::http::HeaderValue::from_static("1"));
+        let r = create_item(State(state.clone()), owner, card("owner card for lane x", "lane-x")).await;
+        assert!(r.status().is_success(), "the owner's proven request files it: {}", r.status());
+        let r = create_item(State(state.clone()), HeaderMap::new(), card("unassigned headerless card", "")).await;
+        assert!(r.status().is_success(), "an unassigned card reaches no lane: {}", r.status());
+        drop(g);
+        let _g = test_override::set(Mode::Report, false);
+        let r = create_item(State(state.clone()), HeaderMap::new(), card("card on a host with no credential", "lane-x")).await;
+        assert!(r.status().is_success(), "no owner credential, so nothing to prove: {}", r.status());
     }
 
     /// Contract A3 (AH-389): once an epic's done line is frozen, a worker

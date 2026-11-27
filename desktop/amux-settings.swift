@@ -482,15 +482,30 @@ extension AppDelegate {
         return parts.joined(separator: " · ") + "\n" + workspaceWindows(l).joined(separator: "\n")
     }
 
+    /// amux > Settings… (⌘,), the Dock menu and the menu bar item: Settings in
+    /// its own window, apart from every amux window (owner, 2026-11-27: "it
+    /// should open up a modal that's outside of the amux app"). The window
+    /// shows the server's Settings alone (app.js `?settings_window=1`): This
+    /// device and This Mac first, then the server's tabs. With no server, or a
+    /// server whose dashboard has no such mode, it shows the app's own page.
     @objc func showSettings(_ sender: Any?) {
+        settings?.builtIn = false
+        showNativeSettings(sender)
+    }
+    /// At most every 10 minutes, opening Settings also checks for an update.
+    func checkUpdatesIfStale() {
+        let u = Updater.shared
+        if u.state == .idle || (u.state != .checking && u.state != .installing && -(u.checkedAt?.timeIntervalSinceNow ?? -1e9) > 600) { u.check() }
+    }
+
+    @objc func showNativeSettings(_ sender: Any?) {
         if settings == nil { settings = SettingsWindowController(app: self) }
+        dlog("verdict=settings_window_open server=\(serverURL == nil ? 0 : 1)")
         settings?.reload()
         settings?.showWindow(nil)
         settings?.window?.makeKeyAndOrderFront(nil)
         activateApp()
-        // Opening Settings checks too, at most every 10 minutes.
-        let u = Updater.shared
-        if u.state == .idle || (u.state != .checking && u.state != .installing && -(u.checkedAt?.timeIntervalSinceNow ?? -1e9) > 600) { u.check() }
+        checkUpdatesIfStale()
         // Workspaces another Mac saved show up here: the list redraws when the
         // server's copy differs from this Mac's.
         let before = (try? JSONEncoder().encode(loadConfig().layouts ?? [])) ?? Data()
@@ -506,90 +521,348 @@ extension AppDelegate {
 }
 
 // ── Settings window ──
-final class SettingsWindowController: NSWindowController, WKScriptMessageHandler, WKNavigationDelegate {
+// One window, apart from the dashboard windows. It loads the server's
+// dashboard in its Settings-only mode, so the This Mac tab and every server tab
+// are the same code the gear opens; the app's own page (settingsHTML) is the
+// fallback when there is no server, it cannot be reached, or it predates the mode.
+final class SettingsWindowController: NSWindowController, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
     weak var app: AppDelegate?
     let webView: WKWebView
+    /// The server whose Settings this window shows; nil while it shows the app's own page.
+    private(set) var server: URL?
+    /// The app's own page even with a server (a test of its buttons).
+    var builtIn = false
 
     init(app: AppDelegate) {
         self.app = app
         let cfg = WKWebViewConfiguration()
+        // The dashboard windows' store: the same sign-in.
+        cfg.websiteDataStore = .default()
+        cfg.applicationNameForUserAgent = "Amux-Desktop/2.0"
         webView = WKWebView(frame: .zero, configuration: cfg)
         QuietTestCopy.keepRendering(webView)
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 680),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 720),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
                          backing: .buffered, defer: false)
-        w.title = "amux Settings"
+        w.title = "Settings"
         w.isReleasedWhenClosed = false
         w.minSize = NSSize(width: 480, height: 420)
         w.contentView = webView
         w.center()
         w.setFrameAutosaveName("amuxSettings")
         super.init(window: w)
-        Updater.shared.changed = { [weak self] in self?.reload() }
+
         cfg.userContentController.add(WeakScriptHandler(self), name: "amuxSettings")
+        cfg.userContentController.add(WeakScriptHandler(self), name: "amuxNotifyPrefs")
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         webView.setValue(false, forKey: "drawsBackground")
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
+    /// The page this window loads for `base`: its Settings and nothing else.
+    static func pageURL(_ base: URL) -> URL? {
+        guard var c = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
+        c.path = "/"
+        c.query = "settings_window=1"
+        c.fragment = nil
+        return c.url
+    }
+
+    func isSettingsPage(_ url: URL?) -> Bool {
+        guard let url = url, let app = app, app.isServerURL(url) else { return false }
+        return URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name == "settings_window" } ?? false
+    }
+
     /// Run once the page has loaded (a test click must not land on the page a reload is replacing).
     var afterLoad: [() -> Void] = []
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if server != nil {
+            // An older server's dashboard has no Settings-only mode: it would
+            // show a whole second amux here.
+            webView.evaluateJavaScript("typeof _settingsWindowMode === 'function' && _settingsWindowMode()") { [weak self] r, _ in
+                guard let self = self else { return }
+                if (r as? Bool) == true {
+                    dlog("verdict=settings_window_shown source=server")
+                    self.runAfterLoad()
+                } else {
+                    self.fallBack("server_has_no_settings_window")
+                }
+            }
+            return
+        }
+        runAfterLoad()
+    }
+
+    private func runAfterLoad() {
         let run = afterLoad
         afterLoad = []
         run.forEach { $0() }
     }
 
-    func reload() {
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        loadFailed(error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        loadFailed(error)
+    }
+
+    /// A load another load replaced (-999) or our own cancel of a link out
+    /// (WebKit 102) is not a failure: the page that replaced it reports itself.
+    private func loadFailed(_ error: Error) {
+        let e = error as NSError
+        if e.code == NSURLErrorCancelled || (e.domain == "WebKitErrorDomain" && e.code == 102) { return }
+        if server != nil { fallBack("load_failed error=\(e.code)") }
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        dlog("verdict=settings_window_process_gone")
+        server = nil
+        reload()
+    }
+
+    /// The app's own page, saying why.
+    private func fallBack(_ why: String) {
         guard let app = app else { return }
+        dlog("verdict=settings_window_shown source=app reason=\(why)")
+        server = nil
         webView.loadHTMLString(settingsHTML(app), baseURL: nil)
     }
 
+    /// Show the current state: the server's Settings when there is a server
+    /// (loaded once; afterwards only told the app's new state), else the app's page.
+    func reload() {
+        guard let app = app else { return }
+        if !builtIn, let base = app.serverURL, let url = SettingsWindowController.pageURL(base) {
+            if server == base, isSettingsPage(webView.url) {
+                app.tellMacSettings(webView)
+                app.tellNotifications(webView)
+                runAfterLoad()
+                return
+            }
+            server = base
+            webView.load(URLRequest(url: url))
+            return
+        }
+        server = nil
+        webView.loadHTMLString(settingsHTML(app), baseURL: nil)
+    }
+
+    func webView(_ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge,
+                 completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        let host = challenge.protectionSpace.host
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           isLocalHost(host) || host == app?.serverURL?.host,
+           let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+
+    /// Settings stays Settings: a link or a page change to anywhere else opens
+    /// in an amux window (the server) or the default browser (elsewhere).
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url, navigationAction.targetFrame?.isMainFrame ?? false,
+              server != nil, !isSettingsPage(url), url.scheme != "about", url.scheme != "blob", url.scheme != "data" else {
+            decisionHandler(.allow)
+            return
+        }
+        decisionHandler(.cancel)
+        open(url)
+    }
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if let url = navigationAction.request.url { open(url) }
+        return nil
+    }
+
+    private func open(_ url: URL) {
+        guard let app = app else { return }
+        if url.scheme == "amux" { app.handleAmuxURL(url); return }
+        if app.isServerURL(url) {
+            dlog("verdict=settings_window_link to=server")
+            let c = app.keyController ?? app.controllers.first(where: { app.isServerURL($0.webView.url ?? url) })
+            if let c = c { c.webView.load(URLRequest(url: url)); c.window?.makeKeyAndOrderFront(nil) } else { _ = app.openWindow(url: url, frame: nil) }
+            activateApp()
+        } else {
+            dlog("verdict=settings_window_link to=browser")
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     func userContentController(_ c: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let app = app, let m = message.body as? [String: Any], let action = m["action"] as? String else { return }
+        guard let app = app, let m = message.body as? [String: Any] else { return }
+        // A server page speaks only from that server; the app's own page from about:blank.
+        if server != nil, !isSettingsPage(webView.url) { return }
+        if message.name == "amuxNotifyPrefs" {
+            if (m["op"] as? String) == "set", let on = m["on"] as? Bool { app.setNotifications(on, source: "settings") } else { app.tellNotifications(webView) }
+            return
+        }
+        switch m["action"] as? String {
+        case "state": app.tellMacSettings(webView)
+        case "close": window?.performClose(nil)
+        default: app.settingsAction(m)
+        }
+    }
+}
+
+/// The app's limits a person can change in Settings > This Mac > Memory and
+/// storage. Each was an environment variable only (owner, 2026-11-26: "all
+/// should be configurable in the ui"); the variable still wins when set.
+struct AppLimit { let key: String, label: String, help: String, unit: String, fallback: Double }
+
+extension AppDelegate {
+    var appLimits: [AppLimit] {
+        let ramMB = Double(ProcessInfo.processInfo.physicalMemory / 1_048_576)
+        return [
+            AppLimit(key: "AMUX_DESKTOP_WEB_BUDGET_MB", label: "Memory for all pages", help: "Past this, pages nobody has looked at for a while unload (they load again when shown).", unit: "MB", fallback: max(4096, ramMB / 8)),
+            AppLimit(key: "AMUX_DESKTOP_DISCARD_HIDDEN_S", label: "Unload a hidden page after", help: "Only while all pages together are over the memory above. 0 never unloads.", unit: "seconds", fallback: 1800),
+            AppLimit(key: "AMUX_DESKTOP_TAB_MB_LIMIT", label: "Refresh a hidden page over", help: "A page out of sight that grows past this reloads on the same view.", unit: "MB", fallback: 1536),
+            AppLimit(key: "AMUX_DESKTOP_TAB_HIDDEN_S", label: "after it has been hidden for", help: "", unit: "seconds", fallback: 120),
+            AppLimit(key: "AMUX_DESKTOP_SHOWN_TAB_MB_LIMIT", label: "Refresh a page on screen over", help: "Never while you are typing in it. 0 turns it off.", unit: "MB", fallback: 6144),
+            AppLimit(key: "AMUX_DESKTOP_STORAGE_AUTO_MB", label: "Compact saved page data past", help: "At launch, and hourly while amux is in the background.", unit: "MB", fallback: 1024),
+        ]
+    }
+}
+
+// ── One handler for every Settings surface ──
+// The dashboard's This Mac tab (app.js _macSettings*, through amuxSettings)
+// and the fallback window send the same {action, name, value}; after each,
+// every surface is told the new state, so two pages never disagree.
+extension AppDelegate {
+    func settingsAction(_ m: [String: Any]) {
+        guard let action = m["action"] as? String else { return }
         let name = m["name"] as? String ?? ""
         var cfg = loadConfig()
+        dlog("verdict=settings_action action=\(action) name=\(name)")
+        let after: () -> Void = { [weak self] in self?.settingsChanged() }
         switch action {
-        case "open": app.openLayout(named: name)
-        case "update": app.saveLayout(named: name) { [weak self] in self?.reload() }; return
-        case "save": app.saveLayout(named: name) { [weak self] in self?.reload() }; return
-        case "delete": app.deleteLayout(named: name)
+        case "state": break
+        case "open": openLayout(named: name)
+        case "update", "save": saveLayout(named: name) { after() }; return
+        case "delete": deleteLayout(named: name)
         case "rename":
-            if let new = app.askText(title: "Rename Layout", message: "", value: name, ok: "Rename") {
-                app.renameLayout(name, to: new)
+            if let new = askText(title: "Rename Workspace", message: "", value: name, ok: "Rename") {
+                renameLayout(name, to: new)
             }
         case "launch":
             cfg.launch = m["value"] as? String
             saveConfig(cfg)
-            app.config = cfg
+            config = cfg
         case "splitDirection":
             cfg.splitDirection = m["value"] as? String
             saveConfig(cfg)
-            app.config = cfg
+            config = cfg
             dlog("verdict=split_direction_set value=\(cfg.splitDirection ?? "right")")
         case "toggle":
             let on = m["value"] as? Bool ?? true
             switch name {
             case "menuBar": cfg.menuBar = on
-            case "notifications": cfg.notifications = on
+            case "notifications": setNotifications(on, source: "settings"); cfg = config
             case "dockBadge": cfg.dockBadge = on
             case "snapToGrid": cfg.snapToGrid = on
             case "openAtLogin": cfg.openAtLogin = on
+            case "computerUse": cfg.computerUse = on
+            case "quickAsk": cfg.quickAsk = on; if !desktopTestQuiet { setQuickAskHotKey(on) }
+            case "zoomAllWindows":
+                if on != zoomAllWindows { toggleZoomAllWindows(nil) }
+                cfg = loadConfig()
             default: break
             }
             saveConfig(cfg)
-            app.config = cfg
-            app.applyBadge()
-            if name == "openAtLogin" { app.applyOpenAtLogin() }
-            if name == "menuBar" { app.startMenuBarItem() }
+            config = cfg
+            applyBadge()
+            if name == "openAtLogin" { applyOpenAtLogin() }
+            if name == "menuBar" { startMenuBarItem() }
+            if name == "computerUse" { MacComputer.shared.apply(on) }
         case "server":
-            (app.keyController ?? app.openWindow(url: nil, frame: nil)).showConnectPage()
+            (keyController ?? openWindow(url: nil, frame: nil)).showConnectPage()
+        case "permission":
+            MacPermissions.turnOn(name)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { after() }
+            return
+        case "compactStorage": compactWebStorage(why: "settings"); return
+        case "limit":
+            // A number sets it; anything else (an emptied field) goes back to the default.
+            guard appLimits.contains(where: { $0.key == name }) else { dlog("verdict=settings_limit_unknown name=\(name)"); return }
+            var l = cfg.limits ?? [:]
+            let v = (m["value"] as? NSNumber)?.doubleValue ?? (m["value"] as? String).flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            if let v = v, v >= 0 { l[name] = v } else { l[name] = nil }
+            cfg.limits = l.isEmpty ? nil : l
+            saveConfig(cfg)
+            config = cfg
+            dlog("verdict=settings_limit_set name=\(name) value=\(v.map { String($0) } ?? "default")")
         case "update-check": Updater.shared.check(); return
         case "update-install": Updater.shared.install(); return
-        default: break
+        default:
+            dlog("verdict=settings_action_unknown action=\(action)")
+            return
         }
-        reload()
+        after()
+    }
+
+    /// Every Settings surface redraws from the new state.
+    func settingsChanged() {
+        settings?.reload()
+        for p in allPages { tellMacSettings(p.webView) }
+    }
+
+    func tellMacSettings(_ w: WKWebView) {
+        guard w.url.map({ isServerURL($0) }) ?? false,
+              let d = try? JSONSerialization.data(withJSONObject: macSettingsState()),
+              let json = String(data: d, encoding: .utf8) else { return }
+        w.evaluateJavaScript("typeof _macSettingsState === 'function' && _macSettingsState(\(json))", completionHandler: nil)
+    }
+
+    /// What the This Mac tab draws. Keys are the toggles' names in settingsAction.
+    func macSettingsState() -> [String: Any] {
+        let c = loadConfig()
+        let df = DateFormatter()
+        df.dateStyle = .medium
+        df.timeStyle = .short
+        let u = Updater.shared
+        let built = u.commit.isEmpty ? "a build that does not record its commit" : "built from \(String(u.commit.prefix(9)))"
+            + (u.builtAt.isEmpty ? "" : " on \(u.builtAt)")
+        return [
+            "workspaces": (c.layouts ?? []).map { l -> [String: Any] in
+                ["name": l.name,
+                 "summary": workspaceSummary(l).components(separatedBy: "\n")[0],
+                 "shows": workspaceWindows(l),
+                 "saved": df.string(from: Date(timeIntervalSince1970: l.savedAt)),
+                 "open": c.activeWorkspace == l.name]
+            },
+            "launch": c.launch ?? "last",
+            "split": c.splitDirection ?? "right",
+            "toggles": [
+                "computerUse": c.computerUse ?? false,
+                "quickAsk": c.quickAsk ?? true,
+                "openAtLogin": c.openAtLogin ?? true,
+                "menuBar": c.menuBar ?? true,
+                "notifications": c.notifications ?? true,
+                "dockBadge": c.dockBadge ?? true,
+                "snapToGrid": c.snapToGrid ?? true,
+                "zoomAllWindows": c.zoomAllWindows ?? true,
+            ],
+            "computerUseNow": MacComputer.shared.stateLine,
+            "openAtLoginNow": openAtLoginStatus,
+            "spacesCanMove": Spaces.canMove,
+            "permissions": MacPermissions.all(),
+            "update": ["built": built, "state": "\(u.state)", "detail": u.state == .idle ? "" : u.detail,
+                       "canInstall": u.state == .available || (u.state == .failed && !u.latest.isEmpty),
+                       "busy": u.state == .checking || u.state == .installing],
+            "server": serverURL?.absoluteString ?? "",
+            "storage": webStorageState(),
+            "limits": appLimits.map { d -> [String: Any] in
+                let env = ProcessInfo.processInfo.environment[d.key].flatMap(Double.init)
+                return ["key": d.key, "label": d.label, "help": d.help, "unit": d.unit, "default": d.fallback,
+                        "value": appLimit(d.key, d.fallback), "set": c.limits?[d.key] != nil, "fromEnv": env != nil]
+            },
+        ]
     }
 }
 
@@ -688,6 +961,23 @@ func settingsHTML(_ app: AppDelegate) -> String {
       <div class="save"><input type="text" id="lname" placeholder="Name this workspace, e.g. Morning triage"
         onkeydown="if(event.key==='Enter')saveNew()"><button class="primary" onclick="saveNew()">Save current windows</button></div>
     </div>
+    <h2>Computer use</h2>
+    <div class="card">
+      \(toggle("computerUse", c.computerUse ?? false, "Let workers use this Mac's apps", "In the background, with their own cursor: your pointer and keyboard stay yours. Each worker may use only the apps you list for it (AMUX_MAC_APPS in the dashboard's Scope tab); terminals, password managers and System Settings stay off limits. ⌘⇧Esc stops it from any app. Now: \(htmlEscape(MacComputer.shared.stateLine))."))
+    </div>
+    <h2>Permissions</h2>
+    <div class="card" id="permissions">
+      \(MacPermissions.all().map { p in
+        let on = p["state"] == "on"
+        return "<div class=\"row\" data-permission=\"\(p["id"] ?? "")\"><div class=\"info\"><div class=\"name\">\(htmlEscape(p["name"] ?? ""))</div><small>\(htmlEscape(p["for"] ?? ""))</small></div>"
+            + "<span class=\"perm-state\" data-state=\"\(p["state"] ?? "")\">\(on ? "On" : p["state"] == "off" ? "Off" : "Not set up")</span>"
+            + (on ? "" : " <button onclick=\"send('permission','\(p["id"] ?? "")',true)\">Turn On</button>") + "</div>"
+      }.joined(separator: "\n      "))
+    </div>
+    <h2>Quick Ask</h2>
+    <div class="card">
+      \(toggle("quickAsk", c.quickAsk ?? true, "⌥Space asks a worker from any app", "A small panel to send a worker a message, with the window you were in or the text you selected attached if you want."))
+    </div>
     <h2>When amux opens</h2>
     <div class="card"><div class="save"><select onchange="send('launch','',this.value)">\(launchOptions)</select></div>
       \(toggle("openAtLogin", c.openAtLogin ?? true, "Open amux at login", "So a restart comes back to your windows on their Desktops. Now: \(htmlEscape(app.openAtLoginStatus))."))
@@ -695,8 +985,8 @@ func settingsHTML(_ app: AppDelegate) -> String {
     </div>
     <h2>General</h2>
     <div class="card">
-      \(toggle("menuBar", c.menuBar ?? true, "Show in menu bar", "CPU and memory readout, with your pinned notes one click away."))
-      \(toggle("notifications", c.notifications ?? true, "Notify when amux needs you", "A notification for each new item waiting on you."))
+      \(toggle("menuBar", c.menuBar ?? true, "Show in menu bar", "The amux icon, with who needs you, new windows, recording, computer use, pins and workspaces."))
+      \(toggle("notifications", c.notifications ?? true, "Notifications", "Each new item waiting on you, and Messages addressed to you. The dashboard's Settings > Alerts has the same switch."))
       \(toggle("dockBadge", c.dockBadge ?? true, "Show count on Dock icon", "The number of items waiting on you."))
       <div class="row"><div class="info"><div class="name">Split opens the new pane</div>
         <small>The Split button, "Open in split pane" and "Split this tab".</small></div>

@@ -64,7 +64,8 @@ pub(crate) fn authorize_dispatch(
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e))))?;
     let ctx = ActionContext {
         actor: worker.to_string(),
-        role: crate::db::harness_store::planning_role_for_actor(conn, worker.as_str())?,
+        // Planning roles were retired with `_amux_planning_nodes` (0180).
+        role: None,
         action: ActionClass::ExecuteTask,
         resource: task.to_string(),
         trust: TrustLevel::Trusted,
@@ -120,6 +121,9 @@ pub(crate) fn authorize_dispatch(
 }
 
 fn actor(headers: &HeaderMap) -> String {
+    if let Some(app) = super::app_identity::actor(headers) {
+        return app.to_string();
+    }
     headers
         .get("x-amux-session")
         .and_then(|v| v.to_str().ok())
@@ -240,13 +244,15 @@ async fn record_receipt(
     let effect = effect_token(decision.effect).to_string();
     let rule = decision.rule_id.clone();
     let rationale = decision.rationale.clone();
+    let trace = super::trace::current();
+    let (trace_id, span_id) = (trace.as_ref().map(|t| t.trace_id.clone()), trace.map(|t| t.span_id));
     state
         .store
         .write_async(move |conn| {
             conn.execute(
                 "INSERT INTO _amux_policy_receipts
-                 (id,actor,role,action,resource,trust,reversible,effect,rule_id,rationale,cost_microusd,created_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                 (id,actor,role,action,resource,trust,reversible,effect,rule_id,rationale,cost_microusd,created_at,trace_id,span_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 rusqlite::params![
                     row_id,
                     actor,
@@ -260,6 +266,8 @@ async fn record_receipt(
                     rationale,
                     cost,
                     Utc::now().to_rfc3339(),
+                    trace_id,
+                    span_id,
                 ],
             )?;
             Ok(crate::db::WriteOutcome {
@@ -338,8 +346,20 @@ async fn request_trust(state: &AppState, headers: &HeaderMap) -> Result<TrustLev
         return Ok(TrustLevel::Untrusted);
     }
     let actor_name = actor(headers);
+    // A published app answers to anyone on the web: never Trusted, whatever
+    // a person allowed it to call.
+    if actor_name.starts_with("app:") {
+        return Ok(TrustLevel::Untrusted);
+    }
     if actor_name == "api-anonymous" {
-        return Ok(TrustLevel::Trusted);
+        // No worker header used to mean Trusted on its own. Now only a
+        // credential the server verified is (human_proof.rs); in enforce mode
+        // the unproven rest is Untrusted, which asks before an external or
+        // irreversible action and never expands a capability.
+        return Ok(match super::human_proof::check(headers, "policy_trust") {
+            super::human_proof::Verdict::Refused => TrustLevel::Untrusted,
+            _ => TrustLevel::Trusted,
+        });
     }
     state
         .store
@@ -434,30 +454,10 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
         }
     };
     let actor_name = actor(req.headers());
-    // THE SECOND BLOCKING ACQUIRE ON THIS PATH, and the one that survives every
-    // short-circuit above it. 150acf5d converted `request_trust` and left this
-    // four lines below it, so writes still took a blocking read acquire on an
-    // HTTP worker and the asymmetry that commit set out to remove was only half
-    // removed.
-    //
-    // It is also why "anonymous callers short-circuit, so policy is not the
-    // stall" was a wrong elimination. That short-circuit is inside
-    // `request_trust` (actor == "api-anonymous" returns Trusted without a
-    // read). This lookup is unconditional: it runs for api-anonymous too, with
-    // that literal as the actor. An unauthenticated curl therefore skips the
-    // read I had checked and still pays for this one.
-    let role = {
-        let actor_name = actor_name.clone();
-        state
-            .store
-            .read_async(move |conn| {
-                Ok(crate::db::harness_store::planning_role_for_actor(conn, &actor_name).ok())
-            })
-            .await
-            .ok()
-            .flatten()
-            .flatten()
-    };
+    // Planning roles came from `_amux_planning_nodes`, which never held a row
+    // and was dropped in migration 0180 (audit step 2). That lookup was also a
+    // blocking read on every write request; it is gone with the table.
+    let role = None;
     let mut ctx = ActionContext {
         actor: actor_name,
         role,

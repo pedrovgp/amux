@@ -3,13 +3,20 @@
 #
 #   cloud/start/deploy.sh live    # amux-cloud at https://cloud.amux.io, live Stripe
 #   cloud/start/deploy.sh test    # amux-cloud-test at https://amux-cloud-test.<sub>.workers.dev, Stripe test mode
+#   cloud/start/deploy.sh live-prepare   # only set up amux Cloud's own Stripe account; deploys nothing
+#
+# Which live Stripe account: AMUX_CLOUD_STRIPE_ACCOUNT in server.env. Unset or "shared" is the
+# account amux Cloud shares with Mixpeek (STRIPE_LIVE_SECRET_KEY); "amux" is its own account
+# (AMUX_CLOUD_STRIPE_LIVE_SECRET_KEY). Setting it to amux and deploying is the cutover step of
+# cloud/start/STRIPE-ACCOUNT-MOVE.md, so set it only there.
 #
 # Reads from ~/.amux/server.env: AMUX_CLOUD_WORKER_TOKEN (Workers + DNS on amux.io), HCLOUD_TOKEN,
 # STRIPE_LIVE_SECRET_KEY / STRIPE_TEST_SECRET_KEY. Keeps generated secrets in ~/.amux/cloud (600):
 # the Stripe webhook signing secret per mode and the test mode's key. Gmail as hello@amux.io comes
 # from ~/.amux/gmail-tokens. No secret is printed.
 set -euo pipefail
-MODE="${1:?usage: deploy.sh live|test}"
+MODE="${1:?usage: deploy.sh live|test|live-prepare}"
+PREPARE=; [[ "$MODE" == live-prepare ]] && { PREPARE=1; MODE=live; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 envv() { grep -E "^(export )?$1=" "$HOME/.amux/server.env" | head -1 | cut -d= -f2- | tr -d '"' || true; }
 log() { echo "[start-deploy] $*"; }
@@ -20,22 +27,32 @@ read -r ZID ACCT < <(cfapi "https://api.cloudflare.com/client/v4/zones?name=amux
 SUB=$(cfapi "https://api.cloudflare.com/client/v4/accounts/$ACCT/workers/subdomain" | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["subdomain"])')
 S="$HOME/.amux/cloud"; mkdir -p "$S"; chmod 700 "$S"
 if [[ "$MODE" == live ]]; then
-  NAME=amux-cloud; KEY="$(envv STRIPE_LIVE_SECRET_KEY)"; URL="https://cloud.amux.io"
-  [[ "$KEY" == sk_live_* || "$KEY" == rk_live_* ]] || { log "FATAL: STRIPE_LIVE_SECRET_KEY missing"; exit 1; }
+  NAME=amux-cloud; URL="https://cloud.amux.io"
+  ACCOUNT="$(envv AMUX_CLOUD_STRIPE_ACCOUNT)"; [[ -n "$PREPARE" ]] && ACCOUNT=amux
+  case "${ACCOUNT:-shared}" in
+    shared) KEYVAR=STRIPE_LIVE_SECRET_KEY; TAG= ;;
+    amux)   KEYVAR=AMUX_CLOUD_STRIPE_LIVE_SECRET_KEY; TAG=-amux ;;
+    *) log "FATAL: AMUX_CLOUD_STRIPE_ACCOUNT=$ACCOUNT (want shared or amux)"; exit 1 ;;
+  esac
+  KEY="$(envv "$KEYVAR")"
+  [[ "$KEY" == sk_live_* || "$KEY" == rk_live_* ]] || { log "FATAL: $KEYVAR missing"; exit 1; }
+  log "stripe account: ${ACCOUNT:-shared} ($KEYVAR)"
 else
   NAME=amux-cloud-test; KEY="$(envv STRIPE_TEST_SECRET_KEY)"; URL="https://amux-cloud-test.$SUB.workers.dev"
   [[ "$KEY" == sk_test_* || "$KEY" == rk_test_* ]] || { log "FATAL: STRIPE_TEST_SECRET_KEY missing"; exit 1; }
   [[ -s "$S/start-test-key" ]] || { python3 -c 'import secrets;print(secrets.token_urlsafe(24))' > "$S/start-test-key"; chmod 600 "$S/start-test-key"; }
 fi
 # Stripe: products, prices, the FIRSTMONTH code, and this function's webhook (secret shown once).
-WF="$S/stripe-$MODE-webhook-secret-worker"; PF="$S/stripe-$MODE-portal-config"
+WF="$S/stripe-$MODE${TAG:-}-webhook-secret-worker"; PF="$S/stripe-$MODE${TAG:-}-portal-config"
 NEW=$(STRIPE_TEST_SECRET_KEY="$KEY" STRIPE_LIVE_SECRET_KEY="$KEY" python3 "$HERE/../control/stripe_setup.py" \
       --control "$URL" --portal-out "$PF" $([[ "$MODE" == live ]] && echo --live) )
 if [[ -n "$NEW" ]]; then (umask 077; printf '%s\n' "$NEW" > "$WF"); fi
-if [[ ! -s "$WF" && "$MODE" == live && -s "$S/stripe-live-webhook-secret-cloud" ]]; then
+# The old control plane's secret belongs to the shared account only.
+if [[ ! -s "$WF" && "$MODE" == live && -z "${TAG:-}" && -s "$S/stripe-live-webhook-secret-cloud" ]]; then
   cp "$S/stripe-live-webhook-secret-cloud" "$WF"; chmod 600 "$WF"   # same URL the control plane registered
 fi
 [[ -s "$WF" ]] || { log "FATAL: the $MODE webhook exists but its secret is not in $WF"; exit 1; }
+if [[ -n "$PREPARE" ]]; then log "prepared amux Cloud's own Stripe account (webhook secret in $WF); the live function is unchanged"; exit 0; fi
 GOLDEN=$(curl -fsS -H "Authorization: Bearer $HC" 'https://api.hetzner.cloud/v1/images?type=snapshot&label_selector=amux-golden&sort=created:desc' | python3 -c 'import json,sys;print(json.load(sys.stdin)["images"][0]["id"])')
 META=$(mktemp); trap 'rm -f "$META"' EXIT; chmod 600 "$META"
 APPLE_BUNDLE_ID="$(envv APPLE_BUNDLE_ID)" POSTHOG_KEY="$(envv POSTHOG_PERSONAL_API_KEY)" python3 - "$META" "$MODE" "$URL" "$KEY" "$(cat "$WF")" "$HC" "$CF" "$ZID" "$GOLDEN" "$HERE/../control/plans.json" "$S" "$(cat "$PF")" <<'EOF'
@@ -57,9 +74,13 @@ b = [{"type": "secret_text", "name": "STRIPE_SECRET_KEY", "text": key},
 sa = os.path.join(s, "gmail-sa.json")
 if os.path.exists(sa):
     b.append({"type": "secret_text", "name": "GMAIL_SA", "text": base64.b64encode(open(sa, "rb").read()).decode()})
-if os.path.exists(gt):
+# A grant sealed at rest (governance PR 18) is no use to the Worker: skip it and say so.
+gt_sealed = os.path.exists(gt) and b'"amux_at_rest"' in open(gt, "rb").read(64)
+if gt_sealed:
+    print("WARN the hello@amux.io grant is encrypted at rest; not sent. The service account (gmail-sa.json) is the mail path", file=sys.stderr)
+elif os.path.exists(gt):
     b.append({"type": "secret_text", "name": "GMAIL_OAUTH", "text": base64.b64encode(open(gt, "rb").read()).decode()})
-if not (os.path.exists(sa) or os.path.exists(gt)):
+if not (os.path.exists(sa) or (os.path.exists(gt) and not gt_sealed)):
     print("WARN no mail credential: billing, deletion and operator emails will fail", file=sys.stderr)
 # Sign in with Apple from the iOS app: the Worker checks Apple's token against the app's bundle id
 # and signs each server's two-minute sign-in link with a key derived from DOOR_ENTRY_SECRET.

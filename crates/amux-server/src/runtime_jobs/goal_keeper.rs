@@ -82,12 +82,8 @@ fn env_f64(k: &str, d: f64) -> f64 {
 
 fn enabled(name: &str) -> bool {
     let off = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no");
-    if let Ok(v) = std::env::var("AMUX_GOAL_CONTINUE") {
-        if !v.trim().is_empty() {
-            return !off(&v);
-        }
-    }
-    crate::api::session_verbs::scoped_setting_in(&crate::api::session_verbs::home(), name, "AMUX_GOAL_CONTINUE")
+    // Process env, then worker > group > global (environment::REGISTRY).
+    crate::environment::resolve(crate::environment::Scope::Lane(name), "AMUX_GOAL_CONTINUE")
         .map(|v| !off(&v))
         .unwrap_or(true)
 }
@@ -426,12 +422,19 @@ pub(crate) fn goal_view(goal: Option<Goal>, footer: impl FnOnce() -> Option<bool
             "state": res.state, "state_why": res.why});
     };
     let by_error = g.cleared.as_ref().is_some_and(|c| c.by_error);
+    let cleared = res.state == "cleared" || by_error;
     serde_json::json!({
         "measured": true,
-        "active": res.active,
+        // `active` is "Claude Code's /goal is set". After a clear by error it
+        // is not, though the keeper still pursues it (`keeper_pursuing`): a
+        // re-arm loop that read `active` true beside cleared_by_error never
+        // re-sent /goal (mxp-gs12, mxp-gs12-soak, tubescience-parity,
+        // 2026-11-13, after an account move).
+        "active": res.active && !cleared,
+        "keeper_pursuing": res.active,
         "met": res.state == "met",
         "evaluator_met": g.met,
-        "cleared": res.state == "cleared" || by_error,
+        "cleared": cleared,
         "cleared_by_error": by_error,
         "state": res.state,
         "state_why": res.why,
@@ -826,7 +829,7 @@ async fn report_goal_prompt(app: &crate::api::AppState, name: &str, line: &str, 
 
 /// Where a worker's goal check runs: its worktree when it has one. The base
 /// directory holds a different checkout, so a check could read "not met" forever.
-fn goal_check_dir(s: &Value) -> &str {
+pub(crate) fn goal_check_dir(s: &Value) -> &str {
     s["worktree_path"].as_str().filter(|p| s["worktree_active"] == true && !p.is_empty())
         .or(s["dir"].as_str())
         .unwrap_or("")
@@ -849,14 +852,16 @@ async fn tick(app: crate::api::AppState) {
     if !stamped.is_empty() {
         crate::api::goal_loop::restore_tick(&app, &stamped).await;
     }
+    // The worker's own checker is a shell schedule (goal_check.rs): keep each
+    // one in step with AMUX_GOAL_CHECK and read its newest run. It runs
+    // whatever the worker is doing, costs no turn, and drives the goal tile
+    // and the stall alert.
+    super::goal_check::sync(&app, &sessions, now).await;
     for s in &sessions {
         let name = s["name"].as_str().unwrap_or("").to_string();
         if name.is_empty() || s["running"] != true || s["archived"] == true || s["provider"] != "claude" {
             continue;
         }
-        // The worker's own checker runs whatever the worker is doing: it is
-        // shell, costs no turn, and drives the goal tile and the stall alert.
-        super::goal_check::maybe_run(&app, &name, goal_check_dir(s), now);
         // A lane the goal-loop guard parked on the owner is not continued:
         // continuing it is the loop (AMUX-5277).
         if stamped.contains(&name) {
@@ -1157,6 +1162,16 @@ mod tests {
     /// read inactive and say why; an unmet goal WITH the footer stays active;
     /// a met goal never consults the footer.
     #[test]
+    fn a_goal_cleared_by_an_error_reads_inactive_while_the_keeper_still_pursues_it() {
+        let g = Some(super::Goal { met: false, condition: "ship it".into(), ts: 2.0,
+            cleared: Some(super::Cleared { by_error: true, why: "Goal cleared after an unrecoverable error (authentication failed)".into() }) });
+        let v = super::goal_view(g, || None, &serde_json::json!({"configured": false}));
+        assert_eq!(v["active"], false, "a re-arm loop must see the /goal is gone: {v}");
+        assert_eq!(v["cleared_by_error"], true, "{v}");
+        assert_eq!(v["keeper_pursuing"], true, "the keeper still keeps it: {v}");
+    }
+
+    #[test]
     fn a_cleared_goal_reads_inactive_and_the_footer_is_only_read_for_an_unmet_one() {
         let unmet = || Some(super::Goal { met: false, condition: "use the bumble app".into(), ts: 1.0, cleared: None });
         let v = super::goal_view(unmet(), || Some(false), &serde_json::json!({"configured": false}));
@@ -1378,7 +1393,9 @@ mod tests {
             assert_eq!((r.state, r.active), ("unknown", true), "{r:?}");
             assert!(r.why.contains("authentication failed"), "{r:?}");
             let v = goal_view(Some(g.clone()), || None, &no);
-            assert_eq!((v["met"].clone(), v["state"].clone(), v["active"].clone()), (json!(false), json!("unknown"), json!(true)), "{v}");
+            // The /goal itself is gone (active false); the keeper still continues it.
+            assert_eq!((v["met"].clone(), v["state"].clone(), v["active"].clone(), v["keeper_pursuing"].clone()),
+                (json!(false), json!("unknown"), json!(false), json!(true)), "{v}");
             // The keeper continues it, quoting the goal without the `continue:` prefix.
             let mut k = Keep::default();
             match decide(&mut k, &g, &r, &[], 1e9) {

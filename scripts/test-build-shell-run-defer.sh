@@ -3,6 +3,11 @@
 # 20261015-182512: 4 of SCHED-465's 25 runs were killed by restarts). Runs the
 # shipped shell_runs_in_flight against canned /api/schedules/runs payloads.
 set -euo pipefail
+# The deploy target directory comes from the environment (server.env reaches
+# every process the server starts); a test's fake cargo must never write there.
+unset AMUX_DEPLOY_TARGET_DIR
+# Their fake cargo writes a few-byte stand-in; the builder refuses those by default.
+export AMUX_DEPLOY_MIN_BIN_BYTES=0
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
@@ -29,6 +34,8 @@ got=$(runs 'not json')
 expect test -z "$got"
 # The hold itself is wired into the build path with its verdicts.
 expect grep -q 'in_flight=$(shell_runs_in_flight "$SHELL_DEFER_MAX_S")' "$ROOT/scripts/rust-auto-build.sh"
+# Shell runs survive a restart now (shell_detached.rs): no hold unless asked for.
+expect grep -q 'SHELL_DEFER_MAX_S="${AMUX_RS_SHELL_DEFER_MAX_S:-0}"' "$ROOT/scripts/rust-auto-build.sh"
 expect grep -q 'verdict=activation_deferred_shell_run' "$ROOT/scripts/rust-auto-build.sh"
 expect grep -q 'verdict=activation_shell_defer_expired' "$ROOT/scripts/rust-auto-build.sh"
 echo "test-build-shell-run-defer: $PASS passed, $FAIL failed"

@@ -32,7 +32,6 @@
 //!
 //! | table                  | column       | unit                        |
 //! |------------------------|--------------|-----------------------------|
-//! | `interaction_log`      | `ts`         | **milliseconds** (INTEGER)  |
 //! | `cmd_history`          | `ts`         | **milliseconds** (INTEGER)  |
 //! | `session_events`       | `ts`         | seconds (REAL)              |
 //! | `token_ledger`         | `ts`         | seconds (INTEGER)           |
@@ -41,7 +40,8 @@
 //! | `_amux_state_events`   | `at`         | **ISO-8601 TEXT**           |
 //!
 //! `ethos.md` records that two sessions in one evening wrote
-//! `datetime(ts,'unixepoch')` against `interaction_log` and got a cutoff ~1000x
+//! `datetime(ts,'unixepoch')` against `interaction_log` (a millisecond table,
+//! since dropped) and got a cutoff ~1000x
 //! too small, so the filter matched the entire table — and one of them nearly
 //! reported the whole historical backlog as post-fix regressions. That was a
 //! READ. This file does DELETEs.
@@ -338,17 +338,9 @@ pub const SPECS: &[SweepSpec] = &[
         env: "AMUX_HOST_METRICS_RETAIN_DAYS",
         default_days: 30.0,
     },
-    // MILLISECONDS. The expensive one: 1,893 B/row (it stores `before`/`detail`/
-    // `result` blobs), 3,236 rows/day. At 90d this single table would reach 524MB —
-    // larger than the entire DB today — which is why it gets 14d and not the 90d
-    // the cheaper tables can afford. 14d x 3,236 x 1,893B = ~82MB.
-    SweepSpec {
-        table: "interaction_log",
-        ts_col: "ts",
-        unit: TsUnit::Millis,
-        env: "AMUX_INTERACTION_LOG_RETAIN_DAYS",
-        default_days: 14.0,
-    },
+    // `interaction_log` was listed here (14d, AMUX_INTERACTION_LOG_RETAIN_DAYS)
+    // until 2026-11-26, when its writers moved to the ledger and a migration
+    // dropped it (primitive integrity audit, P2).
     // The highest row count in the DB (387k) but cheap at 104 B/row, 7,995 rows/day.
     // Cost accounting, so keep it long: it is the only record of what the fleet
     // spent. 365d would be 4.7M rows / ~300MB; 180d x 7,995 x 104B = ~150MB.
@@ -1374,6 +1366,10 @@ pub struct StorageReport {
     pub kept_card_referenced: usize,
     pub upload_refs_error: Option<String>,
     pub memory_entries_removed: usize,
+    /// Expired scratchpad items MOVED to scratchpad-expired/ (still on disk, so
+    /// not counted in `files_removed` / `bytes_freed`).
+    pub scratchpad_moved: usize,
+    pub scratchpad_moved_bytes: u64,
     pub run_logs: super::log_retention::Report,
     pub diagnostic_dirs: Vec<(String, super::log_retention::Report)>,
     pub dirs_removed: usize,
@@ -1581,10 +1577,8 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     .await;
     rep.memory_entries_removed = crate::api::session_verbs::sweep_transcript_evidence();
     // Scratchpad expiry (Ethan, 2026-10-09: "everything should expire after 1
-    // week, configurable in the scratchpad tab").
-    let (sp_files, sp_bytes) = crate::api::scratchpad::sweep(home);
-    rep.files_removed += sp_files;
-    rep.bytes_freed += sp_bytes;
+    // week, configurable in the scratchpad tab"). It moves, so it frees nothing.
+    (rep.scratchpad_moved, rep.scratchpad_moved_bytes) = crate::api::scratchpad::sweep(home);
 
     // Directory-level pruning (evidence captures, etc.).
     let (mut dirs, mut dir_bytes) = (0usize, 0u64);
@@ -1660,6 +1654,7 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
                 || r.vacuumed
                 || r.rotated_logs_removed > 0
                 || r.memory_entries_removed > 0
+                || r.scratchpad_moved > 0
                 || r.run_logs.removed > 0;
             if any_work {
                 tracing::info!(
@@ -1675,6 +1670,8 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
                     rotated_logs_removed = r.rotated_logs_removed,
                     rotated_logs_freed = r.rotated_logs_freed,
                     memory_entries_removed = r.memory_entries_removed,
+                    scratchpad_moved = r.scratchpad_moved,
+                    scratchpad_moved_bytes = r.scratchpad_moved_bytes,
                     run_log_dirs_removed = r.run_logs.removed,
                     run_log_bytes_freed = r.run_logs.bytes_freed,
                     "storage sweep tick"
@@ -1717,6 +1714,7 @@ pub async fn debug_storage() -> axum::Json<Value> {
             "kept_card_referenced": r.kept_card_referenced,
             "upload_references": {"measured": r.upload_refs_error.is_none(), "why_unmeasured": r.upload_refs_error},
             "memory_entries_removed": r.memory_entries_removed,
+            "scratchpad_moved": r.scratchpad_moved, "scratchpad_moved_bytes": r.scratchpad_moved_bytes,
             "run_logs": r.run_logs,
             "diagnostic_dirs": r.diagnostic_dirs,
             "dirs_removed": r.dirs_removed, "dir_bytes_freed": r.dir_bytes_freed,
@@ -2216,7 +2214,7 @@ mod tests {
     #[test]
     fn a_cutoff_that_can_never_fire_deletes_nothing_and_is_not_refused() {
         let c = mem();
-        c.execute_batch("CREATE TABLE interaction_log (id INTEGER PRIMARY KEY, ts INTEGER)")
+        c.execute_batch("CREATE TABLE ms_log (id INTEGER PRIMARY KEY, ts INTEGER)")
             .unwrap();
         let now = unix_now();
         // A live table's real shape: old rows AND recent ones. (A table where
@@ -2224,13 +2222,13 @@ mod tests {
         // `guard_1_also_refuses_a_legitimately_dormant_table`.)
         for d in [400.0, 300.0, 1.0] {
             c.execute(
-                "INSERT INTO interaction_log (ts) VALUES (?1)",
+                "INSERT INTO ms_log (ts) VALUES (?1)",
                 rusqlite::params![((now - d * 86_400.0) * 1000.0) as i64],
             )
             .unwrap();
         }
         let wrong = SweepSpec {
-            table: "interaction_log",
+            table: "ms_log",
             ts_col: "ts",
             unit: TsUnit::Secs, // WRONG: this table is milliseconds.
             env: "AMUX_TEST_NOPE2",

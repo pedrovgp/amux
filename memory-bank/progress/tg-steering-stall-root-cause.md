@@ -359,3 +359,24 @@ grep -a 'steering_own_stale_draft_cleared\|idle_stop_skipped_pending' ~/.amux/lo
   passed). `/api/pull` reports `measured=false, repo=null, state=unmeasured`
   and the builder timer/service are inactive — so this box cannot currently
   explain or drive activation. Reported to the owner; not changed here.
+
+## `upstream/main` as the merge target (2026-11-27, owner decision)
+
+- Owner confirmed `upstream/main` (mixpeek/amux) is the source of truth. The
+  Rust steering fix `3b5918368` does not exist on upstream, but it is already
+  fully present on `feat/telegram-gateway` as a parent of `efc9724e2` (both
+  `session_verbs.rs` and `pane_prompts.rs` carry the fix markers in the same
+  counts as on the fix commit), so no cherry-pick was needed.
+- Asked about removing `origin/main` / local `main`; owner chose **"só trocar o
+  target"**: nothing was deleted. Both refs remain, but future merges target
+  `upstream/main`.
+- Merged `upstream/main` (`3de92c3f8`, 571 commits ahead of the old
+  `origin/main` base) into the feat in a clean detached worktree. `git
+  merge-tree` predicted NO conflicts and the resulting tree hash matched the
+  prediction exactly (`cb6a76c1…`). Zero conflict markers, zero unmerged,
+  `git diff --check` clean; the 59 gateway files and all six fix markers
+  survived the auto-merge in the same counts as on the feat parent.
+- `cargo check --workspace`, `cargo clippy --workspace --all-targets --
+  -D warnings` and gateway `pytest -q` (422 passed) all passed. Full
+  `amux-server --lib` suite via `scripts/test-contended.sh` → exit 0:
+  `test result: ok. 5044 passed; 0 failed; 21 ignored`.

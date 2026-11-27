@@ -1174,7 +1174,7 @@ pub fn reviewer_is_independent(cards: &[(String, String, String)]) -> Vec<Invari
 ///
 /// ```text
 /// SECONDS       _amux_request_log.ts, session_events.ts, token_ledger.ts
-/// MILLISECONDS  cmd_history.ts, interaction_log.ts
+/// MILLISECONDS  cmd_history.ts, _amux_ledger.ts (and interaction_log.ts, dropped 2026-11-26)
 /// ```
 ///
 /// This has now cost four separate sessions. Two on one evening wrote
@@ -1212,10 +1212,66 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // off the migrations. 44 numeric timestamp columns; 5 are milliseconds and
     // they are the whole trap.
     ("_amux_invariant_incident", "resolved_at", false),
+    // 0169: the CRM (api/crm.rs, api/crm_accounts.rs) writes epoch seconds.
+    ("crm_contacts", "icp_scored_at", false),
+    ("crm_contacts", "unsubscribed_at", false),
+    ("crm_contacts", "bounced_at", false),
+    ("crm_accounts", "icp_scored_at", false),
+    ("crm_lookalikes", "found_at", false),
+    ("crm_deal_stages", "at", false),
+    // 0170: api/crm_agent.rs writes epoch seconds.
+    ("crm_channels", "last_checked_at", false),
+    ("crm_channels", "last_changed_at", false),
+    ("crm_touches", "approved_at", false),
+    ("crm_touches", "done_at", false),
+    ("crm_touches", "due_announced_at", false),
+    // 0175: api/outbound.rs writes now_f64() as i64, epoch seconds.
+    ("outbound_requests", "created_at", false),
+    ("outbound_requests", "decided_at", false),
+    ("outbound_requests", "window_until", false),
+    ("outbound_requests", "done_at", false),
     // api/history.rs (pin_message) writes epoch milliseconds.
     ("message_pins", "pinned_at", true),
+    // api/palette_history.rs writes Date-style epoch milliseconds (now_ms).
+    ("nav_visits", "last_at", true),
+    ("nav_picks", "last_at", true),
+    // 0158: api/calls.rs writes now_f64() epoch seconds.
+    ("calls", "requested_at", false),
+    ("calls", "approved_at", false),
+    ("calls", "started_at", false),
+    ("calls", "ended_at", false),
     // 0155: runtime_jobs/goal_check.rs writes the check's epoch seconds.
     ("goal_samples", "at", false),
+    // 0161: api/approval_cards.rs writes config::now_f64() epoch seconds.
+    ("_amux_approval_cards", "filed_at", false),
+    ("_amux_approval_cards", "expires_at", false),
+    ("_amux_approval_cards", "decided_at", false),
+    // 0160: api/ledger_checkpoint.rs writes epoch milliseconds (now_ms).
+    ("_amux_ledger_checkpoints", "ts", true),
+    ("_amux_ledger_checkpoint_exports", "ts", true),
+    // 0162: api/schedule_authority.rs writes chrono::Utc::now().timestamp() epoch seconds.
+    ("worker_sponsors", "set_at", false),
+    ("org_members", "offboarded_at", false),
+    // 0157: api/ledger.rs writes epoch milliseconds (the command's own ts;
+    // prune stamps Utc::now().timestamp_millis()).
+    ("_amux_ledger", "ts", true),
+    ("_amux_ledger_anchor", "pruned_at", true),
+    // 0164: api/mfa.rs, api/sso.rs and api/scim.rs write chrono::Utc::now().timestamp() epoch seconds.
+    ("org_invites", "mfa_at", false),
+    ("mfa_factors", "created_at", false),
+    ("mfa_factors", "confirmed_at", false),
+    ("mfa_recovery_codes", "created_at", false),
+    ("mfa_recovery_codes", "used_at", false),
+    ("scim_tokens", "created_at", false),
+    ("scim_tokens", "last_used_at", false),
+    ("scim_tokens", "revoked_at", false),
+    // 0163: api/governance.rs writes epoch milliseconds (now_ms).
+    ("_amux_ledger", "redacted_at", true),
+    ("_amux_ledger_holds", "placed_at", true),
+    ("_amux_ledger_holds", "lifted_at", true),
+    ("_amux_ledger_holds", "from_ts", true),
+    ("_amux_ledger_holds", "to_ts", true),
+    ("_amux_ledger_erasures", "at", true),
     // 0156: api/directive.rs writes now_f64() epoch seconds.
     ("directives", "issued_at", false),
     ("directives", "delivered_at", false),
@@ -1344,6 +1400,8 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("signal_fires", "fired_at", false),
     ("signal_subscriptions", "created_at", false),
     ("signal_subscriptions", "last_fired_at", false),
+    // 0157: runtime_jobs/event_dispatch.rs writes epoch seconds.
+    ("event_dispatch_cursor", "updated_at", false),
     // SECONDS: DEFAULT (unixepoch('subsec')) in migration 0061.
     ("board_change_log", "changed_at", false),
     ("chatgpt_oauth_requests", "decided_at", false), // chatgpt_app.rs, REAL epoch seconds
@@ -1366,7 +1424,6 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("guard_verdicts", "ts", false),
     // 28cdee7b added the table; `record` stamps chrono::Utc::now().timestamp(), which is seconds.
     ("host_metrics", "ts", false),
-    ("interaction_log", "ts", true),
     ("issue_files", "added_at", false),
     ("issue_tags", "added_at", false),
     // SECONDS, like every other `issues` timestamp. Set from `row.updated`,
@@ -1441,6 +1498,20 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // against a `now` of 1789414183.
     ("task_attempts", "ended_at", false),
     ("task_attempts", "started_at", false),
+    // Declared when 0176 moved these tables into migrations. SECONDS, MEASURED
+    // on the live database 2026-11-26: task_episodes MAX(started_at) 1795727552,
+    // card_budgets MAX(started_at) 1791495908.0, file_visits MAX(last_at)
+    // 1795726148.6. _amux_brex_spend has no live rows yet; api/brex.rs writes
+    // both columns with timestamp_millis(), so they are MILLISECONDS.
+    ("task_episodes", "started_at", false),
+    ("task_episodes", "start_captured_at", false),
+    ("task_episodes", "ended_at", false),
+    ("task_episodes", "end_captured_at", false),
+    ("card_budgets", "started_at", false),
+    ("card_budgets", "exhausted_at", false),
+    ("file_visits", "last_at", false),
+    ("_amux_brex_spend", "posted_at", true),
+    ("_amux_brex_spend", "created_at", true),
     ("token_ledger", "ts", false),
     ("skill_usage", "ts", false), // transcript timestamps, stored as unix seconds (AMUX-5340)
     ("trace_archive", "archived_at", false), // measured 2026-09-27: 1790517771..1790535244 over 5405 rows
@@ -3077,6 +3148,63 @@ pub const BOUNDARY_GUARD: InstalledScript = InstalledScript {
     committed_path: "scripts/hooks/boundary-guard.py",
     noun: "boundary guard",
 };
+
+/// The read-only gate boundaries.toml's tenant-workload-gate names by its
+/// installed path (`gate_command`). mixpeek-dev booted on 2026-11-24 with the
+/// guard and registry updated and no gate (cloud/desktop/update.sh never copied
+/// it), and this Mac had none either, so a worker told to run it found nothing.
+/// Absence is a FAIL here, unlike the other installed scripts, because the
+/// guard's own refusal points at this file.
+pub const TENANT_GATE: InstalledScript = InstalledScript {
+    id: "hooks.tenant_gate_installed",
+    runtime_path: "~/.amux/hooks/tenant-gate.sh",
+    committed_path: "scripts/tenant-gate.sh",
+    noun: "tenant gate",
+};
+
+/// [`installed_script_matches_committed`] for the tenant gate, with a missing
+/// or non-executable file failing loudly instead of reading Unknown.
+/// `executable` is None when the mode could not be read.
+pub fn tenant_gate_installed(
+    baked_src: &str,
+    head_src: Option<&str>,
+    worktree_src: Option<&str>,
+    runtime: Result<String, std::io::Error>,
+    executable: Option<bool>,
+) -> Vec<InvariantResult> {
+    let spec = &TENANT_GATE;
+    let remedy = format!(
+        "install it from a checkout at origin/main: install -m 755 {} {} (./install.sh and \
+         cloud/desktop/update.sh both do this)",
+        spec.committed_path, spec.runtime_path
+    );
+    match runtime {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            vec![InvariantResult::fail(
+                spec.id,
+                format!("{} installed at {}", spec.noun, spec.runtime_path),
+                format!(
+                    "no {} at {}: the tenant-workload-gate refusal tells workers to run it there and \
+                     they find nothing. {remedy}",
+                    spec.noun, spec.runtime_path
+                ),
+            )
+            .evidence(json!({"runtime_path": spec.runtime_path, "committed_path": spec.committed_path, "missing": true}))]
+        }
+        Err(e) => installed_script_matches_committed(spec, baked_src, head_src, worktree_src, Err(e.to_string())),
+        Ok(text) => {
+            if executable == Some(false) {
+                return vec![InvariantResult::fail(
+                    spec.id,
+                    format!("{} at {} is executable", spec.noun, spec.runtime_path),
+                    format!("{} at {} is not executable, so running it by path fails. {remedy}", spec.noun, spec.runtime_path),
+                )
+                .evidence(json!({"runtime_path": spec.runtime_path, "executable": false}))];
+            }
+            installed_script_matches_committed(spec, baked_src, head_src, worktree_src, Ok(text))
+        }
+    }
+}
 
 /// The push gate every land goes through (AF-1129). A landed change to it
 /// reached no real push until a manual install, so the script-tests leg ran only
@@ -8668,6 +8796,31 @@ mod negative_controls {
         );
     }
 
+    /// mixpeek-dev 2026-11-24: a missing tenant gate is a Fail naming the remedy,
+    /// never the Unknown a missing guard reads as; a non-executable one fails;
+    /// the committed bytes pass and older bytes drift.
+    #[test]
+    fn a_missing_tenant_gate_fails_loudly() {
+        let src = "#!/usr/bin/env bash\necho gate\n";
+        let missing = tenant_gate_installed(
+            src,
+            Some(src),
+            Some(src),
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            None,
+        );
+        assert_eq!(missing[0].invariant_id, "hooks.tenant_gate_installed");
+        assert_eq!(missing[0].status, Status::Fail, "{:?}", missing[0]);
+        assert!(missing[0].observed.contains("install -m 755 scripts/tenant-gate.sh"), "{}", missing[0].observed);
+        let noexec = tenant_gate_installed(src, Some(src), Some(src), Ok(src.into()), Some(false));
+        assert_eq!(noexec[0].status, Status::Fail);
+        assert!(noexec[0].observed.contains("not executable"));
+        let ok = tenant_gate_installed(src, Some(src), Some(src), Ok(src.into()), Some(true));
+        assert_eq!(ok[0].status, Status::Pass);
+        let old = tenant_gate_installed(src, Some(src), Some(src), Ok("# older\n".into()), Some(true));
+        assert_eq!(old[0].status, Status::Fail);
+    }
+
     /// AMUX-3033: an identical runtime guard passes, a hand-edit is DETECTED as a
     /// Fail (the whole point — an unreviewed fleet-wide edit must not hide), and
     /// an unreadable runtime (a container that never installed it) is Unknown,
@@ -9442,7 +9595,6 @@ mod negative_controls {
             "cmd_history.queued_at",
             "cmd_history.delivered_at",
             "cmd_history.ts",
-            "interaction_log.ts",
             "dictation_history.ts",
         ] {
             assert!(

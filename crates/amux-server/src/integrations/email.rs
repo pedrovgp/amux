@@ -1013,7 +1013,7 @@ impl GmailClient {
     /// lacks them — Python `_gmail_load_creds`.
     fn load_token_file(&self, account: &str) -> Option<TokenFile> {
         let data: Value =
-            serde_json::from_str(&std::fs::read_to_string(self.token_path(account)).ok()?).ok()?;
+            serde_json::from_str(&crate::integrations::secure_store::read_string(self.token_path(account)).ok()?).ok()?;
         let s = |k: &str| data.get(k).and_then(Value::as_str).map(String::from);
         let mut tf = TokenFile {
             token: s("token").filter(|t| !t.is_empty()),
@@ -2084,7 +2084,7 @@ impl GmailClient {
         // Below the threshold the single path runs alone, so its test cells
         // stay pinned to real behavior.
         const BATCH_THRESHOLD: usize = 20;
-        const META_HEADERS: [&str; 5] = ["From", "To", "Subject", "Date", "Message-ID"];
+        const META_HEADERS: [&str; 8] = ["From", "To", "Subject", "Date", "Message-ID", "Cc", "List-Unsubscribe", "Precedence"];
         use futures::stream::{self, StreamExt};
         let mids: Vec<String> = ids
             .iter()
@@ -2140,6 +2140,13 @@ impl GmailClient {
                 "gmail_id": mid,
                 "read": !unread,
                 "body": full.get("snippet").cloned().unwrap_or(json!("")),
+                "cc": hv("cc"),
+                "labels": full.get("labelIds").cloned().unwrap_or(json!([])),
+                "internal_date": internal_date(&full),
+                // A mailing list or a bulk sender says so in its headers; an
+                // email.received subscriber filters newsletters on this.
+                "bulk": !hv("list-unsubscribe").is_empty()
+                    || matches!(hv("precedence").trim().to_ascii_lowercase().as_str(), "bulk" | "list" | "junk"),
             }));
         }
         // AF-704: `page_token` here is whatever the loop's LAST list_ids call
@@ -2373,6 +2380,14 @@ pub fn email_log_path(home: &Path) -> PathBuf {
 /// must never break or block a send (Python parity). Only sends through
 /// this API appear here.
 pub fn email_log(home: &Path, mut record: Value) {
+    // The trace the send ran under (api/trace.rs), so a sent email joins the
+    // rest of its unit of work.
+    if record.get("trace_id").is_none() {
+        if let Some(t) = crate::api::trace::current() {
+            record["trace_id"] = json!(t.trace_id);
+            record["span_id"] = json!(t.span_id);
+        }
+    }
     let mut write = || -> std::io::Result<()> {
         if record.get("ts").is_none() {
             record["ts"] =
@@ -2973,7 +2988,7 @@ mod tests {
         use crate::integrations::oauth_store;
         let home = temp_home_with_token("acct@example.com", true);
         let old: Value = serde_json::from_slice(
-            &std::fs::read(home.path().join("gmail-tokens/acct@example.com.json")).unwrap(),
+            &crate::integrations::secure_store::read_bytes(home.path().join("gmail-tokens/acct@example.com.json")).unwrap(),
         )
         .unwrap();
         let mut grant = old.clone();
@@ -2998,7 +3013,7 @@ mod tests {
             "committed-family-access"
         );
         let mirror: Value = serde_json::from_slice(
-            &std::fs::read(home.path().join("gmail-tokens/acct@example.com.json")).unwrap(),
+            &crate::integrations::secure_store::read_bytes(home.path().join("gmail-tokens/acct@example.com.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -3014,7 +3029,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let home = temp_home_with_token("acct@example.com", false);
         let path = home.path().join("gmail-tokens/acct@example.com.json");
-        let mut original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut original: Value = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(&path).unwrap()).unwrap();
         original["identity_unverified"] = json!(true);
         original["identity_unverified_why"] = json!("fixture identity probe failure");
         std::fs::write(&path, original.to_string()).unwrap();
@@ -3054,7 +3069,7 @@ mod tests {
             failed.is_err(),
             "successful HTTP refresh is not a committed grant"
         );
-        let retained: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let retained: Value = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(&path).unwrap()).unwrap();
         assert_eq!(retained, original);
         assert_eq!(
             client.access_token("acct@example.com", None).await.unwrap(),
@@ -3062,7 +3077,7 @@ mod tests {
             "failed refresh must not enter a volatile cache"
         );
         assert_eq!(http.calls.lock().unwrap().len(), 2);
-        let stored: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let stored: Value = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(path).unwrap()).unwrap();
         assert_eq!(stored["refresh_token"], "rotated-two");
         assert_eq!(stored["identity_unverified"], true);
         assert_eq!(
@@ -3083,7 +3098,7 @@ mod tests {
             .await;
         let png = &out[0];
         let path = std::path::PathBuf::from(png["path"].as_str().expect("image saved with a path"));
-        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert_eq!(crate::integrations::secure_store::read_bytes(&path).unwrap(), b"hello");
         assert!(path.starts_with(home.path().join("email-attachments")));
         assert!(
             png.get("_data").is_none(),
@@ -3459,7 +3474,7 @@ mod tests {
 
         // ...and PERSISTED the rotated one. Writing back what we sent is the bug.
         let persisted: Value = serde_json::from_str(
-            &std::fs::read_to_string(
+            &crate::integrations::secure_store::read_string(
                 home.path()
                     .join("gmail-tokens")
                     .join("acct@example.com.json"),
@@ -3495,7 +3510,7 @@ mod tests {
             let client = GmailClient::new(http.clone(), home.path().to_path_buf());
             let _ = client.get_signature("acct@example.com").await;
             let persisted: Value = serde_json::from_str(
-                &std::fs::read_to_string(
+                &crate::integrations::secure_store::read_string(
                     home.path()
                         .join("gmail-tokens")
                         .join("acct@example.com.json"),
@@ -3523,7 +3538,7 @@ mod tests {
         // Creates the directory it needs.
         GmailClient::write_token_file_atomically(&path, r#"{"token":"one"}"#).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
+            crate::integrations::secure_store::read_string(&path).unwrap(),
             r#"{"token":"one"}"#
         );
 
@@ -3532,7 +3547,7 @@ mod tests {
         // credential copy nobody knows about.
         GmailClient::write_token_file_atomically(&path, r#"{"token":"two"}"#).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
+            crate::integrations::secure_store::read_string(&path).unwrap(),
             r#"{"token":"two"}"#
         );
         let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
@@ -3572,7 +3587,7 @@ mod tests {
         assert_eq!(form["client_secret"], json!("PLACEHOLDER_CLIENT_SECRET"));
         // Refreshed token persisted back in Python's file shape.
         let persisted: Value = serde_json::from_str(
-            &std::fs::read_to_string(
+            &crate::integrations::secure_store::read_string(
                 home.path()
                     .join("gmail-tokens")
                     .join("acct@example.com.json"),

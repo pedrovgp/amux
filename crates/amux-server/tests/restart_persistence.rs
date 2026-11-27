@@ -171,6 +171,9 @@ impl Rig {
             .env("HOME", self.home.join("fixture-home"))
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("AMUX_HOME", &self.home)
+            // These tests read grant files on disk to prove durability; sealing
+            // is covered by e2e/chaos/encryption-at-rest.mjs (governance PR 18).
+            .env("AMUX_ENCRYPT_AT_REST", "off")
             .env("AMUX_DB", &self.db)
             .env("TMUX_TMPDIR", self._tmp.path())
             .env("AMUX_NO_SELF_ADOPT", "1")
@@ -179,8 +182,13 @@ impl Rig {
             // upkeep must not rotate the grant before that fault is armed;
             // connector_maintenance_process exercises the scheduled path.
             .envs(self.no_external_probes.then_some(("AMUX_CONNECTOR_MAINTENANCE_SECS", "0")))
+            // The inbox watcher reads Gmail with the fixture grant: Google
+            // answers the fake token 401 and the client refreshes again.
+            .envs(self.no_external_probes.then_some(("AMUX_EMAIL_EVENTS_SECS", "0")))
             .env("AMUX_RS_PORT", self.port.to_string())
-            // Auth off: this is a loopback-only temp server.
+            // Auth off, so it must be loopback-only: bind 127.0.0.1, never
+            // the default of every interface.
+            .env("AMUX_RS_BIND", "127.0.0.1")
             .env("AMUX_AUTH_TOKEN", "none")
             // Bootstrap would try to give a created worker a real terminal.
             // Nothing here starts a worker; push it out of the way anyway.
@@ -409,19 +417,6 @@ async fn every_durable_subsystem_survives_a_hard_restart() {
     let sched_id = sched["id"].as_str().expect("sched id").to_string();
     let next_run_before = sched["next_run"].clone();
 
-    let (c, msg) = rig
-        .post(
-            "/api/messages",
-            json!({"to": "human", "body": "rr0150 message body"}),
-        )
-        .await;
-    assert!((200..300).contains(&c), "message create: {msg}");
-    let msg_id = msg["message"]["id"]
-        .as_str()
-        .or_else(|| msg["id"].as_str())
-        .expect("message id")
-        .to_string();
-
     let (c, _) = rig
         .post(
             &format!("/api/sessions/{lane}/steer"),
@@ -474,8 +469,17 @@ async fn every_durable_subsystem_survives_a_hard_restart() {
          VALUES ('tsk_rr0150_live', ?1, ?2, ?3, 0)",
         &[&worker_id, &now.to_rfc3339(), &(now + chrono::Duration::hours(1)).to_rfc3339()],
     );
+    // /api/metrics counts the BOARD's leases (issues.lease_*, audit P0), so the
+    // same live/expired pair is held by two cards as well.
+    let (live_exp, gone_exp) = (now.timestamp() + 3600, now.timestamp() - 3600);
+    rig.seed(
+        "INSERT INTO issues (id, title, created, updated, status, lease_owner, lease_expires_at)
+         VALUES ('RR-LIVE', 'leased', 1, 1, 'doing', ?1, ?2), ('RR-GONE', 'lapsed', 1, 1, 'doing', ?1, ?3)",
+        &[&lane, &live_exp, &gone_exp],
+    );
     let (_, metrics_before) = rig.get("/api/metrics").await;
-    assert_eq!(metrics_before["leases"]["live"], 1, "expired RFC3339 leases must not appear live");
+    assert_eq!(metrics_before["leases"]["source"], "issues");
+    assert_eq!(metrics_before["leases"]["live"], 1, "expired leases must not appear live");
     assert_eq!(metrics_before["leases"]["total"], 2);
     // A 'running' transcode whose heartbeat is long stale — the exact state
     // migration 0009 exists to make survivable (python held this in memory,
@@ -600,21 +604,9 @@ async fn every_durable_subsystem_survives_a_hard_restart() {
         ),
     );
 
-    // 4. messages — the row, and the delivery state machine still advancing.
-    let (c, v) = rig.get(&format!("/api/messages/{msg_id}")).await;
-    let survived = (200..300).contains(&c) && v["body"] == "rr0150 message body";
-    let (ac, av) = rig
-        .post(&format!("/api/messages/{msg_id}/ack"), json!({}))
-        .await;
-    rep.add(
-        "messages",
-        survived && (200..300).contains(&ac),
-        format!(
-            "read-back {c} body_ok={} · ack {ac} delivery={}",
-            v["body"] == "rr0150 message body",
-            av["delivery"].clone()
-        ),
-    );
+    // 4. messages: `_amux_messages` and /api/messages were removed (primitive
+    //    integrity audit 2026-11-26); a message to a worker is its cmd_history
+    //    row, covered by the history and steering sections.
 
     // 5. steering queue — rows survive AND keep their queued_at ordering,
     //    which is what makes "oldest first, one per tick" mean anything.
@@ -734,11 +726,40 @@ async fn every_durable_subsystem_survives_a_hard_restart() {
     };
     let present = rig.count("SELECT COUNT(*) FROM _amux_leases WHERE task_id='tsk_rr0150_expired'");
     let (_, m) = rig.get("/api/metrics").await;
+    // The board half: the seeded expired card must never read live again,
+    // and the metric must agree with the board's own lease rows. After the
+    // restart the dispatcher may claim this rig's ordinary board row, which
+    // is a real lease, so an absolute count (live=1 total=2) is the wrong
+    // assertion: it went red on CI the day /api/metrics started counting
+    // board leases (AF-1432), with the code correct.
+    let now_s = chrono::Utc::now().timestamp();
+    let gone_live = rig.count(&format!(
+        "SELECT COUNT(*) FROM issues WHERE id='RR-GONE' AND lease_expires_at >= {now_s}"
+    ));
+    let held_live = rig.count(&format!(
+        "SELECT COUNT(*) FROM issues WHERE id='RR-LIVE' AND lease_expires_at >= {now_s}"
+    ));
+    let board = |cond: &str| {
+        rig.count(&format!(
+            "SELECT COUNT(*) FROM issues WHERE status = 'doing' AND lease_owner IS NOT NULL \
+             AND TRIM(lease_owner) != '' AND lease_expires_at IS NOT NULL AND deleted IS NULL \
+             AND COALESCE(archived, 0) = 0 AND {cond}"
+        ))
+    };
+    let (db_live, db_total) = (board(&format!("lease_expires_at >= {now_s}")), board("1"));
     rep.add(
         "leases",
-        present == 1 && unexpired == 0 && m["leases"]["live"] == 1 && m["leases"]["total"] == 2,
-        format!("expired_row_present={present} still_expired={} · live={} total={} (one future lease)",
-            unexpired == 0, m["leases"]["live"], m["leases"]["total"]),
+        present == 1
+            && unexpired == 0
+            && gone_live == 0
+            && held_live == 1
+            && m["leases"]["live"] == db_live
+            && m["leases"]["total"] == db_total,
+        format!(
+            "expired_row_present={present} still_expired={} · RR-GONE live={gone_live} RR-LIVE live={held_live} · \
+             metric live={} total={} vs board live={db_live} total={db_total}",
+            unexpired == 0, m["leases"]["live"], m["leases"]["total"]
+        ),
     );
 
     // 11. media jobs (seeded) — the stale 'running' row survives, so the next

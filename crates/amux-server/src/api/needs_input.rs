@@ -500,6 +500,9 @@ pub fn build(conn: &Connection, home: &Path, now: f64) -> rusqlite::Result<Queue
                 "unblocks": "The email is sent exactly as drafted. Decline discards it; nothing is sent.",
                 "context": clip(&s("body"), 600),
                 "email": {"to": s("to"), "cc": s("cc"), "from": s("from"), "subject": s("subject"), "endpoint": doc["endpoint"].clone()},
+                // The whole held message with its reason and what it answers;
+                // the preview's body is cut at 2000 characters, the frozen payload is not.
+                "outbound": email_outbound(&doc),
                 "category": "outbound", "rank": 0,
                 "since": doc["created"].as_f64().unwrap_or(now),
                 "chips": [],
@@ -517,6 +520,10 @@ pub fn build(conn: &Connection, home: &Path, now: f64) -> rusqlite::Result<Queue
             items.push(v);
         }
     }
+    // Governance PR 12: an approval card carries its approval (the decide
+    // action), and a held email's own card folds into the email item.
+    crate::api::approval_cards::annotate_in(conn, &mut items);
+    crate::api::approval_cards::annotate_in(conn, &mut snoozed);
     order_at(&mut items, now);
     order_at(&mut snoozed, now);
     Ok(Queue {
@@ -525,6 +532,18 @@ pub fn build(conn: &Connection, home: &Path, now: f64) -> rusqlite::Result<Queue
         n_considered,
         excluded_peer_actor,
     })
+}
+
+/// A held email's context (api/outbound.rs), with the full drafted text.
+fn email_outbound(doc: &Value) -> Value {
+    let mut c = doc["preview"]["outbound"].clone();
+    if !c.is_object() {
+        return Value::Null;
+    }
+    if let Some(full) = doc["payload"]["body"].as_str() {
+        c["text"] = json!(full);
+    }
+    c
 }
 
 /// One queue shared by every READ of it for [`QUEUE_TTL`] (AF-1029).
@@ -570,6 +589,20 @@ pub(crate) fn shared_queue(store: &crate::db::SharedStore, home: &Path, now: f64
 async fn get_queue(State(state): State<AppState>) -> Response {
     let home = crate::integrations::email::default_amux_home();
     let now = now_f64();
+    // An approval whose item ran out of time (a spend grant: 1h) is closed
+    // before the queue is read, so nobody is asked to decide a dead item.
+    let expired = state
+        .store
+        .write_async(move |conn| {
+            let closed = crate::api::approval_cards::expire_in(conn, now)?;
+            Ok(crate::db::WriteOutcome { applied: !closed.is_empty(), events: vec![] })
+        })
+        .await;
+    if let Ok(w) = &expired {
+        if w.applied {
+            invalidate_queue(&state.store);
+        }
+    }
     let store = state.store.clone();
     let res = tokio::task::spawn_blocking(move || shared_queue(&store, &home, now))
         .await

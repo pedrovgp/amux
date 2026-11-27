@@ -102,12 +102,22 @@ MEMBERS_FILE = os.environ.get("DOOR_MEMBERS", "/etc/amux-door/members")
 JOINED_FILE = os.environ.get("DOOR_JOINED", "/etc/amux-door/joined")   # teammates' own passwords
 FLEET_ENV = os.environ.get("DOOR_FLEET_ENV", "/etc/amux/fleet.env")
 ENTRY_FILE = os.environ.get("DOOR_ENTRY", "/etc/amux-door/entry")    # standalone: this server's app sign-in key
+# The owner proof amux minted at ~/.amux/front-door-owner; update.sh copies it here (0600, this
+# user). Returned to Caddy for the owner only, so amux can tell the owner from a local process
+# (governance PR 3, crates/amux-server/src/api/loopback_trust.rs). Absent: no header, as before.
+OWNER_PROOF_FILE = os.environ.get("DOOR_OWNER_PROOF", "/etc/amux-door/front-door-owner")
 AMUX = os.environ.get("DOOR_AMUX_URL", "https://127.0.0.1:8824")
 MEMBER_RECHECK = float(os.environ.get("DOOR_MEMBER_RECHECK", "60"))
 # Wrong passwords from one address, form or Basic, before that address is refused for the rest
 # of the window. Before this, Basic credentials on any URL could be guessed as fast as scrypt
 # allowed (2026-10-31). Per address, so a stranger guessing never locks the owner out.
 FAIL_LIMIT = int(os.environ.get("DOOR_FAIL_LIMIT", "10"))
+# A second factor (governance PR 20): "user base32-secret last-step" lines, 0600, written by
+# `door.py totp <user>`. DOOR_MFA: off (never asked), optional (default: asked of an account that
+# has one), required (an account without one cannot sign in). Basic credentials for an account
+# with a factor carry the code after the password: `user:password:123456`.
+TOTP_FILE = os.environ.get("DOOR_TOTP", "/etc/amux-door/totp")
+DOOR_MFA = (os.environ.get("DOOR_MFA") or "optional").strip().lower()
 FAIL_WINDOW_S = int(os.environ.get("DOOR_FAIL_WINDOW_S", "900"))
 # Sign-in counts for the activation report. /etc/amux-door is group-writable by amux-door on every
 # server already, so a self-updated door can keep it without a bootstrap change.
@@ -136,6 +146,29 @@ def users(path=None):
                 out[parts[0]] = parts[1]
     except FileNotFoundError:
         pass
+    return out
+
+
+def owner_proof():
+    """The front-door owner secret, or "" when update.sh has not copied it yet."""
+    try:
+        with open(OWNER_PROOF_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def check_headers(user, tok):
+    """What /_door/check hands Caddy for a signed-in person. A member gets their amux member
+    token; the owner (a password account with no member token, whom amux treats as the host
+    owner) gets the owner proof, so amux no longer has to infer the owner from an empty cookie."""
+    out = [("X-Door-User", user)]
+    if tok:
+        out.append(("X-Amux-Member", tok))
+    elif user in users():
+        proof = owner_proof()
+        if proof:
+            out.append(("X-Amux-Front-Door-Owner", proof))
     return out
 
 
@@ -656,7 +689,10 @@ def request_access(user, ip, now=None):
 
 
 def access_card_body(user, ip):
-    return {"title": "Let %s sign in from %s?" % (user, ip), "status": "needsyou", "tags": ["door-access"],
+    # A decision card: the board's default type is code, whose done gate ("Implemented and merged") no
+    # allowlist answer can truthfully tick, so closing it was refused with 409 on every server.
+    return {"title": "Let %s sign in from %s?" % (user, ip), "status": "needsyou", "type": "decision",
+            "tags": ["door-access"],
             "ask_type": "access", "ask_actor": "server owner",
             "ask_question": "Let %s sign in to this server from the new address %s?" % (user, ip),
             "ask_unblocks": "Allowing it adds %s to the address allowlist, and %s can sign in from it." % (ip, user),
@@ -681,20 +717,41 @@ def _file_access_card(user, ip):
         log(event="allowlist", user=user, ip=ip, verdict="door_access_card_failed", reason=str(e)[:120])
 
 
+ACCESS_DONE_GATE = "The decision is recorded on the card: what was chosen, by whom, and when"
+
+
+def _board_refusal(e):
+    """The board's own reason for an HTTP error (its code and gate), never just "409: Conflict"."""
+    try:
+        body = json.loads(e.read() or b"{}")
+        return "%s %s %s" % (getattr(e, "code", ""), body.get("code") or body.get("error") or "", body.get("gate") or "")
+    except Exception:
+        return str(e)
+
+
 def close_access_card(card, how):
+    """Record the owner's answer on the card, then close it under the decision gate it was filed with.
+    Two writes: the board discards a refused transition's whole body, so the record goes first."""
     if not card:
         return
+    path = "/api/board/" + urllib.parse.quote(card, safe="")
+    when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
     try:
-        _, out = _amux("PATCH", "/api/board/" + urllib.parse.quote(card, safe=""), timeout=10,
-                       content_type="application/json",
-                       data=json.dumps({"status": "done", "evidence": "none: %s at /_door/allowlist; an allowlist "
-                                                                      "change leaves no artifact" % how}).encode())
+        # type too: cards filed before the type was set are code cards, and the close resolves the gate
+        # from the card's type at that moment.
+        _amux("PATCH", path, timeout=10, content_type="application/json",
+              data=json.dumps({"type": "decision", "desc_append": "Decided: %s, %s." % (how, when)}).encode())
+        _, out = _amux("PATCH", path, timeout=10, content_type="application/json",
+                       data=json.dumps({"status": "done", "gate_checked": [ACCESS_DONE_GATE],
+                                        "evidence": "none: %s at /_door/allowlist; an allowlist change leaves "
+                                                    "no artifact" % how}).encode())
         resp = json.loads(out or b"{}")
         if resp.get("ok") is False or resp.get("error"):
             raise ValueError(str(resp.get("code") or resp.get("error"))[:80])
         log(event="allowlist", card=card, verdict="door_access_card_closed")
     except Exception as e:
-        log(event="allowlist", card=card, verdict="door_access_card_close_failed", reason=str(e)[:120])
+        reason = _board_refusal(e) if hasattr(e, "read") else str(e)
+        log(event="allowlist", card=card, verdict="door_access_card_close_failed", reason=reason[:160])
 
 
 def take_request(ip, user):
@@ -798,6 +855,84 @@ def cookie_user(header, name=COOKIE):
     return None
 
 
+_B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+
+def b32decode(s):
+    bits = val = 0
+    out = bytearray()
+    for ch in s.strip().upper().rstrip("="):
+        val = (val << 5) | _B32.index(ch)
+        bits += 5
+        if bits >= 8:
+            out.append((val >> (bits - 8)) & 255)
+            bits -= 8
+    return bytes(out)
+
+
+def totp(secret_b32, t=None):
+    """RFC 6238: HMAC-SHA1, 30-second steps, six digits (what every authenticator app shows)."""
+    step = int((time.time() if t is None else t) // 30)
+    h = hmac.new(b32decode(secret_b32), step.to_bytes(8, "big"), hashlib.sha1).digest()
+    o = h[-1] & 15
+    return "%06d" % ((int.from_bytes(h[o:o + 4], "big") & 0x7FFFFFFF) % 1000000)
+
+
+_totp_lock = threading.Lock()
+
+
+def totp_load():
+    out = {}
+    try:
+        with open(TOTP_FILE) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    out[parts[0]] = [parts[1], int(parts[2]) if len(parts) > 2 else 0]
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def totp_save(data):
+    tmp = TOTP_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.writelines("%s %s %d\n" % (u, s, n) for u, (s, n) in sorted(data.items()))
+    os.replace(tmp, TOTP_FILE)
+
+
+def second_factor_ok(user, code, now=None):
+    """(ok, why). An account with a factor must show a code it has not shown before; one without
+    passes unless DOOR_MFA=required."""
+    if DOOR_MFA == "off":
+        return True, ""
+    with _totp_lock:
+        data = totp_load()
+        if user not in data:
+            return (False, "no_factor") if DOOR_MFA == "required" else (True, "")
+        secret, last = data[user]
+        code = (code or "").replace(" ", "")
+        now = time.time() if now is None else now
+        for d in (0, -1, 1):
+            step = int(now // 30) + d
+            if step > last and hmac.compare_digest(totp(secret, step * 30), code):
+                data[user][1] = step
+                totp_save(data)
+                return True, ""
+        return False, "bad_code" if code else "code_missing"
+
+
+def totp_enroll(user):
+    secret = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+    with _totp_lock:
+        data = totp_load()
+        data[user] = [secret, 0]
+        totp_save(data)
+    return "otpauth://totp/amux:%s?secret=%s&issuer=amux&algorithm=SHA1&digits=6&period=30" % (
+        urllib.parse.quote(user), secret)
+
+
 def basic_user(header, ip=None):
     if not header or not header.startswith("Basic "):
         return None
@@ -807,8 +942,17 @@ def basic_user(header, ip=None):
         return None
     if ip and throttled(ip):
         return None
+    code = ""
+    if DOOR_MFA != "off" and ":" in pw and user in totp_load():
+        pw, _, code = pw.rpartition(":")
     if check_password(user, pw):
-        return user
+        ok, why = second_factor_ok(user, code)
+        if ok:
+            return user
+        if ip:
+            note_failure(ip)
+        log(event="basic", user=user, ip=ip, reason=why, verdict="door_basic_second_factor_refused")
+        return None
     if ip:
         note_failure(ip)
         log(event="basic", user=user, ip=ip, verdict="door_basic_refused")
@@ -928,6 +1072,7 @@ button{margin-top:18px;width:100%%;min-height:44px;border:0;border-radius:8px;ba
 <h1>amux</h1><p>%(host)s</p>
 <label for="u">Username</label><input id="u" name="username" autocomplete="username" autocapitalize="none" required value="%(user)s">
 <label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
+<label for="c">Code from your authenticator app (if you set one up)</label><input id="c" name="code" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9 ]*">
 <input type="hidden" name="next" value="%(next)s">%(allow)s
 <button type="submit">Sign in</button>%(err)s
 </form></body></html>"""
@@ -936,10 +1081,18 @@ JOIN_PAGE = PAGE.replace('<form method="post" action="/_door/login">', '<form me
     "<title>Sign in to amux</title>", "<title>Join amux</title>").replace(
     '<h1>amux</h1><p>%(host)s</p>', '<h1>Join %(host)s</h1><p>You were invited to this amux server. Choose the password you will sign in with.</p>').replace(
     '<label for="u">Username</label>', '<label for="u">Your email</label>').replace(
-    'autocomplete="current-password" required>', 'autocomplete="new-password" minlength="10" required>'
+    'autocomplete="current-password" required>', 'autocomplete="new-password" minlength="10" required>').replace(
+    # The join page has no code field; the password confirmation takes its place.
+    '<label for="c">Code from your authenticator app (if you set one up)</label><input id="c" name="code" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9 ]*">\n',
     '<label for="p2">Password again</label><input id="p2" name="password2" type="password" autocomplete="new-password" required>').replace(
     '<input type="hidden" name="next" value="%(next)s">', '<input type="hidden" name="invite" value="%(next)s">').replace(
     '<button type="submit">Sign in</button>', '<button type="submit">Join</button>').replace('%(allow)s', '')
+
+# str.replace does nothing when its pattern is missing, so a change to PAGE's
+# markup would quietly drop a join-page field (land review, 2026-11-16).
+for _needle in ('action="/_door/join"', 'name="password2"', 'name="invite"', 'autocomplete="new-password" minlength="10"'):
+    if _needle not in JOIN_PAGE:
+        raise RuntimeError("door: JOIN_PAGE lost " + _needle + "; a PAGE markup change broke its replace chain")
 
 
 ALLOW_PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -1058,7 +1211,7 @@ class Door(BaseHTTPRequestHandler):
                     return self.send(302, headers=[("Location", loc), ("Cache-Control", "no-store")])
                 note_seen()
                 tok = members().get(user)
-                return self.send(200, headers=[("X-Door-User", user)] + ([("X-Amux-Member", tok)] if tok else []))
+                return self.send(200, headers=check_headers(user, tok))
             accept = self.headers.get("Accept", "")
             if method == "GET" and uri.startswith("/invite/"):
                 # A teammate's invite link (Settings > Team). They have no password yet.
@@ -1194,12 +1347,17 @@ class Door(BaseHTTPRequestHandler):
             return self.allowlist_post(form)
         user = (form.get("username") or [""])[0].strip()
         pw = (form.get("password") or [""])[0]
+        code = (form.get("code") or [""])[0]
         nxt = safe_next((form.get("next") or ["/"])[0])
         ip = client_ip(self.headers, self.client_address[0])
         wait = throttled(ip)
         if wait:
             log(event="signin", user=user, ip=ip, verdict="door_signin_throttled_refused")
             return self.page(nxt, user, "Too many wrong passwords from this address. Try again in %d minutes." % (wait // 60 + 1))
+        # The password and the second factor are checked once: a code is good once, so asking
+        # twice would refuse the person who just typed it.
+        pw_ok = check_password(user, pw)
+        fa_ok, fa_why = second_factor_ok(user, code) if pw_ok else (False, "")
         al = allowlist()
         # A device is trusted for the account that signed in on it, not for every account: another
         # account's password on it is a new sign-in from a new address, refused as one.
@@ -1207,7 +1365,7 @@ class Door(BaseHTTPRequestHandler):
         if device and device != user and al.get("enabled") and not ip_listed(ip, al):
             log(event="signin", user=user, ip=ip, device=device, verdict="door_signin_device_other_account")
         if al.get("enabled") and not ip_listed(ip, al) and device != user:
-            ok = check_password(user, pw)
+            ok = pw_ok and fa_ok
             if not (ok and first_signin_add(user, ip)):
                 # Same cost whatever the password: a right one must not come back faster, and it
                 # counts toward the throttle too, so this cannot be used to test passwords.
@@ -1218,14 +1376,23 @@ class Door(BaseHTTPRequestHandler):
                 return self.page(nxt, user, "This address (%s) is not on this server's allowlist. "
                                             "If your password was right, the owner has been asked to let this address in; "
                                             "sign in again once they have." % ip)
-        elif (form.get("lock") or [""])[0] == "1" and not os.path.exists(ALLOW_FILE) and check_password(user, pw):
+        elif (form.get("lock") or [""])[0] == "1" and not os.path.exists(ALLOW_FILE) and pw_ok and fa_ok:
             if user in admins({}):
                 update_allowlist(lambda d: d.update(enabled=True, first_signin=True, admins=[user]))
                 allow_add(ip, user, "owner_first_signin")
                 log(event="allowlist", user=user, ip=ip, verdict="door_allowlist_turned_on")
             else:
                 log(event="allowlist", user=user, ip=ip, verdict="door_allowlist_lock_not_owner")
-        if check_password(user, pw):
+        if pw_ok:
+            if not fa_ok:
+                why = fa_why
+                log(event="signin", user=user, ip=ip, reason=why, verdict="door_signin_second_factor_refused")
+                note_signin(False)
+                note_failure(ip)
+                time.sleep(1.0)
+                return self.page(nxt, user, "This server requires a second factor for every account; ask the owner to "
+                                            "set one up for you." if why == "no_factor" else
+                                            "Enter the current code from your authenticator app.")
             log(event="signin", user=user, ip=ip, verdict="door_signin_ok")
             note_signin(True)
             return self.send(303, headers=[("Location", nxt), ("Cache-Control", "no-store")] + session_cookies(user))
@@ -1459,6 +1626,10 @@ def allowlist_cli(args):
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "hash":
         print("%s %s" % (sys.argv[2], scrypt_hash(sys.stdin.readline().rstrip("\n"))))
+        return
+    if len(sys.argv) >= 3 and sys.argv[1] == "totp":
+        # Prints the otpauth link once; add it to an authenticator app.
+        print(totp_enroll(sys.argv[2]))
         return
     if len(sys.argv) >= 2 and sys.argv[1] == "allowlist":
         return allowlist_cli(sys.argv[2:])

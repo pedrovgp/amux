@@ -844,7 +844,260 @@ const MIGRATIONS: &[Migration] = &[
         name: "0156_directives",
         sql: include_str!("../../migrations/0156_directives.sql"),
     },
+    Migration {
+        version: 157,
+        name: "0157_event_subscriptions",
+        sql: include_str!("../../migrations/0157_event_subscriptions.sql"),
+    },
+    Migration {
+        version: 158,
+        name: "0158_calls",
+        sql: include_str!("../../migrations/0158_calls.sql"),
+    },
+    Migration {
+        version: 159,
+        name: "0159_intent",
+        sql: include_str!("../../migrations/0159_intent.sql"),
+    },
+    Migration {
+        version: 160,
+        name: "0160_intent_on_primitives",
+        sql: include_str!("../../migrations/0160_intent_on_primitives.sql"),
+    },
+    Migration {
+        version: 161,
+        name: "0161_ledger",
+        sql: include_str!("../../migrations/0161_ledger.sql"),
+    },
+    Migration {
+        version: 162,
+        name: "0162_trace",
+        sql: include_str!("../../migrations/0162_trace.sql"),
+    },
+    Migration {
+        version: 163,
+        name: "0163_cli_telemetry",
+        sql: include_str!("../../migrations/0163_cli_telemetry.sql"),
+    },
+    Migration {
+        version: 164,
+        name: "0164_ledger_checkpoints",
+        sql: include_str!("../../migrations/0164_ledger_checkpoints.sql"),
+    },
+    Migration {
+        version: 165,
+        name: "0165_approval_cards",
+        sql: include_str!("../../migrations/0165_approval_cards.sql"),
+    },
+    Migration {
+        version: 166,
+        name: "0166_schedule_authority",
+        sql: include_str!("../../migrations/0166_schedule_authority.sql"),
+    },
+    Migration {
+        version: 167,
+        name: "0167_audit_governance",
+        sql: include_str!("../../migrations/0167_audit_governance.sql"),
+    },
+    Migration {
+        version: 168,
+        name: "0168_sso_mfa_scim",
+        sql: include_str!("../../migrations/0168_sso_mfa_scim.sql"),
+    },
+    Migration {
+        version: 169,
+        name: "0169_crm_accounts_deals",
+        sql: include_str!("../../migrations/0169_crm_accounts_deals.sql"),
+    },
+    Migration {
+        version: 170,
+        name: "0170_crm_channels_touches",
+        sql: include_str!("../../migrations/0170_crm_channels_touches.sql"),
+    },
+    Migration {
+        version: 171,
+        name: "0171_crm_sequences",
+        sql: include_str!("../../migrations/0171_crm_sequences.sql"),
+    },
+    Migration {
+        version: 172,
+        name: "0172_crm_voices",
+        sql: include_str!("../../migrations/0172_crm_voices.sql"),
+    },
+    Migration {
+        version: 173,
+        name: "0173_schedule_critical",
+        sql: include_str!("../../migrations/0173_schedule_critical.sql"),
+    },
+    Migration {
+        version: 174,
+        name: "0174_crm_account_activity_deal_tags",
+        sql: include_str!("../../migrations/0174_crm_account_activity_deal_tags.sql"),
+    },
+    Migration {
+        version: 175,
+        name: "0175_outbound_requests",
+        sql: include_str!("../../migrations/0175_outbound_requests.sql"),
+    },
+    Migration {
+        version: 176,
+        name: "0176_point_of_use_tables",
+        sql: include_str!("../../migrations/0176_point_of_use_tables.sql"),
+    },
+    Migration {
+        version: DROP_AMUX_MESSAGES,
+        name: "0177_drop_amux_messages",
+        sql: include_str!("../../migrations/0177_drop_amux_messages.sql"),
+    },
+    Migration {
+        version: 178,
+        name: "0178_telegram_links_in_bridge",
+        sql: include_str!("../../migrations/0178_telegram_links_in_bridge.sql"),
+    },
+    Migration {
+        version: DROP_INTERACTION_LOG,
+        name: "0179_drop_interaction_log",
+        sql: include_str!("../../migrations/0179_drop_interaction_log.sql"),
+    },
+    Migration {
+        version: DROP_DORMANT_PLANNING,
+        name: "0180_drop_dormant_planning_tables",
+        sql: include_str!("../../migrations/0180_drop_dormant_planning_tables.sql"),
+    },
+    Migration {
+        version: 181,
+        name: "0181_schedule_managed_by",
+        sql: include_str!("../../migrations/0181_schedule_managed_by.sql"),
+    },
+    Migration {
+        version: 182,
+        name: "0182_crm_closing",
+        sql: include_str!("../../migrations/0182_crm_closing.sql"),
+    },
 ];
+
+/// The migration that drops `interaction_log`. Before it runs,
+/// [`super::audit_archive::interaction_log`] copies the rows it removes.
+const DROP_INTERACTION_LOG: i64 = 179;
+
+/// The migration that drops `_amux_messages`. Before it runs,
+/// [`archive_before_drop`] copies the rows it removes.
+const DROP_AMUX_MESSAGES: i64 = 177;
+
+/// The migration that drops the dormant typed model's planning and budget
+/// tables and the legacy `tasks` table (audit step 2). Archived the same way.
+const DROP_DORMANT_PLANNING: i64 = 180;
+
+/// The tables [`DROP_DORMANT_PLANNING`] drops, each archived as `<table>.json`.
+const DORMANT_PLANNING_TABLES: &[&str] = &[
+    "_amux_goal_contracts",
+    "_amux_goal_contract_revisions",
+    "_amux_planning_nodes",
+    "_amux_current_plans",
+    "_amux_plan_revisions",
+    "_amux_task_budgets",
+    "tasks",
+];
+
+/// One file of rows a dropping migration keeps: written only when `table`
+/// exists and the query returns rows.
+struct ArchiveSet {
+    file: String,
+    table: &'static str,
+    sql: String,
+}
+
+/// What a migration must archive before it runs; empty for most.
+fn archive_sets(version: i64) -> Vec<ArchiveSet> {
+    match version {
+        DROP_AMUX_MESSAGES => vec![
+            ArchiveSet {
+                file: "_amux_messages.json".into(),
+                table: "_amux_messages",
+                sql: "SELECT * FROM _amux_messages ORDER BY created_at, id".into(),
+            },
+            ArchiveSet {
+                file: "_amux_commands.deliver_message.json".into(),
+                table: "_amux_commands",
+                sql: "SELECT * FROM _amux_commands WHERE json_extract(command, '$.kind') = 'deliver_message' \
+                      AND json_type(command, '$.data') = 'text' ORDER BY queued_at, id"
+                    .into(),
+            },
+        ],
+        DROP_DORMANT_PLANNING => DORMANT_PLANNING_TABLES
+            .iter()
+            .map(|t| ArchiveSet { file: format!("{t}.json"), table: t, sql: format!("SELECT * FROM {t} ORDER BY rowid") })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Where the primitive integrity audit's dropped rows are kept, under the amux
+/// home (the database's directory).
+pub(crate) const AUDIT_ARCHIVE_DIR: &str = "archive/primitive-audit-2026-11-26";
+
+/// Rows a query returns, as JSON objects keyed by column name.
+pub(crate) fn rows_json(conn: &Connection, sql: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    use rusqlite::types::ValueRef;
+    let mut stmt = conn.prepare(sql)?;
+    let cols: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let mut o = serde_json::Map::new();
+        for (i, c) in cols.iter().enumerate() {
+            let v = match r.get_ref(i)? {
+                ValueRef::Null => serde_json::Value::Null,
+                ValueRef::Integer(n) => serde_json::json!(n),
+                ValueRef::Real(f) => serde_json::json!(f),
+                ValueRef::Text(t) => serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
+                ValueRef::Blob(b) => serde_json::Value::String(String::from_utf8_lossy(b).into_owned()),
+            };
+            o.insert(c.clone(), v);
+        }
+        out.push(serde_json::Value::Object(o));
+    }
+    Ok(out)
+}
+
+/// Before a dropping migration runs (0177 `_amux_messages`, 0180 the dormant
+/// planning tables), write the rows [`archive_sets`] names to
+/// `<home>/archive/primitive-audit-2026-11-26/` as JSON. A file already there
+/// is kept as it is (a re-run never overwrites the first copy). With rows to
+/// keep and no home to keep them in, the migration is refused rather than
+/// run: the drop must never be the only copy's end.
+fn archive_before_drop(conn: &Connection, home: Option<&std::path::Path>, migration: &str, sets: Vec<ArchiveSet>) -> anyhow::Result<()> {
+    for set in sets {
+        let table_exists = conn
+            .query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [set.table], |_| Ok(()))
+            .optional()?
+            .is_some();
+        let rows = if table_exists { rows_json(conn, &set.sql)? } else { Vec::new() };
+        let file = set.file.as_str();
+        if rows.is_empty() {
+            tracing::info!(migration, file, table_exists, rows = 0, measured = true, n_considered = 0,
+                verdict = "audit_archive_nothing_to_keep", "no rows to archive for this file");
+            continue;
+        }
+        let Some(home) = home else {
+            anyhow::bail!("{migration} would drop {} row(s) archived as {file} but this database has no home to archive them in", rows.len());
+        };
+        let dir = home.join(AUDIT_ARCHIVE_DIR);
+        let path = dir.join(file);
+        if path.exists() {
+            tracing::info!(migration, path = %path.display(), rows = rows.len(), measured = true, n_considered = rows.len(),
+                verdict = "audit_archive_kept_existing", "an archive is already there; left as it is");
+            continue;
+        }
+        std::fs::create_dir_all(&dir)?;
+        let tmp = dir.join(format!(".{file}.tmp"));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&rows)?)?;
+        std::fs::rename(&tmp, &path)?;
+        tracing::warn!(migration, path = %path.display(), rows = rows.len(), measured = true, n_considered = rows.len(),
+            verdict = "audit_archive_written", "rows archived before their table is dropped");
+    }
+    Ok(())
+}
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
 ///
@@ -852,20 +1105,112 @@ const MIGRATIONS: &[Migration] = &[
 /// the `unwrap_or(false)` — if `_amux_migrations` does not exist yet the query
 /// fails and everything is pending, which is the truth for a fresh DB. A
 /// separate predicate here would be a second spelling that drifts.
+///
+/// A version recorded under a DIFFERENT name that has not been reconciled is
+/// pending too: `apply_all` will run that migration's SQL (see
+/// [`MismatchAction`]), so the live-DB guard must count it.
 pub fn pending(conn: &Connection) -> Vec<&'static str> {
     MIGRATIONS
         .iter()
-        .filter(|m| {
-            !conn
-                .query_row(
-                    "SELECT 1 FROM _amux_migrations WHERE version = ?1",
-                    [m.version],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false)
+        .filter(|m| match recorded_row(conn, m.version) {
+            Ok(Some(row)) => mismatch_action(m, &row) == MismatchAction::Apply,
+            Ok(None) | Err(_) => true,
         })
         .map(|m| m.name)
         .collect()
+}
+
+/// What `_amux_migrations` holds for one version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedRow {
+    name: String,
+    /// The registered name this version was reconciled to after a name
+    /// mismatch, if any. The recorded `name` is kept as evidence.
+    reconciled_name: Option<String>,
+    checksum: Option<String>,
+}
+
+/// Read one version's bookkeeping row. Tolerates a table that predates the
+/// `reconciled_name`/`checksum` columns (`pending` runs before `apply_all`
+/// adds them), reading those as NULL.
+fn recorded_row(conn: &Connection, version: i64) -> rusqlite::Result<Option<RecordedRow>> {
+    let full = conn
+        .query_row(
+            "SELECT name, reconciled_name, checksum FROM _amux_migrations WHERE version = ?1",
+            [version],
+            |r| {
+                Ok(RecordedRow {
+                    name: r.get(0)?,
+                    reconciled_name: r.get(1)?,
+                    checksum: r.get(2)?,
+                })
+            },
+        )
+        .optional();
+    match full {
+        Ok(row) => Ok(row),
+        Err(e) if e.to_string().contains("no such column") => conn
+            .query_row(
+                "SELECT name FROM _amux_migrations WHERE version = ?1",
+                [version],
+                |r| {
+                    Ok(RecordedRow {
+                        name: r.get(0)?,
+                        reconciled_name: None,
+                        checksum: None,
+                    })
+                },
+            )
+            .optional(),
+        Err(e) => Err(e),
+    }
+}
+
+/// What the runner does with a version that already has a bookkeeping row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MismatchAction {
+    /// The row is this migration (same name, a documented alias, or already
+    /// reconciled to it). Nothing to run.
+    AlreadyApplied,
+    /// The row names a DIFFERENT migration: this one's SQL never ran here.
+    Apply,
+}
+
+fn mismatch_action(m: &Migration, row: &RecordedRow) -> MismatchAction {
+    if row.name == m.name
+        || known_name_alias(m.version, &row.name, m.name)
+        || row.reconciled_name.as_deref() == Some(m.name)
+    {
+        MismatchAction::AlreadyApplied
+    } else {
+        MismatchAction::Apply
+    }
+}
+
+/// sha256 of a migration's embedded SQL, hex. Recorded on apply so an edit to
+/// an already-applied file is visible (`migration_checksum_changed`).
+fn checksum(sql: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(sql.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Add the bookkeeping columns this runner records. `ADD COLUMN` of a nullable
+/// column with no default is a schema-only change in SQLite (no table rewrite),
+/// and `_amux_migrations` is a couple of hundred rows regardless.
+fn ensure_bookkeeping_columns(conn: &Connection) -> anyhow::Result<()> {
+    for (column, decl) in [
+        ("checksum", "TEXT"),
+        ("reconciled_name", "TEXT"),
+        ("reconciled_at", "TEXT"),
+    ] {
+        if !column_exists(conn, "_amux_migrations", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE _amux_migrations ADD COLUMN {column} {decl};"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 /// True when this binary is a `cargo build` artifact run straight from a
@@ -1017,34 +1362,11 @@ fn truthy_env(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Pure so the collision itself is testable without a database: given what
-/// THIS binary's code expects at `version` (`expected_name`) and what the
-/// live DB actually has recorded there (`recorded_name`), returns a log
-/// message when they disagree, `None` when the recorded row is simply this
-/// same migration re-checked on a later boot (the ordinary, non-colliding
-/// case — every version this binary has ever successfully applied hits this
-/// path on every subsequent startup, and must stay silent).
-fn version_collision_warning(
-    version: i64,
-    expected_name: &str,
-    recorded_name: &str,
-) -> Option<String> {
-    if recorded_name == expected_name || known_name_alias(version, recorded_name, expected_name) {
-        return None;
-    }
-    Some(format!(
-        "migration VERSION COLLISION at {version}: this database recorded it as \
-         {recorded_name:?}, but this binary's code expects {expected_name:?} there. \
-         {expected_name}'s schema change will NEVER run against this database under \
-         version {version} — renumber it in db/migrate.rs."
-    ))
-}
-
 /// Guard + apply. `Store::open` calls this; the bare [`apply_all`] stays for
 /// tests, which run against temp and in-memory databases.
 pub fn apply_all_guarded(conn: &mut Connection, db_path: &std::path::Path) -> anyhow::Result<()> {
     guard_live_db(db_path, &pending(conn))?;
-    apply_all(conn)
+    apply_all_with_home(conn, db_path.parent())
 }
 
 /// An in-memory DB carrying the REAL schema, for tests (AF-328).
@@ -1081,6 +1403,12 @@ pub(crate) fn test_memdb() -> Connection {
 }
 
 pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
+    apply_all_with_home(conn, None)
+}
+
+/// [`apply_all`], with the amux home a migration may archive rows into before
+/// it drops them (the database's directory; None for an in-memory database).
+pub fn apply_all_with_home(conn: &mut Connection, home: Option<&std::path::Path>) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _amux_migrations (
             version    INTEGER PRIMARY KEY,
@@ -1093,32 +1421,22 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
             duration_ms INTEGER
         );",
     )?;
+    // checksum / reconciled_name / reconciled_at: added by ALTER on every
+    // database (fresh or not), for the same reason duration_ms needed two paths.
+    ensure_bookkeeping_columns(conn)?;
     for m in MIGRATIONS {
-        let recorded_name: Option<String> = conn
-            .query_row(
-                "SELECT name FROM _amux_migrations WHERE version = ?1",
-                [m.version],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(recorded) = recorded_name {
-            if let Some(msg) = version_collision_warning(m.version, m.name, &recorded) {
-                // VERSION COLLISION, not a benign re-run. On a box that
-                // builds arbitrary off-main branches (this one, and every
-                // dev box the freshness hook warns about), the SAME version
-                // number can get consumed by UNRELATED migrations from
-                // different branches' own dense-ordered sequences (this
-                // exact shape cost a live outage 2026-08-30, see
-                // frustrations.md — telegram_relay ran for ~15 minutes
-                // erroring "no such column" because version 38 here was
-                // already someone else's migration). `m`'s SQL will NEVER
-                // run against this database under this number — the only
-                // fix is renumbering `m` in code — so this must be LOUD at
-                // startup, not a downstream error the first time the
-                // missing schema is actually touched.
-                tracing::error!("{msg}");
+        let sum = checksum(m.sql);
+        if let Some(row) = recorded_row(conn, m.version)? {
+            match mismatch_action(m, &row) {
+                MismatchAction::AlreadyApplied => {
+                    note_checksum(conn, m, &row, &sum);
+                    continue;
+                }
+                MismatchAction::Apply => {
+                    reconcile_name_mismatch(conn, m, &row, &sum)?;
+                    continue;
+                }
             }
-            continue;
         }
         // TIME EVERY MIGRATION. This function used to log nothing, so 0031
         // holding the connection for 186 seconds on 2026-08-24 was
@@ -1127,12 +1445,19 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
         // migration is the one startup step that can take arbitrarily long
         // while looking exactly like a dead process.
         let started = std::time::Instant::now();
+        let sets = archive_sets(m.version);
+        if !sets.is_empty() {
+            archive_before_drop(conn, home, m.name, sets)?;
+        }
+        if m.version == DROP_INTERACTION_LOG {
+            super::audit_archive::interaction_log(conn, home)?;
+        }
         let tx = conn.transaction()?;
         apply_one(&tx, m.sql)?;
         let ms = started.elapsed().as_millis() as i64;
         tx.execute(
-            "INSERT INTO _amux_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![m.version, m.name, chrono::Utc::now().to_rfc3339()],
+            "INSERT INTO _amux_migrations (version, name, applied_at, checksum) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![m.version, m.name, chrono::Utc::now().to_rfc3339(), sum],
         )?;
         // Best-effort: the column arrives in 0032, so every migration before it
         // on an existing database has nowhere to put this. Failing to RECORD a
@@ -1158,56 +1483,146 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
         }
     }
     report_renumbered_migrations(conn);
-    // Tables ensured at their point of use (not in a numbered migration) are
-    // ensured here too, so the schema is complete after the FIRST boot. Lazily,
-    // task_attempts appeared only once a runtime job first touched it, so a
-    // re-open changed the table set and the nightly "migrations apply to a
-    // populated database" gate failed (AMUX-5374). IF NOT EXISTS keeps the
-    // version-collision protection attempts.rs documents.
-    crate::db::attempts::ensure_table(conn)?;
     Ok(())
 }
 
-/// Versions whose RECORDED name differs from the name now registered for them,
-/// as `(version, recorded, registered)`.
+/// Record (first sight) or compare (later boots) an applied migration's
+/// checksum. Never fails the boot: this is bookkeeping, not schema.
+fn note_checksum(conn: &Connection, m: &Migration, row: &RecordedRow, sum: &str) {
+    match row.checksum.as_deref() {
+        Some(recorded) if recorded == sum => {}
+        Some(recorded) => {
+            // An applied migration's file was edited. Its new text will not
+            // run again here, so whatever the edit changed is not in this
+            // database. Logged once: the new checksum is then recorded.
+            tracing::warn!(
+                verdict = "migration_checksum_changed",
+                migration_version = m.version,
+                migration = m.name,
+                recorded_checksum = recorded,
+                file_checksum = sum,
+                "migration {} was edited after this database applied it; the edit will not run here",
+                m.name
+            );
+            let _ = conn.execute(
+                "UPDATE _amux_migrations SET checksum = ?1 WHERE version = ?2",
+                rusqlite::params![sum, m.version],
+            );
+        }
+        None => {
+            // Applied before checksums were recorded: adopt the file's.
+            let _ = conn.execute(
+                "UPDATE _amux_migrations SET checksum = ?1 WHERE version = ?2",
+                rusqlite::params![sum, m.version],
+            );
+        }
+    }
+}
+
+/// A version this database recorded under a DIFFERENT migration's name.
 ///
-/// AF-353. The runner dedupes on VERSION alone — `SELECT 1 FROM _amux_migrations
-/// WHERE version = ?1`, the name never consulted — so a version this database
-/// has already applied is skipped no matter WHICH migration now claims it. That
-/// is fine while a version keeps its meaning, and this repo routinely takes it
-/// away: renumbering an incoming migration is the DOCUMENTED fix for a
-/// contributor collision (see `versions_are_dense_and_match_their_filenames`
-/// below). Renumbering frees a number, the freed number gets handed to a
-/// different migration, and every database that recorded the old one at that
-/// version skips the new one forever, with a clean boot and a green `/health`.
+/// The runner used to skip it, because it deduped on version alone: a dirty
+/// build that consumed version N meant the real N never ran, with a clean boot
+/// (AMUX-4533; the reason nine tables were created at their point of use, see
+/// 0176). Now the registered migration runs in its own transaction and, when it
+/// succeeds, the row records `reconciled_name` so it runs once. The original
+/// `name` is left as found: it is the evidence of what consumed the number.
 ///
-/// `versions_are_dense_and_match_their_filenames` constrains the ARRAY, and
-/// nothing constrained the array against what a DATABASE already recorded.
-/// The benign case and the destructive case are byte-identical to the runner,
-/// which is why this reports rather than refuses: an old database legitimately
-/// carries an old name for a migration that was renumbered, and refusing to boot
-/// over that would be a gate with no truthful path (ethos rule 3).
+/// Failure never bricks the boot. A migration that cannot run against this
+/// database's shape (a plain CREATE TABLE of a table the other migration also
+/// made, say) is rolled back whole, logged at ERROR with
+/// `migration_name_mismatch_apply_failed`, and retried on the next boot; the
+/// server still starts, exactly as it did when the version was skipped.
+fn reconcile_name_mismatch(
+    conn: &mut Connection,
+    m: &Migration,
+    row: &RecordedRow,
+    sum: &str,
+) -> anyhow::Result<()> {
+    tracing::warn!(
+        verdict = "migration_name_mismatch",
+        migration_version = m.version,
+        recorded_name = %row.name,
+        file_name = m.name,
+        "migration version {} is recorded as {:?} but this binary registers {:?}; \
+         applying {:?} now rather than skipping it",
+        m.version,
+        row.name,
+        m.name,
+        m.name
+    );
+    let started = std::time::Instant::now();
+    let tx = conn.transaction()?;
+    match apply_one(&tx, m.sql) {
+        Ok(()) => {
+            tx.execute(
+                "UPDATE _amux_migrations SET reconciled_name = ?1, reconciled_at = ?2, checksum = ?3 \
+                 WHERE version = ?4",
+                rusqlite::params![m.name, chrono::Utc::now().to_rfc3339(), sum, m.version],
+            )?;
+            tx.commit()?;
+            tracing::warn!(
+                verdict = "migration_name_mismatch_applied",
+                migration_version = m.version,
+                recorded_name = %row.name,
+                file_name = m.name,
+                duration_ms = started.elapsed().as_millis() as i64,
+                "applied {} under version {} (recorded name {:?} kept)",
+                m.name,
+                m.version,
+                row.name
+            );
+        }
+        Err(e) => {
+            drop(tx); // rollback: nothing of the failed migration persists
+            tracing::error!(
+                verdict = "migration_name_mismatch_apply_failed",
+                migration_version = m.version,
+                recorded_name = %row.name,
+                file_name = m.name,
+                error = %e,
+                "could not apply {} over version {} (recorded as {:?}): {e}. Its schema is \
+                 missing from this database; renumber it or reconcile by hand. Retried next boot.",
+                m.name,
+                m.version,
+                row.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Versions whose RECORDED name differs from the name now registered for them
+/// AND that `apply_all` could not reconcile, as `(version, recorded, registered)`.
 ///
-/// Live on this box when written: v35 recorded as `0029_regenerable_samples`,
-/// registered as `0035_regenerable_samples`. Same migration, renamed, nothing
-/// skipped. That known alias is now excluded; every unknown mismatch remains a
-/// collision finding.
+/// AF-353. The runner used to dedupe on VERSION alone, so a version this
+/// database had already applied was skipped no matter WHICH migration now
+/// claimed it. Renumbering an incoming migration is the documented fix for a
+/// contributor collision (see `versions_are_dense_and_match_their_filenames`),
+/// which frees a number for a different migration, and every database that
+/// recorded the old one at that version skipped the new one forever.
+///
+/// `apply_all` now runs the registered migration over a mismatched row and
+/// records `reconciled_name` (see `reconcile_name_mismatch`). What is left here
+/// is the residue: mismatches whose apply failed, so the schema really lags.
+/// Documented same-migration renames (`MIGRATION_NAME_ALIASES`) are excluded.
 pub(crate) fn renumbered_migrations(conn: &Connection) -> Vec<(i64, String, String)> {
-    let mut stmt = match conn.prepare("SELECT version, name FROM _amux_migrations") {
+    let mut stmt = match conn.prepare("SELECT version FROM _amux_migrations") {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let rows = match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
-        Ok(r) => r,
+    let versions: Vec<i64> = match stmt.query_map([], |r| r.get::<_, i64>(0)) {
+        Ok(r) => r.flatten().collect(),
         Err(_) => return Vec::new(),
     };
     let mut out = Vec::new();
-    for row in rows.flatten() {
-        let (version, recorded) = row;
-        if let Some(m) = MIGRATIONS.iter().find(|m| m.version == version) {
-            if m.name != recorded && !known_name_alias(version, &recorded, m.name) {
-                out.push((version, recorded, m.name.to_string()));
-            }
+    for version in versions {
+        let Some(m) = MIGRATIONS.iter().find(|m| m.version == version) else { continue };
+        let Ok(Some(row)) = recorded_row(conn, version) else { continue };
+        // A mismatch `apply_all` reconciled (ran the registered migration) is no
+        // longer a lagging schema; one whose apply failed still is.
+        if mismatch_action(m, &row) == MismatchAction::Apply {
+            out.push((version, row.name, m.name.to_string()));
         }
     }
     out.sort();
@@ -1232,10 +1647,10 @@ fn report_renumbered_migrations(conn: &Connection) {
             migration_version = version,
             recorded_name = %recorded,
             registered_name = %registered,
+            verdict = "migration_name_mismatch_unreconciled",
             "migration version {version} was applied as {recorded:?} but is now registered as \
-             {registered:?}. The runner skips a version it has already applied WITHOUT reading \
-             the name, so if these are different migrations rather than one renumbered, this \
-             database has silently skipped {registered:?} and its schema lags the code."
+             {registered:?}, and applying {registered:?} over it failed (see \
+             migration_name_mismatch_apply_failed above). This database's schema lags the code."
         );
     }
     tracing::warn!(
@@ -1420,6 +1835,199 @@ mod tests {
         }
     }
 
+    /// A database at 0175 holding `_amux_messages` rows and a queued command
+    /// that names one.
+    fn messages_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_history_through(&conn, DROP_AMUX_MESSAGES - 1);
+        conn.execute_batch(
+            "INSERT INTO _amux_messages (id, from_actor, target, body, thread, created_at, delivery) VALUES
+               ('msg_01A', '{\"kind\":\"human\",\"name\":\"owner\"}', '{\"kind\":\"worker\",\"id\":\"wrk_1\"}', 'first kept body', NULL, '2026-09-01T00:00:00Z', '{\"state\":\"queued\"}'),
+               ('msg_01B', '{\"kind\":\"human\",\"name\":\"owner\"}', '{\"kind\":\"worker\",\"id\":\"wrk_1\"}', 'second kept body', NULL, '2026-09-02T00:00:00Z', '{\"state\":\"delivered\"}');
+             INSERT INTO _amux_commands (id, worker_id, command, state, idempotency_key, queued_at, attempts, timing) VALUES
+               ('cmd_1', 'wrk_1', '{\"kind\":\"deliver_message\",\"data\":\"msg_01A\"}', '{\"state\":\"queued\"}', 'deliver-msg_01A', '2026-09-01T00:00:00Z', 0, '{\"kind\":\"at_turn_boundary\"}'),
+               ('cmd_2', 'wrk_1', '{\"kind\":\"deliver_message\",\"data\":\"msg_01B\"}', '{\"state\":\"confirmed\"}', 'deliver-msg_01B', '2026-09-02T00:00:00Z', 1, '{\"kind\":\"at_turn_boundary\"}');",
+        ).unwrap();
+        conn
+    }
+
+    #[test]
+    fn dropping_amux_messages_archives_its_rows_first_and_never_overwrites_the_archive() {
+        let mut conn = messages_fixture();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM search_docs WHERE entity_type='message'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "premise: the old search trigger indexed both messages");
+        let home = tempfile::tempdir().unwrap();
+        apply_all_with_home(&mut conn, Some(home.path())).unwrap();
+        let path = home.path().join(AUDIT_ARCHIVE_DIR).join("_amux_messages.json");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rows.len(), 2, "every row is kept");
+        assert_eq!(rows[0]["id"], "msg_01A");
+        assert_eq!(rows[1]["body"], "second kept body");
+        assert_eq!(rows[0]["delivery"], "{\"state\":\"queued\"}", "columns are kept as stored");
+        let cmds: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(
+            home.path().join(AUDIT_ARCHIVE_DIR).join("_amux_commands.deliver_message.json")).unwrap()).unwrap();
+        assert_eq!(cmds.len(), 2, "the commands that named them are kept too");
+        let gone = conn.query_row("SELECT 1 FROM sqlite_master WHERE name='_amux_messages'", [], |_| Ok(())).optional().unwrap();
+        assert!(gone.is_none(), "the table is dropped");
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM search_docs WHERE entity_type='message'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "and its search documents");
+        // Both commands read again as WorkerCommand; the unfinished one is dead-lettered with its old id.
+        for id in ["cmd_1", "cmd_2"] {
+            let (command, state): (String, String) = conn.query_row(
+                "SELECT command, state FROM _amux_commands WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let parsed: amux_core::protocol::WorkerCommand = serde_json::from_str(&command).unwrap();
+            assert_eq!(parsed, amux_core::protocol::WorkerCommand::DeliverMessage(amux_core::ids::HistoryId(0)), "{id}");
+            let st: amux_core::protocol::CommandState = serde_json::from_str(&state).unwrap();
+            if id == "cmd_1" {
+                assert!(matches!(&st, amux_core::protocol::CommandState::DeadLettered { reason } if reason.contains("msg_01A")), "{state}");
+            } else {
+                assert_eq!(st, amux_core::protocol::CommandState::Confirmed, "a finished command keeps its state");
+            }
+        }
+        // Another database dropping its table later never overwrites the first archive.
+        let mut again = messages_fixture();
+        again.execute("UPDATE _amux_messages SET body='changed'", []).unwrap();
+        apply_all_with_home(&mut again, Some(home.path())).unwrap();
+        let kept: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(kept[0]["body"], "first kept body");
+    }
+
+    #[test]
+    fn rows_with_nowhere_to_archive_them_refuse_the_drop() {
+        let mut conn = messages_fixture();
+        let e = apply_all(&mut conn).unwrap_err().to_string();
+        assert!(e.contains("no home to archive"), "{e}");
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_messages", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "nothing was dropped");
+        // An empty table needs no archive.
+        conn.execute_batch("DELETE FROM _amux_messages; DELETE FROM _amux_commands;").unwrap();
+        apply_all(&mut conn).unwrap();
+    }
+
+    /// A database just before the drop, holding `interaction_log` rows.
+    fn interaction_log_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_history_through(&conn, DROP_INTERACTION_LOG - 1);
+        conn.execute_batch(
+            "INSERT INTO interaction_log (ts, kind, actor, target, action, detail, before, result, seq) VALUES
+               (1794675511113, 'scope', 'human', 'group:alpha', 'write:gates', '{\"capability\":\"gates\"}', '{}', '{\"done\":[]}', 1),
+               (1795033259429, 'scope', 'amux', 'worker:w1', 'write:env', '{}', '', 'kept result', 1);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// A database just before 0180 holding a `tasks` row and a planning node
+    /// with the goal contract its foreign key requires.
+    fn dormant_planning_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_history_through(&conn, DROP_DORMANT_PLANNING - 1);
+        conn.execute_batch(
+            "INSERT INTO tasks (id, session, text, done, pos, created, updated)
+               VALUES ('19c7bf83a1e24746d', 'ops', 'tailscale ingress', 0, 1, 1771606391, 1771606391);
+             INSERT INTO _amux_goal_contracts (id, objective, dependency_policy, release_policy,
+               expected_scope_min, expected_scope_max, version, updated_by, updated_at)
+               VALUES ('goal-1', 'ship it', 'none', 'manual', 1, 1, 1, 'lane-a', '2026-09-01T00:00:00Z');
+             INSERT INTO _amux_planning_nodes (id, goal_id, parent_id, role, owner, title, objective, status, updated_at)
+               VALUES ('pn_1', 'goal-1', NULL, 'root_planner', 'lane-a', 'root', 'plan it', 'active', '2026-09-01T00:00:00Z');",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn dropping_interaction_log_archives_its_rows_first_and_never_overwrites_the_archive() {
+        let mut conn = interaction_log_fixture();
+        let home = tempfile::tempdir().unwrap();
+        apply_all_with_home(&mut conn, Some(home.path())).unwrap();
+        let path = home.path().join(AUDIT_ARCHIVE_DIR).join("interaction_log.json");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rows.len(), 2, "every row is kept");
+        assert_eq!(rows[0]["target"], "group:alpha");
+        assert_eq!(rows[0]["ts"], 1794675511113i64, "integers stay integers");
+        assert_eq!(rows[1]["result"], "kept result");
+        assert_eq!(rows[0]["detail"], "{\"capability\":\"gates\"}", "columns are kept as stored");
+        assert!(!table_exists(&conn, "interaction_log"), "the table is dropped");
+
+        // A second database migrating into the same home must not overwrite
+        // the first copy.
+        let mut again = interaction_log_fixture();
+        again.execute("DELETE FROM interaction_log WHERE id = 1", []).unwrap();
+        apply_all_with_home(&mut again, Some(home.path())).unwrap();
+        let kept: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(kept.len(), 2, "the first archive is left as it is");
+    }
+
+    #[test]
+    fn dropping_interaction_log_is_refused_when_its_rows_have_nowhere_to_go() {
+        let mut conn = interaction_log_fixture();
+        let err = apply_all_with_home(&mut conn, None).unwrap_err().to_string();
+        assert!(err.contains("interaction_log") && err.contains("2 row"), "{err}");
+        assert!(table_exists(&conn, "interaction_log"), "nothing is dropped when the archive cannot be written");
+        let applied: Option<i64> = conn
+            .query_row("SELECT version FROM _amux_migrations WHERE version=?1", [DROP_INTERACTION_LOG], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert_eq!(applied, None, "the drop is not recorded as applied");
+
+        // An archive directory that cannot be created refuses too.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("archive"), b"a file where the directory goes").unwrap();
+        let mut blocked = interaction_log_fixture();
+        assert!(apply_all_with_home(&mut blocked, Some(home.path())).is_err());
+        assert!(table_exists(&blocked, "interaction_log"));
+    }
+
+    #[test]
+    fn dropping_an_empty_interaction_log_needs_no_archive() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_all_with_home(&mut conn, None).expect("a fresh database has nothing to keep");
+        assert!(!table_exists(&conn, "interaction_log"));
+    }
+
+    #[test]
+    fn dropping_the_dormant_planning_tables_archives_their_rows_first() {
+        let mut conn = dormant_planning_fixture();
+        let home = tempfile::tempdir().unwrap();
+        apply_all_with_home(&mut conn, Some(home.path())).unwrap();
+        let dir = home.path().join(AUDIT_ARCHIVE_DIR);
+        let tasks: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(dir.join("tasks.json")).unwrap()).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["text"], "tailscale ingress", "columns are kept as stored");
+        let nodes: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(dir.join("_amux_planning_nodes.json")).unwrap()).unwrap();
+        assert_eq!(nodes[0]["owner"], "lane-a");
+        let goals: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(dir.join("_amux_goal_contracts.json")).unwrap()).unwrap();
+        assert_eq!(goals[0]["id"], "goal-1");
+        assert!(!dir.join("_amux_task_budgets.json").exists(), "an empty table writes no file");
+        for t in DORMANT_PLANNING_TABLES {
+            let gone = conn.query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [t], |_| Ok(())).optional().unwrap();
+            assert!(gone.is_none(), "{t} is dropped");
+        }
+        for kept in ["_amux_leases", "_amux_attempts", "_amux_decompositions", "_amux_memories", "_amux_workers"] {
+            let there = conn.query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [kept], |_| Ok(())).optional().unwrap();
+            assert!(there.is_some(), "{kept} is kept");
+        }
+        // A second database never overwrites the first archive.
+        let mut again = dormant_planning_fixture();
+        again.execute("UPDATE tasks SET text='changed'", []).unwrap();
+        apply_all_with_home(&mut again, Some(home.path())).unwrap();
+        let kept: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(dir.join("tasks.json")).unwrap()).unwrap();
+        assert_eq!(kept[0]["text"], "tailscale ingress");
+    }
+
+    #[test]
+    fn dormant_planning_rows_with_nowhere_to_archive_them_refuse_the_drop() {
+        let mut conn = dormant_planning_fixture();
+        let e = apply_all(&mut conn).unwrap_err().to_string();
+        assert!(e.contains("no home to archive") && e.contains("0180"), "{e}");
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "nothing was dropped");
+        conn.execute_batch("DELETE FROM tasks; DELETE FROM _amux_planning_nodes; DELETE FROM _amux_goal_contracts;").unwrap();
+        apply_all(&mut conn).unwrap();
+    }
+
     /// Either 0082/0083 history converges, and 0139 then removes the project
     /// columns while keeping what the main line still uses.
     fn assert_reconciled_project_schema(conn: &Connection) {
@@ -1513,62 +2121,223 @@ mod tests {
         );
     }
 
-    /// AF-353: a version whose recorded name is no longer the registered one
-    /// must be REPORTED, and a clean database must stay quiet.
-    ///
-    /// Both directions on purpose. A detector that reported every version would
-    /// pass the first half of this alone while being useless, and one that
-    /// reported nothing would pass the second half alone while being the bug.
-    ///
-    /// It drives the SHIPPED query against a real database built through
-    /// `apply_all`, not a hand-made fixture. The defect being guarded lives in
-    /// the disagreement between what a database RECORDED and what the code now
-    /// registers, so a fixture that writes both sides itself would be asserting
-    /// against its own construction.
+    /// The nine tables that used to be created at their point of use (audit
+    /// 2026-11-26 P1). Each must come from a migration now.
+    const POINT_OF_USE_TABLES: &[&str] = &[
+        "task_attempts",
+        "task_episodes",
+        "card_budgets",
+        "group_config",
+        "file_visits",
+        "nav_visits",
+        "nav_picks",
+        "event_dispatch_cursor",
+        "_amux_brex_spend",
+    ];
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    #[derive(Clone)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn with_captured_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(CapturedLogs(buf.clone()))
+            .finish();
+        let _scope = tracing::subscriber::set_default(subscriber);
+        let result = f();
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
+
     #[test]
-    fn a_version_applied_under_a_different_name_is_reported() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        apply_all(&mut conn).unwrap();
+    fn every_point_of_use_table_exists_after_a_fresh_migrate() {
+        let conn = test_memdb();
+        let missing: Vec<&str> =
+            POINT_OF_USE_TABLES.iter().copied().filter(|t| !table_exists(&conn, t)).collect();
+        assert!(missing.is_empty(), "tables a fresh migrate did not create: {missing:?}");
+        // The indexes the point-of-use DDL carried came with them.
+        for idx in [
+            "idx_task_attempts_card_attempt",
+            "idx_task_attempts_running",
+            "idx_task_attempts_worker",
+            "idx_task_episodes_card",
+            "idx_task_episodes_worker",
+            "idx_task_episodes_open",
+            "idx_brex_spend_card_time",
+        ] {
+            assert!(
+                conn.query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [idx],
+                    |_| Ok(())
+                )
+                .is_ok(),
+                "index {idx} missing after a fresh migrate"
+            );
+        }
+    }
 
-        // THE CONTROL, and it is load-bearing: a database the code agrees with
-        // reports nothing. Without it, `renumbered_migrations` returning
-        // everything would look like a pass below.
-        assert_eq!(
-            renumbered_migrations(&conn),
-            Vec::new(),
-            "a database in step with MIGRATIONS must report no renumbering"
+    /// A `CREATE TABLE IF NOT EXISTS` for one of the moved tables anywhere in
+    /// `src/` reintroduces the workaround (and a second spelling of the DDL
+    /// that drifts from the migration). Migrations live in `migrations/`.
+    #[test]
+    fn point_of_use_tables_are_created_only_in_migrations() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        walk(&root.join("src"), &mut files);
+        walk(&root.join("tests"), &mut files);
+        // The control: the scan must actually see source, or it passes vacuously.
+        assert!(files.len() > 50, "scanned only {} .rs files; wrong root", files.len());
+        let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_uppercase();
+        let mut offenders = Vec::new();
+        for f in &files {
+            let text = squash(&std::fs::read_to_string(f).unwrap());
+            for t in POINT_OF_USE_TABLES {
+                // api/brex.rs is owner-tier (review-tiers.txt), so its lazy
+                // CREATE is removed in its own commit for the owner's approval.
+                // Until then 0176 creates the table and this CREATE is a no-op.
+                if *t == "_amux_brex_spend" && f.ends_with("api/brex.rs") {
+                    continue;
+                }
+                // Built at runtime so this test's own source does not match.
+                let needle = format!("{} {}", ["CREATE TABLE IF NOT", "EXISTS"].join(" "), t.to_ascii_uppercase());
+                let hit = text.match_indices(&needle).any(|(i, _)| {
+                    // whole-identifier match: `nav_visits` must not hit `nav_visits_x`
+                    text[i + needle.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+                });
+                if hit {
+                    offenders.push(format!("{}: {t}", f.strip_prefix(root).unwrap().display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "point-of-use CREATE TABLE for a migrated table (put schema in a numbered \
+             migration; the runner no longer skips a mismatched version): {offenders:?}"
         );
+    }
 
-        // Now the real shape: version 1 was applied under the name it had
-        // before someone renumbered it. This is what every database that ran
-        // the pre-renumber code looks like, and the runner cannot tell it from
-        // the case where version 1 now means a DIFFERENT migration entirely.
-        let registered = MIGRATIONS[0].name;
-        conn.execute(
-            "UPDATE _amux_migrations SET name = ?1 WHERE version = ?2",
-            rusqlite::params!["0001_under_its_old_name", MIGRATIONS[0].version],
+    /// AF-353 / audit P1: a version whose recorded name is not the registered
+    /// one is DETECTED (logged with `migration_name_mismatch`), the registered
+    /// migration RUNS, and its tables exist afterwards. A clean database stays
+    /// quiet.
+    #[test]
+    fn a_name_mismatch_on_an_applied_version_is_logged_and_applied() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let ((), quiet) = with_captured_logs(|| apply_all(&mut conn).unwrap());
+        // THE CONTROL: a database in step with MIGRATIONS logs no mismatch.
+        assert!(!quiet.contains("migration_name_mismatch"), "clean db logged a mismatch: {quiet}");
+        assert_eq!(renumbered_migrations(&conn), Vec::new());
+
+        // The AMUX-4533 shape: a dirty build consumed 0176's number for some
+        // other migration, so 0176's tables were never made.
+        let m = MIGRATIONS.iter().find(|m| m.name == "0176_point_of_use_tables").unwrap();
+        conn.execute_batch(
+            "DROP TABLE task_attempts; DROP TABLE task_episodes; DROP TABLE card_budgets;
+             DROP TABLE file_visits; DROP TABLE nav_visits; DROP TABLE nav_picks;
+             DROP TABLE _amux_brex_spend;",
         )
         .unwrap();
+        conn.execute(
+            "UPDATE _amux_migrations SET name = '0176_some_dirty_build', checksum = NULL WHERE version = ?1",
+            [m.version],
+        )
+        .unwrap();
+        assert_eq!(renumbered_migrations(&conn).len(), 1, "detected before the boot");
+        assert_eq!(pending(&conn), vec![m.name], "the live-DB guard must count it as pending");
 
-        let found = renumbered_migrations(&conn);
-        assert_eq!(
-            found.len(),
-            1,
-            "expected exactly the one mismatch: {found:?}"
-        );
-        assert_eq!(found[0].0, MIGRATIONS[0].version);
-        assert_eq!(found[0].1, "0001_under_its_old_name", "the RECORDED name");
-        assert_eq!(found[0].2, registered, "the REGISTERED name");
+        let ((), logs) = with_captured_logs(|| apply_all(&mut conn).unwrap());
+        assert!(logs.contains("migration_name_mismatch"), "no mismatch WARN: {logs}");
+        assert!(logs.contains("0176_some_dirty_build") && logs.contains(m.name), "{logs}");
+        assert!(logs.contains("migration_name_mismatch_applied"), "{logs}");
+        for t in POINT_OF_USE_TABLES {
+            assert!(table_exists(&conn, t), "{t} must exist after the mismatch was reconciled");
+        }
+        let (name, reconciled): (String, Option<String>) = conn
+            .query_row(
+                "SELECT name, reconciled_name FROM _amux_migrations WHERE version = ?1",
+                [m.version],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "0176_some_dirty_build", "the recorded name is kept as evidence");
+        assert_eq!(reconciled.as_deref(), Some(m.name));
+        assert!(renumbered_migrations(&conn).is_empty(), "reconciled is no longer lagging");
+        assert!(pending(&conn).is_empty());
 
-        // And it survives a re-run. `apply_all` skips already-applied versions,
-        // so the mismatch must still be visible on the next boot rather than
-        // being a one-shot only the very first startup could have caught.
-        apply_all(&mut conn).unwrap();
-        assert_eq!(
-            renumbered_migrations(&conn).len(),
-            1,
-            "the mismatch must still be reported on a later boot"
-        );
+        // Once: a later boot neither re-runs nor re-logs it.
+        let ((), again) = with_captured_logs(|| apply_all(&mut conn).unwrap());
+        assert!(!again.contains("migration_name_mismatch"), "re-logged on a later boot: {again}");
+    }
+
+    /// A mismatched migration that CANNOT run against this database's shape
+    /// must not brick the boot: rolled back whole, logged, still reported, and
+    /// still pending for the live-DB guard.
+    #[test]
+    fn a_name_mismatch_whose_migration_fails_does_not_brick_the_boot() {
+        let mut conn = test_memdb();
+        // 0053 is a plain ALTER ADD COLUMN; on a db that already has the column
+        // it fails with "duplicate column", which is the failing shape.
+        let m = MIGRATIONS.iter().find(|m| m.name.contains("telegram_relay_dedup")).unwrap();
+        conn.execute(
+            "UPDATE _amux_migrations SET name = 'other_branch', checksum = NULL WHERE version = ?1",
+            [m.version],
+        )
+        .unwrap();
+        let (res, logs) = with_captured_logs(|| apply_all(&mut conn));
+        res.expect("a failed reconcile must not fail the boot");
+        assert!(logs.contains("migration_name_mismatch_apply_failed"), "{logs}");
+        assert!(logs.contains("migration_name_mismatch_unreconciled"), "{logs}");
+        let reconciled: Option<String> = conn
+            .query_row(
+                "SELECT reconciled_name FROM _amux_migrations WHERE version = ?1",
+                [m.version],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reconciled, None, "a failed apply must not be recorded as reconciled");
+        assert_eq!(renumbered_migrations(&conn).len(), 1);
+        assert_eq!(pending(&conn), vec![m.name]);
     }
 
     #[test]
@@ -1580,21 +2349,39 @@ mod tests {
             ["0029_regenerable_samples"],
         )
         .unwrap();
-
+        let m35 = MIGRATIONS.iter().find(|m| m.version == 35).unwrap();
+        let row = |name: &str| RecordedRow { name: name.into(), reconciled_name: None, checksum: None };
         assert_eq!(
-            version_collision_warning(35, "0035_regenerable_samples", "0029_regenerable_samples",),
-            None,
+            mismatch_action(m35, &row("0029_regenerable_samples")),
+            MismatchAction::AlreadyApplied,
             "the documented rename performed the same schema work"
         );
         assert!(
             renumbered_migrations(&conn).is_empty(),
             "known aliases must not keep every healthy startup in a false error state"
         );
-
-        assert!(
-            version_collision_warning(35, "0035_regenerable_samples", "0035_unrelated").is_some(),
+        assert_eq!(
+            mismatch_action(m35, &row("0035_unrelated")),
+            MismatchAction::Apply,
             "only the exact documented alias may be suppressed"
         );
+        // And a healthy boot over the alias does not re-run 0035.
+        let ((), logs) = with_captured_logs(|| apply_all(&mut conn).unwrap());
+        assert!(!logs.contains("migration_name_mismatch"), "{logs}");
+    }
+
+    #[test]
+    fn an_edited_applied_migration_is_logged_once() {
+        let mut conn = test_memdb();
+        conn.execute("UPDATE _amux_migrations SET checksum = 'stale' WHERE version = 1", []).unwrap();
+        let ((), logs) = with_captured_logs(|| apply_all(&mut conn).unwrap());
+        assert!(logs.contains("migration_checksum_changed"), "{logs}");
+        let ((), again) = with_captured_logs(|| apply_all(&mut conn).unwrap());
+        assert!(!again.contains("migration_checksum_changed"), "{again}");
+        let missing: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _amux_migrations WHERE checksum IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(missing, 0, "every applied migration records a checksum");
     }
 
     /// A version RECORDED but no longer registered at all is NOT a renumber and
@@ -1642,21 +2429,18 @@ mod tests {
     /// The 2026-08-30 incident, reproduced directly: a version number this
     /// binary expects to mean one thing is already recorded in the DB under
     /// a completely different migration's name (an unrelated branch's
-    /// migration having consumed the same number first). `apply_all` must
-    /// neither error nor silently pretend everything is fine — it skips the
-    /// colliding version (its SQL genuinely cannot run there) and leaves
-    /// every OTHER migration to apply normally.
+    /// migration having consumed the same number first). It used to be
+    /// skipped forever; now `apply_all` runs the registered migration over it,
+    /// keeps the colliding row's name as evidence, and every OTHER migration
+    /// still applies normally.
     #[test]
-    fn a_version_recorded_under_a_different_name_is_skipped_not_reapplied_or_fatal() {
-        // Collide a NON-foundational migration (this crate's own telegram
-        // relay dedup ALTER TABLE, found by name rather than a hardcoded
-        // number so this survives a future renumbering) — colliding version
-        // 1 would fake away the baseline schema every other migration here
-        // depends on, and this test wants to isolate ONE collision, not
-        // cascade-fail the whole suite.
+    fn a_version_recorded_under_a_different_name_is_applied_not_skipped_or_fatal() {
+        // Collide a NON-foundational migration (a one-column ALTER TABLE on a
+        // table that stays, found by name rather than a hardcoded number so
+        // this survives a future renumbering).
         let target = super::MIGRATIONS
             .iter()
-            .find(|m| m.name.contains("telegram_relay_dedup"))
+            .find(|m| m.name.contains("schedule_critical"))
             .expect("the migration this test collides must still exist")
             .version;
 
@@ -1671,61 +2455,78 @@ mod tests {
         ))
         .unwrap();
 
-        // Must not error, must not touch the colliding row, and every
-        // migration whose version was NOT already taken still applies.
         apply_all(&mut conn).unwrap();
 
-        let (name, duration): (String, Option<i64>) = conn
+        let (name, reconciled): (String, Option<String>) = conn
             .query_row(
-                "SELECT name, duration_ms FROM _amux_migrations WHERE version = ?1",
+                "SELECT name, reconciled_name FROM _amux_migrations WHERE version = ?1",
                 [target],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(
-            name, "some_other_branchs_migration",
-            "the colliding row must be left exactly as found"
-        );
-        assert_eq!(
-            duration,
-            Some(1),
-            "not re-timed — it was never actually re-run"
-        );
+        assert_eq!(name, "some_other_branchs_migration", "the recorded name is kept as evidence");
+        assert_eq!(reconciled.as_deref(), Some("0173_schedule_critical"));
 
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM _amux_migrations", [], |r| r.get(0))
             .unwrap();
-        // Every real migration except the one whose version collided.
-        assert_eq!(
-            n as usize,
-            super::MIGRATIONS.len(),
-            "every non-colliding migration still applied"
-        );
+        assert_eq!(n as usize, super::MIGRATIONS.len(), "every migration has a row");
 
         let has_col: bool = conn
-            .query_row("SELECT COUNT(*) FROM pragma_table_info('telegram_mappings') WHERE name = 'last_relayed_hash'", [], |r| {
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('schedules') WHERE name = 'critical'", [], |r| {
                 r.get::<_, i64>(0)
             })
             .map(|n| n > 0)
             .unwrap();
-        assert!(
-            !has_col,
-            "the colliding migration's actual SQL must never have run"
+        assert!(has_col, "the colliding migration's SQL must have run");
+        // And not twice: a second boot over the plain ALTER would fail with
+        // "duplicate column" and log apply_failed.
+        let ((), logs) = with_captured_logs(|| apply_all(&mut conn).unwrap());
+        assert!(!logs.contains("migration_name_mismatch"), "{logs}");
+    }
+
+    /// 0178 folds Telegram's old link table into bridge_links and drops it.
+    /// Seeded on the schema 0177 leaves: one chat the bridge already linked
+    /// (its answers had moved to a mentioned worker), one only the old table
+    /// knew (a supergroup whose last message went to a mentioned worker), and
+    /// a link tagged with the old table's name.
+    #[test]
+    fn telegram_links_move_into_bridge_links_and_the_old_table_is_dropped() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_history_through(&conn, 177);
+        let old = concat!("telegram", "_mappings");
+        conn.execute_batch(&format!(
+            "INSERT INTO conversation_posts (id, conv, author_key, author_name, body, ts) VALUES (40, 'w:x', 'k', 'n', 'b', 0);
+             INSERT INTO {old} (chat_id, session, linked_at, chat_type, last_routed_session)
+               VALUES (111, 'amux', '2026-11-01 00:00:00', 'private', 'other'),
+                      (-222, 'ops', '2026-11-02 00:00:00', 'supergroup', 'sales');
+             INSERT INTO bridge_links (platform, conversation, kind, conv, last_post_id, linked_by, linked_at)
+               VALUES ('telegram', '111', 'dm', 'w:other', 7, '{old}', 5);"
+        ))
+        .unwrap();
+        let m = MIGRATIONS.iter().find(|m| m.version == 178).unwrap();
+        assert_eq!(m.name, "0178_telegram_links_in_bridge");
+        apply_one(&conn, m.sql).unwrap();
+
+        type Row = (String, String, String, Option<String>, i64, String, i64);
+        let rows: Vec<Row> = conn
+            .prepare("SELECT conversation, kind, conv, default_conv, last_post_id, linked_by, linked_at FROM bridge_links WHERE platform='telegram' ORDER BY conversation")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("-222".into(), "group".into(), "w:sales".into(), Some("w:ops".into()), 40, "telegram_poll".into(), 1_793_577_600_000),
+                ("111".into(), "dm".into(), "w:other".into(), Some("w:amux".into()), 7, "telegram_poll".into(), 5),
+            ]
         );
-    }
-
-    #[test]
-    fn version_collision_warning_is_silent_on_a_genuine_rerun() {
-        assert_eq!(version_collision_warning(5, "0005_foo", "0005_foo"), None);
-    }
-
-    #[test]
-    fn version_collision_warning_names_both_sides_on_a_real_collision() {
-        let msg = version_collision_warning(38, "0038_telegram_relay_dedup", "0038_telegram")
-            .expect("names differ, must warn");
-        assert!(msg.contains("38"), "{msg:?}");
-        assert!(msg.contains("0038_telegram_relay_dedup"), "{msg:?}");
-        assert!(msg.contains("0038_telegram"), "{msg:?}");
+        let gone: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [old], |r| r.get(0))
+            .unwrap();
+        assert_eq!(gone, 0, "the old table is dropped");
     }
 
     /// AMUX-3609's backfill, driven through the SHIPPED migration body rather

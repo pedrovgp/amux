@@ -64,6 +64,25 @@ if grep -q red README.md; then echo "FAIL: unrelated is red"; exit 1; fi
 echo "test-unrelated: 1 passed, 0 failed"
 """
 
+# A unittest file run as `python3`, naming gadget.sh: one case always fails
+# (as test-cargo-budget.py's /proc case does on a Mac), one fails when
+# gadget.sh says BAD.
+TEST_GADGET = """import subprocess, unittest
+
+
+class Gadget(unittest.TestCase):
+    def test_always_red_here(self):
+        self.fail("this platform cannot run it")
+
+    def test_gadget_says_good(self):
+        out = subprocess.run(["bash", "scripts/gadget.sh"], capture_output=True, text=True).stdout
+        self.assertEqual(out.strip(), "GOOD")
+
+
+if __name__ == "__main__":
+    unittest.main()
+"""
+
 passed = failed = 0
 
 
@@ -166,6 +185,8 @@ def main():
         check("a push whose only red is inherited is allowed", r.returncode, 0)
         check("and says the tests ran", "verdict=script_tests_pass" in r.stderr, True)
         check("and how many it selected", "3 of 4 wired tests" in r.stderr, True)
+        # Which test took the time is in the summary (AF-1197).
+        check("and names its slowest tests", "(slowest test-" in r.stderr, True)
 
         # A changed hook runs the hook tests that name it (AF-1128), and one
         # that names another hook stays out.
@@ -183,6 +204,30 @@ def main():
         check("a change a hook test rejects is refused", r.returncode != 0, True)
         check("the refusal names that test", "scripts/git-hooks/test_thing.py" in r.stderr.split("BLOCKED")[-1], True)
         check("a test of another hook did not run", "scripts/git-hooks/test_other.py" in r.stderr, False)
+
+        # A `python3 scripts/test-x.py` step is wired too, and a test that
+        # already fails on the remote for one case is still refused for a new
+        # one (AF-1197: bfc81b6d5 broke test-cargo-budget.py, which this leg
+        # did not match, and on a Mac that file always fails its /proc case).
+        write(work, "scripts/gadget.sh", WIDGET)
+        write(work, "scripts/test-gadget.py", TEST_GADGET)
+        write(work, ".github/workflows/checks.yml", CHECKS + "      - run: python3 scripts/test-gadget.py\n")
+        commit(work, "adds gadget", ".")
+        check("adding the gadget is allowed with the override",
+              git(work, "push", "origin", "main", env={"AMUX_SKIP_SCRIPT_TESTS": "1"}).returncode, 0)
+        write(work, "scripts/gadget.sh", "#!/usr/bin/env bash\n# reworded\necho GOOD\n")
+        commit(work, "rewords gadget.sh", "scripts")
+        r = git(work, "push", "origin", "main")
+        check("a python3 step that names a changed script runs",
+              "0 failing from this push, 1 already failing on the remote" in r.stderr, True)
+        check("its case that also fails on the remote does not block", r.returncode, 0)
+        write(work, "scripts/gadget.sh", "#!/usr/bin/env bash\necho BAD\n")
+        commit(work, "breaks gadget.sh", "scripts")
+        r = git(work, "push", "origin", "main")
+        tail = r.stderr.split("BLOCKED")[-1]
+        check("a new failing case in an already-red test is refused", r.returncode != 0, True)
+        check("the refusal names the new case", "test_gadget_says_good" in tail, True)
+        check("and not the case the remote shares", "test_always_red_here" in tail, False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -126,6 +126,16 @@ if [[ -f "$SRC/scripts/hooks/boundary-guard.py" && -f "$SRC/boundaries.toml" ]];
   as_user install -m 644 "$SRC/boundaries.toml" "$HOME_DIR/.amux/hooks/boundaries.toml.new" \
     && as_user mv "$HOME_DIR/.amux/hooks/boundaries.toml.new" "$HOME_DIR/.amux/hooks/boundaries.toml"
   GUARD_ARGS=(--boundary-guard "$HOME_DIR/.amux/hooks/boundary-guard.py")
+  # The read-only gate the tenant-workload-gate refusal tells a worker to run, by this path.
+  # install.sh copied it and this script did not, so mixpeek-dev booted with the guard
+  # refusing toward a gate that was not there (2026-11-24 01:07Z).
+  GATE="$HOME_DIR/.amux/hooks/tenant-gate.sh"
+  if [[ -f "$SRC/scripts/tenant-gate.sh" ]] \
+      && as_user install -m 755 "$SRC/scripts/tenant-gate.sh" "$GATE.new" && as_user mv "$GATE.new" "$GATE"; then
+    say "verdict=tenant_gate_installed path=$GATE"
+  else
+    say "verdict=tenant_gate_missing path=$GATE source=$SRC/scripts/tenant-gate.sh: the guard names a gate that is not there"
+  fi
 fi
 if [[ -f "$HOOKS" ]]; then
   if as_user python3 "$HOOKS" --provider claude --settings "$HOME_DIR/.claude/settings.json" \
@@ -162,6 +172,26 @@ if [[ -f $CF ]] && grep -q 'header_up Cookie "amux_member=' $CF && ! grep -q 'he
     say "caddy: amux now sees the public Host (team invite links)"
   else
     mv $CF.prev $CF; systemctl reload caddy; say "WARN caddy Host migration rejected; previous Caddyfile kept"
+  fi
+fi
+
+# The front-door owner proof (governance PR 3, api/loopback_trust.rs): amux mints the secret at
+# ~/.amux/front-door-owner; the door returns it to Caddy for the owner and Caddy forwards it, so
+# amux can tell the owner from a local process. Copied to the door (0600, amux-door) when it
+# changes; an older Caddyfile gains the strip and copy lines once, validated, reverted if refused.
+PROOF_SRC="$HOME_DIR/.amux/front-door-owner"
+if [[ -s "$PROOF_SRC" ]] && ! cmp -s "$PROOF_SRC" /etc/amux-door/front-door-owner; then
+  install -m 600 -o amux-door -g amux-door "$PROOF_SRC" /etc/amux-door/front-door-owner \
+    && say "verdict=front_door_owner_proof_installed"
+fi
+if [[ -f $CF ]] && grep -q 'copy_headers X-Door-User X-Amux-Member$' $CF; then
+  cp -p $CF $CF.prev
+  sed -i -e 's|^\( *\)request_header -X-Amux-Member$|\1request_header -X-Amux-Member\n\1request_header -X-Amux-Front-Door-Owner|' \
+         -e 's|copy_headers X-Door-User X-Amux-Member$|copy_headers X-Door-User X-Amux-Member X-Amux-Front-Door-Owner|' $CF
+  if runuser -u caddy -- caddy validate --config $CF --adapter caddyfile >/dev/null 2>&1 && systemctl reload caddy; then
+    say "verdict=caddy_front_door_owner_proof_forwarded"
+  else
+    mv $CF.prev $CF; systemctl reload caddy; say "WARN verdict=caddy_front_door_owner_proof_rejected previous Caddyfile kept"
   fi
 fi
 

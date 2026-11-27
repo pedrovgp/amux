@@ -11,6 +11,7 @@ pub mod backend;
 pub mod bridge;
 mod cargo_target_guard;
 pub mod config;
+pub mod environment;
 mod fanout_retirement;
 mod boot_watch;
 mod parent_watch;
@@ -531,6 +532,10 @@ async fn async_main() {
 
     boot_watch::step("app_state");
     let reconciled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    api::human_proof::set_owner_credential_configured(auth_token.is_some());
+    // Governance PR 3: the secret a sign-in door or gateway returns for the
+    // owner (loopback_trust.rs). Minted once, 0600; harmless where no door uses it.
+    api::loopback_trust::init(&cfg.amux_home, cfg.env.get(api::loopback_trust::FRONT_DOOR_SECRET_ENV).map(String::as_str));
     let state = api::AppState {
         store: store.clone(),
         started: Instant::now(),
@@ -572,6 +577,14 @@ async fn async_main() {
         jobs::ids::EMAIL_THEMES,
         Some(secs(api::email_intel::THEME_REFRESH_SECS)),
         api::email_intel::theme_refresh_loop,
+    );
+
+    // Memory curation (memory_dream.rs): asks a worker whose memory grew past
+    // AMUX_MEMORY_DREAM_KB to rewrite it, at most weekly.
+    jobs::spawn_loop(
+        jobs::ids::MEMORY_DREAM,
+        Some(secs(runtime_jobs::memory_dream::TICK_SECS)),
+        { let state = state.clone(); move || runtime_jobs::memory_dream::dream_loop(state.clone()) },
     );
 
     jobs::spawn_loop(
@@ -648,7 +661,18 @@ async fn async_main() {
     // to be automatic"). Sweeps for lanes with human messages but no board card
     // and steers each to open one — server-side, so it reaches any group. One
     // nudge per lane per 24h. Held like board-drive so the loop is not dropped.
-    drop(api::messages::accountability_spawn(state.clone()));
+    drop(api::accountability::accountability_spawn(state.clone()));
+    // Outcome threads (o:<id>) resolve their worker from this registry.
+    api::intent_store::load_registry(&state);
+    // The retired worker channels' files become Messages direct messages
+    // (ww:<a>|<b>), once: each imported file is renamed `.imported`.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let home = crate::config::amux_home();
+            api::conversations::import_worker_channels(&state, &home).await;
+        });
+    }
 
     // Pane-size restoration (AMUX-2634): a peek resizes the worker's tmux
     // window to the READER's viewport and tmux pins `window-size manual`, so
@@ -704,6 +728,12 @@ async fn async_main() {
     crate::api::file_visits::spawn_seed(state.store.clone());
     drop(runtime_jobs::host_metrics::spawn(state.clone()));
     drop(runtime_jobs::trace_archive::spawn(state.clone()));
+    drop(runtime_jobs::ledger_checkpoint::spawn(state.clone()));
+    // Encryption at rest (governance PR 18): seal any plain connector grant
+    // once per boot. Reads seal lazily too; this pass covers grants nothing reads.
+    tokio::task::spawn_blocking(|| {
+        crate::integrations::at_rest::migrate_home(&crate::config::amux_home());
+    });
     drop(runtime_jobs::host_guard::spawn());
     drop(runtime_jobs::worker_resources::spawn(state.clone()));
     drop(runtime_jobs::goal_keeper::spawn(state.clone()));
@@ -726,9 +756,6 @@ async fn async_main() {
     // The owner's own iMessage thread and email to themselves (bridge/self_chat.rs).
     drop(bridge::imessage::spawn(state.clone()));
     drop(bridge::email::spawn(state.clone()));
-    // Auto-relay: send session replies back to Telegram when linked sessions respond
-    // to Telegram-routed messages. Works for all workers without per-session configuration.
-    drop(runtime_jobs::telegram_relay::spawn(state.clone()));
     // Compaction-generation watch (AMUX-3742): the reason "amux claude performs
     // worse than raw claude" was invisible for months is that nothing counted
     // how many times a lane's conversation had been summarized away.
@@ -854,6 +881,13 @@ async fn async_main() {
     let proxies_store = state.store.clone();
     api::board_intake::initialize();
     api::history_ask::initialize();
+    // After the helper model is installed: its first tick runs at once, and
+    // spawned earlier it found no model and logged desc_refresh_no_model.
+    drop(runtime_jobs::desc_refresh::spawn(state.clone()));
+    drop(runtime_jobs::event_dispatch::spawn(state.clone()));
+    drop(runtime_jobs::email_events::spawn(state.clone()));
+    drop(runtime_jobs::linkedin_events::spawn(state.clone()));
+    drop(runtime_jobs::crm_watch::spawn(state.clone()));
     boot_watch::step("router");
     let app = api::router(state);
 
@@ -912,6 +946,16 @@ async fn async_main() {
         .unwrap_or(amux_core::circuit::FleetState::Normal)
     };
     boot_watch::step("orchestrator_runtime");
+    // The tick loop is off unless AMUX_RS_ORCH=1 (primitive integrity audit
+    // 2026-11-26, step 2): it planned over rust-managed workers while the board
+    // dispatcher does the real dispatch. Reconciliation below still runs, it is
+    // what /health's `reconciled` waits on.
+    let orch_loop = orchestrator::runtime::loop_decision(
+        cfg.env.get(orchestrator::runtime::LOOP_SWITCH).map(String::as_str),
+    );
+    orchestrator::runtime::record_loop_decision(&orch_loop);
+    tracing::warn!(job = jobs::ids::ORCH_RUNTIME, on = orch_loop.on, measured = true, n_considered = 1,
+        verdict = orch_loop.verdict, "{}", orch_loop.reason);
     let runtime = Arc::new(orchestrator::runtime::Runtime {
         store: store.clone(),
         backends: backends.clone(),
@@ -981,11 +1025,17 @@ async fn async_main() {
             crate::api::reclaim::reap_orphaned_scans(&store);
             reconciled.store(true, std::sync::atomic::Ordering::Release);
             let orch_tick_secs = runtime.tick_secs.max(1);
-            jobs::spawn_loop(
-                jobs::ids::ORCH_RUNTIME,
-                Some(secs(orch_tick_secs)),
-                move || runtime.clone().run(),
-            );
+            if orch_loop.on {
+                jobs::spawn_loop(
+                    jobs::ids::ORCH_RUNTIME,
+                    Some(secs(orch_tick_secs)),
+                    move || runtime.clone().run(),
+                );
+            } else {
+                // Inert but visible: /api/system-jobs shows it `disabled` with
+                // the reason, never a loop that reads `stalled`.
+                jobs::register_disabled(jobs::ids::ORCH_RUNTIME, "loop", Some(secs(orch_tick_secs)), orch_loop.reason);
+            }
         });
     }
 
@@ -1123,10 +1173,13 @@ async fn async_main() {
                             std::fs::metadata(&receipt).ok().and_then(|m| m.modified().ok()));
             let mut observed = stamp();
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            // An in-flight shell schedule run holds adoption, for at most
-            // AMUX_ADOPT_SHELL_DEFER_MAX_S (default 900, like the builder's).
+            // An in-flight shell schedule run used to hold adoption (up to
+            // 900s), because an exec killed it. A shell run is now detached
+            // and adopted by the next process (runtime_jobs/shell_detached.rs),
+            // so the hold defaults to 0. AMUX_ADOPT_SHELL_DEFER_MAX_S=<s>
+            // brings it back if adoption ever has to be bypassed.
             let defer_max = std::time::Duration::from_secs(
-                std::env::var("AMUX_ADOPT_SHELL_DEFER_MAX_S").ok().and_then(|v| v.parse().ok()).unwrap_or(900));
+                std::env::var("AMUX_ADOPT_SHELL_DEFER_MAX_S").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
             let mut defer_since: Option<std::time::Instant> = None;
             let mut defer_logged: Option<std::time::Instant> = None;
             loop {
@@ -1278,7 +1331,11 @@ async fn async_main() {
     boot_watch::step("publish_endpoint");
     legacy_port::publish_endpoint(&cfg.amux_home, cfg.port, None);
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
+    let addr = std::net::SocketAddr::new(cfg.bind, cfg.port);
+    if let Some(bad) = &cfg.bind_rejected {
+        tracing::warn!(value = %bad, fallback = %cfg.bind, verdict = "bind_value_rejected",
+            "AMUX_RS_BIND is not an IP address; binding the default instead");
+    }
     // HOW LONG AFTER `record_boot` DID WE ACTUALLY START SERVING (AMUX-3647).
     //
     // The card proposed a `ready_at` COLUMN on `_amux_request_log` so the

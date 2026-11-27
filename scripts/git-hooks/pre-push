@@ -16,7 +16,7 @@
 # Fail-open by design: any error lets the push proceed. Outside amux
 # ($AMUX_SESSION unset) it is a no-op — the human is always allowed to push.
 # Intentional cross-session push: AMUX_ALLOW_FOREIGN=1 git push ...
-import datetime, glob, json, os, re, shutil, ssl, subprocess, sys, tempfile, urllib.parse, urllib.request
+import datetime, glob, json, os, re, shutil, ssl, subprocess, sys, tempfile, time, urllib.parse, urllib.request
 
 ZERO = "0" * 40
 
@@ -399,7 +399,20 @@ def _harness_guard_gate(refs):
 # behind `run:`, chained with `&&`, with arguments or an env prefix. A test
 # with arguments runs here without them; if that makes it fail, it fails on
 # the remote's tip the same way and counts as inherited (review F1).
-_SCRIPT_TEST_STEP = re.compile(r"(?:\./|\bbash\s+)(scripts/test-[A-Za-z0-9_.-]+\.sh)\b")
+# And `python3 scripts/test-x.py`: bfc81b6d5 broke scripts/test-cargo-budget.py,
+# which this pattern did not match, and main's checks was red 8 hours (AF-1197).
+_SCRIPT_TEST_STEP = re.compile(r"(?:\./|\bbash\s+|\bpython3\s+)(scripts/test-[A-Za-z0-9_.-]+\.(?:sh|py))\b")
+# The failing cases a test names: unittest's `FAIL: test_x (...)` and
+# `ERROR: ...`, and the `FAIL: ...` lines of the shell tests. A test that
+# already fails on the remote for one case must not hide a new case: on a Mac
+# test-cargo-budget.py always fails its /proc case, which made bfc81b6d5's new
+# failure in the same file read as inherited (AF-1197).
+_FAIL_CASE = re.compile(r"^(?:FAIL|ERROR)\b:?\s*(.+)$", re.M)
+_TMP_PATH = re.compile(r"(?:/private)?/var/folders/\S+|/tmp/\S+")
+
+
+def _failing_cases(out, tree):
+    return {_TMP_PATH.sub("<tmp>", m.replace(tree, "<tree>")).strip() for m in _FAIL_CASE.findall(out)}
 _SCRIPT_TESTS_MAX = 12
 _SCRIPT_TEST_TIMEOUT_S = 300
 
@@ -439,9 +452,10 @@ def _script_tests_for(sha, touched):
     return picked, len(wired)
 
 
-def _script_test_failures(sha, tests):
+def _script_test_failures(sha, tests, secs=None):
     """Run `tests` on `sha`'s tree with no amux session in the environment, so
-    a test cannot reach the live server. Returns failing names, or None."""
+    a test cannot reach the live server. Returns failing names, or None.
+    `secs`, when given, gets each test's wall time."""
     tmp = tempfile.mkdtemp(prefix="amux-script-tests-")
     try:
         arch = subprocess.run("git archive %s | tar -x -C %s" % (sha, tmp), shell=True,
@@ -456,14 +470,18 @@ def _script_test_failures(sha, tests):
         for t in tests:
             if not os.path.exists(os.path.join(tmp, t)):
                 continue
+            t0 = time.monotonic()
             try:
                 run = [sys.executable, t] if t.endswith(".py") else ["bash", t]
                 r = subprocess.run(run, cwd=tmp, env=env, capture_output=True, text=True,
                                    timeout=_SCRIPT_TEST_TIMEOUT_S)
                 if r.returncode != 0:
-                    failing.append((t, "\n".join((r.stdout + r.stderr).strip().splitlines()[-6:])))
+                    failing.append((t, "\n".join((r.stdout + r.stderr).strip().splitlines()[-6:]),
+                                    _failing_cases(r.stdout + r.stderr, tmp)))
             except subprocess.TimeoutExpired:
-                failing.append((t, "did not finish in %ds" % _SCRIPT_TEST_TIMEOUT_S))
+                failing.append((t, "did not finish in %ds" % _SCRIPT_TEST_TIMEOUT_S, set()))
+            if secs is not None:
+                secs[t] = secs.get(t, 0) + time.monotonic() - t0
         return failing
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -482,18 +500,22 @@ def _script_tests_gate(refs):
         dropped = tests[_SCRIPT_TESTS_MAX:]
         tests = tests[:_SCRIPT_TESTS_MAX]
         t0 = datetime.datetime.now()
-        failing = _script_test_failures(local, tests)
+        # Per test, both trees: lanes skipped this leg after runs of 1,391 to
+        # 1,779 s that logged no test names, so nobody could say which test
+        # was slow (AF-1197). The audit line and the summary now name them.
+        per = {}
+        failing = _script_test_failures(local, tests, per)
         if failing is None:
             sys.stderr.write("amux pre-push: script tests on %s could not run (git archive failed); "
                              "CI's checks still runs them verdict=script_tests_unmeasured\n" % short)
             _audit("script_tests", "verdict=script_tests_unmeasured sha=%s" % short)
             continue
-        inherited = []
+        inherited, new_cases = [], {}
         if failing:
             base = remote if remote != ZERO else subprocess.run(
                 ["git", "rev-parse", "-q", "--verify", "origin/main"], capture_output=True,
                 text=True, timeout=10).stdout.strip()
-            was = _script_test_failures(base, [t for t, _ in failing]) if base else None
+            was = _script_test_failures(base, [t for t, _, _ in failing], per) if base else None
             if was is None:
                 # A first push, or a base tree that cannot be read: this leg
                 # blocks only what it can show is new, so CI decides (AF-1128).
@@ -503,18 +525,25 @@ def _script_tests_gate(refs):
                                     if base else "no remote tip"))
                 _audit("script_tests", "verdict=script_tests_unmeasured sha=%s" % short)
                 continue
-            was_names = {t for t, _ in was}
-            inherited = [t for t, _ in failing if t in was_names]
-        mine = [(t, why) for t, why in failing if t not in inherited]
+            was_cases = {t: cases for t, _, cases in was}
+            # Inherited only when the remote fails it too, and for every case
+            # this push fails it for. A test that names no case compares whole.
+            inherited = [t for t, _, cases in failing if t in was_cases and cases <= was_cases[t]]
+            new_cases = {t: cases - was_cases.get(t, set()) for t, _, cases in failing}
+        mine = [(t, why if not (new_cases.get(t) and t in was_cases) else
+                 "new failing case(s), the remote fails only the others:\n" + "\n".join(sorted(new_cases[t])))
+                for t, why, _ in failing if t not in inherited]
         secs = (datetime.datetime.now() - t0).total_seconds()
+        slowest = ",".join("%s:%.0f" % (os.path.basename(t), n) for t, n in
+                           sorted(per.items(), key=lambda x: -x[1])[:3])
         verdict = "script_tests_fail" if mine else "script_tests_pass"
         sys.stderr.write("amux pre-push: script tests on %s: %d of %d wired tests name a "
                          "changed script or hook, %d failing from this push, %d already failing on the remote, "
-                         "%d not run (cap %d), %.0fs verdict=%s\n"
+                         "%d not run (cap %d), %.0fs (slowest %s) verdict=%s\n"
                          % (short, len(tests), wired, len(mine), len(inherited), len(dropped),
-                            _SCRIPT_TESTS_MAX, secs, verdict))
-        _audit("script_tests", "verdict=%s sha=%s tests=%d mine=%d inherited=%d secs=%.0f"
-               % (verdict, short, len(tests), len(mine), len(inherited), secs))
+                            _SCRIPT_TESTS_MAX, secs, slowest or "-", verdict))
+        _audit("script_tests", "verdict=%s sha=%s tests=%d mine=%d inherited=%d secs=%.0f slowest=%s"
+               % (verdict, short, len(tests), len(mine), len(inherited), secs, slowest or "-"))
         if mine:
             sys.stderr.write("\nBLOCKED: this push fails tests that CI runs:\n")
             for t, why in mine:
@@ -556,7 +585,7 @@ def _spa_gates(refs):
             _audit("spa_gates", "verdict=spa_gates_unmeasured sha=%s" % short)
             continue
         tests, failing = got
-        inherited = []
+        inherited, new_cases = [], {}
         if failing:
             base = remote if remote != ZERO else subprocess.run(
                 ["git", "rev-parse", "-q", "--verify", "origin/main"], capture_output=True,
@@ -618,6 +647,30 @@ def _land_gate_leg(stdin_text):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _kill_switch_engaged():
+    """The reason, if the owner's kill switch is engaged; None if it is not.
+    AMUX_KILL_SWITCH=off makes it inert. A file that exists but cannot be
+    read reads as engaged: a stop the owner asked for fails closed."""
+    if os.environ.get("AMUX_KILL_SWITCH", "").strip().lower() in ("off", "0", "false", "no"):
+        return None
+    home = os.environ.get("AMUX_HOME") or os.path.join(os.environ.get("HOME", ""), ".amux")
+    path = os.path.join(home, "governance", "kill-switch.json")
+    try:
+        with open(path) as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return "kill-switch file unreadable"
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return "kill-switch file unreadable"
+    if isinstance(d, dict) and d.get("engaged") is True:
+        return str(d.get("reason") or "")
+    return None
+
+
 def main():
     # DATA-LOSS GUARD FIRST, and BEFORE the session early-returns: a stale
     # shared-file republish (MG-1483 — 10 pushed entry-lines silently reverted,
@@ -625,6 +678,19 @@ def main():
     # append-only guard runs for humans and AMUX_ALLOW_FOREIGN pushes too.
     # Stdin is consumed once here and shared with the attribution walk below.
     stdin_text = sys.stdin.read()
+    # THE OWNER'S KILL SWITCH (governance PR 19) comes before everything else
+    # and no override skips it. It reads the file the server writes
+    # (<AMUX_HOME>/governance/kill-switch.json), so it holds with the server
+    # down. A person pushing outside a worker ($AMUX_SESSION unset) is never
+    # stopped: the switch stops automation, not the people cleaning up.
+    killed = _kill_switch_engaged()
+    if killed is not None and os.environ.get("AMUX_SESSION"):
+        sys.stderr.write(
+            "amux pre-push: REFUSED. The owner's kill switch is engaged (%s); no worker\n"
+            "pushes until the owner lifts it (amux audit kill-switch off). Nothing was pushed.\n"
+            "verdict=kill_switch_refused\n" % (killed or "no reason given"))
+        _audit("kill_switch", "verdict=kill_switch_refused")
+        return 1
     try:
         guard = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                              "append-only-push-guard")

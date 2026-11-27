@@ -351,7 +351,12 @@ impl Rig {
             .args(["--exact", "fixture_server_child", "--nocapture"])
             .env("AMUX_MATRIX_CHILD_HOME", &self.home)
             .env("AMUX_HOME", &self.home)
+            // The matrix edits grant files on disk (an expired token, a
+            // revoked grant), so they stay plaintext here; sealing is covered
+            // by e2e/chaos/encryption-at-rest.mjs (governance PR 18).
+            .env("AMUX_ENCRYPT_AT_REST", "off")
             .env("AMUX_RS_PORT", self.port.to_string())
+            .env("AMUX_RS_BIND", "127.0.0.1")
             .env("AMUX_MATRIX_CHILD_PORT", self.port.to_string())
             .env("AMUX_MATRIX_PROVIDER", &self.provider)
             .env("AMUX_NO_SELF_ADOPT", "1")
@@ -380,7 +385,9 @@ impl Rig {
         child.wait().unwrap();
     }
     async fn ready(&self) {
-        for _ in 0..100 {
+        // 30 s: a cold start on a loaded host took 7.8 s and failed the old 5 s
+        // window as "server did not start" (2026-11-12, three land gates).
+        for _ in 0..600 {
             if self
                 .client
                 .get(format!("http://127.0.0.1:{}/health", self.port))
@@ -531,6 +538,7 @@ async fn every_builtin_connector_lifecycle_over_http_and_sigkill() {
         "telegram",
         "mattermost",
         "devto",
+        "phone",
     ];
     let (_, list) = rig
         .call(reqwest::Method::GET, "/api/connectors", json!({}), false)
@@ -566,6 +574,8 @@ async fn every_builtin_connector_lifecycle_over_http_and_sigkill() {
         ("whatsapp", vec!["WHATSAPP_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_APP_SECRET", "WHATSAPP_VERIFY_TOKEN"]),
         ("slack-bot", vec!["SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET"]),
         ("discord", vec!["DISCORD_BOT_TOKEN", "DISCORD_CHANNELS"]),
+        // Outbound calls (api/calls.rs): the bridge's keys, no test endpoint.
+        ("phone", vec!["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM", "XAI_API_KEY", "AMUX_CALL_BRIDGE_URL"]),
     ] {
         let mut body = serde_json::Map::new();
         for k in &keys {
@@ -574,7 +584,9 @@ async fn every_builtin_connector_lifecycle_over_http_and_sigkill() {
         assert_eq!(rig.post(&format!("/api/connectors/{id}/credentials"), Value::Object(body)).await.0, 200, "{id} keys");
         let (_, list) = rig.call(reqwest::Method::GET, "/api/connectors", json!({}), false).await;
         let row = list["connectors"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap().clone();
-        assert!(!row.to_string().contains("matrix-WHATSAPP_TOKEN"), "{id}: a pasted key is never echoed");
+        for k in &keys {
+            assert!(!row.to_string().contains(&format!("matrix-{k}")), "{id}: a pasted {k} is never echoed");
+        }
         assert_eq!(rig.post(&format!("/api/connectors/{id}/auth"), json!({})).await.1["auth"], "apikey", "{id}");
         assert_eq!(rig.post(&format!("/api/connectors/{id}/token"), json!({})).await.0, 400, "{id}: no token to mint");
         if id != "slack-bot" {
@@ -707,34 +719,34 @@ async fn every_builtin_connector_lifecycle_over_http_and_sigkill() {
         .1["bot_token_set"],
         true
     );
-    assert_eq!(
-        rig.post(
-            "/api/telegram/mappings",
-            json!({"chat_id":-100,"session":"matrix-worker","chat_type":"group"})
-        )
-        .await
-        .0,
-        409,
-        "group requires a private link"
-    );
+    // A group /link before any private link is refused; the private one is
+    // a chat bridge link, read back from the bridge.
     fixture.lock().unwrap().updates = vec![
+        json!({"update_id":40,"message":{"chat":{"id":-100,"type":"group"},"text":"/link matrix-worker","from":{"username":"fixture"}}}),
         json!({"update_id":41,"message":{"chat":{"id":100,"type":"private"},"text":"/link matrix-worker","from":{"username":"fixture"}}}),
     ];
     assert_eq!(rig.post("/matrix/poll", json!({})).await.0, 200);
-    let mappings = rig
-        .call(
-            reqwest::Method::GET,
-            "/api/telegram/mappings",
-            json!({}),
-            false,
-        )
+    let links = rig
+        .call(reqwest::Method::GET, "/api/bridge", json!({}), false)
         .await
-        .1;
-    assert_eq!(mappings["mappings"][0]["session"], "matrix-worker");
+        .1["links"]
+        .clone();
+    let telegram: Vec<(String, String)> = links
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["platform"] == "telegram")
+        .map(|l| (l["conversation"].as_str().unwrap().to_string(), l["conv"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(
+        telegram,
+        vec![("100".to_string(), "w:matrix-worker".to_string())],
+        "group requires a private link; the private /link is a bridge link"
+    );
     assert_eq!(
         rig.post(
-            "/api/telegram/mappings",
-            json!({"chat_id":-100,"session":"matrix-worker","chat_type":"group"})
+            "/api/bridge/links",
+            json!({"platform":"telegram","conversation":"-100","target":"matrix-worker","is_group":true})
         )
         .await
         .0,
@@ -1003,7 +1015,7 @@ async fn every_builtin_connector_lifecycle_over_http_and_sigkill() {
     );
 
     for id in ids {
-        if id == "whatsapp" || id == "discord" || id == "devto" {
+        if id == "whatsapp" || id == "discord" || id == "devto" || id == "phone" {
             // No test endpoint: the keys surviving SIGKILL is what "untested"
             // (not "needs_credentials") proves here.
             assert_eq!(
@@ -1103,7 +1115,7 @@ async fn every_builtin_connector_lifecycle_over_http_and_sigkill() {
     );
     for id in ids {
         let (_, t) = rig.post(&format!("/api/connectors/{id}/test"), json!({})).await;
-        if id == "whatsapp" || id == "discord" || id == "devto" {
+        if id == "whatsapp" || id == "discord" || id == "devto" || id == "phone" {
             assert_eq!(t["status"], "untested", "{id}: keys kept, no test endpoint");
         } else {
             assert_eq!(t["ok"], true, "{id}: {t}");
@@ -1115,13 +1127,13 @@ async fn every_builtin_connector_lifecycle_over_http_and_sigkill() {
     assert_eq!(
         rig.call(
             reqwest::Method::DELETE,
-            "/api/telegram/mappings/100",
+            "/api/bridge/links/telegram/100",
             json!({}),
             false
         )
         .await
         .0,
-        204
+        200
     );
     assert_eq!(
         rig.post(

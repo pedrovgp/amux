@@ -159,6 +159,10 @@ FSEVENTSD_CMD=${AMUX_CLEANUP_FSEVENTSD_CMD:-fseventsd_reading}
 # FSEVENTSD_RESTART_COOLDOWN_H, through `sudo -n`, so it needs one sudoers line
 # from the owner (printed when missing) and never prompts. Off with
 # AMUX_CLEANUP_FSEVENTSD_RESTART_GB=0.
+# A small fseventsd that spins with no churn, or stops delivering events, is
+# restarted the same way whatever its size (Mac fseventsd RCA 20261121-183438:
+# pid 50645 at 100% CPU and 0.18G delivered 0 of 20 control files, and under
+# 12G the tick only escalated, so every file watcher stayed blind until the owner).
 FSEVENTSD_RESTART_GB=${AMUX_CLEANUP_FSEVENTSD_RESTART_GB:-12}
 FSEVENTSD_RESTART_COOLDOWN_H=${AMUX_CLEANUP_FSEVENTSD_RESTART_COOLDOWN_H:-6}
 FSEVENTSD_RESTART_CMD=${AMUX_CLEANUP_FSEVENTSD_RESTART_CMD:-sudo -n /usr/bin/killall fseventsd}
@@ -332,6 +336,12 @@ USER_TMP_MAX=${AMUX_CLEANUP_USER_TMP_MAX:-3000}
 # idle over 12 h on 2026-10-04 with the disk at 57 GB free.
 LANE_TMP_ROOT=${AMUX_CLEANUP_LANE_TMP_ROOT:-$HOME/.amux/tmp}
 LANE_TMP_IDLE_MIN=${AMUX_CLEANUP_LANE_TMP_IDLE_MIN:-1440}
+# An idle entry at least this big is not removed the first time: its lane is
+# told, and it goes only if it is still idle LANE_TMP_NOTICE_MIN later.
+LANE_TMP_NOTICE_KB=${AMUX_CLEANUP_LANE_TMP_NOTICE_KB:-512000}
+LANE_TMP_NOTICE_MIN=${AMUX_CLEANUP_LANE_TMP_NOTICE_MIN:-360}
+# Seam: TARGET is the lane, FILE the message path. The tests point it at a recorder.
+LANE_TMP_NOTICE_CMD=${AMUX_CLEANUP_LANE_TMP_NOTICE_CMD:-amux send TARGET --file FILE}
 # At most this many entries per tick. Deleting 11,781 entries (millions of
 # files) in one pass on 2026-10-04 drove fseventsd from 9 to 57 GB resident
 # and filled 52 GB of swap; a capped pass leaves the rest for the next tick.
@@ -466,7 +476,11 @@ LSOF_BIN=${AMUX_CLEANUP_LSOF_BIN:-$(command -v lsof 2>/dev/null || echo /usr/sbi
 # hold a worktree that IS the point of the directory, not scratch beside it).
 # Roots are exactly the shared, generic scratch locations observed to actually
 # accumulate this: the per-user temp dir, and the two committed worktree stores.
-WORKTREE_ROOTS=${AMUX_CLEANUP_WORKTREE_ROOTS:-${USER_TMP%/}@2:$HOME/Dev/amux-worktrees@1:$HOME/.amux/worktrees@1:$HOME/.ao/data/worktrees@1}
+# The user temp dir goes LAST (Mac self RCA 20261127-095953): it held 9,567
+# entries and its depth-2 find took 45-60s, so the scan deadline ran out inside
+# it and 15 of 23 ticks never reached the three real worktree roots after it
+# ("found 0 under 1 root(s), scan complete=no").
+WORKTREE_ROOTS=${AMUX_CLEANUP_WORKTREE_ROOTS:-$HOME/Dev/amux-worktrees@1:$HOME/.amux/worktrees@1:$HOME/.ao/data/worktrees@1:${USER_TMP%/}@2}
 # Short idle floor on purpose: the tick runs every 30 minutes and this class
 # accumulates on a 10-90 minute cadence, so a 24h floor (right for a cargo
 # target, rebuilt in minutes) would let dozens pile up before the first one
@@ -968,10 +982,16 @@ needs_reboot() { # <fseventsd_gb> <threshold>
 # Restart fseventsd when it holds over FSEVENTSD_RESTART_GB. Prints one verdict
 # line and returns 0 only when the restart ran. Sets FSE_RESTART_NEEDS_SUDOERS
 # when sudo refused, so the escalation can carry the one line that fixes it.
-fseventsd_try_restart() { # <gb> <dry:0|1>
+fseventsd_try_restart() { # <gb> <dry:0|1> [why: a stuck daemon, restarted at any size]
   FSE_RESTART_NEEDS_SUDOERS=0
   [ "${FSEVENTSD_RESTART_GB:-0}" != 0 ] || return 1
-  needs_reboot "$1" "$FSEVENTSD_RESTART_GB" || return 1
+  local why=${3:-}
+  if [ -z "$why" ]; then
+    needs_reboot "$1" "$FSEVENTSD_RESTART_GB" || return 1
+    why="held ${1}G (over ${FSEVENTSD_RESTART_GB}G)"
+  else
+    why="was $why at ${1}G"
+  fi
   local last now; now=$(date +%s); last=$(state_get "$STATE_DIR/state" fseventsd_restarted_at || true)
   if [ -n "$last" ] && [ $(( now - last )) -lt $(( FSEVENTSD_RESTART_COOLDOWN_H * 3600 )) ]; then
     echo "mac-cleanup:   fseventsd ${1}G: restarted $(( (now - last) / 60 ))m ago, next restart allowed after ${FSEVENTSD_RESTART_COOLDOWN_H}h (verdict=fseventsd_restart_cooldown)"
@@ -993,12 +1013,12 @@ fseventsd_try_restart() { # <gb> <dry:0|1>
     state_put "$STATE_DIR/state" "fseventsd_restarted_at=$now"
     sleep "${AMUX_CLEANUP_FSEVENTSD_RESTART_SETTLE_S:-3}"
     local after; after=$($FSEVENTSD_CMD 2>/dev/null); after=${after%% *}
-    echo "mac-cleanup:   fseventsd held ${1}G (over ${FSEVENTSD_RESTART_GB}G): restarted it, launchd brought it back at ${after:-?}G (verdict=fseventsd_restarted measured=true)"
+    echo "mac-cleanup:   fseventsd $why: restarted it, launchd brought it back at ${after:-?}G (verdict=fseventsd_restarted measured=true)"
     return 0
   fi
   if printf '%s' "$out" | grep -qi 'password\|sudo\|not allowed\|a terminal is required'; then
     FSE_RESTART_NEEDS_SUDOERS=1
-    echo "mac-cleanup:   fseventsd ${1}G is over ${FSEVENTSD_RESTART_GB}G but the tick may not restart it: sudo refused. One line from the owner lets it (sudo visudo -f /etc/sudoers.d/amux-fseventsd): $FSEVENTSD_SUDOERS_LINE (verdict=fseventsd_restart_needs_sudoers)"
+    echo "mac-cleanup:   fseventsd $why but the tick may not restart it: sudo refused. One line from the owner lets it (sudo visudo -f /etc/sudoers.d/amux-fseventsd): $FSEVENTSD_SUDOERS_LINE (verdict=fseventsd_restart_needs_sudoers)"
   else
     echo "mac-cleanup:   fseventsd ${1}G: restart failed rc=$rc: ${out:0:200} (verdict=fseventsd_restart_failed)"
   fi
@@ -1194,10 +1214,16 @@ TICK_SECTION="" TICK_SECTION_T0=0 TICK_SLOWEST="" TICK_SLOWEST_S=-1
 tick_mark() { # <label> (or "end")
   if [ -n "$TICK_SECTION" ]; then
     local d=$(( SECONDS - TICK_SECTION_T0 ))
+    # An arm that runs past its share takes the time of the arms after it, and
+    # the skip it causes is reported against them (Mac self RCA 20261127-095953).
+    if [ "${TICK_SECTION_CAP:-0}" -gt 0 ] && [ "$d" -gt $(( TICK_SECTION_CAP + ${TICK_OVERRUN_SLACK_S:-10} )) ]; then
+      echo "mac-cleanup: $TICK_SECTION overran its share: took ${d}s of ${TICK_SECTION_CAP}s (verdict=tick_arm_overran)"
+      TICK_OVERRAN="${TICK_OVERRAN:+$TICK_OVERRAN,}${TICK_SECTION// /_}:${d}/${TICK_SECTION_CAP}"
+    fi
     if [ "$d" -gt "$TICK_SLOWEST_S" ]; then TICK_SLOWEST_S=$d; TICK_SLOWEST="${TICK_SECTION// /_}:${d}s"; fi
     [ "$d" -gt 0 ] && TICK_SECTIONS="${TICK_SECTIONS:+$TICK_SECTIONS,}${TICK_SECTION// /_}:${d}"
   fi
-  TICK_SECTION=$1; TICK_SECTION_T0=$SECONDS
+  TICK_SECTION=$1; TICK_SECTION_T0=$SECONDS; TICK_SECTION_CAP=0
   [ "$1" = end ] && TICK_SECTION=""
   return 0
 }
@@ -1220,7 +1246,7 @@ tick_arm() { # <label> [budget var]...
   if [ "$w" -gt 0 ] && [ "$rest" -gt "$w" ]; then
     share=$(( left * w / rest )); [ "$share" -ge 1 ] || share=1
   fi
-  TICK_ARM_SHARE=$share
+  TICK_ARM_SHARE=$share; TICK_SECTION_CAP=$share
   for v in "$@"; do sum=$(( sum + ${!v} )); done
   if [ "$share" -lt "$left" ] && [ "$sum" -gt "$share" ]; then
     # Phases run one after another, so they split the share in proportion.
@@ -1475,6 +1501,32 @@ for n in os.listdir(d):
 PY
 }
 
+# Reports of a fault the process RECORDED and was not killed for: macOS names
+# them ExcUserFault_<app>-..., with an EXC_GUARD of GUARD_TYPE_USER raised by
+# os_fault_with_payload (a framework's own "this should not happen" check).
+# Prints "<file> <responsible app>" per report in the last 48h. Mac crashes RCA
+# 20261123-103607: Playwright's bundled WebKit wrote ten of these in 13 minutes
+# (WebKit::NetworkConnectionToWebProcess::didReceiveInvalidMessage) while an
+# e2e run drove it, and the tick read them as WebKit "crashing 10 times".
+crash_user_faults() { # <dir>
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, os, sys, time
+d = sys.argv[1]
+cut = time.time() - 2 * 86400
+for n in os.listdir(d):
+    p = os.path.join(d, n)
+    if not n.startswith("ExcUserFault_") or not n.endswith(".ips") or not os.path.isfile(p) or os.stat(p).st_mtime < cut:
+        continue
+    try:
+        b = json.loads(open(p, errors="replace").read().split("\n", 1)[1])
+    except Exception:
+        continue
+    e = b.get("exception") or {}
+    if e.get("type") == "EXC_GUARD" and e.get("subtype") == "GUARD_TYPE_USER":
+        print(n, (b.get("responsibleProc") or "unknown").replace(" ", "_"))
+PY
+}
+
 # Crash counts per app over the last <minutes>, as "<count> <app>" lines, most
 # first. A report's crash time is the EARLIER of the stamp macOS puts in its
 # name (-YYYY-MM-DD-HHMMSS, local) and its mtime: macOS rewrites a report long
@@ -1667,7 +1719,7 @@ PY
 check_respawn_loops() {
   local rows cnt name resp rpid key esc_key esc_at n=0
   RESPAWN_LOOPS=""; RESPAWN_ESC_KEY=""
-  export CRASH_SKIP; CRASH_SKIP=$( [ -d "$CRASH_DIR" ] && crash_simulated "$CRASH_DIR" )
+  export CRASH_SKIP; CRASH_SKIP=$( [ -d "$CRASH_DIR" ] && { crash_simulated "$CRASH_DIR"; crash_user_faults "$CRASH_DIR" | awk '{print $1}'; } )
   rows=$($RESPAWN_CMD 2>/dev/null || true)
   while read -r cnt name; do
     [ -n "${name:-}" ] && [ "${cnt:-0}" -ge "$RESPAWN_N" ] 2>/dev/null || continue
@@ -1703,9 +1755,16 @@ check_crash_reports() { # <dry:0|1>
   # A process that sends itself SIGSEGV with kill() did not crash (see
   # crash_simulated): every count below leaves those reports out, and this
   # line says how many and whose, so a test fixture never reads as a crash loop.
-  export CRASH_SKIP; CRASH_SKIP=$(crash_simulated "$CRASH_DIR")
-  if [ -n "$CRASH_SKIP" ]; then
-    echo "mac-cleanup: crash reports: $(printf '%s\n' "$CRASH_SKIP" | grep -c .) in 48h are a fault signal the process sent itself with kill(), not a crash, and are not counted ($(printf '%s\n' "$CRASH_SKIP" | sed -E 's/[-_][0-9]{4}-[0-9]{2}-[0-9]{2}.*//' | sort | uniq -c | sort -rn | awk '{printf "%s%s x%s", (NR>1 ? ", " : ""), $2, $1}')) (verdict=crash_reports_self_signaled)"
+  local selfsig faults
+  selfsig=$(crash_simulated "$CRASH_DIR"); faults=$(crash_user_faults "$CRASH_DIR")
+  export CRASH_SKIP; CRASH_SKIP=$(printf '%s\n%s\n' "$selfsig" "$(printf '%s\n' "$faults" | awk 'NF{print $1}')" | grep . || true)
+  if [ -n "$selfsig" ]; then
+    echo "mac-cleanup: crash reports: $(printf '%s\n' "$selfsig" | grep -c .) in 48h are a fault signal the process sent itself with kill(), not a crash, and are not counted ($(printf '%s\n' "$selfsig" | sed -E 's/[-_][0-9]{4}-[0-9]{2}-[0-9]{2}.*//' | sort | uniq -c | sort -rn | awk '{printf "%s%s x%s", (NR>1 ? ", " : ""), $2, $1}')) (verdict=crash_reports_self_signaled)"
+  fi
+  # Faults a process recorded and lived through: named with who drove them, so
+  # a flood of them is still seen, and never counted as a crash.
+  if [ -n "$faults" ]; then
+    echo "mac-cleanup: crash reports: $(printf '%s\n' "$faults" | grep -c .) in 48h are faults a process recorded with os_fault and was not killed for (ExcUserFault), not crashes, and are not counted ($(printf '%s\n' "$faults" | sed -E 's/^ExcUserFault_//; s/[-_][0-9]{4}-[0-9]{2}-[0-9]{2}[^ ]* / (responsible /; s/$/)/' | sort | uniq -c | sort -rn | awk '{c=$1; $1=""; sub(/^ /,""); printf "%s%s x%s", (NR>1 ? ", " : ""), $0, c}')) (verdict=crash_reports_user_fault)"
   fi
   # The app name is the file name up to the "-YYYY-MM-DD" stamp macOS appends.
   top=$(crash_counts "$CRASH_DIR" 1440 | head -3)
@@ -2793,6 +2852,13 @@ for r in out[:3]:
 # 233G down to 206G (13.3 G/h, "full in 15.5h" off the pre-prune 206.2G) while
 # the same run had just pruned 21.9G and the disk read 228.4G. The writer was
 # real and bounded: the hourly prune takes back what it builds, a sawtooth.
+# The fit uses the newest FIT_H (2h) of the history; the history the tick asks
+# for is NET_H (8h) long, and the burn is also capped at the net loss over all
+# of it. Disk RCA 20261115-032743: a VM database's write-and-trim cycle (the
+# ipcheck-standalone guest, bounded by its 120G disk) handed back 35G at
+# 01:27, so the 2h window from there read 18.3G/h, "full in 22h", while free
+# was 406.9G at 19:16 and 404.2G at 03:31. A disk that holds level over 8h is
+# not filling, and the 2h fit still sees a burn that is.
 burn_from_history() { # <history json on stdin> <min_gbh> [now_ts now_free_gb]
   python3 -c '
 import json,sys
@@ -2801,6 +2867,10 @@ try:
     d=json.load(sys.stdin); rows=[(r["ts"],r["disk_free_gb"]) for r in d.get("samples",[]) if r.get("measured") and r.get("disk_free_gb") is not None]
 except Exception:
     rows=[]
+fit_h=float(sys.argv[4]) if len(sys.argv)>4 and sys.argv[4] else 2.0
+long_rows=list(rows)
+if rows:
+    newest=max(r[0] for r in rows); rows=[r for r in rows if newest-r[0]<=fit_h*3600+60]
 hn=len(rows); ran="-"
 try:
     nt,nf=float(sys.argv[2]),float(sys.argv[3])
@@ -2814,9 +2884,14 @@ xs=[(t-rows[0][0])/3600 for t,_ in rows]; ys=[f for _,f in rows]
 mx=sum(xs)/n; my=sum(ys)/n
 slope=sum((x-mx)*(y-my) for x,y in zip(xs,ys))/max(1e-9,sum((x-mx)**2 for x in xs))
 o=sorted(zip(xs,ys)); net=(o[0][1]-o[-1][1])/max(1e-9,o[-1][0]-o[0][0])
+lo=sorted(long_rows+rows[len(rows)-1:] if ran=="run" else long_rows)
+capped="-"; lspan=(lo[-1][0]-lo[0][0])/3600
+if lspan>span+0.5:
+    lnet=(lo[0][1]-lo[-1][1])/max(1e-9,lspan)
+    if lnet<min(-slope,net): net=lnet; capped="%.1f"%lspan
 burn=min(-slope,net); last=ys[-1] if xs[-1]==max(xs) else ys[xs.index(max(xs))]
-print(("%.1f -" if burn<m else "%.1f %.1f")%((burn,) if burn<m else (burn,last/burn)), hn, "%.1f"%span, ran)
-' "$1" "${2:-}" "${3:-}" 2>/dev/null || echo "- - 0 0.0"
+print(("%.1f -" if burn<m else "%.1f %.1f")%((burn,) if burn<m else (burn,last/burn)), hn, "%.1f"%span, ran, capped)
+' "$1" "${2:-}" "${3:-}" "${BURN_FIT_H:-2}" 2>/dev/null || echo "- - 0 0.0"
 }
 
 # Read a key from the state file; empty if absent.
@@ -2946,12 +3021,13 @@ escalation_message() { # <cls> <verdict> <bundle> <card_file> <now_snapshot> <pr
 
 # One board card for a failure nobody would otherwise see. Deduped by key for 24h
 # in the state file, so a broken path files one card, not one per tick.
-file_card() { # <state_file> <key> <title> <desc>
+file_card() { # <state_file> <key> <title> <desc> [status] [next_action] [acceptance]
   local st=$1 key=$2 last now body cmd code
   now=$(date +%s); last=$(state_get "$st" "card_$key")
   if [ -n "$last" ] && [ $(( now - last )) -lt 86400 ]; then echo "already filed within 24h"; return 0; fi
   body=$(mktemp "${TMPDIR:-/tmp}/mac-card.XXXXXX")
-  python3 -c 'import json,sys; print(json.dumps({"title":sys.argv[1],"desc":sys.argv[2],"session":"desktop","status":"todo","type":"escalation","next_action":"Read the tick output named in the description and restore the broken path.","acceptance_criteria":"The next scheduled tick runs and its escalation path reports no failure."}))' "$3" "$4" > "$body"
+  python3 -c 'import json,sys; print(json.dumps({"title":sys.argv[1],"desc":sys.argv[2],"session":"desktop","status":sys.argv[3],"type":"escalation","next_action":sys.argv[4],"acceptance_criteria":sys.argv[5]}))' "$3" "$4" "${5:-todo}" \
+    "${6:-Read the tick output named in the description and restore the broken path.}" "${7:-The next scheduled tick runs and its escalation path reports no failure.}" > "$body"
   cmd=${CARD_CMD//FILE/$body}
   code=$($cmd 2>/dev/null) || code=failed
   rm -f -- "${body:?}"
@@ -3120,9 +3196,21 @@ keep_docker_context() { # <profile>
 #    The tick logged only a count, so backend could not tell what removed it.
 #    Every removal is now one line with path, size and idle floor, in the run's
 #    output and appended to $STATE_DIR/lane-tmp-removed.log.
+#  - An idle entry of LANE_TMP_NOTICE_KB or more is given notice first
+#    (mixpeek-research, 2026-11-15): ~/.amux/tmp/mixpeek-research/adaptive, a
+#    1.3 GB simulator cache that is only READ, was removed on 11-09, 11-10 and
+#    11-15. Reads change no mtime, and APFS does not update atime on a read
+#    either, so a read-only cache looks idle. Its lane gets one message per
+#    tick naming the entries and how to keep them, and an entry goes only when
+#    it is still idle LANE_TMP_NOTICE_MIN after its notice. Needs STATE_DIR,
+#    where the notices are recorded (lane-tmp-notice.tsv).
 reap_lane_tmp() { # <dry:0|1>
-  local dry=$1 root="${LANE_TMP_ROOT%/}" e ce n=0 kb=0 k inuse capped=0 named db n_named=0 n_small=0 n_marked=0 ledger=""
+  local dry=$1 root="${LANE_TMP_ROOT%/}" e ce n=0 kb=0 k inuse capped=0 named db n_named=0 n_small=0 n_marked=0 n_unsaved=0 ledger=""
   [ -n "${STATE_DIR:-}" ] && ledger="$STATE_DIR/lane-tmp-removed.log"
+  local notice_kb=${LANE_TMP_NOTICE_KB:-512000} notice_min=${LANE_TMP_NOTICE_MIN:-360} notice_file="" notice_dir="" n_notice=0 n_notice_wait=0
+  if [ -n "${STATE_DIR:-}" ] && [ "$dry" != 1 ]; then
+    notice_file="$STATE_DIR/lane-tmp-notice.tsv"; notice_dir=$(mktemp -d "${TMPDIR:-/tmp}/lt-notice.XXXXXX")
+  fi
   local small_kb=${LANE_TMP_KEEP_FILE_KB:-1024}
   # A directory of a few small files is kept like a small file (mxp-gs12,
   # 2026-10-17): ~/.amux/tmp/mxp-gs12/mvs-drill/standby_ok, a 1 KB manual gate a
@@ -3130,7 +3218,12 @@ reap_lane_tmp() { # <dry:0|1>
   # only a TOP-LEVEL file was protected. Kept: at most LANE_TMP_KEEP_DIR_FILES
   # files, none over LANE_TMP_KEEP_FILE_KB, LANE_TMP_KEEP_DIR_KB in all. Build
   # trees, clones and dependency dirs still go: they hold big files or many.
-  local keep_dir_files=${LANE_TMP_KEEP_DIR_FILES:-64} keep_dir_kb=${LANE_TMP_KEEP_DIR_KB:-4096} n_small_dir=0 nf
+  # A directory of a few files under 64 MB in all is kept, whatever its files'
+  # sizes (2026-11-16: mixpeek-meta-worker/shared, 9 MB, and backend/s1-blast,
+  # 12 MB, held S1-investigation results; each had a file over 1 MB, so the old
+  # rule, every file under 1 MB, reaped both). Build trees and extracts, what
+  # this reaper is for, have far more files or far more bytes.
+  local keep_dir_files=${LANE_TMP_KEEP_DIR_FILES:-64} keep_dir_kb=${LANE_TMP_KEEP_DIR_KB:-65536} n_small_dir=0 nf
   [ -d "$root" ] || { echo "mac-cleanup: lane tmp: no $root"; return 0; }
   db=${LANE_TMP_SCHED_DB:-${AMUX_HOME:-$HOME/.amux}/amux.db}
   # Every ~/.amux/tmp/<worker>/<entry> an enabled schedule names, as
@@ -3152,8 +3245,8 @@ reap_lane_tmp() { # <dry:0|1>
   fi
   # Resumes where the last pass ran out of time or hit the cap, as reap_claude_tmp
   # does, so the same front entries cannot use up every tick's budget.
-  local -a ents=(); local j nall start=0 stopped="" t0=$SECONDS rc out n_unk=0 n_over=0
-  local walk=${LANE_TMP_WALK_S:-20} budget=${LANE_TMP_BUDGET_S:-90} cursor_file=""
+  local -a ents=(); local j nall start=0 stopped="" t0=$SECONDS rc out n_unk=0 n_unsized=0 n_over=0
+  local walk=${LANE_TMP_WALK_S:-20} budget=${LANE_TMP_BUDGET_S:-90} cursor_file="" wl step_min=${LANE_TMP_STEP_MIN_S:-5}
   [ -n "${STATE_DIR:-}" ] && cursor_file="$STATE_DIR/lane-tmp.cursor"
   for e in "$root"/*/*; do [ -e "$e" ] && ents+=("$e"); done
   nall=${#ents[@]}
@@ -3166,31 +3259,74 @@ reap_lane_tmp() { # <dry:0|1>
     [ -e "$e" ] || continue
     if [ "$n" -ge "${LANE_TMP_MAX:-300}" ]; then capped=1; stopped=$e; break; fi
     if [ $(( SECONDS - t0 )) -ge "$budget" ]; then n_over=$((n_over+1)); [ -n "$stopped" ] || stopped=$e; continue; fi
-    rc=0; out=$(perl -e 'alarm shift; exec @ARGV' "$walk" find "$e" -mmin -"$LANE_TMP_IDLE_MIN" -print -quit 2>/dev/null) || rc=$?
+    # Each step below waits at most what the budget has left, not a whole walk:
+    # five 20s steps on one entry ran the arm to 196s of an 81s share (Mac self
+    # RCA 20261127-095953). A step cut short keeps the entry, as a timeout does.
+    # LANE_TMP_STEP_MIN_S is the floor, so a pass near its end still judges.
+    wl=$(( budget - (SECONDS - t0) )); [ "$wl" -ge "$step_min" ] || wl=$step_min; [ "$wl" -le "$walk" ] || wl=$walk
+    rc=0; out=$(perl -e 'alarm shift; exec @ARGV' "$wl" find "$e" -mmin -"$LANE_TMP_IDLE_MIN" -print -quit 2>/dev/null) || rc=$?
     if [ "$rc" = 142 ]; then n_unk=$((n_unk+1)); continue; fi
-    [ -n "$out" ] && continue
+    if [ -n "$out" ]; then
+      [ -n "$notice_file" ] && [ -s "$notice_file" ] && awk -F'\t' -v r="${e#"$root"/}" '$1!=r' "$notice_file" > "$notice_file.new" && mv "$notice_file.new" "$notice_file"
+      continue
+    fi
     if printf '%s\n' "$named" | grep -qxF "${e#"$root"/}"; then n_named=$((n_named+1)); continue; fi
     if [ -d "$e" ] && [ ! -L "$e" ] && [ -e "$e/.amux-keep" ]; then n_marked=$((n_marked+1)); continue; fi
+    # A git checkout holding work that exists nowhere else is kept (amux,
+    # 2026-11-12): ~/.amux/tmp/amux/wt-ui, a worktree with a tested, uncommitted
+    # dispatcher fix, idled past the floor and was removed. A worktree whose
+    # tracked files are edited or whose commits are on no remote is a lane's
+    # unsaved work; a clean checkout of pushed commits is still reaped. A git
+    # that cannot answer keeps it: unsaved work must not be guessed away.
+    if [ -d "$e" ] && [ ! -L "$e" ] && [ -e "$e/.git" ]; then
+      local dirty ahead
+      wl=$(( budget - (SECONDS - t0) )); [ "$wl" -ge "$step_min" ] || wl=$step_min; [ "$wl" -le "$walk" ] || wl=$walk
+      dirty=$(perl -e 'alarm shift; exec @ARGV' "$wl" git -C "$e" status --porcelain --untracked-files=no 2>/dev/null) || dirty="?"
+      wl=$(( budget - (SECONDS - t0) )); [ "$wl" -ge "$step_min" ] || wl=$step_min; [ "$wl" -le "$walk" ] || wl=$walk
+      ahead=$(perl -e 'alarm shift; exec @ARGV' "$wl" git -C "$e" rev-list -n 1 HEAD --not --remotes 2>/dev/null) || ahead="?"
+      if [ -n "$dirty" ] || [ -n "$ahead" ]; then
+        n_unsaved=$((n_unsaved+1))
+        echo "mac-cleanup:   lane tmp kept $e: a git checkout with unsaved work ($([ -n "$dirty" ] && echo 'uncommitted changes')$([ -n "$dirty" ] && [ -n "$ahead" ] && echo ', ')$([ -n "$ahead" ] && echo 'commits on no remote')) (verdict=lane_tmp_unsaved_work_kept)"
+        continue
+      fi
+    fi
     if [ -f "$e" ] && [ ! -L "$e" ] && [ "$(du -sk "$e" 2>/dev/null | cut -f1)" -lt "$small_kb" ] 2>/dev/null; then
       n_small=$((n_small+1)); continue
     fi
-    if [ -d "$e" ] && [ ! -L "$e" ] \
-       && [ -z "$(perl -e 'alarm shift; exec @ARGV' "$walk" find "$e" -type f -size +"${small_kb}"k -print -quit 2>/dev/null)" ]; then
-      nf=$(perl -e 'alarm shift; exec @ARGV' "$walk" find "$e" -type f 2>/dev/null | head -n $((keep_dir_files + 1)) | grep -c . || true)
+    if [ -d "$e" ] && [ ! -L "$e" ]; then
+      wl=$(( budget - (SECONDS - t0) )); [ "$wl" -ge "$step_min" ] || wl=$step_min; [ "$wl" -le "$walk" ] || wl=$walk
+      nf=$(perl -e 'alarm shift; exec @ARGV' "$wl" find "$e" -type f 2>/dev/null | head -n $((keep_dir_files + 1)) | grep -c . || true)
       if [ "$nf" -ge 1 ] && [ "$nf" -le "$keep_dir_files" ] && [ "$(du -sk "$e" 2>/dev/null | cut -f1)" -lt "$keep_dir_kb" ] 2>/dev/null; then
         n_small_dir=$((n_small_dir+1)); continue
       fi
     fi
     ce=$( (cd "$e" 2>/dev/null && pwd -P) || printf '%s' "$e"); ce=${ce#/private}
     printf '%s\n' "$inuse" | awk -v p="$ce" '$0==p || index($0, p "/")==1 {f=1} END{exit !f}' && continue
-    k=$(perl -e 'alarm shift; exec @ARGV' "$walk" du -sk "$e" 2>/dev/null | cut -f1)
+    wl=$(( budget - (SECONDS - t0) )); [ "$wl" -ge "$step_min" ] || wl=$step_min; [ "$wl" -le "$walk" ] || wl=$walk
+    k=$(perl -e 'alarm shift; exec @ARGV' "$wl" du -sk "$e" 2>/dev/null | cut -f1)
+    # An entry that could not be sized is kept: an unknown size read as 0 would
+    # skip the notice a large entry is owed.
+    case "$k" in ''|*[!0-9]*) n_unsized=$((n_unsized+1)); continue ;; esac
     if [ "$dry" = 1 ]; then
       n=$((n+1)); kb=$((kb+${k:-0}))
       echo "mac-cleanup:   lane tmp would remove $e ($(( ${k:-0} / 1024 ))M, nothing changed in ${LANE_TMP_IDLE_MIN} min)"
       continue
     fi
+    if [ -n "$notice_file" ] && [ "${k:-0}" -ge "$notice_kb" ] 2>/dev/null; then
+      local rel=${e#"$root"/} since
+      since=$(awk -F'\t' -v r="$rel" '$1==r{print $2; exit}' "$notice_file" 2>/dev/null)
+      if [ -z "$since" ]; then
+        mkdir -p "$STATE_DIR" && printf '%s\t%s\n' "$rel" "$(date +%s)" >> "$notice_file"
+        n_notice=$((n_notice+1))
+        printf -- '- %s (%sM, nothing written in %s min)\n' "$e" "$(( ${k:-0} / 1024 ))" "$LANE_TMP_IDLE_MIN" >> "$notice_dir/${rel%%/*}"
+        echo "mac-cleanup:   lane tmp gave notice for $e ($(( ${k:-0} / 1024 ))M): removed after ${notice_min} min if still idle (verdict=lane_tmp_notice_given)"
+        continue
+      fi
+      if [ $(( $(date +%s) - since )) -lt $(( notice_min * 60 )) ]; then n_notice_wait=$((n_notice_wait+1)); continue; fi
+    fi
     if rm -rf -- "${e:?}" 2>/dev/null; then
       n=$((n+1)); kb=$((kb+${k:-0}))
+      [ -n "$notice_file" ] && [ -s "$notice_file" ] && awk -F'\t' -v r="${e#"$root"/}" '$1!=r' "$notice_file" > "$notice_file.new" && mv "$notice_file.new" "$notice_file"
       echo "mac-cleanup:   lane tmp removed $e ($(( ${k:-0} / 1024 ))M, nothing changed in ${LANE_TMP_IDLE_MIN} min) (verdict=lane_tmp_entry_removed)"
       if [ -n "$ledger" ]; then
         mkdir -p "$STATE_DIR" && printf '%s\t%s\t%s\t%s\tidle_min=%s\n' "$(date '+%F %T %z')" "${e#"$root"/}" "${k:-0}" "$e" "$LANE_TMP_IDLE_MIN" >> "$ledger"
@@ -3199,10 +3335,29 @@ reap_lane_tmp() { # <dry:0|1>
       echo "mac-cleanup:   lane tmp WARN could not remove $e (verdict=lane_tmp_entry_remove_failed)"
     fi
   done
+  # One message per lane, naming each entry given notice this tick. A lane that
+  # cannot be told (no such worker, or an isolated one) is logged; its entries
+  # still wait out the notice.
+  if [ -n "$notice_dir" ]; then
+    local lane msg cmd
+    for lane in $(ls "$notice_dir" 2>/dev/null); do
+      msg="$notice_dir/$lane.msg"
+      { echo "Cleanup notice: these idle entries in your TMPDIR will be removed by the first cleanup tick ${notice_min} min from now if nothing in them is written by then. Reading does not count."
+        echo; cat "$notice_dir/$lane"; echo
+        echo "To keep a directory: touch <dir>/.amux-keep. To keep a file: touch it, or move it into a kept directory."; } > "$msg"
+      cmd=${LANE_TMP_NOTICE_CMD:-amux send TARGET --file FILE}; cmd=${cmd//TARGET/$lane}; cmd=${cmd//FILE/$msg}
+      if eval "$cmd" >/dev/null 2>&1; then
+        echo "mac-cleanup:   lane tmp told $lane about $(grep -c '^- ' "$notice_dir/$lane") entr(ies) (verdict=lane_tmp_notice_sent)"
+      else
+        echo "mac-cleanup:   lane tmp WARN could not tell $lane about $(grep -c '^- ' "$notice_dir/$lane") entr(ies); they still wait ${notice_min} min (verdict=lane_tmp_notice_undelivered)"
+      fi
+    done
+    rm -rf -- "${notice_dir:?}"
+  fi
   if [ "$dry" != 1 ] && [ -n "$cursor_file" ]; then
     if [ -n "$stopped" ]; then mkdir -p "$STATE_DIR" && printf '%s\n' "$stopped" > "$cursor_file"; else rm -f "$cursor_file"; fi
   fi
-  echo "mac-cleanup: lane tmp: $([ "$dry" = 1 ] && echo 'would remove' || echo removed) $n entr$([ "$n" = 1 ] && echo y || echo ies) idle over ${LANE_TMP_IDLE_MIN} min, $(awk -v k="$kb" 'BEGIN{printf "%.1fG", k/1048576}') ($root); kept $n_named named by an enabled schedule, $n_small small file(s) under ${small_kb}K, $n_small_dir small dir(s) (<= ${keep_dir_files} files, none over ${small_kb}K), $n_marked marked .amux-keep$([ "$capped" = 1 ] && echo "; capped at $LANE_TMP_MAX this tick, the rest next tick")$([ "$n_unk" -gt 0 ] && echo "; kept $n_unk whose idle walk ran past ${walk}s (idleness unknown)")$([ "$n_over" -gt 0 ] && echo "; $n_over not reached inside the ${budget}s budget")$([ -n "$stopped" ] && [ "$dry" != 1 ] && echo ", the next tick starts at ${stopped#"$root"/}")"
+  echo "mac-cleanup: lane tmp: $([ "$dry" = 1 ] && echo 'would remove' || echo removed) $n entr$([ "$n" = 1 ] && echo y || echo ies) idle over ${LANE_TMP_IDLE_MIN} min, $(awk -v k="$kb" 'BEGIN{printf "%.1fG", k/1048576}') ($root); kept $n_named named by an enabled schedule, $n_small small file(s) under ${small_kb}K, $n_small_dir small dir(s) (<= ${keep_dir_files} files, under ${keep_dir_kb}K in all), $n_marked marked .amux-keep, $n_unsaved git checkout(s) with unsaved work$([ "$n_notice" -gt 0 ] && echo "; gave notice for $n_notice large entr(ies)")$([ "$n_notice_wait" -gt 0 ] && echo "; $n_notice_wait large entr(ies) inside their ${notice_min} min notice")$([ "$capped" = 1 ] && echo "; capped at $LANE_TMP_MAX this tick, the rest next tick")$([ "$n_unk" -gt 0 ] && echo "; kept $n_unk whose idle walk ran past ${walk}s (idleness unknown)")$([ "$n_unsized" -gt 0 ] && echo "; kept $n_unsized idle whose size could not be read (verdict=lane_tmp_size_unmeasured)")$([ "$n_over" -gt 0 ] && echo "; $n_over not reached inside the ${budget}s budget")$([ -n "$stopped" ] && [ "$dry" != 1 ] && echo ", the next tick starts at ${stopped#"$root"/}")"
 }
 
 reap_user_tmp() { # <dry:0|1>
@@ -3722,7 +3877,9 @@ vm_level=$($PRESSURE_CMD 2>/dev/null); case "$vm_level" in ''|*[!0-9]*) vm_level
 vm_level=$(vm_arm_pressure "${level:-}" "$vm_level")
 if [ "$vm_level" -ge 2 ]; then stop_idle_vms "$DRY" "memory pressure $vm_level"; stop_idle_docker_desktop "$DRY" "memory pressure $vm_level"
 elif [ "$tgt_idle" != "$TARGET_IDLE_H" ]; then stop_idle_vms "$DRY" "disk under ${TARGET_TIGHT_FREE_GB}G"; fi
-tick_arm "worktrees" WORKTREE_BUDGET_S && reap_idle_worktrees "$WORKTREE_ROOTS" "$WORKTREE_IDLE_H" "$DRY"
+# The scan is capped with the budget (Mac self RCA 20261127-095953): only the
+# budget was, so a 60s scan ran on a 23-28s share and skipped the census after it.
+tick_arm "worktrees" WORKTREE_SCAN_S WORKTREE_BUDGET_S && reap_idle_worktrees "$WORKTREE_ROOTS" "$WORKTREE_IDLE_H" "$DRY"
 
 # ── act: thin APFS local snapshots when the disk is tight ────────────────────
 disk_free_gb=$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{ printf "%.1f", $4/1048576 }')
@@ -3847,11 +4004,37 @@ if [ -n "$fse_reading" ]; then
       fse_top="no directory over ${CHURN_FILES} modified files in ${CHURN_MIN}m (scan complete=${CHURN_COMPLETE}; deletions are not counted)"
       echo "mac-cleanup:   fseventsd feed: $fse_top"
     fi
+    # A stuck daemon needs no feed measured: restart it now, as a bloated one is.
+    fse_restarted=0
+    if [ "${fse_spin:-0}" = 1 ]; then
+      fse_why="spinning at ${fse_cpu:-?}% CPU with no file churn"
+      [ "${fse_wedged:-0}" = 1 ] && fse_why="not delivering file events at ${fse_cpu:-?}% CPU"
+      if fseventsd_try_restart "$fse_gb" "$DRY" "$fse_why"; then
+        fse_restarted=1; fse_spin=0; fse_wedged=0
+        reported=$((reported+1))
+      fi
+    fi
     fse_pid=$($FSEVENTSD_PID_CMD 2>/dev/null | head -1 || true)
     fse_esc_pid=$(state_get "$STATE_DIR/state" esc_fseventsd_pid || true)
     fse_esc_at=$(state_get "$STATE_DIR/state" esc_fseventsd || true)
     fse_feed_n=${fse_top%% *}; case "$fse_feed_n" in ''|*[!0-9]*) fse_feed_n=0 ;; esac
-    if [ -n "$fse_pid" ] && [ "$fse_pid" = "$fse_esc_pid" ] \
+    if [ "$fse_restarted" = 1 ]; then
+      :
+    elif [ -n "$fse_pid" ] && [ "$fse_pid" = "$fse_esc_pid" ] && { [ "${fse_spin:-0}" = 1 ] || [ "${fse_wedged:-0}" = 1 ]; } \
+       && [ $(( $(date +%s) - ${fse_esc_at:-0} )) -ge $(( FSEVENTSD_SPIN_REMIND_H * 3600 )) ]; then
+      # The same stuck pid past the reminder window: the cause is known and only
+      # the owner's sudo clears it, so the reminder is the owner's card, not
+      # another lane RCA (RCA 20261124-134002: the 24h reminder re-asked a lane
+      # to root-cause pid 50645, a spin the 11-23 RCAs had named, which no lane
+      # can restart; it had grown 0.81G to 8.8G waiting).
+      fse_since=$(date -r "${fse_esc_at:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")
+      echo "mac-cleanup:   fseventsd pid $fse_pid (${fse_gb}G, ${fse_cpu:-?}% CPU) is still the stuck process escalated at $fse_since; the restart is the owner's, so this is an owner card, not a lane RCA: $(file_card "$STATE_DIR/state" "fseventsd_restart_$fse_pid" \
+        "[ETHAN'S CALL] Restart fseventsd: run sudo killall fseventsd (pid $fse_pid, ${fse_gb}G, ${fse_cpu:-?}% CPU, stuck since $fse_since)" \
+        "fseventsd pid $fse_pid has been $( [ "${fse_wedged:-0}" = 1 ] && echo "not delivering file events" || echo "spinning with no file churn") since the escalation at $fse_since and now holds ${fse_gb}G at ${fse_cpu:-?}% CPU. The cause is a stuck fseventsd thread (macOS); no lane can clear it. Unblock: run sudo killall fseventsd (launchd restarts it, no reboot), or add $FSEVENTSD_SUDOERS_LINE so the tick restarts it itself." \
+        needsyou "Run: sudo killall fseventsd" "The next tick reports fseventsd under its thresholds or a new pid.") (verdict=fseventsd_owner_restart_overdue)"
+      state_put "$STATE_DIR/state" "esc_fseventsd=$(date +%s)"
+      reported=$((reported+1)); fse_owner_pending=1
+    elif [ -n "$fse_pid" ] && [ "$fse_pid" = "$fse_esc_pid" ] \
        && [ $(( $(date +%s) - ${fse_esc_at:-0} )) -lt $(( FSEVENTSD_SPIN_REMIND_H * 3600 )) ] \
        && { [ "${fse_spin:-0}" = 1 ] || [ "$fse_feed_n" -lt $(( churn_floor * FSEVENTSD_CHURN_NEW_X )) ]; }; then
       echo "mac-cleanup:   fseventsd pid $fse_pid (${fse_gb}G) is the process the last fseventsd escalation named $(( ($(date +%s) - fse_esc_at) / 60 ))m ago and it is still hot$( [ "${fse_spin:-0}" = 1 ] || echo ", with churn under ${FSEVENTSD_CHURN_NEW_X}x the floor"): the owner's restart is pending (sudo killall fseventsd, which also returns its memory); not escalated again until a new pid, churn over ${FSEVENTSD_CHURN_NEW_X}x the floor, or ${FSEVENTSD_SPIN_REMIND_H}h (verdict=fseventsd_spin_owner_pending)"
@@ -3861,6 +4044,7 @@ if [ -n "$fse_reading" ]; then
       [ "${FSE_RESTART_NEEDS_SUDOERS:-0}" = 1 ] && fse_verdict="$fse_verdict. The tick restarts it itself once the owner adds: $FSEVENTSD_SUDOERS_LINE"
     elif [ "${fse_spin:-0}" = 1 ]; then
       fse_verdict="fseventsd at ${fse_cpu:-?}% CPU (over ${FSEVENTSD_CPU_PCT}%) holding ${fse_gb}G with no file churn to feed it ($fse_top): a stuck fseventsd thread, not a writer; the owner restarts it with sudo killall fseventsd (launchd brings it back, no reboot)"
+      [ "${FSE_RESTART_NEEDS_SUDOERS:-0}" = 1 ] && fse_verdict="$fse_verdict. The tick restarts it itself once the owner adds: $FSEVENTSD_SUDOERS_LINE"
     else
       echo "mac-cleanup:   fseventsd remedy: stop the churn, then the owner runs sudo killall fseventsd to return its memory (launchd restarts it; no reboot)"
       fse_verdict="fseventsd holds ${fse_gb}G at ${fse_cpu:-?}% CPU (over ${FSEVENTSD_REBOOT_GB}G or ${FSEVENTSD_CPU_PCT}%); stop the file churn feeding it, then sudo killall fseventsd returns its memory (launchd restarts it, no reboot). Top feed: $fse_top"
@@ -3887,12 +4071,13 @@ ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 0)
 STATE="$STATE_DIR/state"
 prev_ts=$(state_get "$STATE" last_ts); prev_free=$(state_get "$STATE" last_disk_free_gb)
 prev_swt=$(state_get "$STATE" last_swap_total_mb || true)   # read before this run's state write below
-HISTORY_CMD=${AMUX_CLEANUP_HISTORY_CMD:-curl -sk --max-time 15 $(amux url 2>/dev/null || echo https://localhost:8824)/api/metrics/host/history?since_h=2}
-read -r burn htf hist_n hist_span hist_run <<EOF
+HISTORY_CMD=${AMUX_CLEANUP_HISTORY_CMD:-curl -sk --max-time 15 $(amux url 2>/dev/null || echo https://localhost:8824)/api/metrics/host/history?since_h=${BURN_NET_H:-8}}
+read -r burn htf hist_n hist_span hist_run hist_net <<EOF
 $($HISTORY_CMD 2>/dev/null | burn_from_history "$BURN_MIN_GBH" "$(date +%s)" "$disk_now")
 EOF
 burn_src="history ${hist_n} samples over ${hist_span}h"
 [ "${hist_run:-}" = "run" ] && burn_src="$burn_src + this run's post-cleanup ${disk_now}G"
+case "${hist_net:--}" in -) ;; *) burn_src="$burn_src, capped at the net loss over ${hist_net}h (verdict=disk_burn_capped_by_net)" ;; esac
 if [ "$htf" = "-" ] && [ "$burn" = "-" ]; then
 read -r burn htf <<EOF
 $(disk_trend "${prev_ts:-0}" "${prev_free:-0}" "$now" "$disk_now" "$BURN_MIN_GBH")
@@ -3965,6 +4150,23 @@ test_binary_note() { # pid command-path
     echo " [cargo test binary, $thr threads, RUST_TEST_THREADS unset: one test thread per core (verdict=cpu_test_threads_unbounded)]"
   fi
 }
+# A worker's tools get OpenMP/BLAS caps from the CPU budget amux exports when
+# the worker STARTS (AMUX_WORKER_CPUS, 130e28713). A worker started before that
+# never got them, so a numpy/torch step it runs opens one thread per core.
+# CPU RCA 20261114-152714: mixpeek-research (running since Oct 29) served at
+# 1200-1700% with 55 busy threads and no OMP_NUM_THREADS. This names such a
+# process and says what applies the cap.
+thread_pool_note() { # pid pcpu command-path
+  case "$3" in */deps/*-[0-9a-f][0-9a-f][0-9a-f]*) return 0 ;; esac
+  [ "${2%%.*}" -ge "${AMUX_CLEANUP_POOL_NOTE_PCT:-400}" ] 2>/dev/null || return 0
+  local envs lane thr
+  envs=$(ps -E -o command= -p "$1" 2>/dev/null)
+  lane=$(printf '%s' "$envs" | grep -o 'AMUX_SESSION=[^ ]*' | head -1); lane=${lane#AMUX_SESSION=}
+  [ -n "$lane" ] || return 0
+  case "$envs" in *OMP_NUM_THREADS=*) return 0 ;; esac
+  thr=$(ps -M -p "$1" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+  echo " [$thr threads, worker $lane has no OMP_NUM_THREADS: it started before its CPU budget; restart the worker or set the cap on the command (verdict=cpu_thread_pools_unbounded)]"
+}
 escalated=0
 if [ -z "$verdicts" ]; then
   echo "mac-cleanup: constraints none"
@@ -3984,7 +4186,7 @@ else
       echo "- $mem pid=$pid $cmd — $(owner_label_for_pid "$pid"), lane: $(lane_for_pid "$pid" "$pmap")"; done
     echo; echo "## Top CPU (with owner)"
     ps -Ao pid=,pcpu=,comm= 2>/dev/null | sort -k2 -rn | head -10 | while read -r pid cpu cmd; do
-      echo "- ${cpu}% pid=$pid $(basename "$cmd") — $(owner_label_for_pid "$pid"), lane: $(lane_for_pid "$pid" "$pmap")$(test_binary_note "$pid" "$cmd")"; done
+      echo "- ${cpu}% pid=$pid $(basename "$cmd") — $(owner_label_for_pid "$pid"), lane: $(lane_for_pid "$pid" "$pmap")$(test_binary_note "$pid" "$cmd")$(thread_pool_note "$pid" "$cpu" "$cmd")"; done
     if printf '%s\n' "$verdicts" | grep -q '^disk '; then
       echo; echo "## Files over 500M written in the last hour (the writers)"
       # Open files first: wherever they live, and only seconds of the budget.
@@ -4069,5 +4271,5 @@ if [ "$SECONDS" -ge "$TICK_WARN_S" ]; then
   echo "mac-cleanup: WARN tick took ${SECONDS}s, over ${TICK_WARN_S}s: the scheduler kills it at 600s, so a slower run is lost; tighten the budgets"
 fi
 tick_mark end
-echo "mac-cleanup: done elapsed=${SECONDS}s slowest=${TICK_SLOWEST:-none} purge=${purged%% *} agents_restarted=${agents_restarted}/${agents_checked} stale_shells=${stale_killed} sqlite_orphans=${sqlite_stopped} targets_reaped=${TARGETS_REAPED} claude_tmp_reaped=${CLAUDE_TMP_REAPED:-0} cpu_restarted=${CPU_RESTARTED:-0} test_orphans=${TEST_ORPHANS_STOPPED:-0} crash_pruned=${CRASH_PRUNED:-0} util_reniced=${UTIL_RENICED:-0} daemons_demoted=${DEMOTED:-0} reclaim_started=${reclaim_started:-0} skipped=${TICK_SKIPPED:-none} sections=${TICK_SECTIONS:-none} constraints=$(printf '%s' "$verdicts" | grep -c . || true) escalated=${escalated} reported=${reported}"
+echo "mac-cleanup: done elapsed=${SECONDS}s slowest=${TICK_SLOWEST:-none} purge=${purged%% *} agents_restarted=${agents_restarted}/${agents_checked} stale_shells=${stale_killed} sqlite_orphans=${sqlite_stopped} targets_reaped=${TARGETS_REAPED} claude_tmp_reaped=${CLAUDE_TMP_REAPED:-0} cpu_restarted=${CPU_RESTARTED:-0} test_orphans=${TEST_ORPHANS_STOPPED:-0} crash_pruned=${CRASH_PRUNED:-0} util_reniced=${UTIL_RENICED:-0} daemons_demoted=${DEMOTED:-0} reclaim_started=${reclaim_started:-0} skipped=${TICK_SKIPPED:-none} overran=${TICK_OVERRAN:-none} sections=${TICK_SECTIONS:-none} constraints=$(printf '%s' "$verdicts" | grep -c . || true) escalated=${escalated} reported=${reported}"
 exit 0

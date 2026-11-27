@@ -34,7 +34,7 @@ function fixture(names = [], shared = {}) {
       removeItem(k) { stored.delete(k); }, key(i) { return [...stored.keys()][i] ?? null; }, get length() { return stored.size; }},
     setTimeout(fn, delay) { timers.set(++tid, fn); timerDelays.set(tid, delay); return tid; }, clearTimeout(id) { timers.delete(id); timerDelays.delete(id); },
     API: '', offlineQueue: [], drafts: [], online: true, _syncFlight: null, _syncRetryTimer: null, _syncBackoffMs: 0, _SYNC_MIN_MS: 2000, _SYNC_MAX_MS: 60000, _OUTBOX_STALLED_MS:600000,
-    _interactionReplay:q => ({id:q.id}), _interactionAcknowledge:async () => {}, _interactionSet() {}, _upqList:async () => [], _uploadSyncPending:false, _syncChecklist:[], _localWriteError: '', _syncBannerRequested: false, _syncBannerAuto: false, _syncChecklistAt: 0, _syncPillText: '', peekSession: null, _swOfflineNotice: null,
+    _interactionReplay:q => ({id:q.id}), _interactionAcknowledge:async () => {}, _interactionSet() {}, _upqList:async () => [], _uploadSyncPending:false, _dictSyncClips:async () => [], _dictPendingBadge:async () => {}, _dictPendingN:0, _dictAttentionN:0, _dictSyncPending:false, _dictPendingRows:[], _dictFlushing:0, _syncChecklist:[], _localWriteError: '', _syncBannerRequested: false, _syncBannerAuto: false, _syncChecklistAt: 0, _syncPillText: '', peekSession: null, _swOfflineNotice: null,
     // Chat tab (AMUX-5350): no chat open, every worker renders as a terminal.
     _chat: {name: null}, _chatShowing: () => false, _workerRenderer: () => 'terminal', _workersAsOfNote: () => '',
     window:{isSecureContext:true}, APP_VER:'test', _writeError: '', _outboxActive: new Set(), _bdSaveRequests: new Set(), consecutiveFailures: 0,
@@ -1081,4 +1081,70 @@ test('a message delivery lock stolen before its work started yields: the thief d
   assert.equal(robbed && robbed.name, 'AbortError', 'the robbed delivery yields to the window that took it over');
   await new Promise(r => setImmediate(r));
   assert.deepEqual(sends, ['thief'], 'the message is delivered once');
+});
+
+// A WORKER DELETE NEVER WAITS IN THE OUTBOX (2026-11-16). Queued, it sat behind
+// a replay that stalled across windows: 8 deletes of two workers from two
+// browsers, none in the request log, and the workers came back.
+function shippedSkipList(ctx) {
+  for (const name of ['_OUTBOX_SKIP', '_OUTBOX_ANSWER_NOW']) vm.runInContext(declaration(name), ctx);
+}
+
+test('the shipped skip list keeps worker deletes out of the outbox and nothing else of a worker', () => {
+  const {ctx} = fixture();
+  shippedSkipList(ctx);
+  const post = {method: 'POST'};
+  assert.equal(ctx._outboxQueueable('/api/sessions/test2/delete', post), false);
+  assert.equal(ctx._outboxQueueable('https://amux.test/api/sessions/a%20b/delete?x=1', post), false);
+  // Other worker actions, and a worker NAMED delete, stay queueable.
+  assert.equal(ctx._outboxQueueable('/api/sessions/test2/stop', post), true);
+  assert.equal(ctx._outboxQueueable('/api/sessions/delete/start', post), true);
+  assert.equal(ctx._outboxQueueable('/api/sessions/delete-me/archive', post), true);
+  assert.equal(ctx._outboxQueueable('/api/board/TASK-1', patch), true);
+});
+
+function apiCallFixture(fetchImpl) {
+  const f = fixture(['apiCall', '_isLocallyQueued']);
+  shippedSkipList(f.ctx);
+  const toasts = []; const calls = [];
+  Object.assign(f.ctx, {
+    showToast: t => toasts.push(t), setOnline() {}, _warnIgnoredFields() {}, console: {...console, error() {}},
+    fetch: async (url, init) => { calls.push(String(url)); return fetchImpl(url, init); },
+  });
+  return {...f, toasts, calls};
+}
+
+test('a delete pressed while this tab believes it is offline goes to the server, not the queue', async () => {
+  const {ctx, calls} = apiCallFixture(async () => new Response('{"ok":true}', {status: 200}));
+  vm.runInContext('online = false', ctx);
+  const r = await ctx.apiCall('/api/sessions/test2/delete', {method: 'POST', headers: {'X-Amux-UI-Token': 't'}});
+  assert.equal(r && r.status, 200, 'the server answered the delete');
+  assert.deepEqual(calls, ['/api/sessions/test2/delete']);
+  assert.equal(ctx._readQueue().length, 0, 'nothing waits in the outbox');
+  // A queueable write under the same belief is still queued, untouched.
+  assert.equal(await ctx.apiCall('/api/board/TASK-1', {...patch}), null);
+  assert.deepEqual(calls, ['/api/sessions/test2/delete'], 'the board edit did not hit the network');
+  assert.equal(ctx._readQueue().length, 1);
+});
+
+test('a delete the server cannot be reached for says so and is not queued', async () => {
+  const {ctx, toasts} = apiCallFixture(async () => { throw new TypeError('Failed to fetch'); });
+  assert.equal(await ctx.apiCall('/api/sessions/test2/delete', {method: 'POST'}), null);
+  assert.equal(ctx._readQueue().length, 0, 'no delete waits to replay later');
+  assert.ok(toasts.some(t => /^Not done: the server could not be reached/.test(t)), JSON.stringify(toasts));
+});
+
+test('worker deletes already queued are dropped at load and the count is reported', async () => {
+  const {ctx} = fixture(['_outboxDropAnswerNow']);
+  shippedSkipList(ctx);
+  const beacons = [];
+  ctx.fetch = async (url, init) => { if (String(url).includes('client-debug')) beacons.push(JSON.parse(init.body)); return new Response('{}'); };
+  // Entries written before the skip list knew about deletes.
+  await ctx._mutateQueue(q => { q.push(
+    {id: 'd1', url: '/api/sessions/test2/delete', options: {method: 'POST'}, timestamp: Date.now()},
+    {id: 'd2', url: '/api/sessions/test/delete', options: {method: 'POST'}, timestamp: Date.now()},
+    {id: 'b1', url: '/api/board/TASK-1', options: {...patch}, timestamp: Date.now()}); });
+  await ctx._outboxDropAnswerNow();
+  assert.deepEqual(ctx._readQueue().map(q => q.id), ['b1']);
+  assert.ok(beacons.some(b => b.verdict === 'answer_now_dropped' && b.dropped === 2 && b.n_considered === 3), JSON.stringify(beacons));
 });
