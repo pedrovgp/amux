@@ -65,6 +65,14 @@ async def _check(cfg: Config) -> int:
         )
     )
     print(
+        "  parked sweep       "
+        + (
+            f"{cfg.parked_sweep_s:g}s (hold max {cfg.parked_hold_max_s:g}s)"
+            if cfg.parked_sweep_s
+            else "off"
+        )
+    )
+    print(
         "  manager reset      "
         + (
             f"{cfg.manager_reset_days}d (idle 1h+, never with cards)"

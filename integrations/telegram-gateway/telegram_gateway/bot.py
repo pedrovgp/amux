@@ -664,6 +664,12 @@ _DRAFT_MARKERS = (
     "already pasted in the composer",
 )
 _QUEUED_MARKERS = ("remains queued",)
+# A DIRECT hold: amux typed the text into the lane's composer and could not
+# submit it ("queued (held in the input box; submitted automatically when this
+# turn ends)"). Acceptance DELETEs the queue row at the same moment
+# (`session_verbs.rs` ~25206), so after this point `/api/debug/steering` cannot
+# see the message any more — only this marker distinguishes it.
+_DIRECT_HOLD_MARKERS = ("held in the input box",)
 
 
 def parked_reason(message: str | None, submission: str | None = None) -> str | None:
@@ -684,6 +690,27 @@ def parked_reason(message: str | None, submission: str | None = None) -> str | N
     if any(marker in text for marker in _QUEUED_MARKERS):
         return "queued"
     return None
+
+
+def chars_preview(text: str | None, limit: int = 60) -> str:
+    """One-line, log-safe preview: newlines and quotes would split a grep."""
+    flat = " ".join((text or "").split())
+    return flat[:limit]
+
+
+def parked_kind(detail: str | None) -> str:
+    """``"direct"`` (text in the composer) vs ``"steering"`` (a durable row).
+
+    The distinction decides how the hold can ever be resolved: a steering row
+    is visible in `/api/debug/steering` until amux accepts it, while a direct
+    hold is invisible there from the moment amux accepts it. Anything we cannot
+    classify is treated as ``steering`` — the conservative choice, because it
+    means "ask amux before declaring the message dead".
+    """
+    text = detail or ""
+    if any(marker in text for marker in _DIRECT_HOLD_MARKERS):
+        return "direct"
+    return "steering"
 
 
 async def _deliver_prompt(
@@ -747,7 +774,7 @@ async def _deliver_prompt(
                 # PARKED, not failed: amux holds the text and delivers it later
                 # (409 + "… remains queued"). Checked BEFORE the 409 retry — a
                 # composer draft never clears by pasting the same text twice.
-                await _note_parked(context, chat_id, session, reason, exc.detail)
+                await _note_parked(context, chat_id, session, reason, exc.detail, text)
                 return reason
             if exc.status in (409, 503) and attempt == 1:
                 await asyncio.sleep(2.0)
@@ -756,11 +783,18 @@ async def _deliver_prompt(
         message = str(resp.get("message") or "") if isinstance(resp, dict) else ""
         reason = parked_reason(message, str(resp.get("submission") or "") or None)
         if reason:
-            await _note_parked(context, chat_id, session, reason, message)
+            await _note_parked(context, chat_id, session, reason, message, text)
             return reason
-        # A confirmed delivery closes the parked stretch: the next park pages
-        # again (once per stretch, the `_cards_warned` shape).
+        # A confirmed delivery closes the parked stretch AND the hold: the next
+        # park pages again (once per stretch, the `_cards_warned` shape) and the
+        # sweep stops watching a promise that was kept.
         _parked_warned.discard((chat_id, session))
+        if state.clear_parked(chat_id, session):
+            log.info(
+                "parked_cleared chat_id=%s session=%s reason=delivered",
+                chat_id,
+                session,
+            )
         return None
     return None
 
@@ -771,6 +805,7 @@ async def _note_parked(
     session: str,
     reason: str,
     detail: str | None,
+    text: str = "",
 ) -> None:
     """Make a parked prompt loud: a WARN every time, ONE topic line per stretch.
 
@@ -779,6 +814,13 @@ async def _note_parked(
     NOTHING — the owner waited on a message that was never going to arrive on
     its own. The WARN is for the sweep; the topic line is for the owner, in the
     one place they are already looking.
+
+    The HOLD this records is the second half (2026-11-26 → 28). The line above
+    used to be the end of the gateway's involvement: amux's own composer watcher
+    is bounded (30 min) and every one of its failure exits is a WARN in a log the
+    owner does not read, so "amux will deliver it later" could be false with
+    nobody the wiser. `parked_sweep_once` now owns that promise until it is
+    kept, revoked, or returned to the owner as an error.
     """
     log.warning(
         "send_parked chat_id=%s session=%s reason=%s detail=%s",
@@ -787,12 +829,33 @@ async def _note_parked(
         reason,
         (detail or "").replace("\n", " ")[:300],
     )
+    state = _state(context)
+    cfg = _cfg(context)
+    hold = state.mark_parked(
+        chat_id,
+        session,
+        text,
+        reason,
+        kind=parked_kind(detail),
+        thread=state.session_topic(chat_id, session),
+    )
+    log.info(
+        "parked_tracked chat_id=%s session=%s kind=%s reason=%s preview=%s "
+        "hold_max_s=%.0f",
+        chat_id,
+        session,
+        hold["kind"],
+        reason,
+        chars_preview(hold["preview"]),
+        cfg.parked_hold_max_s,
+    )
     if (chat_id, session) in _parked_warned:
         return
     bot = context.application.bot
-    state = _state(context)
     thread = state.session_topic(chat_id, session)
     notice = DRAFT_PARKED_NOTICE if reason == "draft" else QUEUE_PARKED_NOTICE
+    minutes = max(1, int(round(cfg.parked_hold_max_s / 60.0)))
+    notice = f"{notice} If it has not arrived in {minutes} min, I will say so here."
     try:
         await bot.send_message(chat_id, notice, message_thread_id=thread)
     except TelegramError as exc:
@@ -816,6 +879,8 @@ async def _note_parked(
     )
 
 
+# The message a hold is RETURNED with when it can no longer be delivered: the
+# owner's words are named, the reason is concrete, and the next step is theirs.
 async def _report_send_error(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -4244,6 +4309,13 @@ _cards_warned: set[tuple[int, str]] = set()
 # deliver to a lane that is not running (`lane_block_reason=not-running`), and
 # no deadline reaps that hold. One WARN per stretch, like `_cards_warned`.
 _pending_warned: set[tuple[int, str]] = set()
+# A lane with a PARKED message (the gateway's own hold) is never idle-stopped
+# either, and for the same reason plus a sharper one: a direct hold lives only
+# in the pane, so a stop destroys it.
+_parked_hold_warned: set[tuple[int, str]] = set()
+# The same guard for a PARKED hold (2026-11-26 → 28): amux accepted the text
+# and deleted the queue row, so the probe above cannot see it and only the
+# gateway's own record knows a message is still unresolved.
 
 
 async def idle_sweep_once(app: Application) -> None:
@@ -4382,6 +4454,25 @@ async def idle_sweep_once(app: Application) -> None:
                     )
                 continue
             _pending_warned.discard((chat_id, session))
+            # A message the gateway ALREADY accepted back from amux's send path
+            # is a promise of its own: "held in the input box" is invisible to
+            # `/api/debug/steering` (acceptance deletes the row), so the queue
+            # probe above cannot see it. Stopping the lane destroys the only
+            # place that text exists (2026-11-27, idle_s=1812 thirty-four
+            # minutes after a parked prompt). The hold expires on its own
+            # (`parked_sweep_once`), so this cannot pin a lane forever.
+            if state.parked(chat_id, session) is not None:
+                if (chat_id, session) not in _parked_hold_warned:
+                    _parked_hold_warned.add((chat_id, session))
+                    log.warning(
+                        "idle_stop_skipped_parked chat_id=%s session=%s "
+                        "hint=a parked message is still unresolved; stopping this "
+                        "lane would destroy it (the hold expires on its own)",
+                        chat_id,
+                        session,
+                    )
+                continue
+            _parked_hold_warned.discard((chat_id, session))
             cards = await client.todo_cards(session)
             if cards:
                 if (chat_id, session) not in _cards_warned:
@@ -4426,6 +4517,256 @@ async def idle_sweep_loop(app: Application) -> None:
             raise
         except Exception:  # never let one bad cycle kill the loop
             log.exception("idle_sweep_failed")
+
+
+# ---------------------------------------------------------------------------
+# parked holds: the promise made by `send_parked`, kept or returned
+# ---------------------------------------------------------------------------
+#
+# 2026-11-26 → 28: every exit of amux's own composer watcher is a WARN in
+# `~/.amux/logs/server-rs.log` — `direct_draft_idle_submit_gave_up` after 30
+# minutes, `direct_draft_lane_stopped` when the pane dies with the text in it
+# (measured seven times for `ocusage` in 90 minutes on 11-25). The gateway had
+# already answered "⌛ queued — amux will deliver it" and kept no record, so a
+# message amux dropped read exactly like one the owner had not sent yet.
+#
+# This sweep is the other half of that promise:
+#   * lane stopped with a durable queue row → START it (the host can resolve
+#     `not-running`; leaving it is the permanent wait A4 forbids);
+#   * lane stopped and no row → the text died with the pane: tell the owner,
+#     then forget it;
+#   * lane running and still queued → the stall watch already pages per row;
+#   * past the deadline → one honest line and stop blocking the lane.
+PARKED_FAILED_NOTICE = (
+    "❌ Not delivered: the message beginning “{preview}” never reached "
+    "`{session}` — {why}. Send it again to retry."
+)
+PARKED_EXPIRED_NOTICE = (
+    "⚠️ Not confirmed: amux accepted the message beginning “{preview}” "
+    "{minutes} min ago and never confirmed it left the worker's input. If it did not "
+    "arrive, send it again to force a fresh attempt."
+)
+# One WARN per reason per process: a probe that keeps failing must not become a
+# line every tick (the `_stall_lanes_failed` shape).
+_parked_probe_failed: set[str] = set()
+
+
+def _queued_depth(lane: dict | None) -> int:
+    """Queue rows amux still owes this lane, or 0 when it does not say."""
+    if not isinstance(lane, dict):
+        return 0
+    queued = lane.get("queued")
+    if isinstance(queued, (int, float)) and not isinstance(queued, bool):
+        return int(queued)
+    return 0
+
+
+async def _parked_page(
+    app: Application, chat_id: int, thread: int | None, text: str
+) -> bool:
+    """One line into the hold's topic; ``False`` when Telegram refused it."""
+    try:
+        await app.bot.send_message(chat_id, text, message_thread_id=thread)
+    except TelegramError as exc:
+        log.warning(
+            "parked_notice_failed chat_id=%s thread=%s kind=failure error=%s",
+            chat_id,
+            thread,
+            exc,
+        )
+        return False
+    return True
+
+
+async def _revive_parked_lane(
+    app: Application,
+    cfg: Config,
+    client: AmuxClient,
+    state: GatewayState,
+    chat_id: int,
+    session: str,
+    hold: dict,
+    now: float,
+) -> None:
+    """Start a stopped lane that still owes a queued message (bounded).
+
+    `not-running` is the one lane block with NO deadline: amux keeps the row
+    forever and `steer_dead_letter_verdict` deliberately does not reap it. The
+    only party that can lift it is the one that stopped the lane — this
+    gateway. One attempt per `parked_revive_s` per hold, logged either way.
+    """
+    last_try = float(hold.get("last_try") or 0.0)
+    if last_try and now - last_try < cfg.parked_revive_s:
+        return
+    try:
+        await client.start(session)
+        await client.wait_until_started(session)
+    except AmuxError as exc:
+        state.note_parked_try(chat_id, session, at=now)
+        log.warning(
+            "parked_start_failed chat_id=%s session=%s status=%s detail=%s "
+            "tries=%s hint=the queue row stays; the next tick retries after %.0fs",
+            chat_id,
+            session,
+            exc.status,
+            exc.detail,
+            int(hold.get("tries") or 0) + 1,
+            cfg.parked_revive_s,
+        )
+        return
+    hold = state.note_parked_try(chat_id, session, at=now) or hold
+    log.info(
+        "parked_lane_started chat_id=%s session=%s tries=%s "
+        "hint=the lane was stopped while a steering row waited; the queue "
+        "drains at its first turn boundary",
+        chat_id,
+        session,
+        hold.get("tries"),
+    )
+
+
+async def parked_sweep_once(app: Application) -> None:
+    """Keep, recover, or RETURN every parked message. Never leave it waiting.
+
+    Reads the queue ONCE (`/api/debug/steering`, AF-320: `None` is "never
+    read", and an unread queue is not an empty one) and the lane list once, then
+    decides per hold. Every decision is one greppable line:
+    `parked_lane_started` / `parked_start_failed` / `parked_failed` /
+    `parked_expired` / `parked_cleared`.
+    """
+    cfg: Config = app.bot_data["cfg"]
+    client: AmuxClient = app.bot_data["client"]
+    state: GatewayState = app.bot_data["state"]
+    holds = state.parked_holds()
+    if not holds:
+        return
+    try:
+        lanes = await client.steering_lanes()
+    except AmuxError as exc:
+        if "probe" not in _parked_probe_failed:
+            _parked_probe_failed.add("probe")
+            log.warning(
+                "parked_sweep_unreadable status=%s detail=%s "
+                "hint=deciding nothing: an unread queue may still hold these messages",
+                exc.status,
+                exc.detail,
+            )
+        return
+    if lanes is None:
+        if "unmeasured" not in _parked_probe_failed:
+            _parked_probe_failed.add("unmeasured")
+            log.warning(
+                "parked_sweep_unmeasured hint=deciding nothing while "
+                "/api/debug/steering reports measured:false"
+            )
+        return
+    _parked_probe_failed.clear()
+    try:
+        rows = await client.list_sessions()
+    except AmuxError as exc:
+        if "sessions" not in _parked_probe_failed:
+            _parked_probe_failed.add("sessions")
+            log.warning(
+                "parked_sweep_unreadable status=%s detail=%s source=sessions",
+                exc.status,
+                exc.detail,
+            )
+        return
+    live = {
+        str(row.get("name")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("name")
+    }
+    now = time.time()
+    for (chat_id, session), hold in holds.items():
+        age = max(0.0, now - float(hold.get("since") or now))
+        lane = live.get(session)
+        running = None if lane is None else lane.get("running")
+        queued = _queued_depth((lanes or {}).get(session))
+        thread = hold.get("thread")
+        if thread is None:
+            thread = state.session_topic(chat_id, session)
+        if age >= cfg.parked_hold_max_s:
+            # Past the budget: stop protecting the lane and say the honest half
+            # ONCE. The text is still amux's to deliver; this line only stops
+            # the owner waiting on a confirmation nobody promised to give.
+            pages = int(hold.get("escalated") or 0)
+            if pages < 1:
+                minutes = int(round(age / 60.0))
+                delivered_notice = PARKED_EXPIRED_NOTICE.format(
+                    preview=hold.get("preview") or "(no preview)",
+                    minutes=minutes,
+                )
+                state.note_parked_try(chat_id, session, at=now)
+                await _parked_page(app, chat_id, thread, delivered_notice)
+            log.warning(
+                "parked_expired chat_id=%s session=%s age_s=%.0f kind=%s reason=%s "
+                "hint=hold released; the lane is stoppable again",
+                chat_id,
+                session,
+                age,
+                hold.get("kind"),
+                hold.get("reason"),
+            )
+            state.clear_parked(chat_id, session)
+            continue
+        if running is None and lane is not None:
+            continue  # a row that will not say whether it runs: decide nothing
+        if lane is None or running is False:
+            if queued:
+                await _revive_parked_lane(
+                    app, cfg, client, state, chat_id, session, hold, now
+                )
+                continue
+            # Nothing durable holds the text and the pane is gone: it died with
+            # the lane. Return it instead of pretending it is queued.
+            state.note_parked_try(chat_id, session, at=now)
+            why = (
+                "the worker stopped with it still in its input"
+                if hold.get("kind") == "direct"
+                else "the worker is not running and amux no longer holds a queued copy"
+            )
+            await _parked_page(
+                app,
+                chat_id,
+                thread,
+                PARKED_FAILED_NOTICE.format(
+                    preview=hold.get("preview") or "(no preview)",
+                    session=session,
+                    why=why,
+                ),
+            )
+            state.clear_parked(chat_id, session)
+            log.warning(
+                "parked_failed chat_id=%s session=%s reason=lane-stopped kind=%s "
+                "age_s=%.0f queued=0",
+                chat_id,
+                session,
+                hold.get("kind"),
+                age,
+            )
+            continue
+        if queued:
+            # amux still owes the delivery from its own queue; the stall watch
+            # pages per row once that row goes stale, so stay quiet here.
+            continue
+        if hold.get("reason") == "draft":
+            # A person's draft is in the composer. amux will not overwrite it
+            # and neither will we: the hold keeps the lane alive, and the
+            # deadline path above closes it out loud.
+            continue
+
+
+async def parked_sweep_loop(app: Application) -> None:
+    cfg: Config = app.bot_data["cfg"]
+    while True:
+        await asyncio.sleep(cfg.parked_sweep_s)
+        try:
+            await parked_sweep_once(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never let one bad cycle kill the loop
+            log.exception("parked_sweep_failed")
 
 
 # ---------------------------------------------------------------------------
@@ -5457,6 +5798,20 @@ async def post_init(app: Application) -> None:
         app.bot_data["stall_task"] = asyncio.create_task(stall_watch_loop(app))
     else:
         log.info("stall_watch_disabled reason=TELEGRAM_GATEWAY_STALL_WATCH_S=0")
+    # The parked hold's own life: a message amux accepted but did not submit is
+    # started, returned, or closed out loud — never left queued forever.
+    if cfg.parked_sweep_s:
+        app.bot_data["parked_task"] = asyncio.create_task(parked_sweep_loop(app))
+    else:
+        log.info("parked_sweep_disabled reason=TELEGRAM_GATEWAY_PARKED_SWEEP_S=0")
+    # The other half of `send_parked`'s promise: a parked message is tracked
+    # until delivered, revived with its lane, or returned to the owner. It stays
+    # off when the tick is 0, and then the idle sweep's hold guard is the only
+    # protection — which is why off is a debug setting, not a mode.
+    if cfg.parked_sweep_s:
+        app.bot_data["parked_task"] = asyncio.create_task(parked_sweep_loop(app))
+    else:
+        log.info("parked_sweep_disabled reason=TELEGRAM_GATEWAY_PARKED_SWEEP_S=0")
     if cfg.manager_reset_days:
         app.bot_data["compaction_task"] = asyncio.create_task(compaction_loop(app))
     # The dispatcher ring: one general-mgr per allowed owner, briefed from the
@@ -5470,7 +5825,8 @@ async def post_init(app: Application) -> None:
     app.bot_data["gm_menu_task"] = asyncio.create_task(ensure_gm_menu_task(app))
     log.info(
         "gateway_started allowed_users=%d amux_url=%s voice=%s relay_interval_s=%s "
-        "idle_stop_s=%s topic_sync_s=%s stall_watch_s=%s stall_log=%s",
+        "idle_stop_s=%s topic_sync_s=%s stall_watch_s=%s parked_sweep_s=%s "
+        "parked_hold_max_s=%s stall_log=%s",
         len(cfg.allowed_user_ids),
         cfg.amux_url,
         "on" if cfg.groq_api_key else "off",
@@ -5478,6 +5834,8 @@ async def post_init(app: Application) -> None:
         f"{cfg.idle_stop_s:g}" if cfg.idle_stop_s else "off",
         f"{cfg.topic_sync_s:g}" if cfg.topic_sync_s else "off",
         f"{cfg.stall_watch_s:g}" if cfg.stall_watch_s else "off",
+        f"{cfg.parked_sweep_s:g}" if cfg.parked_sweep_s else "off",
+        f"{cfg.parked_hold_max_s:g}",
         cfg.amux_server_log,
     )
 
@@ -5512,6 +5870,13 @@ async def post_shutdown(app: Application) -> None:
         stall_task.cancel()
         try:
             await stall_task
+        except asyncio.CancelledError:
+            pass
+    parked_task = app.bot_data.get("parked_task")
+    if parked_task is not None:
+        parked_task.cancel()
+        try:
+            await parked_task
         except asyncio.CancelledError:
             pass
     menu_task = app.bot_data.get("gm_menu_task")

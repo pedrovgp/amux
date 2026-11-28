@@ -75,6 +75,17 @@ Optional
 ``AMUX_SERVER_LOG`` default ``~/.amux/logs/server-rs.log`` — which file that
     watch reads. The first read starts at the file's END, so a gateway restart
     never replays old stalls into the owner's topics.
+``TELEGRAM_GATEWAY_PARKED_SWEEP_S`` default ``60`` — how often the gateway
+    re-checks a PARKED message (amux accepted it without submitting it): a lane
+    that stopped with a durable queue row is started again, a hold whose text
+    died with its lane is returned to the owner as an error, and an unconfirmed
+    hold is eventually closed out loud; ``0`` disables the sweep (holds then
+    still block the idle stop forever, so off is a debug setting).
+``TELEGRAM_GATEWAY_PARKED_HOLD_MAX_S`` default ``1800`` — how long a hold may
+    stay unconfirmed before it stops protecting its lane and the owner is told
+    once. The default matches amux's own composer-watcher budget.
+``TELEGRAM_GATEWAY_PARKED_REVIVE_S`` default ``300`` — the minimum gap between
+    two lane-start attempts for one held message.
 
 Manager mode (a plain message starts a new agent)
 -------------------------------------------------
@@ -105,6 +116,14 @@ DEFAULT_TOPIC_SYNC_S = 60.0
 # The path is overridable (AMUX_SERVER_LOG); 0 disables the watch.
 DEFAULT_AMUX_SERVER_LOG = "~/.amux/logs/server-rs.log"
 DEFAULT_STALL_WATCH_S = 60.0
+# A PARKED message (amux accepted the text without submitting it) is a promise
+# the gateway made; these three knobs bound it. The sweep tick; how long a hold
+# may stay unconfirmed before it stops blocking the lane and the owner is told
+# (amux's own composer watcher gives up after 30 min — the same budget); and
+# the minimum gap between two lane-start attempts for one hold.
+DEFAULT_PARKED_SWEEP_S = 60.0
+DEFAULT_PARKED_HOLD_MAX_S = 1800.0
+DEFAULT_PARKED_REVIVE_S = 300.0
 # Relay fallback peek depth (owner, 2026-10-28, "peek substantially further
 # back … default well above 300"): tmux's own history limit is 2000 lines, so
 # this reaches the entire buffer a long answer can still be hiding in.
@@ -179,6 +198,12 @@ class Config:
     )
     # The stall watch's tick; 0 disables it (see module docstring).
     stall_watch_s: float = DEFAULT_STALL_WATCH_S
+    # A parked message's own life: the sweep that unwedges or returns it.
+    parked_sweep_s: float = DEFAULT_PARKED_SWEEP_S
+    # How long a hold may stay unconfirmed before it stops blocking the lane.
+    parked_hold_max_s: float = DEFAULT_PARKED_HOLD_MAX_S
+    # Minimum gap between two lane-start attempts for one hold.
+    parked_revive_s: float = DEFAULT_PARKED_REVIVE_S
     # Manager mode: a plain message (not a quote-reply) starts a new agent here.
     manager_cwd: str = field(
         default_factory=lambda: os.path.expanduser("~/Documents/pv/projetos")
@@ -398,6 +423,27 @@ def load_config(
         )
         stall_watch_s = DEFAULT_STALL_WATCH_S
 
+    def seconds(name: str, default: float) -> float:
+        """A non-negative seconds knob: 0 is the documented off switch."""
+        try:
+            value = float((env.get(name) or "").strip() or default)
+        except ValueError:
+            problems.append(f"{name} is not a number; using {default:g}")
+            return default
+        if value < 0:
+            problems.append(f"{name} must be 0 (disabled) or positive")
+            return default
+        return value
+
+    # A parked message's own life (see DEFAULT_PARKED_* for why).
+    parked_sweep_s = seconds("TELEGRAM_GATEWAY_PARKED_SWEEP_S", DEFAULT_PARKED_SWEEP_S)
+    parked_hold_max_s = seconds(
+        "TELEGRAM_GATEWAY_PARKED_HOLD_MAX_S", DEFAULT_PARKED_HOLD_MAX_S
+    )
+    parked_revive_s = seconds(
+        "TELEGRAM_GATEWAY_PARKED_REVIVE_S", DEFAULT_PARKED_REVIVE_S
+    )
+
     amux_server_log = Path(
         (env.get("AMUX_SERVER_LOG") or "").strip() or DEFAULT_AMUX_SERVER_LOG
     ).expanduser()
@@ -450,6 +496,9 @@ def load_config(
         topic_sync_s=topic_sync_s,
         amux_server_log=amux_server_log,
         stall_watch_s=stall_watch_s,
+        parked_sweep_s=parked_sweep_s,
+        parked_hold_max_s=parked_hold_max_s,
+        parked_revive_s=parked_revive_s,
         manager_cwd=os.path.expanduser(
             (env.get("MANAGER_CWD") or "").strip() or "~/Documents/pv/projetos"
         ),

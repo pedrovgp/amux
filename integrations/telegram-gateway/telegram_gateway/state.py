@@ -23,6 +23,12 @@ MAX_TOPICS_PER_CHAT = 200
 # Activity stamps, pins and idle markers are keyed by session name: bounded the
 # same way the message map is, so a long-lived chat cannot grow state.json.
 MAX_ACTIVITY_PER_CHAT = 300
+# How much of a parked message is kept for the failure line. The hold exists to
+# carry a PROMISE (which message, since when, what amux said); the text itself
+# stays in amux's queue/composer, so a preview is enough and state.json keeps
+# no second copy of the owner's words.
+PARKED_PREVIEW_CHARS = 80
+MAX_PARKED_PER_CHAT = 100
 
 
 class GatewayState:
@@ -748,6 +754,115 @@ class GatewayState:
         value = stopped.get(session)
         return float(value) if isinstance(value, (int, float)) else None
 
+    # ---- parked messages: the gateway's own promise ----------------------
+
+    def mark_parked(
+        self,
+        chat_id: int,
+        session: str,
+        text: str,
+        reason: str,
+        kind: str = "steering",
+        thread: int | None = None,
+        at: float | None = None,
+    ) -> dict:
+        """Record that amux ACCEPTED ``text`` without submitting it.
+
+        Durable on purpose: the incident this exists for (2026-11-26 →
+        2026-11-28) outlived gateway restarts, so an in-memory set would have
+        forgotten the promise exactly when someone restarted the process to
+        "fix" the silence. ``reason`` is ``parked_reason``'s answer
+        (``draft``/``queued``); ``kind`` separates "amux still holds a queue
+        row" (``steering``) from "the text sits in the composer"
+        (``direct``), because only the first is visible to
+        ``/api/debug/steering`` after acceptance.
+
+        A new park for the same (chat, session) REPLACES the hold: the owner is
+        waiting on the newest message, and the older one was either delivered
+        or is already covered by the same failure page.
+        """
+        chat = self._chat(chat_id)
+        parked = chat.get("parked")
+        if not isinstance(parked, dict):
+            parked = {}
+        hold = {
+            "preview": (text or "").strip()[:PARKED_PREVIEW_CHARS],
+            "reason": reason,
+            "kind": kind,
+            "thread": thread,
+            "since": float(time.time() if at is None else at),
+            "tries": 0,
+            "last_try": 0.0,
+            "escalated": 0,
+        }
+        parked[session] = hold
+        while len(parked) > MAX_PARKED_PER_CHAT:
+            parked.pop(next(iter(parked)), None)
+        chat["parked"] = parked
+        self._save()
+        return dict(hold)
+
+    def parked(self, chat_id: int, session: str) -> dict | None:
+        parked = self._chat(chat_id).get("parked")
+        if not isinstance(parked, dict):
+            return None
+        hold = parked.get(session)
+        return dict(hold) if isinstance(hold, dict) else None
+
+    def clear_parked(self, chat_id: int, session: str) -> bool:
+        chat = self._chat(chat_id)
+        parked = chat.get("parked")
+        if not isinstance(parked, dict) or session not in parked:
+            return False
+        parked.pop(session, None)
+        chat["parked"] = parked
+        self._save()
+        return True
+
+    def parked_holds(self) -> dict[tuple[int, str], dict]:
+        """Every live hold, keyed ``(chat_id, session)`` — the sweep's input.
+
+        Read by ``parked_sweep_once`` and by ``idle_sweep_once`` (a lane with a
+        live hold is never stopped: stopped, its text has nowhere to go).
+        """
+        out: dict[tuple[int, str], dict] = {}
+        for raw_chat, chat in self._data.get("chats", {}).items():
+            if not isinstance(chat, dict):
+                continue
+            parked = chat.get("parked")
+            if not isinstance(parked, dict):
+                continue
+            try:
+                chat_id = int(raw_chat)
+            except (TypeError, ValueError):
+                continue
+            for session, hold in parked.items():
+                if isinstance(hold, dict):
+                    out[(chat_id, str(session))] = dict(hold)
+        return out
+
+    def note_parked_try(
+        self, chat_id: int, session: str, at: float | None = None
+    ) -> dict | None:
+        """Count an unwedge attempt (a lane start) on a hold.
+
+        ``tries``/``last_try`` bound the revive retries, so a lane that refuses
+        to start is retried on a slow cadence and not every sweep tick.
+        """
+        chat = self._chat(chat_id)
+        parked = chat.get("parked")
+        if not isinstance(parked, dict):
+            return None
+        hold = parked.get(session)
+        if not isinstance(hold, dict):
+            return None
+        hold["tries"] = int(hold.get("tries") or 0) + 1
+        hold["last_try"] = float(time.time() if at is None else at)
+        parked[session] = hold
+        chat["parked"] = parked
+        self._save()
+        return dict(hold)
+
     def tracked_sessions(self) -> dict[int, set[str]]:
         """Every session the gateway knows about, for the idle sweep.
 
@@ -765,7 +880,7 @@ class GatewayState:
         for chat_id, session in self.selections().items():
             add(chat_id, session)
         for chat_id, chat in self._data.get("chats", {}).items():
-            for key in ("turn_msg", "activity", "pinned", "idle_stopped"):
+            for key in ("turn_msg", "activity", "pinned", "idle_stopped", "parked"):
                 values = chat.get(key)
                 if isinstance(values, dict):
                     for session in values:
