@@ -275,7 +275,7 @@ still preserved (`steering_draft_preserved`) — no human text is overwritten.
 Logs to watch: `send_parked`, `parked_tracked`, `parked_cleared`,
 `parked_lane_started`, `parked_start_failed`, `parked_failed`, `parked_expired`,
 `parked_sweep_unreadable`, `parked_notice_sent`, `parked_notice_failed`,
-`idle_stop_skipped_parked`, `stall_notice_sent`, `stall_notice_skipped`,
+`parked_page_retry`, `idle_stop_skipped_parked`, `stall_notice_sent`, `stall_notice_skipped`,
 `stall_log_unavailable`, `steering_own_stale_draft_cleared`,
 `steering_draft_preserved`.
 
@@ -297,6 +297,8 @@ promise nobody re-checks is how the owner's message disappeared (2026-11-26 →
 - still unconfirmed after `TELEGRAM_GATEWAY_PARKED_HOLD_MAX_S` (default
   **1800**, amux's own composer-watcher budget) → one honest "⚠️ Not
   confirmed" line, then the hold is released (`parked_expired`).
+- if Telegram refuses that line, the hold is KEPT and retried every tick
+  (`parked_page_retry`): a page that never arrived is not a message returned.
 - an unread or `measured:false` queue decides NOTHING (`parked_sweep_unreadable`).
 - the idle sweep never stops a lane holding a live parked message
   (`idle_stop_skipped_parked`): a direct hold exists only in that pane, so a

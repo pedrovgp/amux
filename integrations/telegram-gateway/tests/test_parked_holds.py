@@ -22,6 +22,7 @@ Contracts pinned here:
 5. an unread queue decides NOTHING (AF-320);
 6. `idle_stop` never stops a lane with a live hold.
 """
+import asyncio
 import json
 import logging
 import time
@@ -49,10 +50,12 @@ def _clean_module_dedupes():
     for name in ("_parked_warned", "_parked_hold_warned"):
         getattr(botmod, name).clear()
     botmod._parked_probe_failed.clear()
+    botmod._parked_page_failed.clear()
     yield
     for name in ("_parked_warned", "_parked_hold_warned"):
         getattr(botmod, name).clear()
     botmod._parked_probe_failed.clear()
+    botmod._parked_page_failed.clear()
 
 
 class HoldAmux:
@@ -325,3 +328,156 @@ def test_idle_stop_never_freezes_a_lane_with_a_live_parked_hold(tmp_path, caplog
         assert fake.verbs() == ["stop"]
     finally:
         run(fake.aclose())
+
+
+# ---- a page Telegram refused is NOT a returned message ---------------------
+
+
+class RefusingSendBot(FakeBot):
+    """Sends fail ``failures`` times, then behave (a topic the owner can read)."""
+
+    def __init__(self, failures: int = 1):
+        super().__init__()
+        self.failures = failures
+
+    async def send_message(self, *args, **kwargs):
+        if self.failures:
+            self.failures -= 1
+            from telegram.error import TelegramError
+
+            raise TelegramError("boom")
+        return await super().send_message(*args, **kwargs)
+
+
+def test_expiry_keeps_the_hold_when_telegram_refuses_the_page(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="telegram_gateway")
+    fake = HoldAmux(
+        rows=[{"name": SESSION, "activity": "x", "status": "idle", "running": True}],
+        steering=[],
+    )
+    _cfg, state, app = setup(tmp_path, fake)
+    app.bot = RefusingSendBot(failures=1)
+    state.mark_parked(
+        CHAT, SESSION, "still waiting?", "queued", kind="direct", at=time.time() - 1900
+    )
+    try:
+        run(botmod.parked_sweep_once(app))
+        # The owner was NOT told, so the message is not returned yet: the hold
+        # survives and the lane keeps its protection until the page lands.
+        assert state.parked(CHAT, SESSION) is not None
+        assert "parked_page_retry" in caplog.text
+        assert "parked_expired" not in caplog.text
+
+        run(botmod.parked_sweep_once(app))  # Telegram accepts now
+        assert state.parked(CHAT, SESSION) is None
+        assert "parked_expired" in caplog.text
+        assert len(app.bot.sent) == 1 and "Not confirmed" in app.bot.sent[0]["text"]
+    finally:
+        run(fake.aclose())
+
+
+def test_failed_page_keeps_the_hold_when_telegram_refuses(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="telegram_gateway")
+    fake = HoldAmux(
+        rows=[{"name": SESSION, "activity": "x", "status": "stopped", "running": False}],
+        steering=[],
+    )
+    _cfg, state, app = setup(tmp_path, fake)
+    app.bot = RefusingSendBot(failures=1)
+    state.mark_parked(CHAT, SESSION, "died with the pane", "queued", kind="direct")
+    try:
+        run(botmod.parked_sweep_once(app))
+        assert state.parked(CHAT, SESSION) is not None, "not returned = hold kept"
+        assert "parked_page_retry" in caplog.text
+
+        run(botmod.parked_sweep_once(app))
+        assert state.parked(CHAT, SESSION) is None
+        assert "parked_failed" in caplog.text
+        assert len(app.bot.sent) == 1 and "Not delivered" in app.bot.sent[0]["text"]
+    finally:
+        run(fake.aclose())
+
+
+# ---- wiring: ONE sweep per process, each cancelled on shutdown -------------
+
+
+def test_post_init_spawns_exactly_one_parked_sweep(tmp_path, caplog, monkeypatch):
+    """The live 2026-11-28 restart started the sweep twice.
+
+    Two consecutive `if cfg.parked_sweep_s:` blocks spawned a loop each; the
+    second assignment overwrote `parked_task`, so shutdown cancelled only one
+    and the other leaked. The visible symptom was two identical
+    `parked_expired` WARNs (38–116 ms apart) for every hold, plus two racers on
+    the revive/expiry paths. This pins one spawn and zero survivors.
+    """
+    log_path = tmp_path / "server.log"
+    log_path.write_text("", encoding="utf-8")
+    cfg = make_cfg(
+        tmp_path,
+        amux_server_log=log_path,
+        state_dir=tmp_path / "gw-state",
+        control_port=0,
+    )
+    app = botmod.build_application(cfg)
+    app.bot_data["client"] = AmuxClient(
+        "https://localhost:1",
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})),
+    )
+
+    started: list = []
+
+    async def fake_loop(application):
+        started.append(application)
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(botmod, "parked_sweep_loop", fake_loop)
+
+    async def scenario():
+        with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+            await botmod.post_init(app)
+            await asyncio.sleep(0)  # let each spawned task reach its first await
+            loops = [
+                task
+                for task in asyncio.all_tasks()
+                if getattr(task.get_coro(), "__qualname__", "").endswith("fake_loop")
+            ]
+            await botmod.post_shutdown(app)
+        return loops
+
+    loops = run(scenario())
+
+    assert len(started) == 1, f"parked sweep started {started!r} times"
+    assert len(loops) == 1, "one task registered"
+    assert loops[0].done(), "post_shutdown must cancel the sweep it spawned"
+
+
+def test_shutdown_cancels_the_loops_the_named_list_forgot(tmp_path, caplog):
+    """`post_shutdown` named six tasks and missed two real ones.
+
+    `compaction_task` and `general_mgr_task` therefore survived every shutdown
+    and printed `Task was destroyed but it is pending!` on the next in-process
+    restart (measured on every 2026-11-28 reboot). Discovery by type is the
+    fix: a loop in `bot_data` is cancelled whether or not someone remembered
+    its name.
+    """
+    cfg = make_cfg(tmp_path, state_dir=tmp_path / "gw-state", control_port=0)
+    app = botmod.build_application(cfg)
+    app.bot_data["client"] = AmuxClient(
+        "https://localhost:1",
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})),
+    )
+
+    async def scenario():
+        async def slow_loop():
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(slow_loop())
+        app.bot_data["compaction_task"] = task  # never in the old named list
+        with caplog.at_level(logging.INFO, logger="telegram_gateway"):
+            await botmod.post_shutdown(app)
+        return task
+
+    task = run(scenario())
+
+    assert task.cancelled(), "an unnamed loop must still be cancelled"
+    assert any("gateway_tasks_cancelled" in m for m in caplog.messages)

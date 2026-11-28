@@ -205,6 +205,61 @@ Every path is a greppable line: `parked_tracked`, `parked_cleared`,
 | 4 | parked sweep | `parked_sweep_once`/loop: start, return, expire, unmeasured = decide nothing | done | 6 tests |
 | 5 | idle guard | `idle_stop_skipped_parked` before the cards probe | done | incident test + release test |
 | 6 | config/docs | `parked_sweep_s`/`parked_hold_max_s`/`parked_revive_s`, wiring, `--check`, `gateway_started` | done | 431 passed |
+| 6.1–6.5 | duplicate sweep + shutdown | RED test (`started 2 times`) → one spawn; `_spawn_task` refuses a second handle; shutdown cancels every `bot_data` task. Live 11:09:22: `gateway_tasks_cancelled n=6 keys=relay_task,idle_task,title_task,stall_task,parked_task,compaction_task`, ZERO `Task was destroyed` | done | 435 passed |
+| 7.1–7.3 | refused page keeps the hold | `_parked_page` verdict + `parked_page_retry`; expiry and failure paths retry instead of clearing | done | 435 passed |
+
+## Follow-up: the live deploy ran the sweep TWICE (2026-11-28, after restart)
+
+Live evidence, first minutes after the 07:34 restart
+(`~/.amux/logs/telegram-gateway.log`):
+
+```
+09:58:01.428 WARNING parked_expired … session=general-mgr-823440998 age_s=1819 …
+09:58:01.466 WARNING parked_expired … session=general-mgr-823440998 age_s=1819 …
+10:09:04.548 WARNING parked_expired … session=amux-papel-opencode-server age_s=1801 …
+10:09:04.664 WARNING parked_expired … session=amux-papel-opencode-server age_s=1801 …
+```
+
+Two lines per hold, 38–116 ms apart. Cause: `post_init` spawned
+`parked_sweep_loop` in two consecutive `if cfg.parked_sweep_s:` blocks
+(`bot.py` 5801-5814); the second assignment overwrote `parked_task`, so
+`post_shutdown` cancelled only the second loop and the first leaked
+(also the `Task was destroyed but it is pending` shape). Every tick then ran
+twice: doubled API reads, doubled WARNs, and two racers on
+`_revive_parked_lane` / the expiry page (the page is `escalated`-guarded, the
+log was not).
+
+### Milestone 6 — one sweep, not two
+- [x] 6.1 RED test: `post_init` starts exactly ONE parked sweep, and
+      `post_shutdown` leaves none of them running (source-level duplicate would
+      fail with two started tasks). — failed first with
+      `parked sweep started 2 times`, green after 6.2.
+- [x] 6.2 Remove the duplicated block; keep one spawn + one cancel path.
+- [x] 6.3 Suite green (`432 passed`), live restart, one `parked_expired` per
+      hold in the log (see the execution log below).
+- [x] 6.4 A second spawn can no longer LEAK: every loop goes through
+      `_spawn_task(app, key, coro, what)`, which cancels the task already under
+      that key and logs `gateway_task_duplicate key=… what=…` (a wiring bug
+      announces itself instead of running unseen).
+- [x] 6.5 `post_shutdown` cancels EVERY `asyncio.Task` in `bot_data`, not a
+      named list: the old list forgot `compaction_task` and `general_mgr_task`,
+      which is why every in-process restart printed
+      `Task was destroyed but it is pending!`. One `gateway_tasks_cancelled
+      n=… keys=…` line records what stopped (`435 passed`).
+
+### Milestone 7 — a refused page is not a returned message
+- [x] 7.1 RED tests: Telegram refuses the expiry page / the failure page →
+      the hold must SURVIVE and `parked_page_retry` be logged; the next tick
+      (page accepted) returns it once.
+- [x] 7.2 `_parked_page` returns its verdict and dedupes its WARN
+      (`_parked_page_failed`); both call sites `continue` without clearing the
+      hold when the page was refused.
+- [x] 7.3 README log list + this section; full suite `435 passed`.
+
+Live evidence for 7: the two pages are the ONLY way an owner learns a parked
+message died; before this, `clear_parked` ran regardless of `_parked_page`'s
+`False` return, so a refused Telegram send erased the last trace of the
+message while the log said `parked_expired`/`parked_failed`.
 
 ## Human Verification
 

@@ -4549,6 +4549,10 @@ PARKED_EXPIRED_NOTICE = (
 # One WARN per reason per process: a probe that keeps failing must not become a
 # line every tick (the `_stall_lanes_failed` shape).
 _parked_probe_failed: set[str] = set()
+# A failure page that Telegram REFUSED must not consume the hold: the owner was
+# not told, so the message is not returned yet. One WARN per hold per attempt
+# kind, cleared by the next successful page.
+_parked_page_failed: set[tuple[int, str, str]] = set()
 
 
 def _queued_depth(lane: dict | None) -> int:
@@ -4562,19 +4566,36 @@ def _queued_depth(lane: dict | None) -> int:
 
 
 async def _parked_page(
-    app: Application, chat_id: int, thread: int | None, text: str
+    app: Application,
+    chat_id: int,
+    thread: int | None,
+    text: str,
+    key: tuple[int, str, str] | None = None,
 ) -> bool:
-    """One line into the hold's topic; ``False`` when Telegram refused it."""
+    """One line into the hold's topic; ``False`` when Telegram refused it.
+
+    ``key`` dedupes the WARN across sweep ticks. A ``False`` return means the
+    owner still does NOT know what happened to their message, so the caller
+    keeps the hold and retries next tick (2026-11-28: both call sites used to
+    clear the hold regardless, which could drop the only trace of a message
+    into a failed send).
+    """
     try:
         await app.bot.send_message(chat_id, text, message_thread_id=thread)
     except TelegramError as exc:
-        log.warning(
-            "parked_notice_failed chat_id=%s thread=%s kind=failure error=%s",
-            chat_id,
-            thread,
-            exc,
-        )
+        if key is None or key not in _parked_page_failed:
+            if key is not None:
+                _parked_page_failed.add(key)
+            log.warning(
+                "parked_notice_failed chat_id=%s thread=%s kind=failure error=%s "
+                "hint=hold kept; the owner has not been told yet",
+                chat_id,
+                thread,
+                exc,
+            )
         return False
+    if key is not None:
+        _parked_page_failed.discard(key)
     return True
 
 
@@ -4698,7 +4719,24 @@ async def parked_sweep_once(app: Application) -> None:
                     minutes=minutes,
                 )
                 state.note_parked_try(chat_id, session, at=now)
-                await _parked_page(app, chat_id, thread, delivered_notice)
+                if not await _parked_page(
+                    app,
+                    chat_id,
+                    thread,
+                    delivered_notice,
+                    key=(chat_id, session, "expired"),
+                ):
+                    # Not told = not returned. Keep the hold (and the lane's
+                    # protection) and try again next tick; dropping it here
+                    # would answer "returned to the owner" with silence.
+                    log.warning(
+                        "parked_page_retry chat_id=%s session=%s kind=expired "
+                        "age_s=%.0f hint=hold kept until the owner is told",
+                        chat_id,
+                        session,
+                        age,
+                    )
+                    continue
             log.warning(
                 "parked_expired chat_id=%s session=%s age_s=%.0f kind=%s reason=%s "
                 "hint=hold released; the lane is stoppable again",
@@ -4726,7 +4764,7 @@ async def parked_sweep_once(app: Application) -> None:
                 if hold.get("kind") == "direct"
                 else "the worker is not running and amux no longer holds a queued copy"
             )
-            await _parked_page(
+            told = await _parked_page(
                 app,
                 chat_id,
                 thread,
@@ -4735,7 +4773,19 @@ async def parked_sweep_once(app: Application) -> None:
                     session=session,
                     why=why,
                 ),
+                key=(chat_id, session, "failed"),
             )
+            if not told:
+                # Not told = not returned: keep the hold and retry next tick,
+                # logging the reason once rather than dropping the message.
+                log.warning(
+                    "parked_page_retry chat_id=%s session=%s kind=failed "
+                    "age_s=%.0f hint=hold kept until the owner is told",
+                    chat_id,
+                    session,
+                    age,
+                )
+                continue
             state.clear_parked(chat_id, session)
             log.warning(
                 "parked_failed chat_id=%s session=%s reason=lane-stopped kind=%s "
@@ -5770,6 +5820,28 @@ async def ensure_gm_menu_task(app: Application) -> None:
         log.exception("gm_menu_ensure_crashed")
 
 
+def _spawn_task(app: Application, key: str, coro, what: str) -> None:
+    """Spawn one background loop, and refuse to orphan a previous one.
+
+    Assigning a second task under the same key used to overwrite the handle
+    with no trace of the first: 2026-11-28, `post_init` spawned
+    `parked_sweep_loop` twice in two adjacent blocks, so two sweeps read the
+    same holds and every deadline page reached the owner TWICE while
+    `post_shutdown` could only cancel the last one. The duplicate is a wiring
+    bug, so it is cancelled (never left running) and announces itself.
+    """
+    prev = app.bot_data.get(key)
+    if isinstance(prev, asyncio.Task) and not prev.done():
+        prev.cancel()
+        log.warning(
+            "gateway_task_duplicate key=%s what=%s hint=two loops were spawned "
+            "under one key; the earlier one was cancelled (a wiring bug)",
+            key,
+            what,
+        )
+    app.bot_data[key] = asyncio.create_task(coro)
+
+
 async def post_init(app: Application) -> None:
     cfg: Config = app.bot_data["cfg"]
     client: AmuxClient = app.bot_data["client"]
@@ -5785,9 +5857,9 @@ async def post_init(app: Application) -> None:
         await control.start()
     else:
         log.info("control_disabled reason=TELEGRAM_GATEWAY_CONTROL_PORT=0")
-    app.bot_data["relay_task"] = asyncio.create_task(relay_loop(app))
-    app.bot_data["idle_task"] = asyncio.create_task(idle_sweep_loop(app))
-    app.bot_data["title_task"] = asyncio.create_task(sync_topic_titles_loop(app))
+    _spawn_task(app, "relay_task", relay_loop(app), "relay")
+    _spawn_task(app, "idle_task", idle_sweep_loop(app), "idle_sweep")
+    _spawn_task(app, "title_task", sync_topic_titles_loop(app), "topic_titles")
     # amux's own `steering queue STALLED` WARN, repeated into the affected
     # topic (2026-11-07: the owner's message waited in a stalled queue and no
     # signal reached the one place they look). Constructed HERE so the reader's
@@ -5799,15 +5871,10 @@ async def post_init(app: Application) -> None:
     else:
         log.info("stall_watch_disabled reason=TELEGRAM_GATEWAY_STALL_WATCH_S=0")
     # The parked hold's own life: a message amux accepted but did not submit is
-    # started, returned, or closed out loud — never left queued forever.
-    if cfg.parked_sweep_s:
-        app.bot_data["parked_task"] = asyncio.create_task(parked_sweep_loop(app))
-    else:
-        log.info("parked_sweep_disabled reason=TELEGRAM_GATEWAY_PARKED_SWEEP_S=0")
-    # The other half of `send_parked`'s promise: a parked message is tracked
-    # until delivered, revived with its lane, or returned to the owner. It stays
-    # off when the tick is 0, and then the idle sweep's hold guard is the only
-    # protection — which is why off is a debug setting, not a mode.
+    # started, returned, or closed out loud — never left queued forever. ONE
+    # loop: a duplicated block here ran every tick twice (doubled
+    # `parked_expired` WARNs, two racers on revive/expiry) and leaked the first
+    # task past `post_shutdown` (2026-11-28, first deploy of this feature).
     if cfg.parked_sweep_s:
         app.bot_data["parked_task"] = asyncio.create_task(parked_sweep_loop(app))
     else:
@@ -5844,48 +5911,32 @@ async def post_shutdown(app: Application) -> None:
     control = app.bot_data.get("control")
     if control is not None:
         await control.stop()
-    task = app.bot_data.get("relay_task")
-    if task is not None:
+    # EVERY background loop, by discovery rather than by name. The named-list
+    # version missed `compaction_task` and `general_mgr_task` (they were never
+    # cancelled) and could not see a task whose handle a duplicate spawn had
+    # overwritten, so each in-process restart left `Task was destroyed but it is
+    # pending!` in the log (2026-11-28: every reboot printed it). A task in
+    # `bot_data` is ours to stop; nothing else in there is a Task.
+    running = [
+        (key, value)
+        for key, value in list(app.bot_data.items())
+        if isinstance(value, asyncio.Task) and not value.done()
+    ]
+    for _key, task in running:
         task.cancel()
+    for key, task in running:
         try:
             await task
         except asyncio.CancelledError:
             pass
-    idle_task = app.bot_data.get("idle_task")
-    if idle_task is not None:
-        idle_task.cancel()
-        try:
-            await idle_task
-        except asyncio.CancelledError:
-            pass
-    title_task = app.bot_data.get("title_task")
-    if title_task is not None:
-        title_task.cancel()
-        try:
-            await title_task
-        except asyncio.CancelledError:
-            pass
-    stall_task = app.bot_data.get("stall_task")
-    if stall_task is not None:
-        stall_task.cancel()
-        try:
-            await stall_task
-        except asyncio.CancelledError:
-            pass
-    parked_task = app.bot_data.get("parked_task")
-    if parked_task is not None:
-        parked_task.cancel()
-        try:
-            await parked_task
-        except asyncio.CancelledError:
-            pass
-    menu_task = app.bot_data.get("gm_menu_task")
-    if menu_task is not None:
-        menu_task.cancel()
-        try:
-            await menu_task
-        except asyncio.CancelledError:
-            pass
+        except Exception:  # a loop that failed while dying must not hide the rest
+            log.exception("gateway_task_shutdown_failed key=%s", key)
+    if running:
+        log.info(
+            "gateway_tasks_cancelled n=%d keys=%s",
+            len(running),
+            ",".join(key for key, _ in running),
+        )
     client: AmuxClient = app.bot_data["client"]
     await client.aclose()
 
